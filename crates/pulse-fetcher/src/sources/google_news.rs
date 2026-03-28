@@ -1,7 +1,9 @@
 use super::RawArticle;
 
 const FEEDS: &[(&str, &str, &str)] = &[
-    ("ai", "Google News AI", "https://news.google.com/rss/search?q=artificial+intelligence+OR+LLM+OR+%22large+language+model%22+OR+ChatGPT+OR+Claude+OR+Gemini+when:1d&hl=en-US&gl=US&ceid=US:en"),
+    // AI: focus on companies, products, and model releases
+    ("ai", "Google News AI Companies", "https://news.google.com/rss/search?q=OpenAI+OR+Anthropic+OR+ChatGPT+OR+Claude+OR+%22Google+Gemini%22+OR+%22Meta+AI%22+OR+Mistral+OR+xAI+OR+Grok+when:1d&hl=en-US&gl=US&ceid=US:en"),
+    ("ai", "Google News AI Products", "https://news.google.com/rss/search?q=%22AI+model%22+OR+%22GPT-5%22+OR+%22new+AI%22+OR+%22AI+agent%22+OR+%22AI+tool%22+OR+%22AI+launch%22+OR+%22AI+release%22+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("miami", "Google News Miami", "https://news.google.com/rss/search?q=%22Miami+Beach%22+OR+%22South+Beach%22+OR+%22Miami-Dade%22+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("italy", "Google News Italy", "https://news.google.com/rss/search?q=Italy+politics+OR+Italian+government+OR+Meloni+when:1d&hl=en&gl=US&ceid=US:en"),
     ("tech", "Google News Tech", "https://news.google.com/rss/search?q=technology+innovation+startup+electronics+when:1d&hl=en-US&gl=US&ceid=US:en"),
