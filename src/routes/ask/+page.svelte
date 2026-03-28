@@ -4,6 +4,17 @@
 	let query = $state('');
 	let messagesContainer: HTMLElement;
 
+	// Check for prefilled question from story cards
+	$effect(() => {
+		const prefill = sessionStorage.getItem('pulse_ask_prefill');
+		if (prefill) {
+			sessionStorage.removeItem('pulse_ask_prefill');
+			query = prefill;
+			// Auto-submit after a tick
+			setTimeout(() => handleSubmit(), 100);
+		}
+	});
+
 	const suggestions = [
 		"What are today's biggest AI developments?",
 		"Tell me about Claude and Anthropic news",

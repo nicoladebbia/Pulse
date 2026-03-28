@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { SECTORS, type SectorId } from '$lib/config';
+	import { goto } from '$app/navigation';
 	import RelevanceBadge from './RelevanceBadge.svelte';
 	import type { Story } from '$lib/tauri/types';
 
@@ -8,11 +9,25 @@
 	let sector = $derived(SECTORS[story.sector as SectorId]);
 
 	function openSource() {
-		if (window.__TAURI_INTERNALS__) {
-			import('@tauri-apps/plugin-shell').then(({ open }) => open(story.original_url));
+		const ipc = (window as any).__TAURI_INTERNALS__;
+		if (ipc) {
+			ipc.invoke('plugin:shell|open', { path: story.original_url });
 		} else {
 			window.open(story.original_url, '_blank');
 		}
+	}
+
+	function askAboutStory() {
+		// Store the question in sessionStorage so Ask Pulse can pick it up
+		const question = `Tell me more about: ${story.headline}. Give me the full picture — background, key players, implications, and what I should keep an eye on.`;
+		sessionStorage.setItem('pulse_ask_prefill', question);
+		goto('/ask');
+	}
+
+	function deepDiveWatchNext() {
+		const question = `Regarding "${story.headline}" — the Watch Next says: "${story.what_to_watch}". Can you expand on this? What should I expect, when, and how might it affect me as an AI builder in Miami?`;
+		sessionStorage.setItem('pulse_ask_prefill', question);
+		goto('/ask');
 	}
 </script>
 
@@ -69,21 +84,37 @@
 		</p>
 	</div>
 
-	<!-- What to Watch -->
-	<div class="mb-6 bg-bg-card border border-border rounded-lg p-4">
-		<h3 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Watch Next</h3>
+	<!-- What to Watch — now clickable -->
+	<div class="mb-6 bg-bg-card border border-border rounded-lg p-4 group">
+		<div class="flex items-center justify-between mb-2">
+			<h3 class="text-xs font-semibold uppercase tracking-wider text-text-muted">Watch Next</h3>
+			<button
+				class="text-xs text-ai opacity-0 group-hover:opacity-100 transition-opacity hover:underline"
+				onclick={deepDiveWatchNext}
+			>
+				Deep dive →
+			</button>
+		</div>
 		<p class="text-sm text-text leading-relaxed">
 			{story.what_to_watch}
 		</p>
 	</div>
 
-	<!-- Sources -->
-	<div class="pt-4 border-t border-border">
+	<!-- Actions -->
+	<div class="pt-4 border-t border-border flex items-center justify-between">
 		<button
 			class="text-sm text-ai hover:underline transition-colors"
 			onclick={openSource}
 		>
-			{story.source_name} →
+			Read original source →
+		</button>
+
+		<button
+			class="flex items-center gap-2 text-sm bg-ai/10 text-ai px-4 py-2 rounded-lg
+				hover:bg-ai/20 transition-colors"
+			onclick={askAboutStory}
+		>
+			◎ Ask more about this
 		</button>
 	</div>
 </div>
