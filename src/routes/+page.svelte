@@ -4,25 +4,26 @@
 	import HeroCard from '$lib/components/stories/HeroCard.svelte';
 	import StoryCard from '$lib/components/stories/StoryCard.svelte';
 	import StoryExpanded from '$lib/components/stories/StoryExpanded.svelte';
-	import { SECTORS, type SectorId } from '$lib/config';
 	import type { Story } from '$lib/tauri/types';
 
 	let stories = $derived(getFilteredStories($currentBriefing, $activeSector));
 	let heroStory = $derived(stories.find(s => s.is_hero) ?? stories[0] ?? null);
 	let gridStories = $derived(heroStory ? stories.filter(s => s.id !== heroStory?.id) : []);
 	let expandedStory = $derived(stories.find(s => s.id === $expandedStoryId) ?? null);
+	let loadError = $state<string | null>(null);
 
 	onMount(async () => {
 		isLoading.set(true);
+		loadError = null;
 		try {
-			// Try to load from Tauri, fall back to empty
-			if (window.__TAURI_INTERNALS__) {
-				const { getTodayBriefing } = await import('$lib/tauri/commands');
-				const briefing = await getTodayBriefing();
-				currentBriefing.set(briefing);
-			}
-		} catch (e) {
-			console.warn('Failed to load briefing:', e);
+			const { invoke } = await import('@tauri-apps/api/core');
+			console.log('[Pulse] Calling get_today_briefing...');
+			const briefing = await invoke('get_today_briefing');
+			console.log('[Pulse] Got briefing:', briefing);
+			currentBriefing.set(briefing as any);
+		} catch (e: any) {
+			console.error('[Pulse] Failed to load briefing:', e);
+			loadError = String(e?.message ?? e);
 		} finally {
 			isLoading.set(false);
 		}
@@ -40,6 +41,14 @@
 		<div class="text-center">
 			<div class="w-8 h-8 border-2 border-ai border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
 			<p class="text-text-muted">Loading your briefing...</p>
+		</div>
+	</div>
+{:else if loadError}
+	<div class="flex items-center justify-center h-64">
+		<div class="text-center max-w-md">
+			<div class="text-4xl mb-4">⚠</div>
+			<h2 class="text-xl font-semibold text-text mb-2">Error Loading Briefing</h2>
+			<p class="text-text-secondary text-sm leading-relaxed mb-4">{loadError}</p>
 		</div>
 	</div>
 {:else if !$currentBriefing || stories.length === 0}
@@ -63,7 +72,6 @@
 
 		<!-- Story Grid -->
 		{#if gridStories.length > 0}
-			{@const sectorGroups = Object.groupBy(gridStories, s => s.sector)}
 			<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
 				{#each gridStories as story (story.id)}
 					<StoryCard {story} onExpand={handleExpand} />

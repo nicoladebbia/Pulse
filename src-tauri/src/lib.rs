@@ -8,7 +8,6 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let app_data = app
@@ -18,6 +17,8 @@ pub fn run() {
             std::fs::create_dir_all(&app_data).ok();
 
             let db_path = app_data.join("pulse.db");
+            eprintln!("Pulse DB path: {}", db_path.display());
+
             let conn = db::connection::initialize(&db_path)
                 .expect("failed to initialize database");
             app.manage(db::DbState(std::sync::Mutex::new(conn)));
@@ -33,6 +34,17 @@ pub fn run() {
             commands::fetch::trigger_manual_fetch,
             commands::fetch::get_fetch_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error running Pulse");
+        .build(tauri::generate_context!())
+        .expect("error building Pulse")
+        .run(|app, event| {
+            // Handle macOS dock click — focus existing window instead of creating new one
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        });
 }
