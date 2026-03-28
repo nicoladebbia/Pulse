@@ -1,0 +1,23 @@
+[package]
+name = "pulse"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "pulse_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-notification = "2"
+tauri-plugin-shell = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+dirs = "6"
