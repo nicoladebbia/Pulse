@@ -2,8 +2,8 @@ use super::{SummarizedStory, AnalysisResult, Connection, RelevanceScore, TrendDe
 use crate::sources::RawArticle;
 use serde::{Deserialize, Serialize};
 
-const HAIKU_MODEL: &str = "claude-haiku-4-5-20250315";
-const SONNET_MODEL: &str = "claude-sonnet-4-5-20241022";
+const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+const SONNET_MODEL: &str = "claude-sonnet-4-6";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
 pub struct ClaudeClient {

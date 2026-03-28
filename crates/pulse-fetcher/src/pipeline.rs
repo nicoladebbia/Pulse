@@ -45,9 +45,37 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
 
 use crate::sources;
 
+const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_schema.sql");
+const MIGRATION_002: &str = include_str!("../../../migrations/002_fts_indexes.sql");
+
 fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult) -> anyhow::Result<()> {
+    // Ensure parent directory exists
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     let conn = rusqlite::Connection::open(db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+
+    // Run migrations
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )?;
+    let applied: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT version FROM schema_migrations")?;
+        stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?
+    };
+    if !applied.contains(&1) {
+        conn.execute_batch(MIGRATION_001)?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (1)", [])?;
+    }
+    if !applied.contains(&2) {
+        conn.execute_batch(MIGRATION_002)?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (2)", [])?;
+    }
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
