@@ -6,8 +6,8 @@
 
 	const suggestions = [
 		"What are today's biggest AI developments?",
-		"How does EU AI regulation connect to Miami tech?",
-		"Summarize this week's Italian political situation",
+		"Tell me about Claude and Anthropic news",
+		"What's happening in Miami Beach?",
 		"What trends are emerging across all sectors?",
 	];
 
@@ -19,27 +19,33 @@
 		query = '';
 		isStreaming.set(true);
 
-		// Scroll to bottom
 		requestAnimationFrame(() => {
 			messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
 		});
 
 		try {
-			if (window.__TAURI_INTERNALS__) {
-				// Will use Tauri command for RAG chat
-				// For now, simulate
-				await new Promise(r => setTimeout(r, 1000));
-				addAssistantMessage(
-					"I'll be able to answer your questions once the RAG pipeline is connected. " +
-					"Ask me anything about the news in your archive!"
-				);
-			} else {
-				await new Promise(r => setTimeout(r, 500));
-				addAssistantMessage(
-					"Ask Pulse is ready to answer questions about your news archive. " +
-					"Connect the Tauri backend to enable RAG-powered responses."
-				);
+			const ipc = (window as any).__TAURI_INTERNALS__;
+			if (!ipc) {
+				addAssistantMessage('Not running inside Tauri — cannot access the archive.');
+				return;
 			}
+
+			const result = await ipc.invoke('ask_pulse', { question: q });
+
+			let answer = result.answer;
+
+			// Add source references if we have them
+			if (result.source_stories && result.source_stories.length > 0) {
+				const sourceList = result.source_stories
+					.map((s: any) => `${s.headline} (${s.sector}, ${s.date})`)
+					.slice(0, 5)
+					.join('\n');
+				answer += `\n\n📎 Sources:\n${sourceList}`;
+			}
+
+			addAssistantMessage(answer, result.source_stories?.map((s: any) => s.id));
+		} catch (e: any) {
+			addAssistantMessage(`Error: ${String(e?.message ?? e)}`);
 		} finally {
 			isStreaming.set(false);
 			requestAnimationFrame(() => {
@@ -69,7 +75,7 @@
 				<div class="text-4xl mb-4">◎</div>
 				<h2 class="text-xl font-semibold text-text mb-2">Ask Pulse</h2>
 				<p class="text-text-secondary text-sm mb-8">
-					Ask questions about your news archive. Pulse searches across all briefings to find answers.
+					Ask questions about your news archive. Pulse searches your briefings and answers with Claude.
 				</p>
 				<div class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-lg mx-auto">
 					{#each suggestions as suggestion}
@@ -89,7 +95,7 @@
 					<div class="{msg.role === 'user'
 						? 'bg-ai text-white rounded-2xl rounded-br-sm'
 						: 'bg-bg-card border border-border text-text rounded-2xl rounded-bl-sm'}
-						px-4 py-3 max-w-[85%] text-sm leading-relaxed"
+						px-4 py-3 max-w-[85%] text-sm leading-relaxed whitespace-pre-wrap"
 					>
 						{msg.content}
 					</div>

@@ -18,6 +18,29 @@ pub fn run() {
 
             let db_path = app_data.join("pulse.db");
 
+            // Load .env from the project directory for API keys
+            let project_env = dirs::home_dir()
+                .unwrap_or_default()
+                .join("Projects/Pulse/.env");
+            if project_env.exists() {
+                if let Ok(content) = std::fs::read_to_string(&project_env) {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if let Some((key, value)) = line.split_once('=') {
+                            let key = key.trim();
+                            let value = value.trim();
+                            if !value.is_empty() && std::env::var(key).is_err() {
+                                // SAFETY: called once at startup before any threads spawn
+                                unsafe { std::env::set_var(key, value); }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Log to file since macOS swallows stderr for .app bundles
             let log_dir = dirs::home_dir().unwrap_or_default().join("Library/Logs/Pulse");
             std::fs::create_dir_all(&log_dir).ok();
@@ -44,6 +67,7 @@ pub fn run() {
             commands::fetch::trigger_manual_fetch,
             commands::fetch::get_fetch_status,
             commands::fetch::ping,
+            commands::chat::ask_pulse,
         ])
         .build(tauri::generate_context!())
         .expect("error building Pulse")
