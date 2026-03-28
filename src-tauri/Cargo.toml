@@ -11,8 +11,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-notification = "2"
+tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-shell = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }

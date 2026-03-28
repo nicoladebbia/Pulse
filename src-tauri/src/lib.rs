@@ -17,7 +17,17 @@ pub fn run() {
             std::fs::create_dir_all(&app_data).ok();
 
             let db_path = app_data.join("pulse.db");
-            eprintln!("Pulse DB path: {}", db_path.display());
+
+            // Log to file since macOS swallows stderr for .app bundles
+            let log_dir = dirs::home_dir().unwrap_or_default().join("Library/Logs/Pulse");
+            std::fs::create_dir_all(&log_dir).ok();
+            let log_path = log_dir.join("app-debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                use std::io::Write;
+                let _ = writeln!(f, "\n--- Pulse started at {} ---", chrono::Local::now());
+                let _ = writeln!(f, "DB path: {}", db_path.display());
+                let _ = writeln!(f, "DB exists: {}", db_path.exists());
+            }
 
             let conn = db::connection::initialize(&db_path)
                 .expect("failed to initialize database");
@@ -33,6 +43,7 @@ pub fn run() {
             commands::search::full_text_search,
             commands::fetch::trigger_manual_fetch,
             commands::fetch::get_fetch_status,
+            commands::fetch::ping,
         ])
         .build(tauri::generate_context!())
         .expect("error building Pulse")

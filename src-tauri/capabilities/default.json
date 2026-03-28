@@ -4,9 +4,6 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "notification:default",
-    "notification:allow-notify",
-    "notification:allow-request-permission",
     "shell:allow-open"
   ]
 }
