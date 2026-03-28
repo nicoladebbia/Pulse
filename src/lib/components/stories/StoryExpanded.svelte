@@ -1,12 +1,23 @@
 <script lang="ts">
 	import { SECTORS, type SectorId } from '$lib/config';
-	import { goto } from '$app/navigation';
 	import RelevanceBadge from './RelevanceBadge.svelte';
 	import type { Story } from '$lib/tauri/types';
 
 	let { story, onClose }: { story: Story; onClose: () => void } = $props();
 
 	let sector = $derived(SECTORS[story.sector as SectorId]);
+
+	// Inline AI conversation state
+	interface AiMessage {
+		question: string;
+		answer: string;
+		sources: { headline: string; sector: string; date: string }[];
+	}
+
+	let aiMessages = $state<AiMessage[]>([]);
+	let isAsking = $state(false);
+	let followUpQuery = $state('');
+	let conversationEl: HTMLElement;
 
 	function openSource() {
 		const ipc = (window as any).__TAURI_INTERNALS__;
@@ -17,17 +28,53 @@
 		}
 	}
 
+	async function askQuestion(question: string) {
+		if (isAsking || !question.trim()) return;
+		isAsking = true;
+
+		try {
+			const ipc = (window as any).__TAURI_INTERNALS__;
+			if (!ipc) return;
+
+			const result = await ipc.invoke('ask_pulse', { question });
+
+			aiMessages = [...aiMessages, {
+				question,
+				answer: result.answer,
+				sources: result.source_stories ?? [],
+			}];
+
+			followUpQuery = '';
+
+			// Scroll to the new response
+			requestAnimationFrame(() => {
+				conversationEl?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+			});
+		} catch (e: any) {
+			aiMessages = [...aiMessages, {
+				question,
+				answer: `Error: ${String(e?.message ?? e)}`,
+				sources: [],
+			}];
+		} finally {
+			isAsking = false;
+		}
+	}
+
 	function askAboutStory() {
-		// Store the question in sessionStorage so Ask Pulse can pick it up
-		const question = `Tell me more about: ${story.headline}. Give me the full picture — background, key players, implications, and what I should keep an eye on.`;
-		sessionStorage.setItem('pulse_ask_prefill', question);
-		goto('/ask');
+		askQuestion(`Tell me more about: ${story.headline}. Give me the full picture — background, key players, implications, and what I should keep an eye on.`);
 	}
 
 	function deepDiveWatchNext() {
-		const question = `Regarding "${story.headline}" — the Watch Next says: "${story.what_to_watch}". Can you expand on this? What should I expect, when, and how might it affect me as an AI builder in Miami?`;
-		sessionStorage.setItem('pulse_ask_prefill', question);
-		goto('/ask');
+		askQuestion(`Regarding "${story.headline}" — the Watch Next says: "${story.what_to_watch}". Expand on this — what should I expect, when, and how might it affect me as an AI builder?`);
+	}
+
+	function handleFollowUp(event: KeyboardEvent) {
+		if (event.key === 'Enter' && !event.shiftKey) {
+			event.preventDefault();
+			// Add story context to follow-up
+			askQuestion(`About "${story.headline}": ${followUpQuery}`);
+		}
 	}
 </script>
 
@@ -84,13 +131,14 @@
 		</p>
 	</div>
 
-	<!-- What to Watch — now clickable -->
+	<!-- Watch Next — clickable deep dive -->
 	<div class="mb-6 bg-bg-card border border-border rounded-lg p-4 group">
 		<div class="flex items-center justify-between mb-2">
 			<h3 class="text-xs font-semibold uppercase tracking-wider text-text-muted">Watch Next</h3>
 			<button
-				class="text-xs text-ai opacity-0 group-hover:opacity-100 transition-opacity hover:underline"
+				class="text-xs text-ai opacity-0 group-hover:opacity-100 transition-opacity hover:underline disabled:opacity-30"
 				onclick={deepDiveWatchNext}
+				disabled={isAsking}
 			>
 				Deep dive →
 			</button>
@@ -100,8 +148,8 @@
 		</p>
 	</div>
 
-	<!-- Actions -->
-	<div class="pt-4 border-t border-border flex items-center justify-between">
+	<!-- Source + Ask More row -->
+	<div class="flex items-center justify-between pb-6 border-b border-border">
 		<button
 			class="text-sm text-ai hover:underline transition-colors"
 			onclick={openSource}
@@ -109,12 +157,98 @@
 			Read original source →
 		</button>
 
-		<button
-			class="flex items-center gap-2 text-sm bg-ai/10 text-ai px-4 py-2 rounded-lg
-				hover:bg-ai/20 transition-colors"
-			onclick={askAboutStory}
-		>
-			◎ Ask more about this
-		</button>
+		{#if aiMessages.length === 0}
+			<button
+				class="flex items-center gap-2 text-sm bg-ai/10 text-ai px-4 py-2 rounded-lg
+					hover:bg-ai/20 transition-colors disabled:opacity-30"
+				onclick={askAboutStory}
+				disabled={isAsking}
+			>
+				{#if isAsking}
+					<div class="w-3 h-3 border-2 border-ai border-t-transparent rounded-full animate-spin"></div>
+					Thinking...
+				{:else}
+					◎ Ask more about this
+				{/if}
+			</button>
+		{/if}
 	</div>
+
+	<!-- Inline AI Conversation -->
+	{#if aiMessages.length > 0 || isAsking}
+		<div class="pt-6 space-y-6" bind:this={conversationEl}>
+			{#each aiMessages as msg, i}
+				<!-- Question -->
+				<div class="flex justify-end">
+					<div class="bg-ai/10 text-ai text-sm px-4 py-2 rounded-2xl rounded-br-sm max-w-[80%]">
+						{msg.question.replace(`About "${story.headline}": `, '')}
+					</div>
+				</div>
+
+				<!-- Answer card -->
+				<div class="bg-bg-card border border-border rounded-xl p-5">
+					<div class="flex items-center gap-2 mb-3">
+						<div class="w-2 h-2 rounded-full bg-ai"></div>
+						<span class="text-xs font-medium text-text-muted uppercase tracking-wider">Pulse Analysis</span>
+					</div>
+					<div class="text-sm text-text leading-relaxed whitespace-pre-wrap">
+						{msg.answer}
+					</div>
+
+					{#if msg.sources.length > 0}
+						<div class="mt-4 pt-3 border-t border-border">
+							<p class="text-[10px] uppercase tracking-wider text-text-muted mb-2">Sources</p>
+							<div class="flex flex-wrap gap-1.5">
+								{#each msg.sources.slice(0, 5) as source}
+									{@const srcSector = SECTORS[source.sector as SectorId]}
+									<span
+										class="text-[10px] px-2 py-0.5 rounded-full border"
+										style="color: {srcSector?.color ?? 'var(--color-text-muted)'}; border-color: {srcSector?.dimColor ?? 'var(--color-border)'}; background: {srcSector?.dimColor ?? 'transparent'}"
+									>
+										{source.headline.length > 40 ? source.headline.slice(0, 40) + '...' : source.headline}
+									</span>
+								{/each}
+							</div>
+						</div>
+					{/if}
+				</div>
+			{/each}
+
+			<!-- Loading indicator -->
+			{#if isAsking}
+				<div class="bg-bg-card border border-border rounded-xl p-5">
+					<div class="flex items-center gap-3">
+						<div class="flex gap-1">
+							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 0ms"></div>
+							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 150ms"></div>
+							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 300ms"></div>
+						</div>
+						<span class="text-sm text-text-muted">Analyzing your archive...</span>
+					</div>
+				</div>
+			{/if}
+
+			<!-- Follow-up input -->
+			{#if !isAsking && aiMessages.length > 0}
+				<div class="relative">
+					<input
+						type="text"
+						bind:value={followUpQuery}
+						onkeydown={handleFollowUp}
+						placeholder="Ask a follow-up about this story..."
+						class="w-full bg-bg-card border border-border rounded-xl px-4 py-3 pr-12 text-text text-sm
+							placeholder:text-text-muted focus:outline-none focus:border-ai transition-colors"
+					/>
+					<button
+						class="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-ai transition-colors
+							disabled:opacity-30"
+						disabled={!followUpQuery.trim()}
+						onclick={() => askQuestion(`About "${story.headline}": ${followUpQuery}`)}
+					>
+						→
+					</button>
+				</div>
+			{/if}
+		</div>
+	{/if}
 </div>
