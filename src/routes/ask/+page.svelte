@@ -1,22 +1,141 @@
 <script lang="ts">
-	// TODO: Ask Pulse RAG chat interface
+	import { messages, isStreaming, addUserMessage, addAssistantMessage, clearChat } from '$lib/stores/chat';
+
 	let query = $state('');
+	let messagesContainer: HTMLElement;
+
+	const suggestions = [
+		"What are today's biggest AI developments?",
+		"How does EU AI regulation connect to Miami tech?",
+		"Summarize this week's Italian political situation",
+		"What trends are emerging across all sectors?",
+	];
+
+	async function handleSubmit() {
+		const q = query.trim();
+		if (!q || $isStreaming) return;
+
+		addUserMessage(q);
+		query = '';
+		isStreaming.set(true);
+
+		// Scroll to bottom
+		requestAnimationFrame(() => {
+			messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+		});
+
+		try {
+			if (window.__TAURI_INTERNALS__) {
+				// Will use Tauri command for RAG chat
+				// For now, simulate
+				await new Promise(r => setTimeout(r, 1000));
+				addAssistantMessage(
+					"I'll be able to answer your questions once the RAG pipeline is connected. " +
+					"Ask me anything about the news in your archive!"
+				);
+			} else {
+				await new Promise(r => setTimeout(r, 500));
+				addAssistantMessage(
+					"Ask Pulse is ready to answer questions about your news archive. " +
+					"Connect the Tauri backend to enable RAG-powered responses."
+				);
+			}
+		} finally {
+			isStreaming.set(false);
+			requestAnimationFrame(() => {
+				messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+			});
+		}
+	}
+
+	function handleKeydown(event: KeyboardEvent) {
+		if (event.key === 'Enter' && !event.shiftKey) {
+			event.preventDefault();
+			handleSubmit();
+		}
+	}
+
+	function askSuggestion(s: string) {
+		query = s;
+		handleSubmit();
+	}
 </script>
 
-<div class="max-w-2xl mx-auto pt-8">
-	<div class="text-center mb-8">
-		<div class="text-4xl mb-4">◎</div>
-		<h2 class="text-xl font-semibold text-text mb-2">Ask Pulse</h2>
-		<p class="text-text-secondary">Ask questions about your news archive.</p>
+<div class="flex flex-col h-full max-w-2xl mx-auto">
+	<!-- Messages -->
+	<div class="flex-1 overflow-y-auto space-y-4 py-4" bind:this={messagesContainer}>
+		{#if $messages.length === 0}
+			<div class="text-center pt-16">
+				<div class="text-4xl mb-4">◎</div>
+				<h2 class="text-xl font-semibold text-text mb-2">Ask Pulse</h2>
+				<p class="text-text-secondary text-sm mb-8">
+					Ask questions about your news archive. Pulse searches across all briefings to find answers.
+				</p>
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-lg mx-auto">
+					{#each suggestions as suggestion}
+						<button
+							class="text-left text-sm bg-bg-card border border-border rounded-lg px-3 py-2.5
+								text-text-secondary hover:text-text hover:bg-bg-card-hover transition-colors"
+							onclick={() => askSuggestion(suggestion)}
+						>
+							{suggestion}
+						</button>
+					{/each}
+				</div>
+			</div>
+		{:else}
+			{#each $messages as msg (msg.id)}
+				<div class="flex {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
+					<div class="{msg.role === 'user'
+						? 'bg-ai text-white rounded-2xl rounded-br-sm'
+						: 'bg-bg-card border border-border text-text rounded-2xl rounded-bl-sm'}
+						px-4 py-3 max-w-[85%] text-sm leading-relaxed"
+					>
+						{msg.content}
+					</div>
+				</div>
+			{/each}
+			{#if $isStreaming}
+				<div class="flex justify-start">
+					<div class="bg-bg-card border border-border rounded-2xl rounded-bl-sm px-4 py-3">
+						<div class="flex gap-1">
+							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 0ms"></div>
+							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 150ms"></div>
+							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 300ms"></div>
+						</div>
+					</div>
+				</div>
+			{/if}
+		{/if}
 	</div>
 
-	<div class="relative">
-		<input
-			type="text"
-			bind:value={query}
-			placeholder="What happened in AI today?"
-			class="w-full bg-bg-card border border-border rounded-lg px-4 py-3 text-text
-				placeholder:text-text-muted focus:outline-none focus:border-ai transition-colors"
-		/>
+	<!-- Input -->
+	<div class="shrink-0 pb-4 pt-2 border-t border-border">
+		{#if $messages.length > 0}
+			<button class="text-xs text-text-muted hover:text-text mb-2" onclick={clearChat}>
+				Clear conversation
+			</button>
+		{/if}
+		<div class="relative">
+			<input
+				type="text"
+				bind:value={query}
+				onkeydown={handleKeydown}
+				placeholder="Ask about your news archive..."
+				disabled={$isStreaming}
+				data-search-input
+				class="w-full bg-bg-card border border-border rounded-xl px-4 py-3 pr-12 text-text text-sm
+					placeholder:text-text-muted focus:outline-none focus:border-ai transition-colors
+					disabled:opacity-50"
+			/>
+			<button
+				class="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-ai transition-colors
+					disabled:opacity-30"
+				disabled={!query.trim() || $isStreaming}
+				onclick={handleSubmit}
+			>
+				→
+			</button>
+		</div>
 	</div>
 </div>

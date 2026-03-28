@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { activeSector, expandedStoryId } from '$lib/stores/briefing';
+	import { navigateDown, navigateUp, expandFocused } from '$lib/stores/navigation';
 	import { goto } from '$app/navigation';
 	import type { SectorId } from '$lib/config';
 
@@ -12,7 +13,6 @@
 	};
 
 	function handleKeydown(event: KeyboardEvent) {
-		// Don't handle if typing in an input
 		const target = event.target as HTMLElement;
 		if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
 			return;
@@ -27,19 +27,37 @@
 			return;
 		}
 
-		// Navigation shortcuts
 		switch (key) {
+			case 'j':
+				event.preventDefault();
+				navigateDown();
+				break;
+			case 'k':
+				event.preventDefault();
+				navigateUp();
+				break;
+			case 'Enter':
+				event.preventDefault();
+				expandFocused();
+				break;
 			case 'Escape':
 				expandedStoryId.set(null);
 				break;
 			case '/':
 				event.preventDefault();
-				// TODO: Focus search input
+				document.querySelector<HTMLInputElement>('[data-search-input]')?.focus();
 				break;
 			case '?':
 				event.preventDefault();
 				goto('/ask');
 				break;
+			case 'o': {
+				// Open source URL for focused story
+				const focusedEl = document.querySelector('[data-focused="true"]');
+				const url = focusedEl?.getAttribute('data-url');
+				if (url) window.open(url, '_blank');
+				break;
+			}
 		}
 	}
 </script>

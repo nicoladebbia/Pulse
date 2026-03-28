@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pulse.daily-fetch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/nicoladebbia/Projects/Pulse/target/release/pulse-fetcher</string>
+        <string>--mode</string>
+        <string>daily</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/nicoladebbia</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/nicoladebbia/Projects/Pulse</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/nicoladebbia/Library/Logs/Pulse/fetch-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/nicoladebbia/Library/Logs/Pulse/fetch-stderr.log</string>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
