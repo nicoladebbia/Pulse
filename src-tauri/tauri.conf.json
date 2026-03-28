@@ -36,7 +36,6 @@
     "externalBin": ["binaries/pulse-fetcher"]
   },
   "plugins": {
-    "notification": {},
     "shell": {
       "open": true
     }
