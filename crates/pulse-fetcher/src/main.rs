@@ -28,6 +28,30 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Auto-load .env from project directory
+    let env_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join("Projects/Pulse/.env");
+    if env_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&env_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim();
+                    let value = value.trim();
+                    if !value.is_empty() && std::env::var(key).is_err() {
+                        // SAFETY: called once at startup before threads spawn
+                        unsafe { std::env::set_var(key, value); }
+                    }
+                }
+            }
+            tracing::info!("Loaded API keys from {}", env_path.display());
+        }
+    }
+
     let db_path = args.db_path.unwrap_or_else(|| {
         dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
