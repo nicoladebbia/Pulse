@@ -115,3 +115,23 @@ pub fn get_briefing_by_date(db: State<DbState>, date: String) -> Result<Option<B
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     load_briefing(&conn, &date)
 }
+
+#[tauri::command]
+pub fn list_briefings(db: State<DbState>) -> Result<Vec<Briefing>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, date, story_count, ai_count, miami_count, italy_count, tech_count, status, created_at
+             FROM briefings ORDER BY date DESC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let briefings = stmt
+        .query_map([], read_briefing)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(briefings)
+}

@@ -61,6 +61,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::briefing::get_today_briefing,
             commands::briefing::get_briefing_by_date,
+            commands::briefing::list_briefings,
             commands::stories::get_stories_by_sector,
             commands::stories::get_story_detail,
             commands::search::full_text_search,
