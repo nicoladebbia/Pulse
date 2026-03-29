@@ -43,18 +43,17 @@
 
 			const result = await ipc.invoke('ask_pulse', { question: q });
 
-			let answer = result.answer;
-
-			// Add source references if we have them
-			if (result.source_stories && result.source_stories.length > 0) {
-				const sourceList = result.source_stories
-					.map((s: any) => `${s.headline} (${s.sector}, ${s.date})`)
-					.slice(0, 5)
-					.join('\n');
-				answer += `\n\n📎 Sources:\n${sourceList}`;
+			// Build a clean formatted response from structured data
+			let parts: string[] = [];
+			if (result.title) parts.push(result.title);
+			if (result.summary) parts.push(result.summary);
+			if (result.key_points?.length > 0) {
+				parts.push(result.key_points.map((p: string) => `▪ ${p}`).join('\n'));
 			}
+			if (result.implications) parts.push(`Why it matters: ${result.implications}`);
+			if (result.watch_next) parts.push(`Watch next: ${result.watch_next}`);
 
-			addAssistantMessage(answer, result.source_stories?.map((s: any) => s.id));
+			addAssistantMessage(parts.join('\n\n'), result.source_stories?.map((s: any) => s.id));
 		} catch (e: any) {
 			addAssistantMessage(`Error: ${String(e?.message ?? e)}`);
 		} finally {

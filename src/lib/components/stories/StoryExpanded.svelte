@@ -10,7 +10,11 @@
 	// Inline AI conversation state
 	interface AiMessage {
 		question: string;
-		answer: string;
+		title: string;
+		summary: string;
+		key_points: string[];
+		implications: string;
+		watch_next: string;
 		sources: { headline: string; sector: string; date: string }[];
 	}
 
@@ -40,7 +44,11 @@
 
 			aiMessages = [...aiMessages, {
 				question,
-				answer: result.answer,
+				title: result.title ?? 'Analysis',
+				summary: result.summary ?? '',
+				key_points: result.key_points ?? [],
+				implications: result.implications ?? '',
+				watch_next: result.watch_next ?? '',
 				sources: result.source_stories ?? [],
 			}];
 
@@ -53,7 +61,11 @@
 		} catch (e: any) {
 			aiMessages = [...aiMessages, {
 				question,
-				answer: `Error: ${String(e?.message ?? e)}`,
+				title: 'Error',
+				summary: String(e?.message ?? e),
+				key_points: [],
+				implications: '',
+				watch_next: '',
 				sources: [],
 			}];
 		} finally {
@@ -185,19 +197,59 @@
 					</div>
 				</div>
 
-				<!-- Answer card -->
-				<div class="bg-bg-card border border-border rounded-xl p-5">
-					<div class="flex items-center gap-2 mb-3">
-						<div class="w-2 h-2 rounded-full bg-ai"></div>
-						<span class="text-xs font-medium text-text-muted uppercase tracking-wider">Pulse Analysis</span>
-					</div>
-					<div class="text-sm text-text leading-relaxed whitespace-pre-wrap">
-						{msg.answer}
+				<!-- Structured answer card -->
+				<div class="bg-bg-card border border-border rounded-xl overflow-hidden" style="border-left: 3px solid var(--color-ai)">
+					<!-- Title -->
+					<div class="px-5 pt-5 pb-3">
+						<div class="flex items-center gap-2 mb-2">
+							<div class="w-2 h-2 rounded-full bg-ai"></div>
+							<span class="text-[10px] font-medium text-text-muted uppercase tracking-wider">Pulse Analysis</span>
+						</div>
+						<h3 class="text-base font-semibold text-text">{msg.title}</h3>
 					</div>
 
+					<!-- Summary -->
+					{#if msg.summary}
+						<div class="px-5 pb-4">
+							<p class="text-sm text-text-secondary leading-relaxed">{msg.summary}</p>
+						</div>
+					{/if}
+
+					<!-- Key Points -->
+					{#if msg.key_points.length > 0}
+						<div class="px-5 pb-4">
+							<h4 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Key Points</h4>
+							<ul class="space-y-1.5">
+								{#each msg.key_points as point}
+									<li class="flex items-start gap-2 text-sm text-text">
+										<span class="text-ai mt-0.5 shrink-0">▪</span>
+										<span>{point}</span>
+									</li>
+								{/each}
+							</ul>
+						</div>
+					{/if}
+
+					<!-- Implications -->
+					{#if msg.implications}
+						<div class="mx-5 mb-4 bg-bg-expanded border border-border-subtle rounded-lg p-3">
+							<h4 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-1.5">Why It Matters to You</h4>
+							<p class="text-sm text-text leading-relaxed">{msg.implications}</p>
+						</div>
+					{/if}
+
+					<!-- Watch Next -->
+					{#if msg.watch_next}
+						<div class="mx-5 mb-4 bg-bg-expanded border border-border-subtle rounded-lg p-3">
+							<h4 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-1.5">Watch Next</h4>
+							<p class="text-sm text-text leading-relaxed">{msg.watch_next}</p>
+						</div>
+					{/if}
+
+					<!-- Sources -->
 					{#if msg.sources.length > 0}
-						<div class="mt-4 pt-3 border-t border-border">
-							<p class="text-[10px] uppercase tracking-wider text-text-muted mb-2">Sources</p>
+						<div class="px-5 pb-4 pt-2 border-t border-border">
+							<p class="text-[10px] uppercase tracking-wider text-text-muted mb-2">Based on</p>
 							<div class="flex flex-wrap gap-1.5">
 								{#each msg.sources.slice(0, 5) as source}
 									{@const srcSector = SECTORS[source.sector as SectorId]}
@@ -205,7 +257,7 @@
 										class="text-[10px] px-2 py-0.5 rounded-full border"
 										style="color: {srcSector?.color ?? 'var(--color-text-muted)'}; border-color: {srcSector?.dimColor ?? 'var(--color-border)'}; background: {srcSector?.dimColor ?? 'transparent'}"
 									>
-										{source.headline.length > 40 ? source.headline.slice(0, 40) + '...' : source.headline}
+										{source.headline.length > 45 ? source.headline.slice(0, 45) + '...' : source.headline}
 									</span>
 								{/each}
 							</div>
