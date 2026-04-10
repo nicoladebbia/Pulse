@@ -50,10 +50,10 @@
 	};
 
 	const trajectoryMeta: Record<string, { icon: string; label: string; class: string }> = {
-		emerging: { icon: '↗', label: 'Emerging', class: 'bg-emerald-500/15 text-emerald-400' },
-		growing: { icon: '⬆', label: 'Growing', class: 'bg-blue-500/15 text-blue-400' },
-		peaking: { icon: '⬤', label: 'Peaking', class: 'bg-amber-500/15 text-amber-400' },
-		declining: { icon: '↘', label: 'Declining', class: 'bg-red-500/15 text-red-400' },
+		dominant: { icon: '◉', label: 'Dominant', class: 'bg-ai/15 text-ai' },
+		hot: { icon: '🔥', label: 'Hot', class: 'bg-amber-500/15 text-amber-400' },
+		rising: { icon: '↗', label: 'Rising', class: 'bg-emerald-500/15 text-emerald-400' },
+		fading: { icon: '↘', label: 'Fading', class: 'bg-red-500/15 text-red-400' },
 	};
 
 	function navigateToStory(storyId: number) {

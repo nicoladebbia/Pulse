@@ -1,5 +1,5 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, UsageStats, TavilyQuota, TrendThread, ChatContext } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, UsageStats, TavilyQuota, TrendThread, ChatContext } from './types';
 
 export async function getTodayBriefing(): Promise<BriefingWithStories | null> {
 	return invoke('get_today_briefing');
@@ -75,6 +75,12 @@ export async function getIdeas(statusFilter?: string): Promise<ProjectIdea[]> {
 
 export async function updateIdeaStatus(id: number, status: string): Promise<void> {
 	return invoke('update_idea_status', { id, status });
+}
+
+// === Trend Badges ===
+
+export async function getStoryTrendBadges(storyIds: number[]): Promise<StoryTrendBadge[]> {
+	return invoke('get_story_trend_badges', { storyIds });
 }
 
 // === Chat Context ===

@@ -39,20 +39,49 @@ pub fn compute_acceleration(window_7d: i64, window_30d: i64) -> f64 {
     rate_7d / rate_30d
 }
 
-/// Classify trajectory based on recent activity and acceleration.
-pub fn classify_trajectory(window_7d: i64, acceleration: f64) -> &'static str {
-    if window_7d == 0 {
+/// Classify trajectory based on volume, consistency, and momentum.
+///
+/// Volume-based tiers:
+/// - **dominant**: 14+ mentions AND 10+ active days — this entity dominates coverage
+/// - **hot**: 7+ mentions AND 5+ active days — significant and sustained attention
+/// - **rising**: 3+ mentions with positive acceleration — gaining momentum
+/// - **fading**: mentions exist but acceleration < 0.8 — losing steam
+/// - **dormant**: no recent mentions
+///
+/// `days_active` is the count of distinct days with mentions in the window.
+pub fn classify_trajectory(window_7d: i64, window_30d: i64, acceleration: f64, days_active: i64) -> &'static str {
+    if window_7d == 0 && window_30d == 0 {
         return "dormant";
     }
-    if acceleration > 2.0 {
-        "emerging"
-    } else if acceleration > 1.3 {
-        "growing"
-    } else if acceleration >= 0.8 {
-        "peaking"
-    } else {
-        "declining"
+
+    let total = window_30d.max(window_7d);
+
+    // Dominant: heavy coverage, sustained over many days
+    if total >= 14 && days_active >= 10 {
+        return "dominant";
     }
+
+    // Hot: solid coverage across multiple days
+    if total >= 7 && days_active >= 5 {
+        return "hot";
+    }
+
+    // Fading: has mentions but decelerating
+    if acceleration < 0.8 && total >= 3 {
+        return "fading";
+    }
+
+    // Rising: has some mentions and accelerating
+    if total >= 3 || days_active >= 2 {
+        return "rising";
+    }
+
+    // Single mention — too thin to classify
+    if window_7d > 0 {
+        return "rising";
+    }
+
+    "dormant"
 }
 
 // ---------------------------------------------------------------------------
@@ -71,14 +100,15 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
         "SELECT e.name, e.sector,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END) AS w7,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-30 days') THEN 1 ELSE 0 END) AS w30,
-            SUM(CASE WHEN em.mentioned_at >= date(?1, '-90 days') THEN 1 ELSE 0 END) AS w90
+            SUM(CASE WHEN em.mentioned_at >= date(?1, '-90 days') THEN 1 ELSE 0 END) AS w90,
+            COUNT(DISTINCT em.mentioned_at) AS days_active
          FROM entities e
          JOIN entity_mentions em ON em.entity_id = e.id
          WHERE em.mentioned_at >= date(?1, '-90 days')
          GROUP BY e.name, e.sector",
     )?;
 
-    let rows: Vec<(String, Option<String>, i64, i64, i64)> = stmt
+    let rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = stmt
         .query_map(params![today], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -86,6 +116,7 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -93,9 +124,9 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
 
     let mut count = 0usize;
 
-    for (topic, sector, w7, w30, w90) in &rows {
+    for (topic, sector, w7, w30, w90, days_active) in &rows {
         let acc = compute_acceleration(*w7, *w30);
-        let traj = classify_trajectory(*w7, acc);
+        let traj = classify_trajectory(*w7, *w30, acc, *days_active);
 
         conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
@@ -316,28 +347,35 @@ mod tests {
 
     #[test]
     fn test_classify_trajectory_dormant() {
-        assert_eq!(classify_trajectory(0, 0.0), "dormant");
-        assert_eq!(classify_trajectory(0, 5.0), "dormant");
+        assert_eq!(classify_trajectory(0, 0, 0.0, 0), "dormant");
     }
 
     #[test]
-    fn test_classify_trajectory_emerging() {
-        assert_eq!(classify_trajectory(10, 3.0), "emerging");
+    fn test_classify_trajectory_dominant() {
+        // 29 mentions in 7d, 49 in 30d, 14 days active → dominant
+        assert_eq!(classify_trajectory(29, 49, 2.5, 14), "dominant");
     }
 
     #[test]
-    fn test_classify_trajectory_growing() {
-        assert_eq!(classify_trajectory(5, 1.5), "growing");
+    fn test_classify_trajectory_hot() {
+        // 8 mentions, 5 days active → hot
+        assert_eq!(classify_trajectory(8, 16, 2.1, 5), "hot");
+        // 12 mentions, 9 days → hot
+        assert_eq!(classify_trajectory(12, 18, 2.9, 9), "hot");
     }
 
     #[test]
-    fn test_classify_trajectory_peaking() {
-        assert_eq!(classify_trajectory(5, 1.0), "peaking");
+    fn test_classify_trajectory_rising() {
+        // 3 mentions, 2 days, accelerating → rising
+        assert_eq!(classify_trajectory(3, 3, 4.3, 2), "rising");
+        // 1 mention, 1 day → rising (single but recent)
+        assert_eq!(classify_trajectory(1, 1, 4.3, 1), "rising");
     }
 
     #[test]
-    fn test_classify_trajectory_declining() {
-        assert_eq!(classify_trajectory(5, 0.5), "declining");
+    fn test_classify_trajectory_fading() {
+        // Has mentions but decelerating
+        assert_eq!(classify_trajectory(2, 11, 0.78, 7), "fading");
     }
 
     // -----------------------------------------------------------------------

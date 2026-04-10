@@ -2,7 +2,11 @@
 	import { SECTORS, type SectorId } from '$lib/config';
 	import type { Story } from '$lib/tauri/types';
 
-	let { story, onExpand, focused = false }: { story: Story; onExpand: (s: Story) => void; focused?: boolean } = $props();
+	import type { StoryTrendBadge } from '$lib/tauri/types';
+
+	let { story, onExpand, focused = false, trendBadge = undefined }: {
+		story: Story; onExpand: (s: Story) => void; focused?: boolean; trendBadge?: StoryTrendBadge;
+	} = $props();
 
 	let sector = $derived(SECTORS[story.sector as SectorId]);
 </script>
@@ -26,6 +30,15 @@
 	{#if story.summary_depth === 'deep'}
 		<span class="text-[8px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-ai/15 text-ai shrink-0">
 			Deep
+		</span>
+	{/if}
+
+	<!-- Trend badge -->
+	{#if trendBadge}
+		<span class="text-[8px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded-full shrink-0
+			{trendBadge.trajectory === 'dominant' ? 'bg-ai/15 text-ai' : 'bg-amber-500/15 text-amber-400'}"
+			title="{trendBadge.entity} — {trendBadge.trajectory}">
+			{trendBadge.trajectory === 'dominant' ? '◉' : '🔥'} Trending
 		</span>
 	{/if}
 

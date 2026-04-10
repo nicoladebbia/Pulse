@@ -6,10 +6,13 @@
 	import CompactStoryRow from '$lib/components/stories/CompactStoryRow.svelte';
 	import ConnectionInsight from '$lib/components/stories/ConnectionInsight.svelte';
 	import StoryExpanded from '$lib/components/stories/StoryExpanded.svelte';
-	import type { Story, BriefingWithStories } from '$lib/tauri/types';
+	import type { Story, BriefingWithStories, StoryTrendBadge } from '$lib/tauri/types';
 	import { isTauri, mockBriefingData } from '$lib/tauri/mock';
+	import { getStoryTrendBadges } from '$lib/tauri/commands';
 	import { isFetching, fetchDone, triggerFetch as storeTriggerFetch } from '$lib/stores/fetch';
 	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
+
+	let trendBadges = $state<Map<number, StoryTrendBadge>>(new Map());
 
 	let allStories = $derived(getFilteredStories($currentBriefing, $activeSectors));
 	let featured = $derived(getFeaturedFromList(allStories, 3));
@@ -85,6 +88,17 @@
 			]);
 
 			currentBriefing.set(result as BriefingWithStories | null);
+
+			// Load trend badges for stories
+			const briefing = result as BriefingWithStories | null;
+			if (briefing?.stories?.length) {
+				const ids = briefing.stories.map(s => s.id);
+				getStoryTrendBadges(ids).then(badges => {
+					const map = new Map<number, StoryTrendBadge>();
+					for (const b of badges) map.set(b.story_id, b);
+					trendBadges = map;
+				}).catch(() => {});
+			}
 		} catch (e: any) {
 			loadError = String(e?.message ?? e);
 		} finally {
@@ -195,7 +209,7 @@
 		<!-- TIER 2: Featured Stories (top 3 by relevance) -->
 		<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
 			{#each featured as story (story.id)}
-				<FeaturedCard {story} onExpand={handleExpand} focused={story.id === $focusedStoryId} />
+				<FeaturedCard {story} onExpand={handleExpand} focused={story.id === $focusedStoryId} trendBadge={trendBadges.get(story.id)} />
 			{/each}
 		</div>
 
@@ -214,7 +228,7 @@
 				<h3 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-3">Also Today</h3>
 				<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50">
 					{#each compact as story (story.id)}
-						<CompactStoryRow {story} onExpand={handleExpand} focused={story.id === $focusedStoryId} />
+						<CompactStoryRow {story} onExpand={handleExpand} focused={story.id === $focusedStoryId} trendBadge={trendBadges.get(story.id)} />
 					{/each}
 				</div>
 				{#if remainingCount > 0}

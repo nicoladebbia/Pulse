@@ -133,6 +133,15 @@ export type ChatStreamEvent =
 		}
 	| { event: 'Error'; data: { message: string } };
 
+// === Trend Badge Types ===
+
+export interface StoryTrendBadge {
+	story_id: number;
+	entity: string;
+	trajectory: string;
+	mention_count: number;
+}
+
 // === Story Headline Types ===
 
 export interface StoryHeadline {

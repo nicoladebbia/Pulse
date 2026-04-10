@@ -25,6 +25,58 @@ pub struct TrendThread {
     pub points: Vec<TrendPoint>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StoryTrendBadge {
+    pub story_id: i64,
+    pub entity: String,
+    pub trajectory: String,
+    pub mention_count: i32,
+}
+
+/// For a list of story IDs, find which ones mention trending entities.
+/// Returns badges for stories that mention non-dormant entities.
+#[tauri::command]
+pub fn get_story_trend_badges(db: State<'_, DbState>, story_ids: Vec<i64>) -> Result<Vec<StoryTrendBadge>, String> {
+    if story_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let placeholders: String = story_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT em.story_id, sig.topic, sig.trajectory, sig.window_30d
+         FROM entity_mentions em
+         JOIN entities e ON e.id = em.entity_id
+         JOIN signals sig ON LOWER(sig.topic) = LOWER(e.name)
+         WHERE em.story_id IN ({})
+           AND sig.trajectory IN ('dominant', 'hot')
+         ORDER BY sig.window_30d DESC",
+        placeholders
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = story_ids.iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>).collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let badges: Vec<StoryTrendBadge> = stmt
+        .query_map(rusqlite::params_from_iter(params.iter().map(|b| b.as_ref())), |row| {
+            Ok(StoryTrendBadge {
+                story_id: row.get(0)?,
+                entity: row.get(1)?,
+                trajectory: row.get(2)?,
+                mention_count: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        // One badge per story (pick the highest-signal entity)
+        .filter(|b| seen.insert(b.story_id))
+        .collect();
+
+    Ok(badges)
+}
+
 /// Get trending entities for the Trends page.
 /// Ranks by days_active * mention_count * acceleration to surface entities
 /// with real momentum across multiple days, not single-mention noise.

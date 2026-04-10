@@ -64,6 +64,7 @@ pub fn run() {
             commands::freedoms::get_today_freedoms,
             commands::freedoms::get_freedoms_by_date,
             commands::trends::get_trends,
+            commands::trends::get_story_trend_badges,
             commands::ideas::generate_ideas,
             commands::ideas::get_ideas,
             commands::ideas::update_idea_status,

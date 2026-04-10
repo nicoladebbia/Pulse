@@ -690,22 +690,26 @@ Focus on MOST important entities (max 5 per story). Prioritize companies, key pe
         "SELECT e.name, e.sector,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END),
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-30 days') THEN 1 ELSE 0 END),
-            SUM(CASE WHEN em.mentioned_at >= date(?1, '-90 days') THEN 1 ELSE 0 END)
+            SUM(CASE WHEN em.mentioned_at >= date(?1, '-90 days') THEN 1 ELSE 0 END),
+            COUNT(DISTINCT em.mentioned_at)
          FROM entities e JOIN entity_mentions em ON em.entity_id = e.id
          GROUP BY e.name, e.sector"
     )?;
-    let rows: Vec<(String, Option<String>, i64, i64, i64)> = stmt.query_map(
-        [&today], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+    let rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = stmt.query_map(
+        [&today], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
     )?.collect::<Result<Vec<_>, _>>()?;
 
-    for (topic, sector, w7, w30, w90) in &rows {
+    for (topic, sector, w7, w30, w90, days_active) in &rows {
         let acc = if *w30 == 0 { if *w7 > 0 { 10.0 } else { 0.0 } }
             else { (*w7 as f64 / 7.0) / (*w30 as f64 / 30.0).max(0.001) };
-        let traj = if *w7 == 0 { "dormant" }
-            else if acc > 2.0 { "emerging" }
-            else if acc > 1.3 { "growing" }
-            else if acc >= 0.8 { "peaking" }
-            else { "declining" };
+        let total = (*w30).max(*w7);
+        let traj = if *w7 == 0 && *w30 == 0 { "dormant" }
+            else if total >= 14 && *days_active >= 10 { "dominant" }
+            else if total >= 7 && *days_active >= 5 { "hot" }
+            else if acc < 0.8 && total >= 3 { "fading" }
+            else if total >= 3 || *days_active >= 2 { "rising" }
+            else if *w7 > 0 { "rising" }
+            else { "dormant" };
         if let Err(e) = conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))

@@ -3,7 +3,11 @@
 	import RelevanceBadge from './RelevanceBadge.svelte';
 	import type { Story } from '$lib/tauri/types';
 
-	let { story, onExpand, focused = false }: { story: Story; onExpand: (s: Story) => void; focused?: boolean } = $props();
+	import type { StoryTrendBadge } from '$lib/tauri/types';
+
+	let { story, onExpand, focused = false, trendBadge = undefined }: {
+		story: Story; onExpand: (s: Story) => void; focused?: boolean; trendBadge?: StoryTrendBadge;
+	} = $props();
 
 	let sector = $derived(SECTORS[story.sector as SectorId]);
 
@@ -33,6 +37,13 @@
 			{#if story.summary_depth === 'deep'}
 				<span class="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-full bg-ai/15 text-ai border border-ai/25">
 					Deep
+				</span>
+			{/if}
+			{#if trendBadge}
+				<span class="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-full border
+					{trendBadge.trajectory === 'dominant' ? 'bg-ai/15 text-ai border-ai/25' : 'bg-amber-500/15 text-amber-400 border-amber-500/25'}"
+					title="{trendBadge.entity} — {trendBadge.trajectory}">
+					{trendBadge.trajectory === 'dominant' ? '◉' : '🔥'} Trending
 				</span>
 			{/if}
 		</div>
