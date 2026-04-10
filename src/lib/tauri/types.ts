@@ -271,10 +271,18 @@ export interface TavilyQuota {
 	warning: string | null;
 }
 
+export interface DailyCost {
+	date: string;
+	cost: number;
+}
+
 export interface UsageStats {
 	period: string;
 	total_cost_usd: number;
+	today_cost_usd: number;
 	total_input_tokens: number;
 	total_output_tokens: number;
+	total_calls: number;
 	by_provider: ProviderUsage[];
+	daily: DailyCost[];
 }

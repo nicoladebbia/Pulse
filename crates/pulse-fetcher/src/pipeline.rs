@@ -217,6 +217,8 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                 Ok(p) => {
                     let count = p.iter().filter(|x| x.is_some()).count();
                     tracing::info!("Generated {} contextual prefixes", count);
+                    let prefix_batches = ((analysis.curated_stories.len() + 9) / 10) as i64;
+                    log_usage(db_path, "anthropic", "claude-haiku", "contextual_prefixes", prefix_batches * 2500, prefix_batches * 500);
                     Some(p)
                 }
                 Err(e) => {
@@ -260,7 +262,12 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     progress.start_stage(9);
     tracing::info!("Phase 9: Extracting entities...");
     match extract_entities_from_stories(db_path, &analysis).await {
-        Ok(count) => tracing::info!("Extracted {} entity mentions", count),
+        Ok(count) => {
+            tracing::info!("Extracted {} entity mentions", count);
+            // ~2000 tokens in, ~500 out per batch of 30 stories; ~3 batches for 80 stories
+            let batches = ((analysis.curated_stories.len() + 29) / 30) as i64;
+            log_usage(db_path, "anthropic", "claude-haiku", "entity_extraction", batches * 2000, batches * 500);
+        }
         Err(e) => tracing::warn!("Entity extraction failed (non-fatal): {}", e),
     }
 

@@ -52,12 +52,21 @@ pub struct ProviderUsage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyCost {
+    pub date: String,
+    pub cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageStats {
     pub period: String,
     pub total_cost_usd: f64,
+    pub today_cost_usd: f64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
+    pub total_calls: i64,
     pub by_provider: Vec<ProviderUsage>,
+    pub daily: Vec<DailyCost>,
 }
 
 /// Get usage stats for a given number of days back.
@@ -91,12 +100,41 @@ pub fn get_usage(conn: &Connection, days: u32) -> Result<UsageStats> {
     let total_cost: f64 = rows.iter().map(|r| r.total_cost_usd).sum();
     let total_input: i64 = rows.iter().map(|r| r.total_input_tokens).sum();
     let total_output: i64 = rows.iter().map(|r| r.total_output_tokens).sum();
+    let total_calls: i64 = rows.iter().map(|r| r.call_count).sum();
+
+    // Today's cost
+    let today_cost: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(estimated_cost_usd), 0.0) FROM api_usage WHERE DATE(created_at) = DATE('now')",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(0.0);
+
+    // Daily breakdown for sparkline
+    let mut daily_stmt = conn.prepare(
+        "SELECT DATE(created_at) as day, SUM(estimated_cost_usd) as cost
+         FROM api_usage
+         WHERE created_at >= datetime('now', ?1)
+         GROUP BY day
+         ORDER BY day ASC",
+    )?;
+
+    let daily: Vec<DailyCost> = daily_stmt
+        .query_map(params![modifier], |row| {
+            Ok(DailyCost {
+                date: row.get(0)?,
+                cost: row.get(1)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(UsageStats {
         period,
         total_cost_usd: total_cost,
+        today_cost_usd: today_cost,
         total_input_tokens: total_input,
         total_output_tokens: total_output,
+        total_calls,
         by_provider: rows,
+        daily,
     })
 }

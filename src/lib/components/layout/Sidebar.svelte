@@ -191,62 +191,81 @@
 				{/if}
 			{/if}
 		</div>
-		<!-- API Usage section (same style as Sectors) -->
+		<!-- API Usage section -->
 		<div class="px-3 py-4 border-t border-border">
-			<p class="px-3 text-xs font-medium text-text-muted uppercase tracking-wider mb-3">API Usage</p>
+			<p class="px-3 text-xs font-medium text-text-muted uppercase tracking-wider mb-3">Spend</p>
 
-			<!-- Running total cost — always visible -->
-			<div class="px-3 mb-2">
-				<div class="flex items-center justify-between">
-					<span class="text-sm text-text-secondary">Monthly cost</span>
-					<span class="text-sm font-semibold font-mono transition-all duration-700 {costAnimating ? 'text-ai cost-bump' : 'text-text'}">
-						${usageStats?.total_cost_usd.toFixed(2) ?? '0.00'}
-					</span>
-				</div>
-			</div>
-
-			<!-- Tavily quota bar -->
-			{#if tavilyQuota}
-				{@const pct = Math.round((tavilyQuota.used / tavilyQuota.limit) * 100)}
-				{@const barColor = tavilyQuota.remaining === 0 ? 'bg-rose-400' : pct >= 95 ? 'bg-amber-400' : 'bg-ai'}
-				<div class="px-3 mb-2">
-					<div class="flex items-center justify-between text-xs text-text-secondary mb-1">
-						<span>Web search</span>
-						<span class="font-mono text-text-muted">{tavilyQuota.used}/{tavilyQuota.limit}</span>
+			{#if usageStats}
+				<!-- Today + Monthly -->
+				<div class="px-3 mb-2 space-y-1.5">
+					<div class="flex items-center justify-between">
+						<span class="text-xs text-text-muted">Today</span>
+						<span class="text-xs font-semibold font-mono transition-all duration-700 {costAnimating ? 'text-ai cost-bump' : 'text-text'}">
+							${usageStats.today_cost_usd.toFixed(3)}
+						</span>
 					</div>
-					<div class="w-full h-1.5 bg-border rounded-full overflow-hidden">
-						<div class="h-full {barColor} rounded-full transition-all duration-700" style="width: {pct}%"></div>
+					<div class="flex items-center justify-between">
+						<span class="text-xs text-text-muted">This month</span>
+						<span class="text-xs font-medium font-mono text-text-secondary">
+							${usageStats.total_cost_usd.toFixed(2)}
+						</span>
 					</div>
 				</div>
-			{/if}
 
-			<!-- Expandable detail -->
-			<button
-				class="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors
-					text-text-secondary hover:bg-bg-card hover:text-text"
-				onclick={() => { showUsageDetail = !showUsageDetail; }}
-			>
-				<span class="w-2 h-2 rounded-full bg-text-secondary"></span>
-				{showUsageDetail ? 'Hide details' : 'Show details'}
-			</button>
-
-			{#if showUsageDetail && usageStats}
-				<div class="px-3 pt-2 space-y-1.5">
-					{#each usageStats.by_provider as p}
-						<div class="flex items-center justify-between text-xs">
-							<span class="text-text-muted">{p.provider}/{p.model}</span>
-							<span class="text-text-secondary font-mono">${p.total_cost_usd.toFixed(3)}</span>
+				<!-- Daily cost sparkline -->
+				{#if usageStats.daily.length > 1}
+					{@const maxCost = Math.max(...usageStats.daily.map(d => d.cost), 0.01)}
+					<div class="px-3 mb-2">
+						<div class="flex items-end gap-px h-6">
+							{#each usageStats.daily as day}
+								{@const height = Math.max(2, (day.cost / maxCost) * 24)}
+								<div
+									class="flex-1 rounded-sm bg-ai/40 hover:bg-ai/70 transition-colors"
+									style="height: {height}px"
+									title="{day.date}: ${day.cost.toFixed(3)}"
+								></div>
+							{/each}
 						</div>
-					{/each}
-					<div class="flex items-center justify-between text-xs pt-1.5 border-t border-border/50">
-						<span class="text-text-muted">Tokens in/out</span>
-						<span class="text-text-secondary font-mono">{(usageStats.total_input_tokens / 1000).toFixed(0)}k / {(usageStats.total_output_tokens / 1000).toFixed(0)}k</span>
+						<div class="flex justify-between text-[9px] text-text-muted mt-0.5">
+							<span>{usageStats.daily.length}d</span>
+							<span>{usageStats.total_calls} calls</span>
+						</div>
 					</div>
-					<div class="flex items-center justify-between text-xs">
-						<span class="text-text-muted">API calls</span>
-						<span class="text-text-secondary font-mono">{usageStats.by_provider.reduce((s, p) => s + p.call_count, 0)}</span>
+				{/if}
+
+				<!-- Tavily quota bar -->
+				{#if tavilyQuota}
+					{@const pct = Math.round((tavilyQuota.used / tavilyQuota.limit) * 100)}
+					{@const barColor = tavilyQuota.remaining === 0 ? 'bg-rose-400' : pct >= 95 ? 'bg-amber-400' : 'bg-ai'}
+					<div class="px-3 mb-2">
+						<div class="flex items-center justify-between text-[10px] text-text-muted mb-1">
+							<span>Web search</span>
+							<span class="font-mono">{tavilyQuota.used}/{tavilyQuota.limit}</span>
+						</div>
+						<div class="w-full h-1 bg-border rounded-full overflow-hidden">
+							<div class="h-full {barColor} rounded-full transition-all duration-700" style="width: {pct}%"></div>
+						</div>
 					</div>
-				</div>
+				{/if}
+
+				<!-- Expandable provider detail -->
+				<button
+					class="w-full px-3 py-1.5 text-[10px] text-text-muted hover:text-text transition-colors text-left"
+					onclick={() => { showUsageDetail = !showUsageDetail; }}
+				>
+					{showUsageDetail ? '▾ Hide breakdown' : '▸ Provider breakdown'}
+				</button>
+
+				{#if showUsageDetail}
+					<div class="px-3 pt-1 space-y-1">
+						{#each usageStats.by_provider as p}
+							<div class="flex items-center justify-between text-[10px]">
+								<span class="text-text-muted truncate mr-2">{p.provider}/{p.model}</span>
+								<span class="text-text-secondary font-mono shrink-0">${p.total_cost_usd.toFixed(3)}</span>
+							</div>
+						{/each}
+					</div>
+				{/if}
 			{/if}
 		</div>
 	</div>
