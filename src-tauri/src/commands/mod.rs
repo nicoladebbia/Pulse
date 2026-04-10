@@ -3,3 +3,7 @@ pub mod stories;
 pub mod search;
 pub mod fetch;
 pub mod chat;
+pub mod freedoms;
+pub mod trends;
+pub mod ideas;
+pub mod usage;

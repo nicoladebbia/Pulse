@@ -19,6 +19,8 @@ pub struct Story {
     pub source_name: String,
     pub published_at: Option<String>,
     pub created_at: String,
+    pub summary_depth: Option<String>,
+    pub deep_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

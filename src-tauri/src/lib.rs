@@ -13,7 +13,7 @@ pub fn run() {
             let app_data = app
                 .path()
                 .app_data_dir()
-                .expect("failed to get app data dir");
+                .map_err(|e| format!("failed to get app data dir: {e}"))?;
             std::fs::create_dir_all(&app_data).ok();
 
             let db_path = app_data.join("pulse.db");
@@ -23,22 +23,7 @@ pub fn run() {
                 .unwrap_or_default()
                 .join("Projects/Pulse/.env");
             if project_env.exists() {
-                if let Ok(content) = std::fs::read_to_string(&project_env) {
-                    for line in content.lines() {
-                        let line = line.trim();
-                        if line.is_empty() || line.starts_with('#') {
-                            continue;
-                        }
-                        if let Some((key, value)) = line.split_once('=') {
-                            let key = key.trim();
-                            let value = value.trim();
-                            if !value.is_empty() && std::env::var(key).is_err() {
-                                // SAFETY: called once at startup before any threads spawn
-                                unsafe { std::env::set_var(key, value); }
-                            }
-                        }
-                    }
-                }
+                dotenvy::from_path(&project_env).ok();
             }
 
             // Log to file since macOS swallows stderr for .app bundles
@@ -53,7 +38,7 @@ pub fn run() {
             }
 
             let conn = db::connection::initialize(&db_path)
-                .expect("failed to initialize database");
+                .map_err(|e| format!("failed to initialize database: {e}"))?;
             app.manage(db::DbState(std::sync::Mutex::new(conn)));
 
             Ok(())
@@ -69,6 +54,19 @@ pub fn run() {
             commands::fetch::get_fetch_status,
             commands::fetch::ping,
             commands::chat::ask_pulse,
+            commands::chat::chat_send,
+            commands::chat::chat_send_stream,
+            commands::chat::chat_list_threads,
+            commands::chat::chat_get_thread,
+            commands::chat::chat_delete_thread,
+            commands::freedoms::get_today_freedoms,
+            commands::freedoms::get_freedoms_by_date,
+            commands::trends::get_trends,
+            commands::ideas::generate_ideas,
+            commands::ideas::get_ideas,
+            commands::ideas::update_idea_status,
+            commands::usage::get_api_usage,
+            commands::usage::get_tavily_quota,
         ])
         .build(tauri::generate_context!())
         .expect("error building Pulse")

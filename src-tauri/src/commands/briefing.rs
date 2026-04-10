@@ -1,6 +1,6 @@
 use tauri::State;
 use crate::db::DbState;
-use crate::models::{Briefing, BriefingWithStories, Story};
+use crate::models::{Briefing, BriefingConnection, BriefingWithStories, Story};
 
 fn read_story(row: &rusqlite::Row) -> rusqlite::Result<Story> {
     let key_facts_json: String = row.get(5)?;
@@ -24,6 +24,8 @@ fn read_story(row: &rusqlite::Row) -> rusqlite::Result<Story> {
         source_name: row.get(14)?,
         published_at: row.get(15)?,
         created_at: row.get(16)?,
+        summary_depth: row.get(17).ok(),
+        deep_summary: row.get(18).ok(),
     })
 }
 
@@ -38,18 +40,52 @@ fn read_briefing(row: &rusqlite::Row) -> rusqlite::Result<Briefing> {
         tech_count: row.get(6)?,
         status: row.get(7)?,
         created_at: row.get(8)?,
+        briefing_type: row.get::<_, String>(9).unwrap_or_else(|_| "daily".to_string()),
+        executive_summary: row.get(10).ok(),
+        time_label: row.get(11).ok(),
     })
 }
 
 const BRIEFING_SQL: &str =
-    "SELECT id, date, story_count, ai_count, miami_count, italy_count, tech_count, status, created_at
-     FROM briefings WHERE date = ?1";
+    "SELECT id, date, story_count, ai_count, miami_count, italy_count, tech_count, status, created_at, briefing_type, executive_summary, time_label
+     FROM briefings WHERE date = ?1 AND briefing_type = 'daily'
+     ORDER BY created_at DESC LIMIT 1";
+
+fn load_connections(conn: &rusqlite::Connection, briefing_id: i64) -> Vec<BriefingConnection> {
+    let mut stmt = match conn.prepare(
+        "SELECT cc.story_id_a, sa.headline, sa.sector,
+                cc.story_id_b, sb.headline, sb.sector,
+                cc.connection_text, cc.insight_text
+         FROM cross_connections cc
+         JOIN stories sa ON sa.id = cc.story_id_a
+         JOIN stories sb ON sb.id = cc.story_id_b
+         WHERE cc.briefing_id = ?1"
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    stmt.query_map([briefing_id], |row| {
+        Ok(BriefingConnection {
+            story_id_a: row.get(0)?,
+            headline_a: row.get(1)?,
+            sector_a: row.get(2)?,
+            story_id_b: row.get(3)?,
+            headline_b: row.get(4)?,
+            sector_b: row.get(5)?,
+            connection_text: row.get(6)?,
+            insight_text: row.get(7)?,
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
 
 const STORIES_SQL: &str =
     "SELECT id, briefing_id, sector, headline, summary, key_facts,
             why_it_matters, what_to_watch, importance_score, relevance_score,
             relevance_reason, is_hero, display_order, original_url, source_name,
-            published_at, created_at
+            published_at, created_at, summary_depth, deep_summary
      FROM stories WHERE briefing_id = ?1
      ORDER BY display_order ASC";
 
@@ -95,11 +131,13 @@ fn load_briefing(conn: &rusqlite::Connection, date: &str) -> Result<Option<Brief
     log(&format!("Loaded {} stories successfully", stories.len()));
 
     let hero_story = stories.iter().find(|s| s.is_hero).cloned();
+    let connections = load_connections(&conn, briefing.id);
 
     Ok(Some(BriefingWithStories {
         briefing,
         stories,
         hero_story,
+        connections,
     }))
 }
 
@@ -122,8 +160,8 @@ pub fn list_briefings(db: State<DbState>) -> Result<Vec<Briefing>, String> {
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, date, story_count, ai_count, miami_count, italy_count, tech_count, status, created_at
-             FROM briefings ORDER BY date DESC",
+            "SELECT id, date, story_count, ai_count, miami_count, italy_count, tech_count, status, created_at, briefing_type, executive_summary, time_label
+             FROM briefings ORDER BY date DESC, created_at DESC LIMIT 100",
         )
         .map_err(|e| e.to_string())?;
 

@@ -1,6 +1,27 @@
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{ipc::Channel, State};
 use crate::db::DbState;
+use crate::services::{api_usage, brave_search, conversation, conversation::ConversationLLM, search, reranking, profile, embeddings, embeddings::EmbeddingProvider, entities, signals, causality, contrarian, patterns, predictions};
+
+// ============ Streaming types ============
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", content = "data")]
+pub enum ChatStreamEvent {
+    Delta { text: String },
+    Complete {
+        message: String,
+        source_story_ids: Vec<i64>,
+        suggested_followups: Vec<String>,
+        thread_topic: String,
+        thread_title: Option<String>,
+        proactive_connections: Vec<conversation::ProactiveInsight>,
+        search_source: String, // "archive", "web", or "archive+web"
+    },
+    Error { message: String },
+}
+
+// ============ Legacy Ask Pulse (backward compat) ============
 
 const SONNET_MODEL: &str = "claude-sonnet-4-6";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -60,7 +81,7 @@ struct StructuredAnswer {
 pub async fn ask_pulse(db: State<'_, DbState>, question: String) -> Result<ChatResponse, String> {
     let retrieved = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        search_stories(&conn, &question)?
+        search_stories_legacy(&conn, &question)?
     };
 
     if retrieved.is_empty() {
@@ -149,7 +170,6 @@ Retrieved stories:
         .and_then(|c| c.text.clone())
         .unwrap_or_default();
 
-    // Extract JSON from response (may have markdown fences)
     let json_str = extract_json(&text);
 
     let parsed: StructuredAnswer = serde_json::from_str(&json_str)
@@ -185,7 +205,7 @@ struct RetrievedStory {
     date: String,
 }
 
-fn search_stories(conn: &rusqlite::Connection, query: &str) -> Result<Vec<RetrievedStory>, String> {
+fn search_stories_legacy(conn: &rusqlite::Connection, query: &str) -> Result<Vec<RetrievedStory>, String> {
     let fts_query = query
         .split_whitespace()
         .map(|word| {
@@ -258,4 +278,844 @@ fn search_stories(conn: &rusqlite::Connection, query: &str) -> Result<Vec<Retrie
     }
 
     Ok(results)
+}
+
+// ============ New Intelligence Chat Commands ============
+
+#[tauri::command]
+pub async fn chat_send(
+    db: State<'_, DbState>,
+    thread_id: Option<String>,
+    message: String,
+) -> Result<conversation::ConversationResponse, String> {
+    if message.len() > 20_000 {
+        return Err("Message too long".to_string());
+    }
+
+    // 1. Classify topic and resolve thread
+    let topic = conversation::classify_topic(&message);
+
+    let (thread, is_new_thread) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        if let Some(tid) = &thread_id {
+            // Use existing thread
+            let threads = conversation::list_threads(&conn).map_err(|e| e.to_string())?;
+            let thread = threads.into_iter().find(|t| t.id == *tid)
+                .ok_or_else(|| "Thread not found".to_string())?;
+            (thread, false)
+        } else {
+            // Try to find a recent thread for the same topic
+            let recent = conversation::find_recent_thread(&conn, topic).map_err(|e| e.to_string())?;
+            if let Some(t) = recent {
+                (t, false)
+            } else {
+                let t = conversation::create_thread(&conn, topic).map_err(|e| e.to_string())?;
+                (t, true)
+            }
+        }
+    };
+
+    // 2. Store user message
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conversation::store_message(&conn, &thread.id, "user", &message, None, None)
+            .map_err(|e| e.to_string())?;
+
+        // Track user interests
+        profile::track_interest(&conn, &format!("interest:{}", topic)).ok();
+    }
+
+    // 2.5. Query rewriting — expand keywords + generate HyDE answer (non-fatal)
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY not set. Add it to .env".to_string())?;
+    let expanded = search::rewrite_query(&api_key, &message).await;
+
+    // 3. Hybrid search — compute embedding on HyDE text for better semantic match
+    let query_embedding: Option<Vec<f32>> = match embeddings::VoyageProvider::from_env() {
+        Ok(provider) => {
+            match provider.embed(&[expanded.semantic_text.clone()], "query").await {
+                Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("Query embedding failed (non-fatal): {}", e);
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    };
+
+    let stories = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        search::hybrid_search(&conn, &expanded.fts_keywords, query_embedding.as_deref(), 25)
+            .map_err(|e| e.to_string())?
+    };
+
+    // 3.5. LLM rerank — refine top 25 into top 15 by true relevance (non-fatal)
+    let stories = if stories.len() > 6 {
+        reranking::llm_rerank(&api_key, &message, stories, 15).await
+    } else {
+        stories
+    };
+
+    // 4. Gather intelligence context (filtered by query relevance)
+    let keywords = extract_keywords(&message);
+
+    let (entity_context, signal_context, causal_context, contrarian_context, pattern_context, predictions_context, profile_str) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+        // Entity context: find entities mentioned in the query
+        let entity_ctx = match entities::search_entities(&conn, &message) {
+            Ok(ents) => {
+                let mut pairs = Vec::new();
+                for ent in ents.into_iter().take(5) {
+                    // Limit to last 5 mentions per entity to avoid context bloat
+                    let mut mentions = entities::get_entity_mentions(&conn, ent.id).unwrap_or_default();
+                    if mentions.len() > 5 {
+                        mentions = mentions.into_iter().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
+                    }
+                    pairs.push((ent, mentions));
+                }
+                conversation::format_entity_context(&pairs)
+            }
+            Err(_) => String::new(),
+        };
+
+        // Signal context: only signals relevant to the query (not global top)
+        let signal_ctx = match signals::get_top_accelerating(&conn, 15) {
+            Ok(sigs) => {
+                let filtered: Vec<_> = if keywords.is_empty() {
+                    sigs.into_iter().take(5).collect()
+                } else {
+                    sigs.into_iter()
+                        .filter(|s| keywords_match_text(&s.topic, &keywords))
+                        .take(5)
+                        .collect()
+                };
+                conversation::format_signal_context(&filtered)
+            }
+            Err(_) => String::new(),
+        };
+
+        // Causal chains for the topic (already filtered by trigger)
+        let causal_ctx = match causality::find_causal_chains(&conn, &message, 30, 2) {
+            Ok(chains) if !chains.is_empty() => {
+                chains.iter().map(|c| {
+                    format!("When '{}' occurs, '{}' typically follows ~{:.0} days later ({}x observed, confidence: {:.0}%)",
+                        c.trigger_event, c.consequence, c.avg_delay_days, c.occurrences, c.confidence * 100.0)
+                }).collect::<Vec<_>>().join("\n")
+            }
+            _ => String::new(),
+        };
+
+        // Contrarian signals (already filtered by entity)
+        let contrarian_ctx = match contrarian::detect_contrarian(&conn, &message, 30, 0.4) {
+            Ok(Some(signal)) => {
+                format!("Consensus sentiment: {:.1} ({} stories). But {} dissenting stories suggest otherwise.",
+                    signal.consensus_sentiment, signal.total_stories, signal.dissent_count)
+            }
+            _ => String::new(),
+        };
+
+        // Cross-sector patterns: only those relevant to query
+        let pattern_ctx = match patterns::detect_cross_sector_patterns(&conn, 5, 2, 30) {
+            Ok(pats) if !pats.is_empty() => {
+                let filtered: Vec<_> = if keywords.is_empty() {
+                    pats
+                } else {
+                    pats.into_iter()
+                        .filter(|p| {
+                            keywords_match_text(&p.source_pattern, &keywords)
+                            || keywords_match_text(&p.predicted_pattern, &keywords)
+                            || keywords_match_text(&p.source_sector, &keywords)
+                            || keywords_match_text(&p.target_sector, &keywords)
+                        })
+                        .collect()
+                };
+                if filtered.is_empty() {
+                    String::new()
+                } else {
+                    filtered.iter().map(|p| {
+                        format!("Pattern from {}: '{}' → Now emerging in {}: '{}' (confidence: {:.0}%)",
+                            p.source_sector, p.source_pattern, p.target_sector, p.predicted_pattern, p.confidence * 100.0)
+                    }).collect::<Vec<_>>().join("\n")
+                }
+            }
+            _ => String::new(),
+        };
+
+        // Active predictions: try full query + individual keywords for broader recall
+        let pred_ctx = {
+            let mut all_preds = Vec::new();
+            let mut seen_titles = std::collections::HashSet::new();
+            // Full query match
+            if let Ok(preds) = predictions::get_predictions_for_topic(&conn, &message) {
+                for p in preds {
+                    if seen_titles.insert(p.title.clone()) {
+                        all_preds.push(p);
+                    }
+                }
+            }
+            // Individual keyword matches for broader recall
+            for kw in &keywords {
+                if let Ok(preds) = predictions::get_predictions_for_topic(&conn, kw) {
+                    for p in preds {
+                        if seen_titles.insert(p.title.clone()) {
+                            all_preds.push(p);
+                        }
+                    }
+                }
+            }
+            all_preds.truncate(5);
+            if all_preds.is_empty() {
+                String::new()
+            } else {
+                all_preds.iter().map(|p| {
+                    format!("[{}] {} (confidence: {:.0}%, timeframe: {}, status: {})",
+                        p.sector.as_deref().unwrap_or("general"), p.prediction, p.confidence * 100.0, p.predicted_timeframe, p.status)
+                }).collect::<Vec<_>>().join("\n")
+            }
+        };
+
+        // User profile
+        let prof = match profile::get_profile(&conn) {
+            Ok(p) => profile::profile_summary(&p),
+            Err(_) => String::new(),
+        };
+
+        (entity_ctx, signal_ctx, causal_ctx, contrarian_ctx, pattern_ctx, pred_ctx, prof)
+    };
+
+    // 5. Build system prompt
+    let stories_context = conversation::format_stories_context(&stories);
+    let system_prompt = conversation::build_system_prompt(
+        &profile_str,
+        &stories_context,
+        &entity_context,
+        &signal_context,
+        &causal_context,
+        &contrarian_context,
+        &pattern_context,
+        &predictions_context,
+    );
+
+    // 6. Load conversation history
+    let history = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conversation::get_thread_messages(&conn, &thread.id)
+            .map_err(|e| e.to_string())?
+    };
+
+    let messages_for_llm: Vec<(String, String)> = history.iter()
+        .rev().take(10).collect::<Vec<_>>().into_iter().rev()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+
+    // 7. Call Claude
+    let llm = conversation::ClaudeConversation::from_env()
+        .map_err(|e| e.to_string())?;
+
+    let raw_response = llm.send_message(&system_prompt, &messages_for_llm)
+        .await
+        .map_err(|e| format!("Claude error: {}", e))?;
+
+    // 8. Parse response
+    let source_ids = conversation::extract_story_references(&raw_response);
+    let followups = conversation::extract_followups(&raw_response);
+    let extracted_predictions = conversation::extract_predictions(&raw_response);
+    let clean_message = conversation::clean_response(&raw_response);
+
+    // 9. Find proactive connections (older similar stories)
+    let proactive = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+        // Use query embedding to find older related stories (deduplicated)
+        let mut connections = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        if let (Some(first_story), Some(qe)) = (stories.first(), &query_embedding) {
+            if let Ok(older) = embeddings::find_similar_older_than(&conn, qe, 7, 3, 0.5) {
+                for (sid, _score) in older {
+                    if !seen_ids.insert(sid) { continue; } // Skip duplicates
+                    if let Ok(mut s) = conn.prepare(
+                        "SELECT s.headline, b.date FROM stories s JOIN briefings b ON b.id = s.briefing_id WHERE s.id = ?1"
+                    ) {
+                        if let Ok(row) = s.query_row([sid], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        }) {
+                            connections.push(conversation::ProactiveInsight {
+                                story_id: sid,
+                                headline: row.0,
+                                date: row.1,
+                                connection: format!("Related to '{}'", first_story.headline),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        connections
+    };
+
+    // 10. Generate thread title if new
+    let thread_title = if is_new_thread {
+        // Use first few words of the message as a simple title
+        let title = message.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
+        let title = if title.chars().count() > 50 {
+            format!("{}...", title.chars().take(47).collect::<String>())
+        } else {
+            title
+        };
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conversation::update_thread_title(&conn, &thread.id, &title).ok();
+        Some(title)
+    } else {
+        thread.title.clone()
+    };
+
+    // 11. Store assistant response
+    let all_source_ids: Vec<i64> = source_ids.iter().copied()
+        .chain(stories.iter().map(|s| s.story_id))
+        .filter(|id| *id > 0) // Filter out encoded freedom story IDs (negative)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter().collect();
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conversation::store_message(
+            &conn,
+            &thread.id,
+            "assistant",
+            &clean_message,
+            Some(&all_source_ids),
+            None,
+        ).map_err(|e| e.to_string())?;
+    }
+
+    // 12. Store any predictions made
+    if !extracted_predictions.is_empty() {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        for (pred_text, confidence, timeframe) in &extracted_predictions {
+            let pred = predictions::Prediction {
+                id: None,
+                title: pred_text.chars().take(100).collect(),
+                prediction: pred_text.clone(),
+                confidence: *confidence,
+                reasoning: format!("Generated in response to: {}", message),
+                evidence_types: vec!["conversation".to_string()],
+                evidence_story_ids: all_source_ids.clone(),
+                predicted_timeframe: timeframe.clone(),
+                sector: Some(topic.to_string()),
+                status: "active".to_string(),
+            };
+            predictions::store_prediction(&conn, &pred).ok();
+        }
+    }
+
+    Ok(conversation::ConversationResponse {
+        message: clean_message,
+        source_story_ids: all_source_ids,
+        suggested_followups: followups,
+        thread_topic: topic.to_string(),
+        thread_title,
+        proactive_connections: proactive,
+    })
+}
+
+/// Streaming version of chat_send. Sends text deltas as they arrive from Claude,
+/// then sends a Complete event with metadata (sources, followups, etc).
+/// Steps 1-6 are identical to chat_send. Step 7 streams instead of blocking.
+#[tauri::command]
+pub async fn chat_send_stream(
+    db: State<'_, DbState>,
+    thread_id: Option<String>,
+    message: String,
+    on_event: Channel<ChatStreamEvent>,
+) -> Result<(), String> {
+    if message.len() > 20_000 {
+        return Err("Message too long".to_string());
+    }
+
+    // --- Steps 1-6 identical to chat_send ---
+
+    // 1. Classify topic and resolve thread
+    let topic = conversation::classify_topic(&message);
+
+    let (thread, is_new_thread) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        if let Some(tid) = &thread_id {
+            let threads = conversation::list_threads(&conn).map_err(|e| e.to_string())?;
+            let thread = threads.into_iter().find(|t| t.id == *tid)
+                .ok_or_else(|| "Thread not found".to_string())?;
+            (thread, false)
+        } else {
+            let recent = conversation::find_recent_thread(&conn, topic).map_err(|e| e.to_string())?;
+            if let Some(t) = recent {
+                (t, false)
+            } else {
+                let t = conversation::create_thread(&conn, topic).map_err(|e| e.to_string())?;
+                (t, true)
+            }
+        }
+    };
+
+    // 2. Store user message
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conversation::store_message(&conn, &thread.id, "user", &message, None, None)
+            .map_err(|e| e.to_string())?;
+        profile::track_interest(&conn, &format!("interest:{}", topic)).ok();
+    }
+
+    // 2.5. Query rewriting
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY not set. Add it to .env".to_string())?;
+    let expanded = search::rewrite_query(&api_key, &message).await;
+
+    // 3. Compute query embedding + hybrid search
+    let query_embedding: Option<Vec<f32>> = match embeddings::VoyageProvider::from_env() {
+        Ok(provider) => {
+            match provider.embed(&[expanded.semantic_text.clone()], "query").await {
+                Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    };
+
+    let stories = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        search::hybrid_search(&conn, &expanded.fts_keywords, query_embedding.as_deref(), 25)
+            .map_err(|e| e.to_string())?
+    };
+
+    // 3.5. LLM rerank
+    let stories = if stories.len() > 6 {
+        reranking::llm_rerank(&api_key, &message, stories, 15).await
+    } else {
+        stories
+    };
+
+    // 3.6. Smart web search trigger (4 rules)
+    let should_web_search = should_trigger_web_search(&message, &stories, &db)?;
+
+    let (web_context, search_source) = if should_web_search {
+        let quota_ok = {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            brave_search::check_quota(&conn).is_ok()
+        };
+
+        if !quota_ok {
+            tracing::info!("Web search skipped: Tavily monthly limit reached");
+            (None, "archive".to_string())
+        } else {
+            match brave_search::search(&message, 5).await {
+                Ok(results) if !results.is_empty() => {
+                    let conn = db.0.lock().map_err(|e| e.to_string())?;
+                    brave_search::log_call(&conn);
+                    drop(conn);
+
+                    let ctx = brave_search::format_web_context(&results);
+                    let source = if stories.is_empty() {
+                        "web".to_string()
+                    } else {
+                        "archive+web".to_string()
+                    };
+                    (Some(ctx), source)
+                }
+                Err(e) => {
+                    tracing::info!("Web search failed: {}", e);
+                    (None, "archive".to_string())
+                }
+                _ => (None, "archive".to_string()),
+            }
+        }
+    } else {
+        (None, "archive".to_string())
+    };
+
+    // 4. Gather intelligence context (filtered)
+    let keywords = extract_keywords(&message);
+    let (entity_context, signal_context, causal_context, contrarian_context, pattern_context, predictions_context, profile_str) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+        let entity_ctx = match entities::search_entities(&conn, &message) {
+            Ok(ents) => {
+                let mut pairs = Vec::new();
+                for ent in ents.into_iter().take(5) {
+                    let mut mentions = entities::get_entity_mentions(&conn, ent.id).unwrap_or_default();
+                    if mentions.len() > 5 {
+                        mentions = mentions.into_iter().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
+                    }
+                    pairs.push((ent, mentions));
+                }
+                conversation::format_entity_context(&pairs)
+            }
+            Err(_) => String::new(),
+        };
+
+        let signal_ctx = match signals::get_top_accelerating(&conn, 15) {
+            Ok(sigs) => {
+                let filtered: Vec<_> = if keywords.is_empty() {
+                    sigs.into_iter().take(5).collect()
+                } else {
+                    sigs.into_iter().filter(|s| keywords_match_text(&s.topic, &keywords)).take(5).collect()
+                };
+                conversation::format_signal_context(&filtered)
+            }
+            Err(_) => String::new(),
+        };
+
+        let causal_ctx = match causality::find_causal_chains(&conn, &message, 30, 2) {
+            Ok(chains) if !chains.is_empty() => {
+                chains.iter().map(|c| {
+                    format!("When '{}' occurs, '{}' typically follows ~{:.0} days later ({}x observed, confidence: {:.0}%)",
+                        c.trigger_event, c.consequence, c.avg_delay_days, c.occurrences, c.confidence * 100.0)
+                }).collect::<Vec<_>>().join("\n")
+            }
+            _ => String::new(),
+        };
+
+        let contrarian_ctx = match contrarian::detect_contrarian(&conn, &message, 30, 0.4) {
+            Ok(Some(signal)) => {
+                format!("Consensus sentiment: {:.1} ({} stories). But {} dissenting stories suggest otherwise.",
+                    signal.consensus_sentiment, signal.total_stories, signal.dissent_count)
+            }
+            _ => String::new(),
+        };
+
+        let pattern_ctx = match patterns::detect_cross_sector_patterns(&conn, 5, 2, 30) {
+            Ok(pats) if !pats.is_empty() => {
+                let filtered: Vec<_> = if keywords.is_empty() { pats } else {
+                    pats.into_iter().filter(|p| {
+                        keywords_match_text(&p.source_pattern, &keywords)
+                        || keywords_match_text(&p.predicted_pattern, &keywords)
+                        || keywords_match_text(&p.source_sector, &keywords)
+                        || keywords_match_text(&p.target_sector, &keywords)
+                    }).collect()
+                };
+                if filtered.is_empty() { String::new() } else {
+                    filtered.iter().map(|p| {
+                        format!("Pattern from {}: '{}' → Now emerging in {}: '{}' (confidence: {:.0}%)",
+                            p.source_sector, p.source_pattern, p.target_sector, p.predicted_pattern, p.confidence * 100.0)
+                    }).collect::<Vec<_>>().join("\n")
+                }
+            }
+            _ => String::new(),
+        };
+
+        let pred_ctx = {
+            let mut all_preds = Vec::new();
+            let mut seen_titles = std::collections::HashSet::new();
+            if let Ok(preds) = predictions::get_predictions_for_topic(&conn, &message) {
+                for p in preds { if seen_titles.insert(p.title.clone()) { all_preds.push(p); } }
+            }
+            for kw in &keywords {
+                if let Ok(preds) = predictions::get_predictions_for_topic(&conn, kw) {
+                    for p in preds { if seen_titles.insert(p.title.clone()) { all_preds.push(p); } }
+                }
+            }
+            all_preds.truncate(5);
+            if all_preds.is_empty() { String::new() } else {
+                all_preds.iter().map(|p| {
+                    format!("[{}] {} (confidence: {:.0}%, timeframe: {}, status: {})",
+                        p.sector.as_deref().unwrap_or("general"), p.prediction, p.confidence * 100.0, p.predicted_timeframe, p.status)
+                }).collect::<Vec<_>>().join("\n")
+            }
+        };
+
+        let prof = match profile::get_profile(&conn) { Ok(p) => profile::profile_summary(&p), Err(_) => String::new() };
+        (entity_ctx, signal_ctx, causal_ctx, contrarian_ctx, pattern_ctx, pred_ctx, prof)
+    };
+
+    // 5. Build system prompt
+    let stories_context = conversation::format_stories_context(&stories);
+    let mut system_prompt = conversation::build_system_prompt(
+        &profile_str, &stories_context, &entity_context, &signal_context,
+        &causal_context, &contrarian_context, &pattern_context, &predictions_context,
+    );
+
+    // Append web search results if available
+    if let Some(ref wc) = web_context {
+        system_prompt.push_str(&format!(
+            "\n\nWEB SEARCH RESULTS (live web — use when archive doesn't cover the topic):\n{}",
+            wc
+        ));
+    }
+
+    // 6. Load conversation history
+    let history = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conversation::get_thread_messages(&conn, &thread.id).map_err(|e| e.to_string())?
+    };
+    let messages_for_llm: Vec<(String, String)> = history.iter()
+        .rev().take(10).collect::<Vec<_>>().into_iter().rev()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+
+    // --- Step 7: Stream Claude response ---
+    let llm = conversation::ClaudeConversation::from_env().map_err(|e| e.to_string())?;
+
+    let on_event_clone = on_event.clone();
+    let raw_response = llm.send_message_stream(
+        &system_prompt,
+        &messages_for_llm,
+        move |chunk| {
+            if let Err(e) = on_event_clone.send(ChatStreamEvent::Delta { text: chunk.to_string() }) {
+                tracing::warn!("failed to send Delta event: {}", e);
+            }
+        },
+    )
+    .await
+    .map_err(|e| {
+        on_event.send(ChatStreamEvent::Error { message: e.to_string() }).ok();
+        format!("Claude error: {}", e)
+    })?;
+
+    // --- Steps 8-12: Parse, store, send Complete ---
+    let source_ids = conversation::extract_story_references(&raw_response);
+    let followups = conversation::extract_followups(&raw_response);
+    let extracted_predictions = conversation::extract_predictions(&raw_response);
+    let clean_message = conversation::clean_response(&raw_response);
+
+    // Proactive connections
+    let proactive = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut connections = Vec::new();
+        if let (Some(first_story), Some(qe)) = (stories.first(), &query_embedding) {
+            if let Ok(older) = embeddings::find_similar_older_than(&conn, qe, 7, 3, 0.5) {
+                for (sid, _score) in older {
+                    if let Ok(mut s) = conn.prepare("SELECT s.headline, b.date FROM stories s JOIN briefings b ON b.id = s.briefing_id WHERE s.id = ?1") {
+                        if let Ok(row) = s.query_row([sid], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                            connections.push(conversation::ProactiveInsight {
+                                story_id: sid, headline: row.0, date: row.1,
+                                connection: format!("Related to '{}'", first_story.headline),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        connections
+    };
+
+    // Thread title
+    let thread_title = if is_new_thread {
+        let title = message.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
+        let title = if title.chars().count() > 50 {
+            format!("{}...", title.chars().take(47).collect::<String>())
+        } else {
+            title
+        };
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conversation::update_thread_title(&conn, &thread.id, &title).ok();
+        Some(title)
+    } else {
+        thread.title.clone()
+    };
+
+    // Store assistant response
+    let all_source_ids: Vec<i64> = source_ids.iter().copied()
+        .chain(stories.iter().map(|s| s.story_id))
+        .filter(|id| *id > 0) // Filter out encoded freedom story IDs (negative)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter().collect();
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conversation::store_message(&conn, &thread.id, "assistant", &clean_message, Some(&all_source_ids), None)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Store predictions
+    if !extracted_predictions.is_empty() {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        for (pred_text, confidence, timeframe) in &extracted_predictions {
+            let pred = predictions::Prediction {
+                id: None,
+                title: pred_text.chars().take(100).collect(),
+                prediction: pred_text.clone(),
+                confidence: *confidence,
+                reasoning: format!("Generated in response to: {}", message),
+                evidence_types: vec!["conversation".to_string()],
+                evidence_story_ids: all_source_ids.clone(),
+                predicted_timeframe: timeframe.clone(),
+                sector: Some(topic.to_string()),
+                status: "active".to_string(),
+            };
+            predictions::store_prediction(&conn, &pred).ok();
+        }
+    }
+
+    // Log token usage (best-effort estimate)
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        // Rough estimate: 4 chars per token
+        let input_est = (system_prompt.len() + message.len()) as i64 / 4;
+        let output_est = clean_message.len() as i64 / 4;
+        api_usage::log_usage(&conn, "anthropic", "claude-sonnet", "chat", input_est, output_est).ok();
+        // Tavily usage is logged inside brave_search::search() on success
+    }
+
+    // Send Complete event with cleaned message text
+    if let Err(e) = on_event.send(ChatStreamEvent::Complete {
+        message: clean_message,
+        source_story_ids: all_source_ids,
+        suggested_followups: followups,
+        thread_topic: topic.to_string(),
+        thread_title,
+        proactive_connections: proactive,
+        search_source,
+    }) {
+        tracing::warn!("failed to send Complete event: {}", e);
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn chat_list_threads(db: State<'_, DbState>) -> Result<Vec<conversation::ChatThread>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conversation::list_threads(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn chat_get_thread(db: State<'_, DbState>, thread_id: String) -> Result<Vec<conversation::ChatMessage>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conversation::get_thread_messages(&conn, &thread_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn chat_delete_thread(db: State<'_, DbState>, thread_id: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conversation::delete_thread(&conn, &thread_id).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Smart web search trigger
+// ---------------------------------------------------------------------------
+
+/// Decide whether to trigger a web search based on 4 rules:
+/// 1. Comparison questions ("X vs Y", "best tools", "alternatives to")
+/// 2. Time-sensitive words ("latest", "today", "just released", "new")
+/// 3. Low archive confidence (<5 results)
+/// 4. Unknown entities (query keywords not found in archive entities)
+fn should_trigger_web_search(
+    message: &str,
+    stories: &[search::ScoredStory],
+    db: &State<'_, crate::db::DbState>,
+) -> Result<bool, String> {
+    let lower = message.to_lowercase();
+
+    // Rule 1: Comparison questions
+    const COMPARISON_PATTERNS: &[&str] = &[
+        " vs ", " versus ", "compare", "comparison", "better than",
+        "best tool", "best app", "alternatives to", "alternative to",
+        "instead of", "competitor", "which is better", "difference between",
+    ];
+    if COMPARISON_PATTERNS.iter().any(|p| lower.contains(p)) {
+        tracing::info!("Web search triggered: comparison question");
+        return Ok(true);
+    }
+
+    // Rule 2: Time-sensitive words
+    const TIME_PATTERNS: &[&str] = &[
+        "latest", "newest", "just released", "just launched", "just came out",
+        "this week", "this month", "today", "yesterday", "right now",
+        "current state", "as of", "new version", "new release", "new update",
+        "recently", "breaking", "announce",
+    ];
+    if TIME_PATTERNS.iter().any(|p| lower.contains(p)) {
+        tracing::info!("Web search triggered: time-sensitive query");
+        return Ok(true);
+    }
+
+    // Rule 3: Low archive confidence
+    if stories.len() < 5 {
+        tracing::info!("Web search triggered: low archive results ({})", stories.len());
+        return Ok(true);
+    }
+
+    // Rule 4: Unknown entities — check if main keywords exist in entities table
+    let keywords = extract_keywords(message);
+    if !keywords.is_empty() {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let known_count: i64 = keywords.iter().filter(|kw| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM entities WHERE name_normalized LIKE '%' || ?1 || '%'",
+                [kw.as_str()],
+                |row| row.get::<_, i64>(0),
+            ).unwrap_or(0) > 0
+        }).count() as i64;
+
+        let total = keywords.len() as i64;
+        // If less than half of keywords are known entities, search the web
+        if total > 0 && known_count < (total + 1) / 2 {
+            tracing::info!("Web search triggered: unknown entities ({}/{} known)", known_count, total);
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// Keyword helpers for intelligence layer filtering
+// ---------------------------------------------------------------------------
+
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "but", "not", "you", "all", "can",
+    "has", "her", "was", "one", "our", "out", "what", "when", "who",
+    "how", "why", "this", "that", "with", "from", "about", "been",
+    "have", "will", "more", "some", "than", "them", "into", "most",
+    "could", "would", "should", "there", "their", "which", "being",
+    "does", "doing", "going", "happening", "tell", "know",
+];
+
+/// Extract meaningful lowercased keywords from text (3+ chars, no stopwords).
+fn extract_keywords(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|w| w.to_lowercase())
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|w| w.len() >= 3 && !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Check if any keyword appears as a substring in the target text.
+fn keywords_match_text(text: &str, keywords: &[String]) -> bool {
+    let lower = text.to_lowercase();
+    keywords.iter().any(|kw| lower.contains(kw.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_keywords() {
+        let kws = extract_keywords("What's happening with OpenAI regulation?");
+        assert!(kws.contains(&"openai".to_string()));
+        assert!(kws.contains(&"regulation".to_string()));
+        assert!(!kws.contains(&"what".to_string())); // stopword
+        assert!(!kws.contains(&"with".to_string())); // stopword
+    }
+
+    #[test]
+    fn test_extract_keywords_short_words_filtered() {
+        let kws = extract_keywords("Is AI ok?");
+        assert!(!kws.contains(&"is".to_string())); // 2 chars
+        assert!(!kws.contains(&"ai".to_string())); // 2 chars
+        assert!(!kws.contains(&"ok".to_string())); // 2 chars
+    }
+
+    #[test]
+    fn test_keywords_match_text() {
+        let keywords = vec!["openai".to_string(), "regulation".to_string()];
+        assert!(keywords_match_text("OpenAI launches new model", &keywords));
+        assert!(keywords_match_text("EU regulation framework", &keywords));
+        assert!(!keywords_match_text("Google releases Gemini", &keywords));
+    }
+
+    #[test]
+    fn test_keywords_match_text_empty() {
+        let empty: Vec<String> = vec![];
+        assert!(!keywords_match_text("anything", &empty));
+    }
 }

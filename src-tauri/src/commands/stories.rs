@@ -15,7 +15,7 @@ pub fn get_stories_by_sector(
             "SELECT id, briefing_id, sector, headline, summary, key_facts,
                     why_it_matters, what_to_watch, importance_score, relevance_score,
                     relevance_reason, is_hero, display_order, original_url, source_name,
-                    published_at, created_at
+                    published_at, created_at, summary_depth, deep_summary
              FROM stories WHERE briefing_id = ?1 AND sector = ?2
              ORDER BY display_order ASC",
         )
@@ -44,6 +44,8 @@ pub fn get_stories_by_sector(
                 source_name: row.get(14)?,
                 published_at: row.get(15)?,
                 created_at: row.get(16)?,
+                summary_depth: row.get(17).ok(),
+                deep_summary: row.get(18).ok(),
             })
         })
         .map_err(|e| e.to_string())?
@@ -62,7 +64,7 @@ pub fn get_story_detail(db: State<DbState>, story_id: i64) -> Result<StoryDetail
             "SELECT id, briefing_id, sector, headline, summary, key_facts,
                     why_it_matters, what_to_watch, importance_score, relevance_score,
                     relevance_reason, is_hero, display_order, original_url, source_name,
-                    published_at, created_at
+                    published_at, created_at, summary_depth, deep_summary
              FROM stories WHERE id = ?1",
             [story_id],
             |row| {
@@ -87,6 +89,8 @@ pub fn get_story_detail(db: State<DbState>, story_id: i64) -> Result<StoryDetail
                     source_name: row.get(14)?,
                     published_at: row.get(15)?,
                     created_at: row.get(16)?,
+                    summary_depth: row.get(17).ok(),
+                    deep_summary: row.get(18).ok(),
                 })
             },
         )
