@@ -1,8 +1,10 @@
 <script lang="ts">
-	import { messages, isStreaming, lastResponse, activeThreadId, sendMessage, startNewThread } from '$lib/stores/chat';
+	import { messages, isStreaming, isSearching, lastResponse, activeThreadId, sendMessage, startNewThread } from '$lib/stores/chat';
 	import ChatMessage from './ChatMessage.svelte';
 	import ChatInput from './ChatInput.svelte';
 	import ChatInsights from './ChatInsights.svelte';
+	import ChatThinking from './ChatThinking.svelte';
+	import ChatFollowups from './ChatFollowups.svelte';
 
 	let messagesContainer: HTMLElement;
 
@@ -53,16 +55,8 @@
 				<ChatMessage message={msg} />
 			{/each}
 
-			{#if $isStreaming && ($messages[$messages.length - 1]?.content === '')}
-				<div class="flex justify-start">
-					<div class="bg-bg-card border border-border rounded-2xl rounded-bl-sm px-4 py-3">
-						<div class="flex gap-1">
-							<div class="w-1.5 h-1.5 bg-ai rounded-full animate-bounce" style="animation-delay: 0ms"></div>
-							<div class="w-1.5 h-1.5 bg-ai rounded-full animate-bounce" style="animation-delay: 150ms"></div>
-							<div class="w-1.5 h-1.5 bg-ai rounded-full animate-bounce" style="animation-delay: 300ms"></div>
-						</div>
-					</div>
-				</div>
+			{#if $isSearching}
+				<ChatThinking />
 			{/if}
 
 			<!-- Proactive insights -->
@@ -72,17 +66,7 @@
 
 			<!-- Follow-up suggestions -->
 			{#if $lastResponse?.suggested_followups?.length && !$isStreaming}
-				<div class="flex flex-wrap gap-1.5 pt-1">
-					{#each $lastResponse.suggested_followups as followup}
-						<button
-							class="text-[11px] bg-ai/10 text-ai px-2.5 py-1 rounded-full
-								hover:bg-ai/20 transition-colors"
-							onclick={() => sendMessage(followup)}
-						>
-							{followup}
-						</button>
-					{/each}
-				</div>
+				<ChatFollowups followups={$lastResponse.suggested_followups} onAsk={sendMessage} />
 			{/if}
 		{/if}
 	</div>

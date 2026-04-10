@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store';
-import type { ChatThread, ChatMessage, ConversationResponse, ProactiveInsight, ChatStreamEvent } from '$lib/tauri/types';
+import type { ChatThread, ChatMessage, ConversationResponse, ProactiveInsight, ChatStreamEvent, SearchStep } from '$lib/tauri/types';
 import { chatSendStream } from '$lib/tauri/commands';
 import { isTauri, simulateChatStream } from '$lib/tauri/mock';
 
@@ -9,6 +9,8 @@ export const activeThreadId = writable<string | null>(null);
 export const threads = writable<ChatThread[]>([]);
 export const messages = writable<ChatMessage[]>([]);
 export const isStreaming = writable(false);
+export const isSearching = writable(false);
+export const searchSteps = writable<SearchStep[]>([]);
 export const lastResponse = writable<ConversationResponse | null>(null);
 export const lastSearchSource = writable<string>('archive');
 
@@ -65,6 +67,8 @@ export async function sendMessage(message: string) {
 
 	const threadId = get(activeThreadId);
 	isStreaming.set(true);
+	isSearching.set(true);
+	searchSteps.set([]);
 
 	// Add optimistic user message
 	const tempMsg: ChatMessage = {
@@ -103,7 +107,22 @@ export async function sendMessage(message: string) {
 			// Discard events if user switched threads during this stream
 			if (streamGeneration !== myGeneration) return;
 
+			if (event.event === 'Searching') {
+				searchSteps.update(steps => {
+					// Mark previous steps as done
+					const updated = steps.map(s => ({ ...s, done: true }));
+					updated.push({ stage: event.data.stage, detail: event.data.detail, done: false });
+					return updated;
+				});
+				return;
+			}
+
 			if (event.event === 'Delta') {
+				// First delta means search is done, streaming has started
+				if (get(isSearching)) {
+					isSearching.set(false);
+					searchSteps.update(steps => steps.map(s => ({ ...s, done: true })));
+				}
 				accumulated += event.data.text;
 				// Update the assistant message in-place with streaming text
 				messages.update(m => {
@@ -169,6 +188,7 @@ export async function sendMessage(message: string) {
 		});
 	} finally {
 		isStreaming.set(false);
+		isSearching.set(false);
 	}
 }
 

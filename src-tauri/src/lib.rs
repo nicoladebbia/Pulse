@@ -59,6 +59,7 @@ pub fn run() {
             commands::chat::chat_list_threads,
             commands::chat::chat_get_thread,
             commands::chat::chat_delete_thread,
+            commands::chat::get_chat_context,
             commands::freedoms::get_today_freedoms,
             commands::freedoms::get_freedoms_by_date,
             commands::trends::get_trends,

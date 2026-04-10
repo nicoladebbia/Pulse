@@ -1,10 +1,25 @@
 <script lang="ts">
-	import { messages, isStreaming, startNewThread, sendMessage, lastResponse, lastSearchSource } from '$lib/stores/chat';
+	import { messages, isStreaming, isSearching, startNewThread, sendMessage, lastResponse, lastSearchSource } from '$lib/stores/chat';
 	import ChatMessage from '$lib/components/chat/ChatMessage.svelte';
-	import type { ChatMessage as ChatMessageType } from '$lib/tauri/types';
+	import ChatThinking from '$lib/components/chat/ChatThinking.svelte';
+	import ChatFollowups from '$lib/components/chat/ChatFollowups.svelte';
+	import { getChatContext } from '$lib/tauri/commands';
+	import { isTauri } from '$lib/tauri/mock';
+	import type { ChatContext } from '$lib/tauri/types';
 
 	let query = $state('');
 	let messagesContainer: HTMLElement;
+	let chatContext = $state<ChatContext | null>(null);
+	let contextLoaded = $state(false);
+
+	// Load dynamic suggestions
+	$effect(() => {
+		if (contextLoaded) return;
+		contextLoaded = true;
+		if (isTauri()) {
+			getChatContext().then(ctx => { chatContext = ctx; }).catch(() => {});
+		}
+	});
 
 	// Check for prefilled question from story cards
 	$effect(() => {
@@ -12,16 +27,22 @@
 		if (prefill) {
 			sessionStorage.removeItem('pulse_ask_prefill');
 			query = prefill;
-			// Auto-submit after a tick
 			setTimeout(() => handleSubmit(), 100);
 		}
 	});
 
-	const suggestions = [
+	const CATEGORY_ICONS: Record<string, string> = {
+		signal: '📡',
+		story: '📰',
+		prediction: '🔮',
+		general: '→',
+	};
+
+	const fallbackSuggestions = [
 		"What are today's biggest AI developments?",
-		"Tell me about Claude and Anthropic news",
 		"What's happening in Miami Beach?",
 		"What trends are emerging across all sectors?",
+		"Any patterns between AI and regulation?",
 	];
 
 	async function handleSubmit() {
@@ -62,38 +83,54 @@
 	<!-- Messages -->
 	<div class="flex-1 overflow-y-auto space-y-4 py-4" bind:this={messagesContainer}>
 		{#if $messages.length === 0}
-			<div class="text-center pt-16">
-				<div class="text-4xl mb-4">◎</div>
-				<h2 class="text-xl font-semibold text-text mb-2">Ask Pulse</h2>
-				<p class="text-text-secondary text-sm mb-8">
-					Ask questions about your news archive. Pulse searches your briefings and answers with Claude.
-				</p>
-				<div class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-lg mx-auto">
-					{#each suggestions as suggestion}
-						<button
-							class="text-left text-sm bg-bg-card border border-border rounded-lg px-3 py-2.5
-								text-text-secondary hover:text-text hover:bg-bg-card-hover transition-colors"
-							onclick={() => askSuggestion(suggestion)}
-						>
-							{suggestion}
-						</button>
-					{/each}
-				</div>
+			<div class="text-center pt-12">
+				<div class="w-3 h-3 rounded-full bg-ai mx-auto mb-4 animate-pulse"></div>
+
+				{#if chatContext}
+					<h2 class="text-lg font-semibold text-text mb-1">{chatContext.greeting}</h2>
+					{#if chatContext.entity_count > 0}
+						<p class="text-text-muted text-xs mb-8">
+							Tracking {chatContext.entity_count} entities across {chatContext.briefing_days} days
+						</p>
+					{/if}
+
+					<div class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-lg mx-auto">
+						{#each chatContext.suggestions as suggestion}
+							<button
+								class="text-left text-sm bg-bg-card border border-border rounded-lg px-3 py-2.5
+									text-text-secondary hover:text-text hover:bg-bg-card-hover transition-colors
+									flex items-center gap-2"
+								onclick={() => askSuggestion(suggestion.text)}
+							>
+								<span class="text-xs shrink-0">{CATEGORY_ICONS[suggestion.category] ?? '→'}</span>
+								<span>{suggestion.text}</span>
+							</button>
+						{/each}
+					</div>
+				{:else}
+					<h2 class="text-xl font-semibold text-text mb-2">Ask Pulse</h2>
+					<p class="text-text-secondary text-sm mb-8">
+						Ask questions about your news archive. Pulse searches your briefings and answers with Claude.
+					</p>
+					<div class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-lg mx-auto">
+						{#each fallbackSuggestions as suggestion}
+							<button
+								class="text-left text-sm bg-bg-card border border-border rounded-lg px-3 py-2.5
+									text-text-secondary hover:text-text hover:bg-bg-card-hover transition-colors"
+								onclick={() => askSuggestion(suggestion)}
+							>
+								{suggestion}
+							</button>
+						{/each}
+					</div>
+				{/if}
 			</div>
 		{:else}
 			{#each $messages as msg (msg.id)}
 				<ChatMessage message={msg} />
 			{/each}
-			{#if $isStreaming}
-				<div class="flex justify-start">
-					<div class="bg-bg-card border border-border rounded-2xl rounded-bl-sm px-4 py-3">
-						<div class="flex gap-1">
-							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 0ms"></div>
-							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 150ms"></div>
-							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 300ms"></div>
-						</div>
-					</div>
-				</div>
+			{#if $isSearching}
+				<ChatThinking />
 			{/if}
 			{#if !$isStreaming && $lastSearchSource && $lastSearchSource !== 'archive'}
 				<div class="text-xs text-text-muted mt-1 mb-2 flex items-center gap-1.5">
@@ -105,17 +142,7 @@
 				</div>
 			{/if}
 			{#if !$isStreaming && $lastResponse?.suggested_followups?.length}
-				<div class="flex flex-wrap gap-2 pt-2">
-					{#each $lastResponse.suggested_followups as followup}
-						<button
-							class="text-xs bg-bg-card border border-border rounded-lg px-3 py-2
-								text-text-secondary hover:text-text hover:bg-bg-card-hover hover:border-ai/30 transition-colors"
-							onclick={() => askSuggestion(followup)}
-						>
-							{followup}
-						</button>
-					{/each}
-				</div>
+				<ChatFollowups followups={$lastResponse.suggested_followups} onAsk={askSuggestion} />
 			{/if}
 		{/if}
 	</div>

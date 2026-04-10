@@ -261,48 +261,77 @@ pub fn build_system_prompt(
     pattern_context: &str,
     predictions_context: &str,
 ) -> String {
-    format!(
-        r#"You are Pulse, an intelligence analyst with deep memory of a curated news archive spanning AI/LLMs, Miami Beach, Italian politics, and tech/innovation. You have been tracking these topics daily and have built up temporal awareness of how stories evolve.
+    let mut prompt = String::from(
+        r#"You are Pulse, an intelligence analyst. You track AI/LLMs, Miami Beach, Italian politics, and tech/innovation daily. You have deep temporal awareness of how stories evolve.
 
-The reader is a tech founder in Miami Beach who builds AI/ML applications, Shopify e-commerce tools, and iOS apps. Italian heritage. Follows Serie A football.
+The reader is a tech founder in Miami Beach who builds AI/ML apps, Shopify tools, and iOS apps. Italian heritage, follows Serie A.
 
-CONVERSATION RULES:
-- Reference specific stories with dates, source names, and concrete numbers
-- When a topic connects to older archive stories, explicitly mention it with the date
-- Be conversational and insightful, not robotic. Provide analysis, not just summaries.
-- If asked for predictions, give them with confidence scores and reasoning
-- If the archive doesn't contain relevant information, say so honestly
-- When you spot a pattern across time, call it out proactively
-- Keep responses focused and substantive — aim for 2-4 paragraphs for most questions
+RESPONSE FORMAT — follow this structure:
 
-USER PROFILE:
-{profile_summary}
+## Bottom Line
+1-2 sentences. The direct answer. No preamble, no "Great question." Start with the substance.
 
-RETRIEVED STORIES (ranked by relevance):
-{stories_context}
+## Analysis
+The depth. Use specific dates, company names, numbers from the stories. When a topic connects to older stories, say when ("first reported March 28, escalated April 5"). When you're uncertain, be explicit: say HIGH CONFIDENCE, MODERATE CONFIDENCE, or LOW CONFIDENCE.
 
-ENTITY INTELLIGENCE:
-{entity_context}
+## What to Watch
+1-2 sentences on what to monitor going forward. Be specific — name the trigger events.
 
-SIGNAL STRENGTH DATA:
-{signal_context}
+RULES:
+- Lead with the conclusion, not the setup
+- Be direct and opinionated — you're an analyst, not a summarizer
+- Use concrete details: names, dates, numbers, not vague references
+- If the archive doesn't cover a topic, say so plainly
+- When you spot a pattern across time, call it out
+- Keep it tight: 2-4 paragraphs in the Analysis section for most questions
+- If asked for predictions, include confidence and reasoning
 
-CAUSAL PATTERNS:
-{causal_context}
+"#,
+    );
 
-CONTRARIAN SIGNALS:
-{contrarian_context}
+    // Only include non-empty context sections to avoid wasting tokens
+    prompt.push_str("RETRIEVED STORIES (ranked by relevance):\n");
+    prompt.push_str(stories_context);
 
-CROSS-SECTOR PATTERNS:
-{pattern_context}
+    if !entity_context.is_empty() {
+        prompt.push_str("\n\nENTITY INTELLIGENCE:\n");
+        prompt.push_str(entity_context);
+    }
+    if !signal_context.is_empty() {
+        prompt.push_str("\n\nSIGNAL STRENGTH:\n");
+        prompt.push_str(signal_context);
+    }
+    if !causal_context.is_empty() {
+        prompt.push_str("\n\nCAUSAL PATTERNS:\n");
+        prompt.push_str(causal_context);
+    }
+    if !contrarian_context.is_empty() {
+        prompt.push_str("\n\nCONTRARIAN SIGNALS:\n");
+        prompt.push_str(contrarian_context);
+    }
+    if !pattern_context.is_empty() {
+        prompt.push_str("\n\nCROSS-SECTOR PATTERNS:\n");
+        prompt.push_str(pattern_context);
+    }
+    if !predictions_context.is_empty() {
+        prompt.push_str("\n\nACTIVE PREDICTIONS:\n");
+        prompt.push_str(predictions_context);
+    }
+    if !profile_summary.is_empty() {
+        prompt.push_str("\n\nUSER PROFILE:\n");
+        prompt.push_str(profile_summary);
+    }
 
-ACTIVE PREDICTIONS:
-{predictions_context}
+    prompt.push_str(r#"
 
-When referencing stories, include the story ID in brackets like [story:123] so the system can extract source references.
-When suggesting follow-up questions, format them as: [followup: "question text"]
-If you make a prediction, format it as: [prediction: "prediction text" | confidence: 0.X | timeframe: "..."]"#
-    )
+METADATA MARKERS (the UI extracts these — include them naturally):
+- Reference stories: [story:123]
+- Suggest follow-ups: [followup: "question text" | type: "deeper"], [followup: "question text" | type: "compare"], [followup: "question text" | type: "predict"], or [followup: "question text" | type: "timeline"]
+- Make predictions: [prediction: "prediction text" | confidence: 0.X | timeframe: "..."]
+
+Suggest 2-4 follow-up questions. Use the types: "deeper" (drill into sub-topic), "compare" (contrast), "predict" (what happens next), "timeline" (how it evolved)."#);
+
+    prompt
 }
 
 /// Format scored stories into a context string for the prompt.
@@ -449,14 +478,32 @@ pub fn extract_followups(response: &str) -> Vec<String> {
         // Find the closing ]
         if let Some(end) = response[abs_start..].find(']') {
             let inner = response[abs_start..abs_start + end].trim();
-            // Strip surrounding quotes
-            let cleaned = inner
+            // Parse: "question text" | type: "deeper"
+            let parts: Vec<&str> = inner.split('|').collect();
+            let question = parts[0]
+                .trim()
                 .trim_start_matches('"')
                 .trim_end_matches('"')
                 .trim()
                 .to_string();
-            if !cleaned.is_empty() {
-                followups.push(cleaned);
+
+            let ftype = if parts.len() >= 2 {
+                parts[1]
+                    .trim()
+                    .strip_prefix("type:")
+                    .map(|s| s.trim().trim_matches('"').trim().to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            if !question.is_empty() {
+                // Encode type into the string as "type::question" for frontend parsing
+                if ftype.is_empty() {
+                    followups.push(question);
+                } else {
+                    followups.push(format!("{}::{}", ftype, question));
+                }
             }
             search_from = abs_start + end + 1;
         } else {

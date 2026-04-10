@@ -110,7 +110,14 @@ export interface ConversationResponse {
 
 // === Streaming Chat Types ===
 
+export interface SearchStep {
+	stage: string;
+	detail: string;
+	done: boolean;
+}
+
 export type ChatStreamEvent =
+	| { event: 'Searching'; data: { stage: string; detail: string } }
 	| { event: 'Delta'; data: { text: string } }
 	| {
 			event: 'Complete';
@@ -125,6 +132,21 @@ export type ChatStreamEvent =
 			};
 		}
 	| { event: 'Error'; data: { message: string } };
+
+// === Chat Context Types ===
+
+export interface ChatSuggestion {
+	text: string;
+	category: string;
+}
+
+export interface ChatContext {
+	greeting: string;
+	suggestions: ChatSuggestion[];
+	story_count: number;
+	briefing_days: number;
+	entity_count: number;
+}
 
 // === Fetch Status Types ===
 

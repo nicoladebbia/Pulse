@@ -1,3 +1,4 @@
+use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, State};
 use crate::db::DbState;
@@ -8,6 +9,7 @@ use crate::services::{api_usage, brave_search, conversation, conversation::Conve
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
 pub enum ChatStreamEvent {
+    Searching { stage: String, detail: String },
     Delta { text: String },
     Complete {
         message: String,
@@ -665,6 +667,12 @@ pub async fn chat_send_stream(
         profile::track_interest(&conn, &format!("interest:{}", topic)).ok();
     }
 
+    // --- Emit search progress events ---
+    on_event.send(ChatStreamEvent::Searching {
+        stage: "searching".into(),
+        detail: "Searching your archive...".into(),
+    }).ok();
+
     // 2.5. Query rewriting
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| "ANTHROPIC_API_KEY not set. Add it to .env".to_string())?;
@@ -687,8 +695,17 @@ pub async fn chat_send_stream(
             .map_err(|e| e.to_string())?
     };
 
+    on_event.send(ChatStreamEvent::Searching {
+        stage: "found".into(),
+        detail: format!("Found {} stories", stories.len()),
+    }).ok();
+
     // 3.5. LLM rerank
     let stories = if stories.len() > 6 {
+        on_event.send(ChatStreamEvent::Searching {
+            stage: "reranking".into(),
+            detail: "Ranking by relevance...".into(),
+        }).ok();
         reranking::llm_rerank(&api_key, &message, stories, 15).await
     } else {
         stories
@@ -696,6 +713,13 @@ pub async fn chat_send_stream(
 
     // 3.6. Smart web search trigger (4 rules)
     let should_web_search = should_trigger_web_search(&message, &stories, &db)?;
+
+    if should_web_search {
+        on_event.send(ChatStreamEvent::Searching {
+            stage: "web".into(),
+            detail: "Searching the web...".into(),
+        }).ok();
+    }
 
     let (web_context, search_source) = if should_web_search {
         let quota_ok = {
@@ -733,6 +757,11 @@ pub async fn chat_send_stream(
     };
 
     // 4. Gather intelligence context (filtered)
+    on_event.send(ChatStreamEvent::Searching {
+        stage: "analyzing".into(),
+        detail: "Analyzing patterns & signals...".into(),
+    }).ok();
+
     let keywords = extract_keywords(&message);
     let (entity_context, signal_context, causal_context, contrarian_context, pattern_context, predictions_context, profile_str) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -852,6 +881,11 @@ pub async fn chat_send_stream(
         .collect();
 
     // --- Step 7: Stream Claude response ---
+    on_event.send(ChatStreamEvent::Searching {
+        stage: "thinking".into(),
+        detail: "Generating analysis...".into(),
+    }).ok();
+
     let llm = conversation::ClaudeConversation::from_env().map_err(|e| e.to_string())?;
 
     let on_event_clone = on_event.clone();
@@ -897,14 +931,9 @@ pub async fn chat_send_stream(
         connections
     };
 
-    // Thread title
+    // Thread title — use Haiku for a concise title, fall back to first words
     let thread_title = if is_new_thread {
-        let title = message.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
-        let title = if title.chars().count() > 50 {
-            format!("{}...", title.chars().take(47).collect::<String>())
-        } else {
-            title
-        };
+        let title = generate_thread_title(&api_key, &message, &clean_message).await;
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         conversation::update_thread_title(&conn, &thread.id, &title).ok();
         Some(title)
@@ -968,6 +997,110 @@ pub async fn chat_send_stream(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatSuggestion {
+    pub text: String,
+    pub category: String, // "signal", "story", "prediction", "general"
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatContext {
+    pub greeting: String,
+    pub suggestions: Vec<ChatSuggestion>,
+    pub story_count: i64,
+    pub briefing_days: i64,
+    pub entity_count: i64,
+}
+
+#[tauri::command]
+pub fn get_chat_context(db: State<'_, DbState>) -> Result<ChatContext, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    // Counts for greeting
+    let story_count: i64 = conn.query_row("SELECT COUNT(*) FROM stories", [], |r| r.get(0)).unwrap_or(0);
+    let briefing_days: i64 = conn.query_row("SELECT COUNT(DISTINCT date) FROM briefings WHERE briefing_type = 'daily'", [], |r| r.get(0)).unwrap_or(0);
+    let entity_count: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0)).unwrap_or(0);
+
+    let mut suggestions = Vec::new();
+
+    // Top accelerating signals → "What's driving the surge in [topic]?"
+    if let Ok(sigs) = signals::get_top_accelerating(&conn, 3) {
+        for sig in sigs {
+            if sig.acceleration > 1.5 {
+                suggestions.push(ChatSuggestion {
+                    text: format!("What's driving the surge in {}?", sig.topic),
+                    category: "signal".into(),
+                });
+            }
+        }
+    }
+
+    // Today's hero story → "Tell me more about [headline]"
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let hero: Option<String> = conn.query_row(
+        "SELECT s.headline FROM stories s JOIN briefings b ON b.id = s.briefing_id
+         WHERE b.date = ?1 AND s.is_hero = 1 AND b.briefing_type = 'daily'
+         ORDER BY s.importance_score DESC LIMIT 1",
+        [&today],
+        |row| row.get(0),
+    ).ok();
+    if let Some(headline) = hero {
+        let short = if headline.len() > 60 {
+            format!("{}...", &headline[..57])
+        } else {
+            headline
+        };
+        suggestions.push(ChatSuggestion {
+            text: format!("Tell me more about {}", short),
+            category: "story".into(),
+        });
+    }
+
+    // Active predictions → "Update on your prediction about [topic]"
+    if let Ok(preds) = predictions::get_active_predictions(&conn) {
+        let preds: Vec<_> = preds.into_iter().take(2).collect();
+        for pred in preds {
+            let short = if pred.title.len() > 40 {
+                format!("{}...", &pred.title[..37])
+            } else {
+                pred.title.clone()
+            };
+            suggestions.push(ChatSuggestion {
+                text: format!("Update on the prediction: {}", short),
+                category: "prediction".into(),
+            });
+        }
+    }
+
+    // Always include a general fallback
+    if suggestions.len() < 3 {
+        suggestions.push(ChatSuggestion {
+            text: "What patterns are emerging across all sectors?".into(),
+            category: "general".into(),
+        });
+    }
+
+    suggestions.truncate(4);
+
+    // Time-aware greeting
+    let hour = chrono::Local::now().hour();
+    let time_greeting = if hour < 12 { "Good morning" } else if hour < 17 { "Good afternoon" } else { "Good evening" };
+
+    let greeting = if story_count > 0 {
+        format!("{}. Your archive spans {} stories across {} days.", time_greeting, story_count, briefing_days)
+    } else {
+        format!("{}. Ask me anything about the news.", time_greeting)
+    };
+
+    Ok(ChatContext {
+        greeting,
+        suggestions,
+        story_count,
+        briefing_days,
+        entity_count,
+    })
 }
 
 #[tauri::command]
@@ -1076,6 +1209,52 @@ fn extract_keywords(text: &str) -> Vec<String> {
         .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
         .filter(|w| w.len() >= 3 && !STOPWORDS.contains(&w.as_str()))
         .collect()
+}
+
+/// Generate a concise thread title using Haiku. Falls back to first words on failure.
+async fn generate_thread_title(api_key: &str, question: &str, answer: &str) -> String {
+    let fallback = || {
+        let title: String = question.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
+        if title.chars().count() > 50 {
+            format!("{}...", title.chars().take(47).collect::<String>())
+        } else {
+            title
+        }
+    };
+
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
+        Ok(c) => c,
+        Err(_) => return fallback(),
+    };
+
+    let body = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 30,
+        "system": "Generate a 3-5 word title for this conversation. No quotes, no punctuation, just the topic. Examples: 'OpenAI GPT-5 Analysis', 'Miami Tech Funding', 'EU AI Regulation Impact'",
+        "messages": [{"role": "user", "content": format!("Q: {}\nA: {}", &question[..question.len().min(200)], &answer[..answer.len().min(300)])}]
+    });
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            if let Ok(json) = r.json::<serde_json::Value>().await {
+                let title = json["content"][0]["text"].as_str().unwrap_or("").trim().to_string();
+                if !title.is_empty() && title.len() < 60 {
+                    return title;
+                }
+            }
+            fallback()
+        }
+        _ => fallback(),
+    }
 }
 
 /// Check if any keyword appears as a substring in the target text.
