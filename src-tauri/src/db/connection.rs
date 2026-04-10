@@ -13,6 +13,7 @@ pub const MIGRATION_007: &str = include_str!("../../../migrations/007_executive_
 pub const MIGRATION_008: &str = include_str!("../../../migrations/008_intelligence_upgrade.sql");
 #[allow(dead_code)]
 pub const MIGRATION_009: &str = include_str!("../../../migrations/009_multiple_daily_briefings.sql");
+pub const MIGRATION_010: &str = include_str!("../../../migrations/010_trajectory_labels.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -164,6 +165,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
         let tx = conn.unchecked_transaction()?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (9)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 10: Update trajectory labels (dominant/hot/rising/fading)
+    if !applied.contains(&10) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_010)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (10)", [])?;
         tx.commit()?;
     }
 
