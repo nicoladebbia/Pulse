@@ -145,7 +145,27 @@ fn load_briefing(conn: &rusqlite::Connection, date: &str) -> Result<Option<Brief
 pub fn get_today_briefing(db: State<DbState>) -> Result<Option<BriefingWithStories>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    load_briefing(&conn, &today)
+
+    // Try today first
+    if let Some(briefing) = load_briefing(&conn, &today)? {
+        return Ok(Some(briefing));
+    }
+
+    // Fall back to the most recent briefing (covers overnight gap between 9 PM and 8 AM)
+    let latest_date: Option<String> = conn
+        .query_row(
+            "SELECT date FROM briefings WHERE briefing_type = 'daily' AND status = 'complete' ORDER BY date DESC, created_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(date) = latest_date {
+        log(&format!("No briefing for {}, falling back to latest: {}", today, date));
+        return load_briefing(&conn, &date);
+    }
+
+    Ok(None)
 }
 
 #[tauri::command]
