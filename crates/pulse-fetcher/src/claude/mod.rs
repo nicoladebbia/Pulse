@@ -52,12 +52,13 @@ pub async fn translate_italian(articles: &[RawArticle]) -> anyhow::Result<Vec<Ra
     }
 
     tracing::info!("Translating {} Italian articles...", italian.len());
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
+    let api_key = std::env::var("GROQ_API_KEY")
+        .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
 
-    let client = client::ClaudeClient::new(&api_key);
+    let client = client::GroqClient::new(&api_key);
     let mut result = articles.to_vec();
 
+    let mut translated_count = 0;
     for article in &mut result {
         if article.language == "it" {
             match client.translate(&article.title, &article.content_snippet).await {
@@ -65,24 +66,35 @@ pub async fn translate_italian(articles: &[RawArticle]) -> anyhow::Result<Vec<Ra
                     article.title = title;
                     article.content_snippet = snippet;
                     article.language = "en".to_string();
+                    translated_count += 1;
                 }
                 Err(e) => tracing::warn!("Translation failed: {}", e),
             }
+            // Throttle to stay under Gemini free tier (15 RPM)
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     }
+    tracing::info!("Translated {}/{} Italian articles", translated_count, italian.len());
 
     Ok(result)
 }
 
-pub async fn summarize_stories(articles: &[RawArticle]) -> anyhow::Result<Vec<SummarizedStory>> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
-    let client = client::ClaudeClient::new(&api_key);
+pub async fn summarize_stories(articles: &[RawArticle], progress: Option<&crate::pipeline::ProgressWriter>) -> anyhow::Result<Vec<SummarizedStory>> {
+    let api_key = std::env::var("GROQ_API_KEY")
+        .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
+    let client = client::GroqClient::new(&api_key);
 
     let mut summaries = Vec::new();
     let chunks: Vec<_> = articles.chunks(10).collect();
+    let total_chunks = chunks.len();
 
-    for chunk in chunks {
+    for (batch_idx, chunk) in chunks.into_iter().enumerate() {
+        tracing::info!("Summarizing batch {}/{} ({} stories done)", batch_idx + 1, total_chunks, summaries.len());
+        if let Some(pw) = progress {
+            let sub_pct = (batch_idx as f64 / total_chunks as f64) * 100.0;
+            pw.update_detail(&format!("Batch {}/{} ({} done)", batch_idx + 1, total_chunks, summaries.len()), sub_pct);
+        }
+
         let futures: Vec<_> = chunk
             .iter()
             .map(|article| {
@@ -102,20 +114,25 @@ pub async fn summarize_stories(articles: &[RawArticle]) -> anyhow::Result<Vec<Su
 
         let results = futures::future::join_all(futures).await;
         summaries.extend(results.into_iter().flatten());
+
+        // Brief pause between batches to avoid burst limits
+        if batch_idx < total_chunks - 1 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
 
     Ok(summaries)
 }
 
 pub async fn analyze_cross_sector(stories: &[SummarizedStory]) -> anyhow::Result<AnalysisResult> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
-    let client = client::ClaudeClient::new(&api_key);
+    let api_key = std::env::var("GROQ_API_KEY")
+        .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
+    let client = client::GroqClient::new(&api_key);
 
-    // Sort by importance and take top 30
+    // Sort by importance and take top 120 for curation
     let mut sorted = stories.to_vec();
     sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
-    sorted.truncate(30);
+    sorted.truncate(120);
 
     client.analyze(&sorted).await
 }

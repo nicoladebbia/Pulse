@@ -2,37 +2,51 @@ use super::{SummarizedStory, AnalysisResult, Connection, RelevanceScore, TrendDe
 use crate::sources::RawArticle;
 use serde::{Deserialize, Serialize};
 
-const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
-const SONNET_MODEL: &str = "claude-sonnet-4-6";
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
+// Groq models — fast inference, OpenAI-compatible API
+const FAST_MODEL: &str = "llama-3.1-8b-instant";
+const STRONG_MODEL: &str = "llama-3.3-70b-versatile";
+const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 
-pub struct ClaudeClient {
+pub struct GroqClient {
     api_key: String,
     http: reqwest::Client,
 }
 
 #[derive(Serialize)]
-struct MessageRequest {
+struct ChatRequest {
     model: String,
+    messages: Vec<ChatMessage>,
     max_tokens: u32,
-    system: String,
-    messages: Vec<Message>,
+    temperature: f32,
+    response_format: ResponseFormat,
+}
+
+#[derive(Serialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    fmt_type: String,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Message {
+struct ChatMessage {
     role: String,
     content: String,
 }
 
 #[derive(Deserialize)]
-struct MessageResponse {
-    content: Vec<ContentBlock>,
+struct ChatResponse {
+    choices: Option<Vec<ChatChoice>>,
+    error: Option<ChatError>,
 }
 
 #[derive(Deserialize)]
-struct ContentBlock {
-    text: Option<String>,
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+#[derive(Deserialize)]
+struct ChatError {
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -88,48 +102,122 @@ struct CurationResult {
     tech: Vec<usize>,
 }
 
-impl ClaudeClient {
+impl GroqClient {
     pub fn new(api_key: &str) -> Self {
         Self {
             api_key: api_key.to_string(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .pool_max_idle_per_host(0)
+                .build()
+                .expect("failed to build HTTP client"),
         }
     }
 
-    async fn call(&self, model: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
-        let request = MessageRequest {
+    pub async fn call(&self, model: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+        let request = ChatRequest {
             model: model.to_string(),
+            messages: vec![
+                ChatMessage { role: "system".to_string(), content: system.to_string() },
+                ChatMessage { role: "user".to_string(), content: user_msg.to_string() },
+            ],
             max_tokens,
-            system: system.to_string(),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: user_msg.to_string(),
-            }],
+            temperature: 0.3,
+            response_format: ResponseFormat { fmt_type: "json_object".to_string() },
         };
 
-        let resp = self.http
-            .post(API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+        // Retry with backoff for rate limits
+        for attempt in 0..4u32 {
+            let resp = self.http
+                .post(API_URL)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .send()
+                .await?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await?;
-            anyhow::bail!("Claude API error {}: {}", status, body);
+            let status = resp.status();
+            if status.as_u16() == 429 {
+                let delay = 30 * (attempt + 1) as u64;
+                tracing::warn!("Rate limited (attempt {}), waiting {}s...", attempt + 1, delay);
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await?;
+                anyhow::bail!("Groq API error {}: {}", status, body);
+            }
+
+            let response: ChatResponse = resp.json().await?;
+
+            if let Some(err) = response.error {
+                anyhow::bail!("Groq API error: {}", err.message);
+            }
+
+            let text = response
+                .choices
+                .and_then(|c| c.into_iter().next())
+                .map(|c| c.message.content)
+                .unwrap_or_default();
+
+            return Ok(text);
         }
 
-        let response: MessageResponse = resp.json().await?;
-        let text = response
-            .content
-            .first()
-            .and_then(|c| c.text.clone())
-            .unwrap_or_default();
+        anyhow::bail!("Groq API: max retries exceeded due to rate limiting")
+    }
 
-        Ok(text)
+    /// Like `call()` but returns plain text (no JSON response_format constraint).
+    /// Used for executive summaries and other prose generation.
+    pub async fn call_text(&self, model: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage { role: "system".to_string(), content: system.to_string() },
+                ChatMessage { role: "user".to_string(), content: user_msg.to_string() },
+            ],
+            max_tokens,
+            temperature: 0.3,
+            response_format: ResponseFormat { fmt_type: "text".to_string() },
+        };
+
+        for attempt in 0..4u32 {
+            let resp = self.http
+                .post(API_URL)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .send()
+                .await?;
+
+            let status = resp.status();
+            if status.as_u16() == 429 {
+                let delay = 30 * (attempt + 1) as u64;
+                tracing::warn!("Rate limited (attempt {}), waiting {}s...", attempt + 1, delay);
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await?;
+                anyhow::bail!("Groq API error {}: {}", status, body);
+            }
+
+            let response: ChatResponse = resp.json().await?;
+            if let Some(err) = response.error {
+                anyhow::bail!("Groq API error: {}", err.message);
+            }
+
+            let text = response
+                .choices
+                .and_then(|c| c.into_iter().next())
+                .map(|c| c.message.content)
+                .unwrap_or_default();
+
+            return Ok(text.trim().to_string());
+        }
+
+        anyhow::bail!("Groq API: max retries exceeded due to rate limiting")
     }
 
     pub async fn translate(&self, title: &str, snippet: &str) -> anyhow::Result<(String, String)> {
@@ -139,7 +227,7 @@ impl ClaudeClient {
             title, snippet
         );
 
-        let text = self.call(HAIKU_MODEL, system, &user_msg, 500).await?;
+        let text = self.call(FAST_MODEL, system, &user_msg, 500).await?;
         let parsed: TranslationResponse = serde_json::from_str(&extract_json(&text))?;
         Ok((parsed.title_en, parsed.snippet_en))
     }
@@ -151,7 +239,7 @@ impl ClaudeClient {
             article.source_name, article.title, article.url, article.content_snippet, article.sector
         );
 
-        let text = self.call(HAIKU_MODEL, system, &user_msg, 800).await?;
+        let text = self.call(FAST_MODEL, system, &user_msg, 2000).await?;
         let parsed: SummaryResponse = serde_json::from_str(&extract_json(&text))?;
 
         Ok(SummarizedStory {
@@ -177,10 +265,9 @@ impl ClaudeClient {
         }
         user_msg.push_str("\nReturn valid JSON with keys: connections, relevance_scores, trends, curation.");
 
-        let text = self.call(SONNET_MODEL, system, &user_msg, 3000).await?;
+        let text = self.call(STRONG_MODEL, system, &user_msg, 4000).await?;
         let parsed: AnalysisResponse = serde_json::from_str(&extract_json(&text))?;
 
-        // Gather curated story indices
         let mut curated_indices: Vec<usize> = Vec::new();
         curated_indices.extend(&parsed.curation.ai);
         curated_indices.extend(&parsed.curation.miami);
