@@ -1,9 +1,6 @@
 <script lang="ts">
 	import { SECTORS, type SectorId } from '$lib/config';
-	import RelevanceBadge from './RelevanceBadge.svelte';
-	import type { Story } from '$lib/tauri/types';
-
-	import type { StoryTrendBadge } from '$lib/tauri/types';
+	import type { Story, StoryTrendBadge } from '$lib/tauri/types';
 
 	let { story, onExpand, focused = false, trendBadge = undefined }: {
 		story: Story; onExpand: (s: Story) => void; focused?: boolean; trendBadge?: StoryTrendBadge;
@@ -11,7 +8,6 @@
 
 	let sector = $derived(SECTORS[story.sector as SectorId]);
 
-	// Extract first sentence of why_it_matters
 	let whySnippet = $derived(
 		story.why_it_matters.split(/[.!?]\s/)[0] + '.'
 	);
@@ -25,31 +21,14 @@
 	data-url={story.original_url}
 	onclick={() => onExpand(story)}
 >
-	<!-- Header: sector + badges -->
-	<div class="flex items-center justify-between mb-3">
-		<div class="flex items-center gap-2">
-			<span
-				class="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded"
-				style="color: {sector?.color}; background: {sector?.dimColor}"
-			>
-				{sector?.name ?? story.sector}
-			</span>
-			{#if story.summary_depth === 'deep'}
-				<span class="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-full bg-ai/15 text-ai border border-ai/25">
-					Deep
-				</span>
-			{/if}
-			{#if trendBadge}
-				<span class="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-full border
-					{trendBadge.trajectory === 'dominant' ? 'bg-ai/15 text-ai border-ai/25' : 'bg-amber-500/15 text-amber-400 border-amber-500/25'}"
-					title="{trendBadge.entity} — {trendBadge.trajectory}">
-					{trendBadge.trajectory === 'dominant' ? '◉' : '🔥'} Trending
-				</span>
-			{/if}
-		</div>
-		{#if story.relevance_score}
-			<RelevanceBadge score={story.relevance_score} />
-		{/if}
+	<!-- Sector pill -->
+	<div class="flex items-center gap-2 mb-2">
+		<span
+			class="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded"
+			style="color: {sector?.color}; background: {sector?.dimColor}"
+		>
+			{sector?.name ?? story.sector}
+		</span>
 	</div>
 
 	<!-- Headline -->
@@ -67,12 +46,33 @@
 		{whySnippet}
 	</p>
 
-	<!-- Source + time -->
-	<div class="flex items-center gap-2 text-xs text-text-muted">
-		<span>{story.source_name}</span>
-		{#if story.published_at}
-			<span>·</span>
-			<span>{new Date(story.published_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}</span>
-		{/if}
+	<!-- Footer: source + meta badges -->
+	<div class="flex items-center justify-between">
+		<div class="flex items-center gap-2 text-xs text-text-muted">
+			<span>{story.source_name}</span>
+			{#if story.published_at}
+				<span>·</span>
+				<span>{new Date(story.published_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}</span>
+			{/if}
+		</div>
+		<div class="flex items-center gap-1.5">
+			{#if story.summary_depth === 'deep'}
+				<span class="text-[9px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-ai/15 text-ai">
+					Deep
+				</span>
+			{/if}
+			{#if trendBadge}
+				<span class="text-[9px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded-full
+					{trendBadge.trajectory === 'dominant' ? 'bg-ai/15 text-ai' : 'bg-amber-500/15 text-amber-400'}"
+					title="{trendBadge.entity}">
+					↗ Trending
+				</span>
+			{/if}
+			{#if story.relevance_score && story.relevance_score >= 7}
+				<span class="text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400">
+					{story.relevance_score}/10
+				</span>
+			{/if}
+		</div>
 	</div>
 </button>
