@@ -8,3 +8,7 @@ target/
 *.db-shm
 dist/
 .DS_Store
+src-tauri/binaries/
+
+# Codesight codebase maps
+.codesight/

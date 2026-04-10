@@ -1,0 +1,19 @@
+# Rust build artifacts
+target/
+
+# Node dependencies
+node_modules/
+
+# Build output
+build/
+dist/
+
+# SvelteKit generated
+.svelte-kit/
+
+# Lock files
+pnpm-lock.yaml
+Cargo.lock
+
+# OS
+.DS_Store

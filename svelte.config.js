@@ -9,7 +9,8 @@ const config = {
 			fallback: 'index.html'
 		}),
 		prerender: {
-			handleHttpError: 'warn'
+			handleHttpError: 'warn',
+			entries: ['*', '/freedoms/time', '/freedoms/financial', '/freedoms/location', '/freedoms/health']
 		}
 	}
 };

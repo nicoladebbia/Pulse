@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-anyhow = "1"
+anyhow = { workspace = true }
 dirs = "6"
+dotenvy = { workspace = true }
 futures = "0.3"

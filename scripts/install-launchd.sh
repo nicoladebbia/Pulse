@@ -14,17 +14,8 @@ echo "Installing Pulse daily fetch agent..."
 mkdir -p "$LOG_DIR"
 mkdir -p "$APP_DATA"
 
-# Load API keys from .env
-if [ -f "$PROJECT_DIR/.env" ]; then
-    echo "Loading API keys from .env..."
-    export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
-fi
-
-# Generate plist with API keys
-sed -e "s|__ANTHROPIC_API_KEY__|${ANTHROPIC_API_KEY:-}|g" \
-    -e "s|__VOYAGE_API_KEY__|${VOYAGE_API_KEY:-}|g" \
-    -e "s|__CURRENTS_API_KEY__|${CURRENTS_API_KEY:-}|g" \
-    "$PLIST_SRC" > "$PLIST_DEST"
+# Copy plist (API keys are loaded from .env by the fetcher binary at runtime)
+cp "$PLIST_SRC" "$PLIST_DEST"
 
 # Unload if already loaded
 launchctl unload "$PLIST_DEST" 2>/dev/null || true

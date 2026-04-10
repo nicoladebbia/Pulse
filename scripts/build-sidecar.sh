@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -12,8 +12,9 @@ cd "$PROJECT_DIR"
 # Build release binary
 cargo build --release -p pulse-fetcher
 
-# Copy to sidecar location with target triple
-TARGET_TRIPLE="aarch64-apple-darwin"
+# Detect target triple dynamically (supports both ARM and Intel Macs)
+TARGET_TRIPLE="$(rustc -vV | grep '^host:' | cut -d' ' -f2)"
+mkdir -p src-tauri/binaries
 cp "target/release/pulse-fetcher" "src-tauri/binaries/pulse-fetcher-${TARGET_TRIPLE}"
 
 echo "✓ Sidecar built and copied to src-tauri/binaries/"
