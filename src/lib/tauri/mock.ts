@@ -153,45 +153,36 @@ export const mockArchiveBriefings: Briefing[] = [
 
 export const mockTrends: TrendThread[] = [
 	{
-		id: 1, title: 'GPT-5 Launch Fallout', sector: 'ai', trajectory: 'growing', acceleration: 1.8,
+		id: 1, title: 'Anthropic', sector: 'ai', trajectory: 'emerging', acceleration: 2.5,
+		mention_count: 29, days_active: 14, sparkline: [2, 3, 1, 2, 3, 2, 1, 3, 2, 2, 1, 3, 2, 2],
 		points: [
-			{ date: daysAgo(10), headline: 'GPT-5 rumors surface', significance: 3 },
-			{ date: daysAgo(7), headline: 'Leaked benchmarks show reasoning gains', significance: 5 },
-			{ date: daysAgo(3), headline: 'OpenAI confirms GPT-5 timeline', significance: 7 },
-			{ date: daysAgo(0), headline: 'GPT-5 launches with real-time reasoning', significance: 9 },
+			{ story_id: 1, date: daysAgo(0), headline: 'Claude gains computer control capability for task automation', significance: 8 },
+			{ story_id: 2, date: daysAgo(1), headline: 'Anthropic leaks Claude Mythos with dramatically higher benchmarks', significance: 9 },
+			{ story_id: 3, date: daysAgo(3), headline: 'Anthropic raises $5B Series E at $60B valuation', significance: 7 },
 		],
 	},
 	{
-		id: 2, title: 'Miami Tech Hub Growth', sector: 'miami', trajectory: 'emerging', acceleration: 3.5,
+		id: 2, title: 'OpenAI', sector: 'ai', trajectory: 'emerging', acceleration: 2.4,
+		mention_count: 25, days_active: 14, sparkline: [1, 2, 3, 2, 1, 2, 2, 1, 3, 2, 1, 2, 1, 2],
 		points: [
-			{ date: daysAgo(12), headline: 'Miami VC funding hits record Q1', significance: 4 },
-			{ date: daysAgo(6), headline: 'Three crypto firms relocate to Miami', significance: 5 },
-			{ date: daysAgo(1), headline: '$500M tech district expansion approved', significance: 8 },
+			{ story_id: 4, date: daysAgo(0), headline: 'OpenAI preps Operator agentic AI launch', significance: 8 },
+			{ story_id: 5, date: daysAgo(2), headline: 'GPT-5 timeline confirmed for Q2 release', significance: 9 },
 		],
 	},
 	{
-		id: 3, title: 'EU AI Regulation Wave', sector: 'italy', trajectory: 'peaking', acceleration: 1.1,
+		id: 3, title: 'Giorgia Meloni', sector: 'italy', trajectory: 'emerging', acceleration: 2.6,
+		mention_count: 11, days_active: 9, sparkline: [0, 1, 0, 1, 2, 0, 1, 1, 0, 1, 1, 1, 1, 0],
 		points: [
-			{ date: daysAgo(13), headline: 'EU AI Act enters force', significance: 6 },
-			{ date: daysAgo(8), headline: 'France proposes AI safety amendments', significance: 4 },
-			{ date: daysAgo(4), headline: 'Germany delays AI compliance deadline', significance: 3 },
-			{ date: daysAgo(0), headline: 'Italy passes supplementary AI framework', significance: 7 },
+			{ story_id: 6, date: daysAgo(1), headline: 'Meloni pushes new AI governance framework in EU', significance: 6 },
+			{ story_id: 7, date: daysAgo(4), headline: 'Italy-US tech partnership announced at bilateral summit', significance: 5 },
 		],
 	},
 	{
-		id: 4, title: 'Rust Adoption Accelerates', sector: 'tech', trajectory: 'growing', acceleration: 1.6,
+		id: 4, title: 'SpaceX', sector: 'tech', trajectory: 'emerging', acceleration: 3.8,
+		mention_count: 7, days_active: 7, sparkline: [0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1],
 		points: [
-			{ date: daysAgo(11), headline: 'White House memo on memory-safe languages', significance: 6 },
-			{ date: daysAgo(5), headline: 'Linux kernel Rust drivers hit milestone', significance: 5 },
-			{ date: daysAgo(0), headline: 'Rust surpasses C++ in developer satisfaction', significance: 7 },
-		],
-	},
-	{
-		id: 5, title: 'AI Funding Mega-Rounds', sector: 'ai', trajectory: 'peaking', acceleration: 0.9,
-		points: [
-			{ date: daysAgo(9), headline: 'xAI raises $6B Series C', significance: 8 },
-			{ date: daysAgo(4), headline: 'Mistral valued at $6B in new round', significance: 6 },
-			{ date: daysAgo(0), headline: 'Anthropic raises $5B Series E', significance: 9 },
+			{ story_id: 8, date: daysAgo(0), headline: 'SpaceX Starship completes first orbital refueling test', significance: 9 },
+			{ story_id: 9, date: daysAgo(3), headline: 'SpaceX wins $3B NASA Artemis lunar cargo contract', significance: 7 },
 		],
 	},
 ];

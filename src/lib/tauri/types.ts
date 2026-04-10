@@ -226,6 +226,7 @@ export type IdeaStreamEvent =
 // === Trend Types ===
 
 export interface TrendPoint {
+	story_id: number;
 	date: string;
 	headline: string;
 	significance: number;
@@ -237,6 +238,9 @@ export interface TrendThread {
 	sector: string;
 	trajectory: string;
 	acceleration: number;
+	mention_count: number;
+	days_active: number;
+	sparkline: number[];
 	points: TrendPoint[];
 }
 
