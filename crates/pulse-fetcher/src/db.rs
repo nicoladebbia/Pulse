@@ -1,30 +1,14 @@
-use rusqlite::{Connection, Result};
-use std::path::Path;
-use std::time::Duration;
+use rusqlite::Connection;
 
-pub const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_schema.sql");
-pub const MIGRATION_002: &str = include_str!("../../../migrations/002_fts_indexes.sql");
-pub const MIGRATION_003: &str = include_str!("../../../migrations/003_intelligence.sql");
-pub const MIGRATION_004: &str = include_str!("../../../migrations/004_freedoms.sql");
-pub const MIGRATION_005: &str = include_str!("../../../migrations/005_contextual_prefix.sql");
-pub const MIGRATION_006: &str = include_str!("../../../migrations/006_freedoms_search.sql");
-#[allow(dead_code)]
-pub const MIGRATION_007: &str = include_str!("../../../migrations/007_executive_summary.sql");
-pub const MIGRATION_008: &str = include_str!("../../../migrations/008_intelligence_upgrade.sql");
-#[allow(dead_code)]
-pub const MIGRATION_009: &str = include_str!("../../../migrations/009_multiple_daily_briefings.sql");
-
-pub fn initialize(db_path: &Path) -> Result<Connection> {
-    let conn = Connection::open(db_path)?;
-
-    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    conn.busy_timeout(Duration::from_secs(5))?;
-
-    run_migrations(&conn)?;
-
-    Ok(conn)
-}
+const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_schema.sql");
+const MIGRATION_002: &str = include_str!("../../../migrations/002_fts_indexes.sql");
+const MIGRATION_003: &str = include_str!("../../../migrations/003_intelligence.sql");
+const MIGRATION_004: &str = include_str!("../../../migrations/004_freedoms.sql");
+const MIGRATION_005: &str = include_str!("../../../migrations/005_contextual_prefix.sql");
+const MIGRATION_006: &str = include_str!("../../../migrations/006_freedoms_search.sql");
+const MIGRATION_007: &str = include_str!("../../../migrations/007_executive_summary.sql");
+const MIGRATION_008: &str = include_str!("../../../migrations/008_intelligence_upgrade.sql");
+const MIGRATION_009: &str = include_str!("../../../migrations/009_multiple_daily_briefings.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -37,7 +21,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 }
 
 /// Run all pending migrations, each wrapped in a transaction for atomicity.
-pub fn run_migrations(conn: &Connection) -> Result<()> {
+pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
@@ -48,7 +32,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     let applied: Vec<i64> = {
         let mut stmt = conn.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
         stmt.query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<_>>>()?
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     // Migrations 1-4 run as pure SQL batches
@@ -72,12 +56,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     // Migration 5: ALTER TABLE stories ADD COLUMN context_prefix + FTS rebuild
-    // ALTER TABLE ADD COLUMN has no IF NOT EXISTS in SQLite, so guard in Rust
     if !applied.contains(&5) {
         if !column_exists(conn, "stories", "context_prefix") {
             conn.execute_batch("ALTER TABLE stories ADD COLUMN context_prefix TEXT;")?;
         }
-        // Strip the ALTER from the SQL and run the rest (FTS rebuild + triggers)
         let sql_005_rest = MIGRATION_005
             .lines()
             .filter(|line| !line.trim().starts_with("ALTER TABLE stories ADD COLUMN"))
@@ -85,10 +67,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             .join("\n");
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(&sql_005_rest)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version) VALUES (5)",
-            [],
-        )?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (5)", [])?;
         tx.commit()?;
     }
 
@@ -104,10 +83,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             .join("\n");
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(&sql_006_rest)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version) VALUES (6)",
-            [],
-        )?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (6)", [])?;
         tx.commit()?;
     }
 
@@ -117,16 +93,12 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             conn.execute_batch("ALTER TABLE briefings ADD COLUMN executive_summary TEXT;")?;
         }
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version) VALUES (7)",
-            [],
-        )?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (7)", [])?;
         tx.commit()?;
     }
 
     // Migration 8: api_usage, project_ideas tables + adaptive summary columns
     if !applied.contains(&8) {
-        // Run CREATE TABLE / CREATE INDEX statements (idempotent via IF NOT EXISTS)
         let sql_008_tables = MIGRATION_008
             .lines()
             .filter(|line| !line.trim().starts_with("ALTER TABLE"))
@@ -136,7 +108,6 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tx.execute_batch(&sql_008_tables)?;
         tx.commit()?;
 
-        // ALTER TABLE for stories columns (no IF NOT EXISTS in SQLite)
         if !column_exists(conn, "stories", "summary_depth") {
             conn.execute_batch("ALTER TABLE stories ADD COLUMN summary_depth TEXT DEFAULT 'standard';")?;
         }
@@ -145,16 +116,12 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         }
 
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version) VALUES (8)",
-            [],
-        )?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (8)", [])?;
         tx.commit()?;
     }
 
-    // Migration 9: Multiple daily briefings (drop unique index, add time_label)
+    // Migration 9: Multiple daily briefings
     if !applied.contains(&9) {
-        // DROP INDEX is idempotent-safe, ALTER TABLE needs guard
         conn.execute_batch("DROP INDEX IF EXISTS idx_briefings_date_type;")?;
         if !column_exists(conn, "briefings", "time_label") {
             conn.execute_batch("ALTER TABLE briefings ADD COLUMN time_label TEXT;")?;
@@ -167,7 +134,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
 
-    // Ensure composite indexes exist (idempotent, no migration version needed)
+    // Ensure composite indexes exist (idempotent)
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_freedom_stories_bf ON freedom_stories(briefing_id, freedom, display_order);"
     )?;
@@ -175,11 +142,27 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Create an in-memory DB with all migrations applied (for testing)
-#[allow(dead_code)]
-pub fn initialize_in_memory() -> Result<Connection> {
-    let conn = Connection::open_in_memory()?;
-    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    run_migrations(&conn)?;
-    Ok(conn)
+/// Log an API call to the usage tracking table.
+pub fn log_api_usage(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    model: &str,
+    endpoint: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) {
+    let cost = match (provider, model) {
+        ("groq", m) if m.contains("8b") => (input_tokens as f64 * 0.05 + output_tokens as f64 * 0.08) / 1_000_000.0,
+        ("groq", _) => (input_tokens as f64 * 0.59 + output_tokens as f64 * 0.79) / 1_000_000.0,
+        ("anthropic", m) if m.contains("haiku") => (input_tokens as f64 * 0.25 + output_tokens as f64 * 1.25) / 1_000_000.0,
+        ("anthropic", m) if m.contains("sonnet") => (input_tokens as f64 * 3.0 + output_tokens as f64 * 15.0) / 1_000_000.0,
+        ("voyage", _) => (input_tokens as f64 * 0.02) / 1_000_000.0,
+        _ => 0.0,
+    };
+
+    conn.execute(
+        "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![provider, model, endpoint, input_tokens, output_tokens, cost],
+    ).ok();
 }
