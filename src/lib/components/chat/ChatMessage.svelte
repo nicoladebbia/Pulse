@@ -4,33 +4,62 @@
 
 	let { message }: { message: ChatMessage } = $props();
 
-	// Detect BLUF structure: ## Bottom Line ... ## Analysis ...
-	const hasStructure = $derived(
-		message.role === 'assistant' && /^##\s+(Bottom Line|Analysis|What to Watch)/m.test(message.content)
-	);
-
 	interface ParsedSection {
 		type: 'bluf' | 'analysis' | 'watch' | 'text';
 		content: string;
 	}
 
+	// Detect if the response has any meaningful structure (## headers, --- dividers, or our expected format)
+	const hasStructure = $derived(
+		message.role === 'assistant' &&
+		message.content.length > 200 &&
+		(/^##\s+/m.test(message.content) || /^---$/m.test(message.content))
+	);
+
 	const sections = $derived.by((): ParsedSection[] => {
 		if (!hasStructure) return [{ type: 'text', content: message.content }];
 
-		const parts: ParsedSection[] = [];
 		const lines = message.content.split('\n');
-		let currentType: ParsedSection['type'] = 'text';
+		const parts: ParsedSection[] = [];
+		let currentType: ParsedSection['type'] = 'bluf'; // First section before any header = BLUF
 		let currentLines: string[] = [];
+		let seenFirstHeader = false;
 
 		for (const line of lines) {
 			const trimmed = line.trim();
 			let newType: ParsedSection['type'] | null = null;
 
+			// Exact matches for our expected format
 			if (/^##\s+Bottom Line/i.test(trimmed)) newType = 'bluf';
 			else if (/^##\s+Analysis/i.test(trimmed)) newType = 'analysis';
-			else if (/^##\s+What to Watch/i.test(trimmed)) newType = 'watch';
+			else if (/^##\s+(What to Watch|Watch|Looking Ahead|Outlook)/i.test(trimmed)) newType = 'watch';
+			// Any other ## header → analysis section
+			else if (/^##\s+/.test(trimmed)) {
+				if (!seenFirstHeader) {
+					// First header after opening text = start of analysis
+					newType = 'analysis';
+				} else {
+					// Subsequent headers stay in analysis
+					currentLines.push(line);
+					continue;
+				}
+			}
+			// --- divider → treat as section break, next content is analysis
+			else if (trimmed === '---') {
+				if (currentLines.length > 0) {
+					const content = currentLines.join('\n').trim();
+					if (content) parts.push({ type: currentType, content });
+				}
+				if (!seenFirstHeader) {
+					currentType = 'analysis';
+					seenFirstHeader = true;
+				}
+				currentLines = [];
+				continue;
+			}
 
 			if (newType) {
+				seenFirstHeader = true;
 				if (currentLines.length > 0) {
 					const content = currentLines.join('\n').trim();
 					if (content) parts.push({ type: currentType, content });
@@ -45,6 +74,15 @@
 			const content = currentLines.join('\n').trim();
 			if (content) parts.push({ type: currentType, content });
 		}
+
+		// If the last section looks like a "what to watch" but wasn't detected, check for keywords
+		if (parts.length > 2) {
+			const last = parts[parts.length - 1];
+			if (last.type === 'analysis' && /\b(watch|monitor|track|keep an eye)\b/i.test(last.content) && last.content.length < 500) {
+				last.type = 'watch';
+			}
+		}
+
 		return parts;
 	});
 
@@ -113,10 +151,10 @@
 		out = out.replace(/\*(.+?)\*/g, '<em class="italic text-text-secondary">$1</em>');
 		// Inline code
 		out = out.replace(/`(.+?)`/g, '<code class="text-xs bg-bg-card-hover px-1 py-0.5 rounded font-mono">$1</code>');
-		// Confidence badges
-		out = out.replace(/\bHIGH CONFIDENCE\b/g, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/15 text-emerald-400">HIGH</span>');
-		out = out.replace(/\bMODERATE CONFIDENCE\b/g, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/15 text-amber-400">MODERATE</span>');
-		out = out.replace(/\bLOW CONFIDENCE\b/g, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-500/15 text-red-400">LOW</span>');
+		// Confidence badges — match "HIGH CONFIDENCE", "HIGH:", "Confidence: HIGH", "HIGH confidence", etc.
+		out = out.replace(/\b(HIGH)\s*(CONFIDENCE|confidence)?:?/g, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/15 text-emerald-400">HIGH</span>');
+		out = out.replace(/\b(MODERATE)\s*(CONFIDENCE|confidence)?:?/g, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/15 text-amber-400">MODERATE</span>');
+		out = out.replace(/\b(LOW)\s*(CONFIDENCE|confidence)?:?/g, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-500/15 text-red-400">LOW</span>');
 		// Restore links
 		for (let i = 0; i < links.length; i++) {
 			const [text, url] = links[i];

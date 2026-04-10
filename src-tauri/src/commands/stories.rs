@@ -1,6 +1,49 @@
+use serde::Serialize;
 use tauri::State;
 use crate::db::DbState;
 use crate::models::{Story, StoryDetail, StorySource, CrossConnection};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoryHeadline {
+    pub id: i64,
+    pub headline: String,
+    pub sector: String,
+    pub date: String,
+}
+
+/// Fetch headlines for a list of story IDs (used by chat sources).
+#[tauri::command]
+pub fn get_story_headlines(db: State<DbState>, story_ids: Vec<i64>) -> Result<Vec<StoryHeadline>, String> {
+    if story_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let placeholders: String = story_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT s.id, s.headline, s.sector, b.date
+         FROM stories s JOIN briefings b ON b.id = s.briefing_id
+         WHERE s.id IN ({})",
+        placeholders
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = story_ids.iter().map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>).collect();
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter().map(|b| b.as_ref())), |row| {
+            Ok(StoryHeadline {
+                id: row.get(0)?,
+                headline: row.get(1)?,
+                sector: row.get(2)?,
+                date: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(rows)
+}
 
 #[tauri::command]
 pub fn get_stories_by_sector(

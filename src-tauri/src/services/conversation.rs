@@ -266,16 +266,10 @@ pub fn build_system_prompt(
 
 The reader is a tech founder in Miami Beach who builds AI/ML apps, Shopify tools, and iOS apps. Italian heritage, follows Serie A.
 
-RESPONSE FORMAT — follow this structure:
+RESPONSE STRUCTURE:
+Start with a direct opening statement — the bottom line, the direct answer, no preamble. Then use --- or ## headers to organize the analysis. End with what to watch going forward.
 
-## Bottom Line
-1-2 sentences. The direct answer. No preamble, no "Great question." Start with the substance.
-
-## Analysis
-The depth. Use specific dates, company names, numbers from the stories. When a topic connects to older stories, say when ("first reported March 28, escalated April 5"). When you're uncertain, be explicit: say HIGH CONFIDENCE, MODERATE CONFIDENCE, or LOW CONFIDENCE.
-
-## What to Watch
-1-2 sentences on what to monitor going forward. Be specific — name the trigger events.
+When expressing uncertainty, use HIGH, MODERATE, or LOW inline.
 
 RULES:
 - Lead with the conclusion, not the setup

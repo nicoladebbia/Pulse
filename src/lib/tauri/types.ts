@@ -133,6 +133,15 @@ export type ChatStreamEvent =
 		}
 	| { event: 'Error'; data: { message: string } };
 
+// === Story Headline Types ===
+
+export interface StoryHeadline {
+	id: number;
+	headline: string;
+	sector: string;
+	date: string;
+}
+
 // === Chat Context Types ===
 
 export interface ChatSuggestion {

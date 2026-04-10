@@ -1,5 +1,5 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
-import type { BriefingWithStories, Story, StoryDetail, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, UsageStats, TavilyQuota, TrendThread, ChatContext } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, UsageStats, TavilyQuota, TrendThread, ChatContext } from './types';
 
 export async function getTodayBriefing(): Promise<BriefingWithStories | null> {
 	return invoke('get_today_briefing');
@@ -15,6 +15,10 @@ export async function getStoriesBySector(briefingId: number, sector: string): Pr
 
 export async function getStoryDetail(storyId: number): Promise<StoryDetail> {
 	return invoke('get_story_detail', { storyId });
+}
+
+export async function getStoryHeadlines(storyIds: number[]): Promise<StoryHeadline[]> {
+	return invoke('get_story_headlines', { storyIds });
 }
 
 export async function fullTextSearch(query: string): Promise<Story[]> {

@@ -1,13 +1,28 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { expandedStoryId, currentBriefing } from '$lib/stores/briefing';
+	import { expandedStoryId } from '$lib/stores/briefing';
+	import { getStoryHeadlines } from '$lib/tauri/commands';
+	import { isTauri } from '$lib/tauri/mock';
+	import { SECTORS, type SectorId } from '$lib/config';
+	import type { StoryHeadline } from '$lib/tauri/types';
 
 	let { storyIds }: { storyIds: number[] } = $props();
 
-	function getHeadline(id: number): string | null {
-		const stories = $currentBriefing?.stories ?? [];
-		return stories.find(s => s.id === id)?.headline ?? null;
-	}
+	let headlines = $state<StoryHeadline[]>([]);
+	let loaded = $state(false);
+	let expanded = $state(false);
+
+	const validIds = $derived(storyIds.filter(id => id > 0));
+	const displayCount = $derived(expanded ? headlines.length : Math.min(headlines.length, 4));
+
+	$effect(() => {
+		if (loaded || validIds.length === 0) return;
+		loaded = true;
+
+		if (isTauri()) {
+			getStoryHeadlines(validIds).then(h => { headlines = h; }).catch(() => {});
+		}
+	});
 
 	function navigateToStory(id: number) {
 		expandedStoryId.set(id);
@@ -19,25 +34,48 @@
 	}
 </script>
 
-{#if storyIds.length > 0}
+{#if validIds.length > 0}
 	<div class="mt-2 pt-2 border-t border-border/50">
-		<p class="text-[10px] uppercase tracking-wider text-text-muted mb-1.5">Sources</p>
+		<p class="text-[10px] uppercase tracking-wider text-text-muted mb-1.5">
+			Sources ({validIds.length})
+		</p>
 		<div class="space-y-1">
-			{#each storyIds.filter(id => id > 0).slice(0, 6) as id}
-				{@const headline = getHeadline(id)}
-				<button
-					class="block w-full text-left text-[11px] px-2 py-1 rounded bg-ai/5 text-text-secondary hover:bg-ai/15 hover:text-ai transition-colors cursor-pointer"
-					onclick={() => navigateToStory(id)}
-				>
-					{#if headline}
-						{truncate(headline, 80)}
-					{:else}
+			{#if headlines.length > 0}
+				{#each headlines.slice(0, displayCount) as story}
+					{@const color = SECTORS[story.sector as SectorId]?.color ?? 'var(--color-text-muted)'}
+					<button
+						class="block w-full text-left text-[11px] px-2 py-1.5 rounded bg-bg-card border border-border/50
+							text-text-secondary hover:bg-bg-card-hover hover:text-text transition-colors cursor-pointer
+							flex items-center gap-2"
+						onclick={() => navigateToStory(story.id)}
+					>
+						<span class="w-1.5 h-1.5 rounded-full shrink-0" style="background: {color}"></span>
+						<span class="flex-1 truncate">{truncate(story.headline, 70)}</span>
+						<span class="text-[9px] text-text-muted shrink-0">{story.date}</span>
+					</button>
+				{/each}
+				{#if headlines.length > 4 && !expanded}
+					<button
+						class="text-[10px] text-ai hover:underline"
+						onclick={() => expanded = true}
+					>
+						+{headlines.length - 4} more sources
+					</button>
+				{/if}
+			{:else}
+				<!-- Fallback while loading or if fetch fails -->
+				{#each validIds.slice(0, 4) as id}
+					<button
+						class="block w-full text-left text-[11px] px-2 py-1 rounded bg-bg-card border border-border/50
+							text-text-secondary hover:bg-bg-card-hover hover:text-text transition-colors cursor-pointer"
+						onclick={() => navigateToStory(id)}
+					>
 						Story #{id}
-					{/if}
-				</button>
-			{/each}
-			{#if storyIds.length > 6}
-				<span class="text-[10px] text-text-muted">+{storyIds.length - 6} more</span>
+					</button>
+				{/each}
+				{#if validIds.length > 4}
+					<span class="text-[10px] text-text-muted">+{validIds.length - 4} more</span>
+				{/if}
 			{/if}
 		</div>
 	</div>

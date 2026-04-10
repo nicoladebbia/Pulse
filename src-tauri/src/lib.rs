@@ -49,6 +49,7 @@ pub fn run() {
             commands::briefing::list_briefings,
             commands::stories::get_stories_by_sector,
             commands::stories::get_story_detail,
+            commands::stories::get_story_headlines,
             commands::search::full_text_search,
             commands::fetch::trigger_manual_fetch,
             commands::fetch::get_fetch_status,
