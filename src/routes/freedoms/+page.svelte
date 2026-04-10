@@ -35,7 +35,7 @@
 
 	let totalStories = $derived(
 		briefing
-			? briefing.time_stories.length + briefing.financial_stories.length +
+			? briefing.time_stories.length + briefing.wealth_stories.length +
 			  briefing.location_stories.length + briefing.health_stories.length
 			: 0
 	);

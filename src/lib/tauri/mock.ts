@@ -208,9 +208,9 @@ export const mockFreedomsBriefing: FreedomsBriefing = {
 		makeFreedomStory(100, 'time', 'AI Agents Now Handle 60% of Routine Dev Tasks', 'New study shows AI coding assistants are dramatically reducing time spent on boilerplate and debugging.'),
 		makeFreedomStory(101, 'time', 'The 4-Day Work Week Goes Mainstream in Europe', 'Following successful trials, three more EU countries announce nationwide 4-day week pilots.'),
 	],
-	financial_stories: [
-		makeFreedomStory(104, 'financial', 'Micro-SaaS Founders Report Record Bootstrapped Revenue', 'The indie SaaS community reports a 40% increase in solo-founder revenue, driven by AI-assisted development.'),
-		makeFreedomStory(105, 'financial', 'New Tax-Advantaged Accounts for Digital Nomads', 'US introduces a new savings vehicle designed for location-independent workers.'),
+	wealth_stories: [
+		makeFreedomStory(104, 'wealth', 'Micro-SaaS Founders Report Record Bootstrapped Revenue', 'The indie SaaS community reports a 40% increase in solo-founder revenue, driven by AI-assisted development.'),
+		makeFreedomStory(105, 'wealth', 'New Tax-Advantaged Accounts for Digital Nomads', 'US introduces a new savings vehicle designed for location-independent workers.'),
 	],
 	location_stories: [
 		makeFreedomStory(108, 'location', 'Portugal Launches Enhanced Digital Nomad Visa 2.0', 'Updated visa program offers faster processing, lower income thresholds, and a path to residency.'),

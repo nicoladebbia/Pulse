@@ -19,12 +19,12 @@ export const FREEDOM_CONFIG = {
 		description: 'Intelligence on productivity, automation, passive income, AI delegation, async work, and the 4-day work week movement.',
 		motif: 'linear-gradient(180deg, var(--color-freedom-time-dim) 0%, transparent 40%)',
 	},
-	financial: {
-		id: 'financial', key: 'financial_stories' as const,
-		label: 'Financial Freedom', subtitle: 'Build your wealth',
+	wealth: {
+		id: 'wealth', key: 'wealth_stories' as const,
+		label: 'Wealth Freedom', subtitle: 'Build your wealth',
 		icon: '◆', color: 'var(--color-freedom-financial)', dim: 'var(--color-freedom-financial-dim)',
-		tagline: 'Investing, markets, FIRE, bootstrapping, real estate',
-		description: 'Intelligence on investing, markets, crypto, real estate, startup funding, bootstrapping, FIRE, and tax strategies.',
+		tagline: 'Investing, markets, crypto, FIRE, passive income, real estate',
+		description: 'Intelligence on investing, markets, crypto, real estate, startup funding, bootstrapping, FIRE, tax strategies, and wealth building.',
 		motif: 'linear-gradient(180deg, var(--color-freedom-financial-dim) 0%, transparent 40%)',
 	},
 	location: {
@@ -46,4 +46,4 @@ export const FREEDOM_CONFIG = {
 } as const;
 
 export type FreedomId = keyof typeof FREEDOM_CONFIG;
-export const FREEDOM_ORDER: FreedomId[] = ['time', 'financial', 'location', 'health'];
+export const FREEDOM_ORDER: FreedomId[] = ['time', 'wealth', 'location', 'health'];

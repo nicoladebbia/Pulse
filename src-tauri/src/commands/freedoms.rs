@@ -23,12 +23,11 @@ pub struct FreedomsBriefing {
     pub date: String,
     pub summary: Option<String>,
     pub time_stories: Vec<FreedomStory>,
-    pub financial_stories: Vec<FreedomStory>,
+    pub wealth_stories: Vec<FreedomStory>,
     pub location_stories: Vec<FreedomStory>,
     pub health_stories: Vec<FreedomStory>,
 }
 
-/// Load all freedom stories for a briefing in one query, grouped by freedom type.
 fn load_all_freedom_stories(conn: &rusqlite::Connection, briefing_id: i64) -> Result<(Vec<FreedomStory>, Vec<FreedomStory>, Vec<FreedomStory>, Vec<FreedomStory>), String> {
     let mut stmt = conn.prepare(
         "SELECT id, freedom, headline, summary, key_facts, why_it_matters, what_to_watch,
@@ -59,21 +58,21 @@ fn load_all_freedom_stories(conn: &rusqlite::Connection, briefing_id: i64) -> Re
     .map_err(|e| e.to_string())?;
 
     let mut time = Vec::new();
-    let mut financial = Vec::new();
+    let mut wealth = Vec::new();
     let mut location = Vec::new();
     let mut health = Vec::new();
 
     for story in all {
         match story.freedom.as_str() {
             "time" => time.push(story),
-            "financial" => financial.push(story),
+            "wealth" => wealth.push(story),
             "location" => location.push(story),
             "health" => health.push(story),
             _ => {}
         }
     }
 
-    Ok((time, financial, location, health))
+    Ok((time, wealth, location, health))
 }
 
 #[tauri::command]
@@ -81,19 +80,25 @@ pub fn get_today_freedoms(db: State<'_, DbState>) -> Result<Option<FreedomsBrief
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    let row: Option<(i64, Option<String>)> = conn.query_row(
-        "SELECT id, executive_summary FROM briefings WHERE date = ?1 AND briefing_type = 'freedoms'",
-        [&today], |row| Ok((row.get(0)?, row.get(1)?))
-    ).ok();
+    // Try today first, fall back to most recent (same as daily briefing)
+    let row: Option<(i64, String, Option<String>)> = conn.query_row(
+        "SELECT id, date, executive_summary FROM briefings WHERE date = ?1 AND briefing_type = 'freedoms'",
+        [&today], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    ).ok().or_else(|| {
+        conn.query_row(
+            "SELECT id, date, executive_summary FROM briefings WHERE briefing_type = 'freedoms' AND status = 'complete' ORDER BY date DESC, created_at DESC LIMIT 1",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        ).ok()
+    });
 
-    let Some((bid, summary)) = row else { return Ok(None) };
+    let Some((bid, date, summary)) = row else { return Ok(None) };
 
-    let (time_stories, financial_stories, location_stories, health_stories) = load_all_freedom_stories(&conn, bid)?;
+    let (time_stories, wealth_stories, location_stories, health_stories) = load_all_freedom_stories(&conn, bid)?;
     Ok(Some(FreedomsBriefing {
-        date: today,
+        date,
         summary,
         time_stories,
-        financial_stories,
+        wealth_stories,
         location_stories,
         health_stories,
     }))
@@ -110,12 +115,12 @@ pub fn get_freedoms_by_date(db: State<'_, DbState>, date: String) -> Result<Opti
 
     let Some((bid, summary)) = row else { return Ok(None) };
 
-    let (time_stories, financial_stories, location_stories, health_stories) = load_all_freedom_stories(&conn, bid)?;
+    let (time_stories, wealth_stories, location_stories, health_stories) = load_all_freedom_stories(&conn, bid)?;
     Ok(Some(FreedomsBriefing {
         date,
         summary,
         time_stories,
-        financial_stories,
+        wealth_stories,
         location_stories,
         health_stories,
     }))

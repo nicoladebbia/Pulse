@@ -28,7 +28,7 @@
 		error = '';
 		try {
 			const keyMap: Record<string, keyof FreedomsBriefing> = {
-				time: 'time_stories', financial: 'financial_stories',
+				time: 'time_stories', financial: 'wealth_stories',
 				location: 'location_stories', health: 'health_stories',
 			};
 			if (!isTauri()) {
@@ -189,7 +189,7 @@
 									{#if story.why_it_matters}
 										<div class="pl-4 border-l-2" style="border-color: color-mix(in srgb, {config.color} 30%, transparent)">
 											<h4 class="text-[10px] font-medium uppercase tracking-[0.15em] text-text-muted mb-1.5">
-												{freedom === 'financial' ? 'Impact on Your Wealth' :
+												{freedom === 'wealth' ? 'Impact on Your Wealth' :
 												 freedom === 'time' ? 'Impact on Your Time' :
 												 freedom === 'location' ? 'Impact on Your Mobility' :
 												 'Impact on Your Health'}

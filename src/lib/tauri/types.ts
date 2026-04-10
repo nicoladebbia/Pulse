@@ -199,7 +199,7 @@ export interface FreedomsBriefing {
 	date: string;
 	summary: string | null;
 	time_stories: FreedomStory[];
-	financial_stories: FreedomStory[];
+	wealth_stories: FreedomStory[];
 	location_stories: FreedomStory[];
 	health_stories: FreedomStory[];
 }

@@ -862,15 +862,22 @@ Focus on MOST important entities (max 5 per story)."#,
             let nn = ent.name.to_lowercase().trim().to_string();
             if nn.is_empty() { continue; }
 
-            // Use "freedom" as sector prefix for freedom entities
+            // Use the specific freedom type as sector (e.g., "freedom_time", "freedom_wealth")
+            // Determine which freedom this entity likely belongs to from the curated list
+            let freedom_sector = curated.iter()
+                .find(|(_, s)| s.headline.to_lowercase().contains(&ent.name.to_lowercase())
+                    || s.summary.to_lowercase().contains(&ent.name.to_lowercase()))
+                .map(|(f, _)| format!("freedom_{}", f))
+                .unwrap_or_else(|| "freedom".to_string());
+
             if let Err(e) = conn.execute(
                 "INSERT INTO entities (name, name_normalized, entity_type, sector, first_seen, last_seen, mention_count, sentiment_avg)
-                 VALUES (?1, ?2, ?3, 'freedom', ?4, ?4, 1, ?5)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, ?6)
                  ON CONFLICT(name_normalized, entity_type) DO UPDATE SET
-                   last_seen = MAX(last_seen, ?4),
-                   sentiment_avg = (sentiment_avg * mention_count + ?5) / (mention_count + 1),
+                   last_seen = MAX(last_seen, ?5),
+                   sentiment_avg = (sentiment_avg * mention_count + ?6) / (mention_count + 1),
                    mention_count = mention_count + 1",
-                rusqlite::params![ent.name, nn, et, today, ent.sentiment],
+                rusqlite::params![ent.name, nn, et, freedom_sector, today, ent.sentiment],
             ) {
                 tracing::warn!("freedom entity insert failed for '{}': {}", ent.name, e);
                 continue;
@@ -952,7 +959,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     // Sort by importance and take top stories for curation
     let mut sorted = summaries.clone();
     sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
-    sorted.truncate(80);
+    sorted.truncate(120);
 
     let mut user_msg = String::new();
     for (i, s) in sorted.iter().enumerate() {
@@ -978,7 +985,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     #[derive(serde::Deserialize)]
     struct FreedomsCuration {
         time: Vec<usize>,
-        financial: Vec<usize>,
+        wealth: Vec<usize>,
         location: Vec<usize>,
         health: Vec<usize>,
     }
@@ -997,9 +1004,9 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
             curated.push(("time", s));
         }
     }
-    for &idx in &parsed.curation.financial {
+    for &idx in &parsed.curation.wealth {
         if let Some(s) = sorted.get(idx) {
-            curated.push(("financial", s));
+            curated.push(("wealth", s));
         }
     }
     for &idx in &parsed.curation.location {
@@ -1082,6 +1089,34 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Freedom entity extraction failed (non-fatal): {}", e),
     }
 
+    // Phase 8: Generate embeddings for freedom stories in main stories table (non-fatal)
+    tracing::info!("Freedoms: Generating embeddings...");
+    let freedom_summaries: Vec<crate::claude::SummarizedStory> = curated.iter().map(|(_, s)| (*s).clone()).collect();
+    match crate::embeddings::generate(&freedom_summaries, None).await {
+        Ok(embs) => {
+            if let Ok(conn) = rusqlite::Connection::open(db_path) {
+                for se in &embs {
+                    if let Some((_, story)) = curated.get(se.story_index) {
+                        let story_id: Option<i64> = conn.query_row(
+                            "SELECT id FROM stories WHERE headline = ?1 ORDER BY id DESC LIMIT 1",
+                            rusqlite::params![story.headline],
+                            |row| row.get(0),
+                        ).ok();
+                        if let Some(sid) = story_id {
+                            let blob: Vec<u8> = se.embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+                            conn.execute(
+                                "INSERT OR REPLACE INTO story_embeddings (story_id, embedding) VALUES (?1, ?2)",
+                                rusqlite::params![sid, blob],
+                            ).ok();
+                        }
+                    }
+                }
+            }
+            tracing::info!("Generated {} freedom story embeddings", embs.len());
+        }
+        Err(e) => tracing::warn!("Freedom embedding generation failed (non-fatal): {}", e),
+    }
+
     let duration = start.elapsed();
     tracing::info!("Freedoms pipeline complete in {:.1}s", duration.as_secs_f64());
 
@@ -1132,7 +1167,7 @@ fn write_freedoms_to_db(
 
     // Count per freedom
     let time_count = curated.iter().filter(|(f, _)| *f == "time").count();
-    let financial_count = curated.iter().filter(|(f, _)| *f == "financial").count();
+    let wealth_count = curated.iter().filter(|(f, _)| *f == "wealth").count();
     let location_count = curated.iter().filter(|(f, _)| *f == "location").count();
     let health_count = curated.iter().filter(|(f, _)| *f == "health").count();
     let total = curated.len();
@@ -1141,7 +1176,7 @@ fn write_freedoms_to_db(
     tx.execute(
         "INSERT INTO briefings (date, story_count, ai_count, miami_count, italy_count, tech_count, status, briefing_type)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'complete', 'freedoms')",
-        rusqlite::params![today, total, time_count, financial_count, location_count, health_count],
+        rusqlite::params![today, total, time_count, wealth_count, location_count, health_count],
     )?;
     let briefing_id = tx.last_insert_rowid();
 
@@ -1197,10 +1232,41 @@ fn write_freedoms_to_db(
         )?;
     }
 
+    // Also insert into main stories table for RAG (search, embeddings, Ask Pulse)
+    // Use sector = "freedom_{type}" so they're searchable but distinguishable from daily stories
+    for (i, (freedom, story)) in curated.iter().enumerate() {
+        let key_facts_json = serde_json::to_string(&story.key_facts)?;
+        let sector = format!("freedom_{}", freedom);
+        let url_hash = crate::dedup::url_hash(&story.article.url);
+        let title_hash = crate::dedup::title_hash(&story.article.title);
+
+        // Skip if already exists (dedup by url_hash)
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stories WHERE url_hash = ?1)",
+            [&url_hash], |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !exists {
+            tx.execute(
+                "INSERT INTO stories (briefing_id, sector, original_title, original_url, headline, summary, key_facts,
+                    why_it_matters, what_to_watch, importance_score, is_hero, display_order,
+                    source_name, url_hash, title_hash, published_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14, ?15)",
+                rusqlite::params![
+                    briefing_id, sector, story.article.title, story.article.url,
+                    story.headline, story.summary, key_facts_json,
+                    story.why_it_matters, story.what_to_watch, story.importance_score,
+                    i as i32, story.article.source_name, url_hash, title_hash,
+                    story.article.published_at,
+                ],
+            ).ok(); // Non-fatal — if it fails, the freedom_stories entry still works
+        }
+    }
+
     tx.commit()?;
     tracing::info!(
-        "Wrote {} freedom stories to briefing {} (time={}, financial={}, location={}, health={})",
-        total, briefing_id, time_count, financial_count, location_count, health_count
+        "Wrote {} freedom stories to briefing {} (time={}, wealth={}, location={}, health={})",
+        total, briefing_id, time_count, wealth_count, location_count, health_count
     );
 
     Ok(())
