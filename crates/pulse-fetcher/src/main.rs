@@ -207,7 +207,7 @@ async fn extract_entities(db_path: &std::path::Path) -> anyhow::Result<()> {
         .build()?;
 
     // Process in batches of 15 stories per Haiku call
-    for (batch_idx, chunk) in stories.chunks(15).enumerate() {
+    for (batch_idx, chunk) in stories.chunks(30).enumerate() {
         let mut stories_text = String::new();
         for (id, headline, summary, sector, date, why) in chunk {
             stories_text.push_str(&format!(

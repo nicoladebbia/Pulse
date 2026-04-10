@@ -320,6 +320,64 @@ impl GroqClient {
             trends,
         })
     }
+    /// Pre-curate raw articles before summarization. Uses 70B to pick the
+    /// ~90 most newsworthy articles from ~150-200 raw headlines, so we only
+    /// pay for summarizing stories that will actually make the briefing.
+    pub async fn pre_curate(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
+        let system = r#"You are a news editor selecting the most newsworthy articles for a daily intelligence briefing covering 4 sectors: AI & LLMs, Miami Beach, Italy, and Tech & Innovation.
+
+From the list of raw articles below, select the BEST ~90 articles (roughly 22-25 per sector). Pick articles that are:
+- Substantive news (not clickbait, listicles, or opinion)
+- Non-duplicate (if two articles cover the same story, pick the better source)
+- High signal (major events, company news, product launches, policy changes)
+
+Return ONLY a JSON array of article indices, like: [0, 2, 5, 7, 11, ...]
+Select ~90 total. No explanation, just the JSON array."#;
+
+        let mut user_msg = String::new();
+        for (i, article) in articles.iter().enumerate() {
+            // Compact format: just index, sector, source, title — minimal tokens
+            user_msg.push_str(&format!(
+                "[{}] [{}] {} — {}\n",
+                i, article.sector, article.source_name, article.title
+            ));
+        }
+        user_msg.push_str(&format!("\nSelect the best ~90 from these {} articles. Return JSON array of indices.", articles.len()));
+
+        let text = self.call(STRONG_MODEL, system, &user_msg, 1000).await?;
+
+        // Parse the JSON array
+        let json_str = extract_json_array(&text);
+        let indices: Vec<usize> = serde_json::from_str(&json_str)
+            .unwrap_or_else(|_| {
+                tracing::warn!("Pre-curation JSON parse failed, falling back to all articles");
+                (0..articles.len()).collect()
+            });
+
+        // Validate indices
+        let valid: Vec<usize> = indices.into_iter()
+            .filter(|&i| i < articles.len())
+            .collect();
+
+        if valid.len() < 20 {
+            tracing::warn!("Pre-curation returned too few articles ({}), falling back to all", valid.len());
+            return Ok((0..articles.len()).collect());
+        }
+
+        tracing::info!("Pre-curated {} articles from {} raw", valid.len(), articles.len());
+        Ok(valid)
+    }
+}
+
+/// Extract JSON array from response text
+fn extract_json_array(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(start) = trimmed.find('[') {
+        if let Some(end) = trimmed.rfind(']') {
+            return trimmed[start..=end].to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Extract JSON from a response that might have markdown code fences

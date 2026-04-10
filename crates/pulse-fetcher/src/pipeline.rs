@@ -121,11 +121,37 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let unique_articles = crate::dedup::deduplicate_with_history(raw_articles, historical_hashes, historical_titles);
     tracing::info!("{} articles after dedup", unique_articles.len());
 
-    // Phase 3: Summarize all articles
+    // Phase 2.5: Pre-curate — pick the best ~90 articles BEFORE expensive summarization
+    let articles_to_summarize = if unique_articles.len() > 100 {
+        tracing::info!("Pre-curating: selecting best articles from {} candidates...", unique_articles.len());
+        let api_key = std::env::var("GROQ_API_KEY")
+            .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
+        let client = crate::claude::client::GroqClient::new(&api_key);
+        match client.pre_curate(&unique_articles).await {
+            Ok(indices) => {
+                let curated: Vec<_> = indices.into_iter()
+                    .filter_map(|i| unique_articles.get(i).cloned())
+                    .collect();
+                log_usage(db_path, "groq", "llama-3.3-70b-versatile", "pre_curate",
+                    (unique_articles.len() * 30) as i64, 500);
+                tracing::info!("Pre-curated to {} articles (saved {} summarization calls)",
+                    curated.len(), unique_articles.len() - curated.len());
+                curated
+            }
+            Err(e) => {
+                tracing::warn!("Pre-curation failed (non-fatal), summarizing all: {}", e);
+                unique_articles
+            }
+        }
+    } else {
+        tracing::info!("Skipping pre-curation ({} articles, threshold 100)", unique_articles.len());
+        unique_articles
+    };
+
+    // Phase 3: Summarize pre-curated articles (not ALL articles)
     progress.start_stage(3);
-    tracing::info!("Phase 3: Summarizing {} stories...", unique_articles.len());
-    let summaries = crate::claude::summarize_stories(&unique_articles, Some(&progress)).await?;
-    // Log Groq usage for summarization (~500 tokens per story input, ~300 output)
+    tracing::info!("Phase 3: Summarizing {} stories...", articles_to_summarize.len());
+    let summaries = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress)).await?;
     let sum_count = summaries.len() as i64;
     log_usage(db_path, "groq", "llama-3.1-8b-instant", "summarize", sum_count * 500, sum_count * 300);
 
@@ -154,22 +180,59 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         }
     };
 
-    // Phase 6: Contextual prefixes (non-fatal)
+    // Phase 6: Contextual prefixes (non-fatal, only for stories without existing entity coverage)
     progress.start_stage(6);
     tracing::info!("Phase 6: Generating contextual prefixes...");
-    let day_context: String = analysis.curated_stories.iter()
-        .map(|s| format!("[{}] {}", s.article.sector, s.headline))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let prefixes = match crate::contextual::generate_prefixes(&analysis.curated_stories, &day_context).await {
-        Ok(p) => {
-            let count = p.iter().filter(|x| x.is_some()).count();
-            tracing::info!("Generated {} contextual prefixes", count);
-            Some(p)
-        }
-        Err(e) => {
-            tracing::warn!("Contextual prefix generation failed (non-fatal): {}", e);
+    let prefixes = if db_path.exists() {
+        // Check which stories already have entity mentions (from previous fetches)
+        let stories_needing_prefix: Vec<&crate::claude::SummarizedStory> = if let Ok(conn) = rusqlite::Connection::open(db_path) {
+            analysis.curated_stories.iter()
+                .filter(|s| {
+                    // Story needs a prefix if it doesn't already have entity mentions
+                    let has_mentions: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM entity_mentions em JOIN stories st ON st.id = em.story_id WHERE st.headline = ?1)",
+                        [&s.headline],
+                        |row| row.get(0),
+                    ).unwrap_or(false);
+                    !has_mentions
+                })
+                .collect()
+        } else {
+            analysis.curated_stories.iter().collect()
+        };
+
+        if stories_needing_prefix.is_empty() {
+            tracing::info!("All stories have entity coverage, skipping prefix generation");
             None
+        } else {
+            tracing::info!("Generating prefixes for {} stories (skipping {} with entity coverage)",
+                stories_needing_prefix.len(), analysis.curated_stories.len() - stories_needing_prefix.len());
+            let day_context: String = analysis.curated_stories.iter()
+                .map(|s| format!("[{}] {}", s.article.sector, s.headline))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Generate prefixes for all stories but only send the ones that need it
+            // (contextual::generate_prefixes expects the full array for cross-referencing)
+            match crate::contextual::generate_prefixes(&analysis.curated_stories, &day_context).await {
+                Ok(p) => {
+                    let count = p.iter().filter(|x| x.is_some()).count();
+                    tracing::info!("Generated {} contextual prefixes", count);
+                    Some(p)
+                }
+                Err(e) => {
+                    tracing::warn!("Contextual prefix generation failed (non-fatal): {}", e);
+                    None
+                }
+            }
+        }
+    } else {
+        let day_context: String = analysis.curated_stories.iter()
+            .map(|s| format!("[{}] {}", s.article.sector, s.headline))
+            .collect::<Vec<_>>()
+            .join("\n");
+        match crate::contextual::generate_prefixes(&analysis.curated_stories, &day_context).await {
+            Ok(p) => { tracing::info!("Generated {} contextual prefixes", p.iter().filter(|x| x.is_some()).count()); Some(p) }
+            Err(e) => { tracing::warn!("Contextual prefix generation failed: {}", e); None }
         }
     };
 
@@ -577,7 +640,7 @@ async fn extract_entities_from_stories(db_path: &Path, analysis: &crate::claude:
     let mut total_stored = 0;
 
     // Process stories in batches of 15
-    for (batch_start, chunk) in analysis.curated_stories.chunks(15).enumerate().map(|(i, c)| (i * 15, c)) {
+    for (batch_start, chunk) in analysis.curated_stories.chunks(30).enumerate().map(|(i, c)| (i * 30, c)) {
         let mut stories_text = String::new();
         for (i, story) in chunk.iter().enumerate() {
             let global_idx = batch_start + i;
@@ -845,9 +908,32 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     let unique = crate::dedup::deduplicate_with_history(freedom_articles, historical_hashes, historical_titles);
     tracing::info!("Freedoms: {} after dedup", unique.len());
 
+    // Phase 2.5: Pre-curate if many articles
+    let to_summarize = if unique.len() > 40 {
+        tracing::info!("Freedoms: Pre-curating from {} articles...", unique.len());
+        let api_key = std::env::var("GROQ_API_KEY")
+            .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
+        let client = crate::claude::client::GroqClient::new(&api_key);
+        match client.pre_curate(&unique).await {
+            Ok(indices) => {
+                let curated: Vec<_> = indices.into_iter()
+                    .filter_map(|i| unique.get(i).cloned())
+                    .collect();
+                tracing::info!("Freedoms: Pre-curated to {} articles", curated.len());
+                curated
+            }
+            Err(e) => {
+                tracing::warn!("Freedoms pre-curation failed, summarizing all: {}", e);
+                unique
+            }
+        }
+    } else {
+        unique
+    };
+
     // Phase 3: Summarize
-    tracing::info!("Freedoms: Summarizing...");
-    let summaries = crate::claude::summarize_stories(&unique, None).await?;
+    tracing::info!("Freedoms: Summarizing {} stories...", to_summarize.len());
+    let summaries = crate::claude::summarize_stories(&to_summarize, None).await?;
     tracing::info!("Freedoms: {} summaries", summaries.len());
 
     // Phase 4: Curate with freedoms prompt
