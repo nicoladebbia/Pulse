@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { messages, isStreaming, addUserMessage, addAssistantMessage, clearChat } from '$lib/stores/chat';
+	import { messages, isStreaming, startNewThread, sendMessage, lastResponse, lastSearchSource } from '$lib/stores/chat';
+	import ChatMessage from '$lib/components/chat/ChatMessage.svelte';
+	import type { ChatMessage as ChatMessageType } from '$lib/tauri/types';
 
 	let query = $state('');
 	let messagesContainer: HTMLElement;
@@ -26,42 +28,17 @@
 		const q = query.trim();
 		if (!q || $isStreaming) return;
 
-		addUserMessage(q);
 		query = '';
-		isStreaming.set(true);
 
 		requestAnimationFrame(() => {
 			messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
 		});
 
-		try {
-			const ipc = (window as any).__TAURI_INTERNALS__;
-			if (!ipc) {
-				addAssistantMessage('Not running inside Tauri — cannot access the archive.');
-				return;
-			}
+		await sendMessage(q);
 
-			const result = await ipc.invoke('ask_pulse', { question: q });
-
-			// Build a clean formatted response from structured data
-			let parts: string[] = [];
-			if (result.title) parts.push(result.title);
-			if (result.summary) parts.push(result.summary);
-			if (result.key_points?.length > 0) {
-				parts.push(result.key_points.map((p: string) => `▪ ${p}`).join('\n'));
-			}
-			if (result.implications) parts.push(`Why it matters: ${result.implications}`);
-			if (result.watch_next) parts.push(`Watch next: ${result.watch_next}`);
-
-			addAssistantMessage(parts.join('\n\n'), result.source_stories?.map((s: any) => s.id));
-		} catch (e: any) {
-			addAssistantMessage(`Error: ${String(e?.message ?? e)}`);
-		} finally {
-			isStreaming.set(false);
-			requestAnimationFrame(() => {
-				messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
-			});
-		}
+		requestAnimationFrame(() => {
+			messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+		});
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -74,6 +51,10 @@
 	function askSuggestion(s: string) {
 		query = s;
 		handleSubmit();
+	}
+
+	function clearChat() {
+		startNewThread();
 	}
 </script>
 
@@ -101,15 +82,7 @@
 			</div>
 		{:else}
 			{#each $messages as msg (msg.id)}
-				<div class="flex {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
-					<div class="{msg.role === 'user'
-						? 'bg-ai text-white rounded-2xl rounded-br-sm'
-						: 'bg-bg-card border border-border text-text rounded-2xl rounded-bl-sm'}
-						px-4 py-3 max-w-[85%] text-sm leading-relaxed whitespace-pre-wrap"
-					>
-						{msg.content}
-					</div>
-				</div>
+				<ChatMessage message={msg} />
 			{/each}
 			{#if $isStreaming}
 				<div class="flex justify-start">
@@ -120,6 +93,28 @@
 							<div class="w-2 h-2 bg-ai rounded-full animate-bounce" style="animation-delay: 300ms"></div>
 						</div>
 					</div>
+				</div>
+			{/if}
+			{#if !$isStreaming && $lastSearchSource && $lastSearchSource !== 'archive'}
+				<div class="text-xs text-text-muted mt-1 mb-2 flex items-center gap-1.5">
+					{#if $lastSearchSource === 'web'}
+						<span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span> Answered from web search
+					{:else if $lastSearchSource === 'archive+web'}
+						<span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> Answered from archive + web search
+					{/if}
+				</div>
+			{/if}
+			{#if !$isStreaming && $lastResponse?.suggested_followups?.length}
+				<div class="flex flex-wrap gap-2 pt-2">
+					{#each $lastResponse.suggested_followups as followup}
+						<button
+							class="text-xs bg-bg-card border border-border rounded-lg px-3 py-2
+								text-text-secondary hover:text-text hover:bg-bg-card-hover hover:border-ai/30 transition-colors"
+							onclick={() => askSuggestion(followup)}
+						>
+							{followup}
+						</button>
+					{/each}
 				</div>
 			{/if}
 		{/if}

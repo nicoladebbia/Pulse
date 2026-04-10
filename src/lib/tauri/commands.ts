@@ -1,5 +1,5 @@
-import { invoke } from '@tauri-apps/api/core';
-import type { BriefingWithStories, Story, StoryDetail } from './types';
+import { invoke, Channel } from '@tauri-apps/api/core';
+import type { BriefingWithStories, Story, StoryDetail, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, UsageStats, TavilyQuota, TrendThread } from './types';
 
 export async function getTodayBriefing(): Promise<BriefingWithStories | null> {
 	return invoke('get_today_briefing');
@@ -27,4 +27,64 @@ export async function triggerManualFetch(): Promise<string> {
 
 export async function getFetchStatus(): Promise<boolean> {
 	return invoke('get_fetch_status');
+}
+
+export async function chatSend(threadId: string | null, message: string): Promise<ConversationResponse> {
+	return invoke('chat_send', { threadId, message });
+}
+
+export async function chatListThreads(): Promise<ChatThread[]> {
+	return invoke('chat_list_threads');
+}
+
+export async function chatGetThread(threadId: string): Promise<ChatMessage[]> {
+	return invoke('chat_get_thread', { threadId });
+}
+
+export async function chatDeleteThread(threadId: string): Promise<void> {
+	return invoke('chat_delete_thread', { threadId });
+}
+
+export async function chatSendStream(
+	threadId: string | null,
+	message: string,
+	onEvent: (event: ChatStreamEvent) => void
+): Promise<void> {
+	const channel = new Channel<ChatStreamEvent>();
+	channel.onmessage = onEvent;
+	return invoke('chat_send_stream', { threadId, message, onEvent: channel });
+}
+
+// === Ideas ===
+
+export async function generateIdeas(
+	onEvent: (event: IdeaStreamEvent) => void
+): Promise<void> {
+	const channel = new Channel<IdeaStreamEvent>();
+	channel.onmessage = onEvent;
+	return invoke('generate_ideas', { onEvent: channel });
+}
+
+export async function getIdeas(statusFilter?: string): Promise<ProjectIdea[]> {
+	return invoke('get_ideas', { statusFilter: statusFilter ?? null });
+}
+
+export async function updateIdeaStatus(id: number, status: string): Promise<void> {
+	return invoke('update_idea_status', { id, status });
+}
+
+// === Trends ===
+
+export async function getTrends(): Promise<TrendThread[]> {
+	return invoke('get_trends');
+}
+
+// === API Usage ===
+
+export async function getApiUsage(days: number): Promise<UsageStats> {
+	return invoke('get_api_usage', { days });
+}
+
+export async function getTavilyQuota(): Promise<TavilyQuota> {
+	return invoke('get_tavily_quota');
 }

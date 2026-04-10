@@ -1,15 +1,15 @@
 <script lang="ts">
-	import { activeSector, expandedStoryId } from '$lib/stores/briefing';
+	import { activeSectors, expandedStoryId } from '$lib/stores/briefing';
 	import { navigateDown, navigateUp, expandFocused } from '$lib/stores/navigation';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
 	import type { SectorId } from '$lib/config';
 
-	const sectorKeys: Record<string, SectorId | null> = {
+	const sectorKeys: Record<string, SectorId> = {
 		'1': 'ai',
 		'2': 'miami',
 		'3': 'italy',
 		'4': 'tech',
-		'0': null,
 	};
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -20,27 +20,53 @@
 
 		const key = event.key;
 
-		// Sector switching
-		if (key in sectorKeys) {
+		// 0 = show all (home page only)
+		if (key === '0' && $page.url.pathname === '/') {
 			event.preventDefault();
-			activeSector.set(sectorKeys[key]);
+			activeSectors.set([]);
 			return;
 		}
 
+		// 1-4 = toggle sector (home page only)
+		if (key in sectorKeys && $page.url.pathname === '/') {
+			event.preventDefault();
+			const sector = sectorKeys[key];
+			activeSectors.update(current => {
+				if (current.includes(sector)) {
+					return current.filter(s => s !== sector);
+				} else {
+					return [...current, sector];
+				}
+			});
+			return;
+		}
+
+		const isHome = $page.url.pathname === '/';
+
 		switch (key) {
 			case 'j':
+				if (!isHome) return;
 				event.preventDefault();
 				navigateDown();
+				requestAnimationFrame(() => {
+					document.querySelector('[data-focused="true"]')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+				});
 				break;
 			case 'k':
+				if (!isHome) return;
 				event.preventDefault();
 				navigateUp();
+				requestAnimationFrame(() => {
+					document.querySelector('[data-focused="true"]')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+				});
 				break;
 			case 'Enter':
+				if (!isHome) return;
 				event.preventDefault();
 				expandFocused();
 				break;
 			case 'Escape':
+				if (!isHome) return;
 				expandedStoryId.set(null);
 				break;
 			case '/':
@@ -51,7 +77,16 @@
 				event.preventDefault();
 				goto('/ask');
 				break;
+			case 'f':
+				event.preventDefault();
+				goto('/freedoms');
+				break;
+			case 'p':
+				event.preventDefault();
+				goto('/ask');
+				break;
 			case 'o': {
+				if (!isHome) return;
 				// Open source URL for focused story
 				const focusedEl = document.querySelector('[data-focused="true"]');
 				const url = focusedEl?.getAttribute('data-url');

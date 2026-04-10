@@ -1,16 +1,39 @@
 <script lang="ts">
 	import { SECTORS, type SectorId } from '$lib/config';
-
-	interface TrendThread {
-		id: number;
-		title: string;
-		sector: string;
-		trajectory: string;
-		points: { date: string; headline: string; significance: number }[];
-	}
+	import { isTauri, mockTrends } from '$lib/tauri/mock';
+	import { getTrends } from '$lib/tauri/commands';
+	import type { TrendThread } from '$lib/tauri/types';
 
 	let threads = $state<TrendThread[]>([]);
 	let selectedThread = $state<TrendThread | null>(null);
+	let isLoading = $state(true);
+	let loaded = $state(false);
+	let error = $state<string | null>(null);
+
+	$effect(() => {
+		if (loaded) return;
+		loaded = true;
+		loadTrends();
+	});
+
+	async function loadTrends() {
+		error = null;
+		try {
+			if (!isTauri()) {
+				threads = mockTrends;
+				return;
+			}
+			threads = await getTrends();
+		} catch (e: any) {
+			error = String(e?.message ?? e);
+		} finally {
+			isLoading = false;
+		}
+	}
+
+	function selectThread(thread: TrendThread) {
+		selectedThread = selectedThread?.id === thread.id ? null : thread;
+	}
 
 	// Generate date labels for the last 14 days
 	const days = Array.from({ length: 14 }, (_, i) => {
@@ -38,7 +61,20 @@
 		<p class="text-sm text-text-muted">Story threads evolving over time</p>
 	</div>
 
-	{#if threads.length > 0}
+	{#if isLoading}
+		<div class="flex items-center justify-center h-64">
+			<div class="w-6 h-6 border border-ai border-t-transparent rounded-full animate-spin"></div>
+		</div>
+	{:else if error}
+		<div class="flex items-center justify-center h-64">
+			<div class="text-center max-w-md">
+				<div class="text-4xl mb-4">⚠</div>
+				<h3 class="text-lg font-semibold text-text mb-2">Error Loading Trends</h3>
+				<p class="text-text-secondary text-sm mb-4">{error}</p>
+				<button class="text-sm text-ai hover:underline" onclick={loadTrends}>Retry</button>
+			</div>
+		</div>
+	{:else if threads.length > 0}
 		<!-- Timeline River SVG -->
 		<div class="bg-bg-card border border-border rounded-xl p-6 overflow-x-auto">
 			<svg width="100%" height={threads.length * 50 + 40} viewBox="0 0 800 {threads.length * 50 + 40}">
@@ -61,7 +97,10 @@
 					{@const color = SECTORS[thread.sector as SectorId]?.color ?? 'var(--color-text-muted)'}
 
 					<!-- Thread label -->
-					<text x="0" y={y + 5} fill={color} class="text-[11px] font-medium" dominant-baseline="middle">
+					<!-- svelte-ignore a11y_click_events_have_key_events -->
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<text x="0" y={y + 5} fill={color} class="text-[11px] font-medium cursor-pointer" dominant-baseline="middle"
+						onclick={() => selectThread(thread)}>
 						{trajectoryIcons[thread.trajectory] ?? ''} {thread.title.slice(0, 20)}
 					</text>
 
@@ -71,6 +110,7 @@
 						{#if dayIdx >= 0}
 							{@const cx = 60 + dayIdx * 52}
 							<!-- Dot -->
+							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<circle
 								cx={cx}
 								cy={y}
@@ -78,6 +118,7 @@
 								fill={color}
 								opacity="0.8"
 								class="cursor-pointer hover:opacity-100"
+								onclick={() => selectThread(thread)}
 							>
 								<title>{point.headline} ({point.date})</title>
 							</circle>

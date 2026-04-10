@@ -1,16 +1,66 @@
 <script lang="ts">
-	import { currentBriefing, isLoading, activeSector, expandedStoryId, getFilteredStories } from '$lib/stores/briefing';
-	import HeroCard from '$lib/components/stories/HeroCard.svelte';
-	import StoryCard from '$lib/components/stories/StoryCard.svelte';
+	import { currentBriefing, isLoading, activeSectors, expandedStoryId, getFilteredStories, getFeaturedFromList, getCompactFromList } from '$lib/stores/briefing';
+	import { updateStoryList, focusedStoryId } from '$lib/stores/navigation';
+	import BriefingSummary from '$lib/components/stories/BriefingSummary.svelte';
+	import FeaturedCard from '$lib/components/stories/FeaturedCard.svelte';
+	import CompactStoryRow from '$lib/components/stories/CompactStoryRow.svelte';
+	import ConnectionInsight from '$lib/components/stories/ConnectionInsight.svelte';
 	import StoryExpanded from '$lib/components/stories/StoryExpanded.svelte';
 	import type { Story, BriefingWithStories } from '$lib/tauri/types';
+	import { isTauri, mockBriefingData } from '$lib/tauri/mock';
+	import { isFetching, fetchDone, triggerFetch as storeTriggerFetch } from '$lib/stores/fetch';
+	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
 
-	let stories = $derived(getFilteredStories($currentBriefing, $activeSector));
-	let heroStory = $derived(stories.find(s => s.is_hero) ?? stories[0] ?? null);
-	let gridStories = $derived(heroStory ? stories.filter(s => s.id !== heroStory?.id) : []);
-	let expandedStory = $derived(stories.find(s => s.id === $expandedStoryId) ?? null);
+	let allStories = $derived(getFilteredStories($currentBriefing, $activeSectors));
+	let featured = $derived(getFeaturedFromList(allStories, 3));
+	let compact = $derived(getCompactFromList(allStories, 3, 12));
+	let connections = $derived($currentBriefing?.connections ?? []);
+	let executiveSummary = $derived($currentBriefing?.briefing.executive_summary ?? null);
+	let expandedStory = $derived(allStories.find(s => s.id === $expandedStoryId) ?? null);
+	let remainingCount = $derived(Math.max(0, allStories.length - 15));
+
 	let loadError = $state<string | null>(null);
 	let loaded = $state(false);
+	let nudgeDismissed = $state(false);
+
+	// Compute briefing staleness
+	function getBriefingAgeHours(): number {
+		const createdAt = $currentBriefing?.briefing?.created_at;
+		if (!createdAt) return 0;
+		const created = new Date(createdAt + 'Z');
+		return (Date.now() - created.getTime()) / (1000 * 60 * 60);
+	}
+
+	let showNudge = $derived(getBriefingAgeHours() >= 6 && !nudgeDismissed && !$isFetching);
+
+	function formatBriefingTime(): string {
+		const createdAt = $currentBriefing?.briefing?.created_at;
+		if (!createdAt) return '';
+		const created = new Date(createdAt + 'Z');
+		return created.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+	}
+
+	function formatAgeText(): string {
+		const hours = Math.floor(getBriefingAgeHours());
+		if (hours < 1) return 'less than an hour ago';
+		if (hours === 1) return '1 hour ago';
+		return `${hours} hours ago`;
+	}
+
+	function handleNudgeRefresh() {
+		storeTriggerFetch();
+	}
+
+	function handleRefreshReload() {
+		nudgeDismissed = true;
+		fetchDone.set(false);
+		loadBriefing();
+	}
+
+	// Keep navigation store in sync with visible stories
+	$effect(() => {
+		updateStoryList(allStories);
+	});
 
 	$effect(() => {
 		if (loaded) return;
@@ -23,12 +73,12 @@
 		loadError = null;
 
 		try {
-			const ipc = (window as any).__TAURI_INTERNALS__;
-			if (!ipc) {
-				loadError = 'Not running inside Tauri.';
+			if (!isTauri()) {
+				currentBriefing.set(mockBriefingData);
 				return;
 			}
 
+			const ipc = (window as any).__TAURI_INTERNALS__;
 			const result = await Promise.race([
 				ipc.invoke('get_today_briefing'),
 				new Promise((_, rej) => setTimeout(() => rej(new Error('Timed out loading briefing')), 10000))
@@ -66,37 +116,112 @@
 			<div class="text-4xl mb-4">⚠</div>
 			<h2 class="text-xl font-semibold text-text mb-2">Error Loading Briefing</h2>
 			<p class="text-text-secondary text-sm leading-relaxed mb-4">{loadError}</p>
-			<button
-				class="text-sm text-ai hover:underline"
-				onclick={retry}
-			>
-				Retry
-			</button>
+			<button class="text-sm text-ai hover:underline" onclick={retry}>Retry</button>
 		</div>
 	</div>
-{:else if !$currentBriefing || stories.length === 0}
+{:else if !$currentBriefing}
 	<div class="flex items-center justify-center h-64">
 		<div class="text-center max-w-md">
 			<div class="text-4xl mb-4">◉</div>
 			<h2 class="text-xl font-semibold text-text mb-2">No Briefing Yet</h2>
 			<p class="text-text-secondary leading-relaxed">
 				Your daily Pulse briefing hasn't been generated yet.
-				It runs automatically at 8:00 AM, or you can trigger it manually.
+				It runs automatically at 8:00 AM and 9:00 PM, or you can trigger it manually.
+			</p>
+		</div>
+	</div>
+{:else if allStories.length === 0}
+	<div class="flex items-center justify-center h-64">
+		<div class="text-center max-w-md">
+			<div class="text-4xl mb-4">◉</div>
+			<h2 class="text-xl font-semibold text-text mb-2">No coverage today</h2>
+			<p class="text-text-secondary leading-relaxed">
+				{#if $activeSectors.length > 0}
+					No stories found for the selected sectors. Try adding more sectors.
+				{:else}
+					No stories were curated for today's briefing.
+				{/if}
 			</p>
 		</div>
 	</div>
 {:else}
-	<!-- Magazine Layout -->
-	<div class="space-y-6 pt-2">
-		{#if heroStory}
-			<HeroCard story={heroStory} onExpand={handleExpand} />
+	<div class="space-y-8 pt-2 max-w-4xl mx-auto">
+		<!-- Staleness nudge -->
+		{#if $fetchDone && !$isFetching}
+			<div class="flex items-center justify-between bg-emerald-400/5 border border-emerald-400/20 rounded-xl px-4 py-3">
+				<div class="flex items-center gap-3">
+					<div class="w-2 h-2 rounded-full bg-emerald-400"></div>
+					<p class="text-sm text-text-secondary">Briefing refreshed successfully.</p>
+				</div>
+				<button
+					class="text-xs px-3 py-1.5 rounded-lg bg-ai/15 text-ai border border-ai/25 hover:bg-ai/25 transition-colors"
+					onclick={handleRefreshReload}
+				>
+					Reload
+				</button>
+			</div>
+		{:else if $isFetching}
+			<div class="bg-bg-card border border-ai/20 rounded-xl px-4 py-4">
+				<FetchTaskList />
+			</div>
+		{:else if showNudge}
+			<div class="flex items-center justify-between bg-ai/5 border border-ai/20 rounded-xl px-4 py-3">
+				<div class="flex items-center gap-3">
+					<div class="w-2 h-2 rounded-full bg-amber-400"></div>
+					<p class="text-sm text-text-secondary">
+						Your briefing is from <span class="text-text font-medium">{formatBriefingTime()}</span> — {formatAgeText()}.
+					</p>
+				</div>
+				<div class="flex items-center gap-2 shrink-0">
+					<button
+						class="text-xs px-3 py-1.5 rounded-lg bg-ai/15 text-ai border border-ai/25 hover:bg-ai/25 transition-colors"
+						onclick={handleNudgeRefresh}
+					>
+						{new Date().getHours() >= 12 ? 'Get evening briefing' : 'Get latest briefing'}
+					</button>
+					<button
+						class="text-xs text-text-muted hover:text-text transition-colors px-2 py-1.5"
+						onclick={() => nudgeDismissed = true}
+					>
+						Dismiss
+					</button>
+				</div>
+			</div>
 		{/if}
 
-		{#if gridStories.length > 0}
-			<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-				{#each gridStories as story (story.id)}
-					<StoryCard {story} onExpand={handleExpand} />
+		<!-- TIER 1: Executive Summary -->
+		<BriefingSummary summary={executiveSummary} briefing={$currentBriefing.briefing} />
+
+		<!-- TIER 2: Featured Stories (top 3 by relevance) -->
+		<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+			{#each featured as story (story.id)}
+				<FeaturedCard {story} onExpand={handleExpand} focused={story.id === $focusedStoryId} />
+			{/each}
+		</div>
+
+		<!-- Cross-Connections -->
+		{#if connections.length > 0}
+			<div class="space-y-3">
+				{#each connections.slice(0, 3) as connection}
+					<ConnectionInsight {connection} />
 				{/each}
+			</div>
+		{/if}
+
+		<!-- TIER 3: Also Today -->
+		{#if compact.length > 0}
+			<div>
+				<h3 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-3">Also Today</h3>
+				<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50">
+					{#each compact as story (story.id)}
+						<CompactStoryRow {story} onExpand={handleExpand} focused={story.id === $focusedStoryId} />
+					{/each}
+				</div>
+				{#if remainingCount > 0}
+					<a href="/archive" class="block text-center text-sm text-ai hover:underline mt-3 py-2">
+						View all {$currentBriefing.briefing.story_count} stories in Archive
+					</a>
+				{/if}
 			</div>
 		{/if}
 	</div>

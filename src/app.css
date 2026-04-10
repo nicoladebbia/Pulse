@@ -22,6 +22,19 @@
 	--color-tech: #a855f7;
 	--color-tech-dim: #3b1764;
 
+	/* Freedom — minimal prestige palette */
+	--color-gold: #C9A84C;
+	--color-gold-dim: #2A2311;
+	--color-gold-muted: #8B7635;
+	--color-freedom-time: #C9A84C;
+	--color-freedom-time-dim: #2A2311;
+	--color-freedom-financial: #6B8F71;
+	--color-freedom-financial-dim: #1A2B1C;
+	--color-freedom-location: #7B9DAF;
+	--color-freedom-location-dim: #1A2530;
+	--color-freedom-health: #B07070;
+	--color-freedom-health-dim: #2B1A1A;
+
 	/* Relevance score colors */
 	--color-relevance-high: #22c55e;
 	--color-relevance-mid: #eab308;

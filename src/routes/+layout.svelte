@@ -3,7 +3,6 @@
 	import Sidebar from '$lib/components/layout/Sidebar.svelte';
 	import Header from '$lib/components/layout/Header.svelte';
 	import KeyboardHandler from '$lib/components/layout/KeyboardHandler.svelte';
-
 	let { children } = $props();
 </script>
 

@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { SECTORS, type SectorId } from '$lib/config';
 	import RelevanceBadge from './RelevanceBadge.svelte';
-	import type { Story } from '$lib/tauri/types';
+	import type { Story, ChatStreamEvent } from '$lib/tauri/types';
+	import { chatSendStream } from '$lib/tauri/commands';
+	import { isTauri, simulateChatStream } from '$lib/tauri/mock';
 
 	let { story, onClose }: { story: Story; onClose: () => void } = $props();
 
@@ -10,18 +12,15 @@
 	// Inline AI conversation state
 	interface AiMessage {
 		question: string;
-		title: string;
-		summary: string;
-		key_points: string[];
-		implications: string;
-		watch_next: string;
-		sources: { headline: string; sector: string; date: string }[];
+		content: string;
+		sources: number[];
+		isStreaming: boolean;
 	}
 
 	let aiMessages = $state<AiMessage[]>([]);
 	let isAsking = $state(false);
 	let followUpQuery = $state('');
-	let conversationEl: HTMLElement;
+	let conversationEl = $state<HTMLElement | null>(null);
 
 	function openSource() {
 		const ipc = (window as any).__TAURI_INTERNALS__;
@@ -36,41 +35,66 @@
 		if (isAsking || !question.trim()) return;
 		isAsking = true;
 
+		const msgIndex = aiMessages.length;
+		aiMessages = [...aiMessages, { question, content: '', sources: [], isStreaming: true }];
+		followUpQuery = '';
+
+		let accumulated = '';
+
 		try {
-			const ipc = (window as any).__TAURI_INTERNALS__;
-			if (!ipc) return;
+			const streamFn = isTauri()
+				? (cb: (event: ChatStreamEvent) => void) => chatSendStream(null, question, cb)
+				: (cb: (event: any) => void) => simulateChatStream(cb);
 
-			const result = await ipc.invoke('ask_pulse', { question });
+			await streamFn((event: ChatStreamEvent) => {
+				if (event.event === 'Delta') {
+					accumulated += event.data.text;
+					aiMessages[msgIndex].content = accumulated;
+				} else if (event.event === 'Complete') {
+					aiMessages[msgIndex].content = event.data.message;
+					aiMessages[msgIndex].sources = event.data.source_story_ids;
+					aiMessages[msgIndex].isStreaming = false;
+				} else if (event.event === 'Error') {
+					aiMessages[msgIndex].content = accumulated + `\n\nError: ${event.data.message}`;
+					aiMessages[msgIndex].isStreaming = false;
+				}
+			});
 
-			aiMessages = [...aiMessages, {
-				question,
-				title: result.title ?? 'Analysis',
-				summary: result.summary ?? '',
-				key_points: result.key_points ?? [],
-				implications: result.implications ?? '',
-				watch_next: result.watch_next ?? '',
-				sources: result.source_stories ?? [],
-			}];
-
-			followUpQuery = '';
-
-			// Scroll to the new response
 			requestAnimationFrame(() => {
 				conversationEl?.scrollIntoView({ behavior: 'smooth', block: 'end' });
 			});
 		} catch (e: any) {
-			aiMessages = [...aiMessages, {
-				question,
-				title: 'Error',
-				summary: String(e?.message ?? e),
-				key_points: [],
-				implications: '',
-				watch_next: '',
-				sources: [],
-			}];
+			aiMessages[msgIndex].content = `Error: ${String(e?.message ?? e)}`;
+			aiMessages[msgIndex].isStreaming = false;
 		} finally {
 			isAsking = false;
+			aiMessages[msgIndex].isStreaming = false;
 		}
+	}
+
+	function esc(s: string): string {
+		return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+	}
+
+	function inlineMd(s: string): string {
+		let out = esc(s);
+		out = out.replace(/\*\*(.+?)\*\*/g, '<strong class="font-semibold text-text">$1</strong>');
+		out = out.replace(/\*(.+?)\*/g, '<em class="italic text-text-secondary">$1</em>');
+		out = out.replace(/`(.+?)`/g, '<code class="text-xs bg-bg-card-hover px-1 py-0.5 rounded font-mono">$1</code>');
+		return out;
+	}
+
+	function renderMarkdown(text: string): string {
+		return text.split('\n').map(line => {
+			const t = line.trim();
+			if (t.startsWith('### ')) return `<h4 class="text-xs font-semibold uppercase tracking-wider text-text-muted mt-3 mb-1">${esc(t.slice(4))}</h4>`;
+			if (t.startsWith('## ')) return `<h3 class="text-sm font-semibold text-text mt-3 mb-1.5">${inlineMd(t.slice(3))}</h3>`;
+			if (t.startsWith('- ')) return `<div class="flex items-start gap-2 ml-1"><span class="text-ai mt-0.5 shrink-0 text-xs">▪</span><span>${inlineMd(t.slice(2))}</span></div>`;
+			if (/^\d+\.\s/.test(t)) return `<div class="flex items-start gap-2 ml-1"><span class="text-text-muted mt-0.5 shrink-0 text-xs font-mono">${t.match(/^\d+/)![0]}.</span><span>${inlineMd(t.replace(/^\d+\.\s/, ''))}</span></div>`;
+			if (t === '') return '<div class="h-2"></div>';
+			return `<p>${inlineMd(t)}</p>`;
+		}).join('\n');
 	}
 
 	function askAboutStory() {
@@ -113,14 +137,34 @@
 	</div>
 
 	<!-- Headline -->
-	<h1 class="text-2xl font-bold text-text leading-tight mb-4">
-		{story.headline}
-	</h1>
+	<div class="flex items-start gap-2 mb-4">
+		<h1 class="text-2xl font-bold text-text leading-tight">
+			{story.headline}
+		</h1>
+		{#if story.summary_depth === 'deep'}
+			<span class="shrink-0 mt-1.5 text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-full bg-ai/15 text-ai border border-ai/25">
+				Deep Analysis
+			</span>
+		{/if}
+	</div>
 
 	<!-- Summary -->
 	<p class="text-text-secondary text-base leading-relaxed mb-6">
 		{story.summary}
 	</p>
+
+	<!-- Deep Summary (for high-impact stories) -->
+	{#if story.deep_summary}
+		<div class="mb-6 bg-bg-card border border-ai/20 rounded-xl p-5" style="border-left: 3px solid var(--color-ai)">
+			<div class="flex items-center gap-2 mb-3">
+				<div class="w-2 h-2 rounded-full bg-ai"></div>
+				<span class="text-[10px] font-medium text-text-muted uppercase tracking-wider">Deep Analysis</span>
+			</div>
+			<div class="text-sm text-text-secondary leading-relaxed space-y-2">
+				{@html renderMarkdown(story.deep_summary)}
+			</div>
+		</div>
+	{/if}
 
 	<!-- Key Facts -->
 	<div class="mb-6">
@@ -197,68 +241,24 @@
 					</div>
 				</div>
 
-				<!-- Structured answer card -->
+				<!-- Streamed response -->
 				<div class="bg-bg-card border border-border rounded-xl overflow-hidden" style="border-left: 3px solid var(--color-ai)">
-					<!-- Title -->
-					<div class="px-5 pt-5 pb-3">
-						<div class="flex items-center gap-2 mb-2">
-							<div class="w-2 h-2 rounded-full bg-ai"></div>
+					<div class="px-5 pt-5 pb-4">
+						<div class="flex items-center gap-2 mb-3">
+							<div class="w-2 h-2 rounded-full bg-ai {msg.isStreaming ? 'animate-pulse' : ''}"></div>
 							<span class="text-[10px] font-medium text-text-muted uppercase tracking-wider">Pulse Analysis</span>
 						</div>
-						<h3 class="text-base font-semibold text-text">{msg.title}</h3>
+						<div class="text-sm text-text-secondary leading-relaxed prose-inline">
+							{@html renderMarkdown(msg.content)}
+						</div>
 					</div>
 
-					<!-- Summary -->
-					{#if msg.summary}
-						<div class="px-5 pb-4">
-							<p class="text-sm text-text-secondary leading-relaxed">{msg.summary}</p>
-						</div>
-					{/if}
-
-					<!-- Key Points -->
-					{#if msg.key_points.length > 0}
-						<div class="px-5 pb-4">
-							<h4 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Key Points</h4>
-							<ul class="space-y-1.5">
-								{#each msg.key_points as point}
-									<li class="flex items-start gap-2 text-sm text-text">
-										<span class="text-ai mt-0.5 shrink-0">▪</span>
-										<span>{point}</span>
-									</li>
-								{/each}
-							</ul>
-						</div>
-					{/if}
-
-					<!-- Implications -->
-					{#if msg.implications}
-						<div class="mx-5 mb-4 bg-bg-expanded border border-border-subtle rounded-lg p-3">
-							<h4 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-1.5">Why It Matters to You</h4>
-							<p class="text-sm text-text leading-relaxed">{msg.implications}</p>
-						</div>
-					{/if}
-
-					<!-- Watch Next -->
-					{#if msg.watch_next}
-						<div class="mx-5 mb-4 bg-bg-expanded border border-border-subtle rounded-lg p-3">
-							<h4 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-1.5">Watch Next</h4>
-							<p class="text-sm text-text leading-relaxed">{msg.watch_next}</p>
-						</div>
-					{/if}
-
-					<!-- Sources -->
 					{#if msg.sources.length > 0}
 						<div class="px-5 pb-4 pt-2 border-t border-border">
-							<p class="text-[10px] uppercase tracking-wider text-text-muted mb-2">Based on</p>
+							<p class="text-[10px] uppercase tracking-wider text-text-muted mb-2">Sources</p>
 							<div class="flex flex-wrap gap-1.5">
-								{#each msg.sources.slice(0, 5) as source}
-									{@const srcSector = SECTORS[source.sector as SectorId]}
-									<span
-										class="text-[10px] px-2 py-0.5 rounded-full border"
-										style="color: {srcSector?.color ?? 'var(--color-text-muted)'}; border-color: {srcSector?.dimColor ?? 'var(--color-border)'}; background: {srcSector?.dimColor ?? 'transparent'}"
-									>
-										{source.headline.length > 45 ? source.headline.slice(0, 45) + '...' : source.headline}
-									</span>
+								{#each msg.sources.slice(0, 6) as id}
+									<span class="text-[10px] px-2 py-0.5 rounded-full bg-ai/10 text-ai font-mono">#{id}</span>
 								{/each}
 							</div>
 						</div>
@@ -266,8 +266,8 @@
 				</div>
 			{/each}
 
-			<!-- Loading indicator -->
-			{#if isAsking}
+			<!-- Loading indicator (before first token) -->
+			{#if isAsking && aiMessages.length > 0 && !aiMessages[aiMessages.length - 1].content}
 				<div class="bg-bg-card border border-border rounded-xl p-5">
 					<div class="flex items-center gap-3">
 						<div class="flex gap-1">
