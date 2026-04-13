@@ -265,6 +265,29 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     tracing::info!("Phase 8: Writing to database...");
     write_to_db(db_path, &analysis, embeddings.as_deref(), prefixes.as_deref(), executive_summary.as_deref())?;
 
+    // Phase 8.5: Auto-backfill missing embeddings from previous failed runs (non-fatal)
+    {
+        let conn = rusqlite::Connection::open(db_path)?;
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM stories", [], |r| r.get(0))?;
+        let embedded: i64 = conn.query_row("SELECT COUNT(*) FROM story_embeddings WHERE story_id > 0", [], |r| r.get(0))?;
+        let missing = total - embedded;
+
+        if missing > 0 {
+            tracing::warn!("Embedding coverage: {}/{} stories ({:.0}%) — backfilling {} missing",
+                embedded, total, (embedded as f64 / total as f64) * 100.0, missing);
+            match backfill_missing_embeddings(db_path, 50).await {
+                Ok(filled) => {
+                    if filled > 0 {
+                        tracing::info!("Auto-backfill: embedded {} previously missing stories", filled);
+                    }
+                }
+                Err(e) => tracing::warn!("Auto-backfill failed (non-fatal): {}", e),
+            }
+        } else {
+            tracing::info!("Embedding coverage: {}/{} stories (100%)", embedded, total);
+        }
+    }
+
     // Phase 9: Extract entities (non-fatal)
     progress.start_stage(9);
     tracing::info!("Phase 9: Extracting entities...");
@@ -607,6 +630,64 @@ fn prefilter_articles(mut articles: Vec<RawArticle>) -> Vec<RawArticle> {
     );
 
     result
+}
+
+/// Backfill embeddings for stories that are missing them (from previous failed runs).
+/// Processes up to `max_stories` at a time to avoid long-running API calls.
+async fn backfill_missing_embeddings(db_path: &Path, max_stories: usize) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    let stories: Vec<(i64, String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.headline, s.summary, s.key_facts
+             FROM stories s
+             LEFT JOIN story_embeddings se ON se.story_id = s.id
+             WHERE se.story_id IS NULL
+             ORDER BY s.id DESC
+             LIMIT ?1"
+        )?;
+        stmt.query_map([max_stories as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?.collect::<Result<Vec<_>, _>>()?
+    };
+
+    if stories.is_empty() {
+        return Ok(0);
+    }
+
+    let mut filled = 0;
+    for chunk in stories.chunks(10) {
+        if filled > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(21)).await;
+        }
+
+        let texts: Vec<String> = chunk.iter().map(|(_, headline, summary, key_facts)| {
+            format!("{}. {}. {}", headline, summary, key_facts)
+        }).collect();
+        let ids: Vec<i64> = chunk.iter().map(|(id, _, _, _)| *id).collect();
+
+        match crate::embeddings::generate_from_texts(&texts).await {
+            Ok(embeddings) => {
+                for (i, emb) in embeddings.iter().enumerate() {
+                    let blob: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    conn.execute(
+                        "INSERT OR REPLACE INTO story_embeddings (story_id, embedding) VALUES (?1, ?2)",
+                        rusqlite::params![ids[i], blob],
+                    )?;
+                    filled += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Auto-backfill batch failed: {}", e);
+                break; // Stop on first failure to avoid burning rate limit
+            }
+        }
+    }
+
+    if filled > 0 {
+        log_usage(db_path, "voyage", "voyage-3-lite", "backfill_embeddings", (filled as i64) * 200, 0);
+    }
+    Ok(filled)
 }
 
 fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddings: Option<&[crate::embeddings::StoryEmbedding]>, prefixes: Option<&[Option<String>]>, executive_summary: Option<&str>) -> anyhow::Result<()> {
