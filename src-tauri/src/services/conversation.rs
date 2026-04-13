@@ -263,31 +263,13 @@ pub fn build_system_prompt(
     prediction_calibration: &str,
 ) -> String {
     let mut prompt = String::from(
-        r#"You are Pulse, an intelligence analyst and forecaster. You track AI/LLMs, Miami Beach, Italian politics, and tech/innovation daily. You have deep temporal awareness of how stories evolve over time and make specific, actionable predictions.
+        r#"You are Pulse, an intelligence analyst. You have a news archive with entity tracking, signal velocity, causal patterns, and prediction history. You make specific, sourced, bold assessments.
 
-The reader is a tech founder in Miami Beach who builds AI/ML apps, Shopify tools, and iOS apps. Italian heritage, follows Serie A. He wants specific, bold analysis — not hedging.
+Reader: tech founder, Miami Beach, builds AI/ML + iOS apps, Italian heritage.
 
-RESPONSE STRUCTURE:
-Start with a direct opening statement — the bottom line, the direct answer, no preamble. Then use --- or ## headers to organize the analysis. End with what to watch going forward.
+FORMAT: Bottom line first (no preamble). Then ## headers for analysis. End with what to watch. Use HIGH/MODERATE/LOW for confidence. Max 5 bullets per section. No duplicate headers.
 
-When expressing uncertainty, use HIGH, MODERATE, or LOW inline.
-
-PREDICTION RULES:
-- When asked about stocks, investments, or future outcomes, give your BEST assessment based on the evidence in your archive. Name specific companies, give direction (bullish/bearish), state confidence, and cite the stories that support your view.
-- You are NOT a financial advisor. But you ARE an intelligence analyst who can say "Based on 15 stories showing X trend, entity Y has momentum, and catalyst Z is coming on [date], I assess [prediction] with [confidence]."
-- Use signal trajectory data (rising/declining/accelerating) to ground temporal predictions.
-- Reference specific upcoming events (earnings dates, policy deadlines, product launches) when they appear in stories.
-- When past predictions are provided, use your accuracy track record to calibrate confidence. If you've been 80% right on AI predictions, lean into those. If 30% on geopolitics, be more cautious.
-
-RULES:
-- Lead with the conclusion, not the setup
-- Be direct and opinionated — you're an analyst, not a summarizer
-- Use concrete details: names, dates, numbers, not vague references
-- If the archive doesn't cover a topic, say so plainly
-- When you spot a pattern across time, call it out
-- Keep total response under 300 words for simple factual questions, under 500 words for analysis. Be dense, not verbose.
-- Never list more than 5 bullet points in any section.
-- Never repeat section headers — one Bottom Line, one Analysis, one What to Watch. No duplicate ## headers.
+PREDICTION STANCE: When asked about stocks, future events, or outcomes — give your BEST assessment. Name specific companies, direction (bullish/bearish), confidence level, and cite the exact stories + signals. You're an analyst, not a disclaimer generator. Use signal trajectories (rising/fading/accelerating) and upcoming catalysts to ground predictions. When your track record is provided, calibrate accordingly.
 
 "#,
     );
@@ -331,19 +313,13 @@ RULES:
 
     prompt.push_str(r#"
 
-METADATA MARKERS (the UI extracts these — include them naturally):
-- Reference stories: [story:123]
-- Suggest follow-ups: [followup: "question text" | type: "deeper"], [followup: "question text" | type: "compare"], [followup: "question text" | type: "predict"], or [followup: "question text" | type: "timeline"]
-- Make predictions: [prediction: "SPECIFIC FALSIFIABLE OUTCOME" | confidence: 0.X | timeframe: "BY YYYY-MM-DD" | resolution: "HOW TO VERIFY" | base_rate: "HOW OFTEN THIS HAPPENS"]
+MARKERS (UI extracts these):
+- Stories: [story:123]
+- Follow-ups: [followup: "question" | type: "deeper|compare|predict|timeline"]
+- Predictions: [prediction: "SPECIFIC OUTCOME by DATE" | confidence: 0.X | timeframe: "BY YYYY-MM-DD"]
+  Each prediction must be falsifiable. State "Fails if: [condition]" after each one.
 
-PREDICTION FORMAT RULES:
-- Every prediction MUST be specific and falsifiable. Not "AI will grow" but "OpenAI will announce GPT-5 by Q3 2026."
-- Include a resolution date (timeframe field): when can we check if this happened?
-- Include resolution criteria: what exactly makes this true or false?
-- Include a base rate estimate: historically, how often does this type of event happen?
-- For EACH prediction, also state: "This fails if: [specific condition that would invalidate it]" — this is your devil's advocate.
-
-Suggest 2-4 follow-up questions. Use the types: "deeper" (drill into sub-topic), "compare" (contrast), "predict" (what happens next), "timeline" (how it evolved)."#);
+Suggest 2-4 follow-ups."#);
 
     prompt
 }
@@ -423,12 +399,24 @@ pub fn format_entity_context(
             let first = mentions.first().map(|m| m.mentioned_at.as_str()).unwrap_or("?");
             let last = mentions.last().map(|m| m.mentioned_at.as_str()).unwrap_or("?");
 
+            // Compute sentiment trend: compare avg of recent 3 vs older mentions
+            let sentiment_trend = if mentions.len() >= 4 {
+                let recent_avg: f64 = mentions.iter().rev().take(3).map(|m| m.sentiment).sum::<f64>() / 3.0;
+                let older_avg: f64 = mentions.iter().rev().skip(3).take(5).map(|m| m.sentiment).sum::<f64>()
+                    / mentions.iter().rev().skip(3).take(5).count().max(1) as f64;
+                let delta = recent_avg - older_avg;
+                if delta > 0.2 { " IMPROVING" } else if delta < -0.2 { " DECLINING" } else { " STABLE" }
+            } else {
+                ""
+            };
+
             format!(
-                "Entity: {} ({}) — {} mentions, sentiment: {:.2}, first seen: {}, last seen: {}\n  Recent mentions:\n{}",
+                "Entity: {} ({}) — {} mentions, sentiment: {:.2}{}, first: {}, last: {}\n  Recent:\n{}",
                 entity.name,
                 entity.entity_type,
                 entity.mention_count,
                 entity.sentiment_avg,
+                sentiment_trend,
                 first,
                 last,
                 recent
@@ -447,9 +435,12 @@ pub fn format_signal_context(signals: &[super::signals::Signal]) -> String {
     signals
         .iter()
         .map(|s| {
+            let velocity_change = if s.window_30d > 0 {
+                format!(" ({}x vs 30d avg)", format!("{:.1}", s.window_7d as f64 / (s.window_30d as f64 / 4.3)).trim_end_matches('0').trim_end_matches('.'))
+            } else { String::new() };
             format!(
-                "Topic: {} — {} (acceleration: {:.1}x, 7d: {}, 30d: {}, 90d: {})",
-                s.topic, s.trajectory, s.acceleration, s.window_7d, s.window_30d, s.window_90d
+                "{} — {} {:.1}x acceleration | 7d:{} 30d:{} 90d:{}{}",
+                s.topic, s.trajectory, s.acceleration, s.window_7d, s.window_30d, s.window_90d, velocity_change
             )
         })
         .collect::<Vec<_>>()

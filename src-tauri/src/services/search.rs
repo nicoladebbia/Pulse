@@ -801,17 +801,20 @@ pub fn hybrid_search_with_hyde(
         }
     }
 
-    // 6.5 Apply novelty boost (novel stories get full score, rehashed get 50%)
-    for story in stories.iter_mut() {
-        if story.story_id > 0 {
-            let novelty: f64 = conn.query_row(
-                "SELECT COALESCE(novelty, 1.0) FROM stories WHERE id = ?1",
-                params![story.story_id], |row| row.get(0),
-            ).unwrap_or(1.0);
-            story.score *= (0.5 + 0.5 * novelty as f32);
+    // 6.5 Apply novelty boost — penalize stories that are near-duplicates of other
+    // stories in the same briefing (same headline overlap = same event, different source)
+    if stories.len() > 1 {
+        // Check each story against all EARLIER stories in the briefing for same-event coverage
+        for i in 1..stories.len() {
+            let dominated = stories[..i].iter().any(|earlier| {
+                earlier.date == stories[i].date && headline_word_overlap(&earlier.headline, &stories[i].headline) > 0.5
+            });
+            if dominated {
+                stories[i].score *= 0.6; // 40% penalty for covering same event
+            }
         }
+        stories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
-    stories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     // 7. Apply date filter if specified
     if let Some(from) = date_from {
