@@ -801,6 +801,18 @@ pub fn hybrid_search_with_hyde(
         }
     }
 
+    // 6.5 Apply novelty boost (novel stories get full score, rehashed get 50%)
+    for story in stories.iter_mut() {
+        if story.story_id > 0 {
+            let novelty: f64 = conn.query_row(
+                "SELECT COALESCE(novelty, 1.0) FROM stories WHERE id = ?1",
+                params![story.story_id], |row| row.get(0),
+            ).unwrap_or(1.0);
+            story.score *= (0.5 + 0.5 * novelty as f32);
+        }
+    }
+    stories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
     // 7. Apply date filter if specified
     if let Some(from) = date_from {
         stories.retain(|s| s.date.as_str() >= from);

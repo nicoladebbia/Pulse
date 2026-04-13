@@ -530,9 +530,15 @@ pub async fn chat_send(
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         match predictions::get_prediction_stats(&conn) {
             Ok(stats) if stats.total > 0 => {
-                format!("Predictions made: {} total. Validated: {} ({:.0}% accuracy). Invalidated: {}. Active: {}.",
-                    stats.total, stats.validated + stats.partially_validated,
-                    stats.accuracy_rate * 100.0, stats.invalidated, stats.active)
+                {
+                    let mut cal = format!("Predictions made: {} total. Validated: {} ({:.0}% accuracy). Invalidated: {}. Active: {}.",
+                        stats.total, stats.validated + stats.partially_validated,
+                        stats.accuracy_rate * 100.0, stats.invalidated, stats.active);
+                    if let Some(brier) = stats.avg_brier_score {
+                        cal.push_str(&format!(" Brier score: {:.3} (0=perfect, 0.25=random).", brier));
+                    }
+                    cal
+                }
             }
             _ => String::new(),
         }
@@ -967,9 +973,15 @@ pub async fn chat_send_stream(
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         match predictions::get_prediction_stats(&conn) {
             Ok(stats) if stats.total > 0 => {
-                format!("Predictions made: {} total. Validated: {} ({:.0}% accuracy). Invalidated: {}. Active: {}.",
-                    stats.total, stats.validated + stats.partially_validated,
-                    stats.accuracy_rate * 100.0, stats.invalidated, stats.active)
+                {
+                    let mut cal = format!("Predictions made: {} total. Validated: {} ({:.0}% accuracy). Invalidated: {}. Active: {}.",
+                        stats.total, stats.validated + stats.partially_validated,
+                        stats.accuracy_rate * 100.0, stats.invalidated, stats.active);
+                    if let Some(brier) = stats.avg_brier_score {
+                        cal.push_str(&format!(" Brier score: {:.3} (0=perfect, 0.25=random).", brier));
+                    }
+                    cal
+                }
             }
             _ => String::new(),
         }

@@ -30,6 +30,8 @@ pub struct PredictionStats {
     pub expired: usize,
     /// (validated + partially_validated) / (validated + partially_validated + invalidated + expired)
     pub accuracy_rate: f64,
+    /// Average Brier score (0=perfect, 0.25=random, 1=always wrong). None if no scored predictions.
+    pub avg_brier_score: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +304,12 @@ pub fn get_prediction_stats(conn: &Connection) -> Result<PredictionStats> {
         stats.accuracy_rate =
             (stats.validated + stats.partially_validated) as f64 / resolved;
     }
+
+    // Compute average Brier score for scored predictions
+    stats.avg_brier_score = conn.query_row(
+        "SELECT AVG(brier_score) FROM insights WHERE insight_type = 'prediction' AND brier_score IS NOT NULL",
+        [], |row| row.get::<_, Option<f64>>(0),
+    ).ok().flatten();
 
     Ok(stats)
 }

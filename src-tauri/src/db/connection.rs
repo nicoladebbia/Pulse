@@ -17,6 +17,7 @@ pub const MIGRATION_010: &str = include_str!("../../../migrations/010_trajectory
 pub const MIGRATION_011: &str = include_str!("../../../migrations/011_rename_financial_to_wealth.sql");
 pub const MIGRATION_012: &str = include_str!("../../../migrations/012_chat_feedback.sql");
 pub const MIGRATION_013: &str = include_str!("../../../migrations/013_feedback_reputation.sql");
+pub const MIGRATION_014: &str = include_str!("../../../migrations/014_intelligence_upgrade.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -200,6 +201,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_013)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 14: Intelligence upgrade (probability tracking, novelty, alerts)
+    if !applied.contains(&14) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_014)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (14)", [])?;
         tx.commit()?;
     }
 

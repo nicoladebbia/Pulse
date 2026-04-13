@@ -13,6 +13,9 @@ pub struct SummarizedStory {
     pub why_it_matters: String,
     pub what_to_watch: String,
     pub importance_score: i32,
+    pub sentiment: Option<f64>,
+    pub novelty: Option<f64>,
+    pub event_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

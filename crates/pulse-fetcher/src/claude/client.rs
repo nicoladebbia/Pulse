@@ -57,6 +57,9 @@ struct SummaryResponse {
     why_it_matters: String,
     what_to_watch: String,
     importance_score: i32,
+    sentiment: Option<f64>,
+    novelty: Option<f64>,
+    event_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +253,9 @@ impl GroqClient {
             why_it_matters: parsed.why_it_matters,
             what_to_watch: parsed.what_to_watch,
             importance_score: parsed.importance_score,
+            sentiment: parsed.sentiment,
+            novelty: parsed.novelty,
+            event_type: parsed.event_type,
         })
     }
 

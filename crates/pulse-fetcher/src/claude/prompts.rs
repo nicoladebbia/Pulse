@@ -9,8 +9,15 @@ Return valid JSON with these exact keys:
   "key_facts": ["5-8 concrete facts with specific numbers, names, dates, dollar amounts, and figures. Be precise and detailed."],
   "why_it_matters": "2-3 paragraphs connecting this to the reader's world. Be specific about how this impacts their work, their projects, and their interests. Go beyond surface-level connections — explain the mechanics of why this matters.",
   "what_to_watch": "2-3 sentences about what comes next, what developments to monitor, potential second-order effects, and key dates or milestones.",
-  "importance_score": 7
+  "importance_score": 7,
+  "sentiment": 0.3,
+  "novelty": 0.8,
+  "event_type": "product"
 }
+
+sentiment: -1.0 (very negative) to 1.0 (very positive). 0.0 = neutral.
+novelty: 0.0 (rehashed/old news already widely covered) to 1.0 (genuinely new information, first report).
+event_type: one of "earnings", "product", "regulatory", "legal", "executive", "partnership", "funding", "research", "geopolitical", "other".
 
 importance_score guide for AI sector:
 10 = New model release, major product launch (GPT-5, Claude update, Gemini release)

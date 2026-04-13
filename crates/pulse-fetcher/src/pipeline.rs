@@ -286,6 +286,17 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Deep summary generation failed (non-fatal): {}", e),
     }
 
+    // Phase 11: Validate predictions against new stories (non-fatal)
+    tracing::info!("Phase 11: Validating predictions...");
+    match validate_and_expire_predictions(db_path) {
+        Ok((validated, expired)) => {
+            if validated > 0 || expired > 0 {
+                tracing::info!("Predictions: {} validated/updated, {} expired", validated, expired);
+            }
+        }
+        Err(e) => tracing::warn!("Prediction validation failed (non-fatal): {}", e),
+    }
+
     // Done
     progress.finish();
     send_notification(analysis.curated_stories.len())?;
@@ -294,6 +305,110 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     tracing::info!("Pipeline complete in {:.1}s", duration.as_secs_f64());
 
     Ok(())
+}
+
+/// Validate active predictions against recent stories and expire stale ones.
+fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::Result<(usize, usize)> {
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    // 1. Get today's story IDs for validation
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let story_ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT s.id FROM stories s JOIN briefings b ON b.id = s.briefing_id WHERE b.date = ?1"
+        )?;
+        stmt.query_map([&today], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    // 2. Get active predictions
+    let mut pred_stmt = conn.prepare(
+        "SELECT id, title, content, confidence FROM insights WHERE insight_type = 'prediction' AND status = 'active'"
+    )?;
+    let predictions: Vec<(i64, String, String, f64)> = pred_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if predictions.is_empty() || story_ids.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // 3. For each prediction, check if any new story mentions its key terms
+    let mut validated = 0usize;
+    for (pred_id, title, content, confidence) in &predictions {
+        // Extract key words from prediction title (3+ chars, non-stopword)
+        let keywords: Vec<String> = title.split_whitespace()
+            .chain(content.split_whitespace())
+            .filter(|w| w.len() >= 4)
+            .map(|w| w.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+            .filter(|w| !["this", "that", "will", "with", "from", "have", "been", "more", "than", "about"].contains(&w.as_str()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .take(8)
+            .collect();
+
+        if keywords.is_empty() { continue; }
+
+        // Check if any today's stories match 3+ keywords
+        for &sid in &story_ids {
+            let headline: Option<String> = conn.query_row(
+                "SELECT headline || ' ' || summary FROM stories WHERE id = ?1",
+                [sid], |row| row.get(0),
+            ).ok();
+
+            if let Some(text) = headline {
+                let lower = text.to_lowercase();
+                let matches = keywords.iter().filter(|kw| lower.contains(kw.as_str())).count();
+                if matches >= 3 {
+                    // Update probability history
+                    let history: String = conn.query_row(
+                        "SELECT COALESCE(probability_history, '[]') FROM insights WHERE id = ?1",
+                        [pred_id], |row| row.get(0),
+                    ).unwrap_or_else(|_| "[]".to_string());
+
+                    let mut entries: Vec<serde_json::Value> = serde_json::from_str(&history).unwrap_or_default();
+                    let new_prob = (confidence + 0.1).min(0.95); // Nudge up on supporting evidence
+                    entries.push(serde_json::json!({
+                        "date": today,
+                        "probability": new_prob,
+                        "reason": format!("Supporting story: sid={}", sid)
+                    }));
+
+                    conn.execute(
+                        "UPDATE insights SET probability_history = ?1, confidence = ?2 WHERE id = ?3",
+                        rusqlite::params![serde_json::to_string(&entries).unwrap_or_default(), new_prob, pred_id],
+                    ).ok();
+                    validated += 1;
+                    break; // One match per prediction per day
+                }
+            }
+        }
+    }
+
+    // 4. Expire stale predictions (past their predicted_date with no resolution)
+    let expired: usize = conn.execute(
+        "UPDATE insights SET status = 'expired' WHERE insight_type = 'prediction' AND status = 'active' AND predicted_date IS NOT NULL AND predicted_date < date('now', '-7 days')",
+        [],
+    ).unwrap_or(0);
+
+    // 5. Compute Brier scores for resolved predictions
+    let mut brier_stmt = conn.prepare(
+        "SELECT id, confidence, status FROM insights WHERE insight_type = 'prediction' AND status IN ('validated', 'invalidated') AND brier_score IS NULL"
+    )?;
+    let to_score: Vec<(i64, f64, String)> = brier_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (id, confidence, status) in &to_score {
+        let outcome: f64 = if status == "validated" { 1.0 } else { 0.0 };
+        let brier = (confidence - outcome).powi(2);
+        conn.execute("UPDATE insights SET brier_score = ?1 WHERE id = ?2", rusqlite::params![brier, id]).ok();
+    }
+
+    Ok((validated, expired))
 }
 
 async fn generate_freedoms_summary(curated: &[(&str, &crate::claude::SummarizedStory)]) -> anyhow::Result<String> {
@@ -527,8 +642,9 @@ fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddi
                 briefing_id, sector, original_title, original_url, original_language,
                 content_snippet, source_name, published_at, headline, summary,
                 key_facts, why_it_matters, what_to_watch, importance_score,
-                is_hero, display_order, url_hash, title_hash, context_prefix
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                is_hero, display_order, url_hash, title_hash, context_prefix,
+                sentiment, novelty, event_type
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             rusqlite::params![
                 briefing_id,
                 story.article.sector,
@@ -549,6 +665,9 @@ fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddi
                 crate::dedup::url_hash(&story.article.url),
                 crate::dedup::title_hash(&story.article.title),
                 context_prefix,
+                story.sentiment,
+                story.novelty,
+                story.event_type,
             ],
         )?;
         story_db_ids.push(tx.last_insert_rowid());

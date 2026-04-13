@@ -334,7 +334,14 @@ RULES:
 METADATA MARKERS (the UI extracts these — include them naturally):
 - Reference stories: [story:123]
 - Suggest follow-ups: [followup: "question text" | type: "deeper"], [followup: "question text" | type: "compare"], [followup: "question text" | type: "predict"], or [followup: "question text" | type: "timeline"]
-- Make predictions: [prediction: "prediction text" | confidence: 0.X | timeframe: "..."]
+- Make predictions: [prediction: "SPECIFIC FALSIFIABLE OUTCOME" | confidence: 0.X | timeframe: "BY YYYY-MM-DD" | resolution: "HOW TO VERIFY" | base_rate: "HOW OFTEN THIS HAPPENS"]
+
+PREDICTION FORMAT RULES:
+- Every prediction MUST be specific and falsifiable. Not "AI will grow" but "OpenAI will announce GPT-5 by Q3 2026."
+- Include a resolution date (timeframe field): when can we check if this happened?
+- Include resolution criteria: what exactly makes this true or false?
+- Include a base rate estimate: historically, how often does this type of event happen?
+- For EACH prediction, also state: "This fails if: [specific condition that would invalidate it]" — this is your devil's advocate.
 
 Suggest 2-4 follow-up questions. Use the types: "deeper" (drill into sub-topic), "compare" (contrast), "predict" (what happens next), "timeline" (how it evolved)."#);
 
