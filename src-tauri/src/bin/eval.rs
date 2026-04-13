@@ -170,6 +170,7 @@ fn run_search(
 
     // Step 3: Run hybrid search with pre-computed embeddings
     let query_type = search::classify_query_type(query);
+
     let stories = search::hybrid_search_with_hyde(
         conn,
         &final_query,
@@ -187,7 +188,7 @@ fn run_search(
 // HyDE: generate hypothetical documents via Haiku, then embed via Voyage
 // ---------------------------------------------------------------------------
 
-/// Generate 3 diverse HyDE variants per query, concatenated into one text per query.
+/// Generate 3 diverse HyDE variants per query, concatenated into one text.
 /// Results are cached to eval/hyde_cache.json for reproducible eval runs.
 async fn generate_hyde_texts(queries: &[String], cache_path: &std::path::Path) -> Result<Vec<String>> {
     // Check cache first
@@ -214,7 +215,7 @@ async fn generate_hyde_texts(queries: &[String], cache_path: &std::path::Path) -
         "system": r#"You generate hypothetical news article snippets for search retrieval. For each query, write 3 DIFFERENT news snippets (labeled a, b, c) covering diverse angles of the topic.
 
 For example, "Italian politics latest" should have:
-a) A snippet about parliamentary legislation or Meloni's government
+a) A snippet about parliamentary legislation or Meloni's government actions
 b) A snippet about Italian court decisions or legal matters
 c) A snippet about Italian elections or referendum results
 
@@ -247,18 +248,18 @@ etc."#,
 
     let response: serde_json::Value = resp.json().await?;
     let text = response["content"][0]["text"].as_str().unwrap_or("");
+    parse_hyde_response(text, queries, cache_path)
+}
 
-    // Parse [Na], [Nb], [Nc] lines and concatenate per query
+fn parse_hyde_response(text: &str, queries: &[String], cache_path: &std::path::Path) -> Result<Vec<String>> {
     let mut per_query: Vec<Vec<String>> = vec![Vec::new(); queries.len()];
 
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
-        // Match patterns like [1a], [1b], [2a], etc.
         if let Some(rest) = trimmed.strip_prefix('[') {
             if let Some(bracket_end) = rest.find(']') {
                 let tag = &rest[..bracket_end];
-                // Extract number part
                 let num_str: String = tag.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(num) = num_str.parse::<usize>() {
                     let idx = num.saturating_sub(1);
