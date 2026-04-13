@@ -841,8 +841,8 @@ pub fn hybrid_search_with_hyde(
         }
         // Re-sort by score
         semantic.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        semantic.truncate(limit * 2);
     }
+    semantic.truncate(limit * 3);
 
     // 4. Merge results
     let mut merged = merge_results(&all_fts, &semantic);

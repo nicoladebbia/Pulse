@@ -109,8 +109,10 @@ pub async fn generate(
                         last_err = Some(format!("Voyage API error {}: {}", status, body));
                         continue;
                     }
-                    response = Some(resp.json().await?);
-                    break;
+                    match resp.json().await {
+                        Ok(parsed) => { response = Some(parsed); break; }
+                        Err(e) => { last_err = Some(format!("Failed to parse Voyage response: {}", e)); continue; }
+                    }
                 }
                 Err(e) => {
                     last_err = Some(format!("Voyage API request failed: {}", e));
