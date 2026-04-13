@@ -273,8 +273,9 @@ async fn fetch_single(
     let feed = feed_rs::parser::parse(&response[..])?;
     let mut articles = Vec::new();
 
-    // Only take articles from the last 24 hours
-    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    // Take articles from the last 48 hours (pipeline runs at 8 AM + 9 PM,
+    // 48h covers timezone gaps and feeds with stale pub dates)
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(48);
 
     for entry in feed.entries.iter().take(20) {
         let pub_date = entry.published.or(entry.updated);

@@ -102,7 +102,8 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let raw_articles: Vec<_> = all_articles.into_iter()
         .filter(|a| !a.sector.starts_with("freedom_"))
         .collect();
-    tracing::info!("Collected {} raw articles (excluding freedom sources)", raw_articles.len());
+    let raw_count = raw_articles.len();
+    tracing::info!("Collected {} raw articles (excluding freedom sources)", raw_count);
 
     // Phase 2: Deduplicate
     progress.start_stage(2);
@@ -160,7 +161,14 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     tracing::info!("Phase 3: Summarizing {} stories...", articles_to_summarize.len());
     let summaries = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress)).await?;
     let sum_count = summaries.len() as i64;
+    let sum_failed = articles_to_summarize.len() as i64 - sum_count;
     log_usage(db_path, "groq", "llama-3.1-8b-instant", "summarize", sum_count * 500, sum_count * 300);
+
+    if sum_failed > 0 {
+        tracing::warn!("Summarized {}/{} stories ({} failed)", sum_count, articles_to_summarize.len(), sum_failed);
+    } else {
+        tracing::info!("Summarized all {} stories successfully", sum_count);
+    }
 
     if summaries.is_empty() {
         anyhow::bail!("No stories could be summarized — all API calls failed. Aborting to avoid storing empty briefing.");
@@ -325,7 +333,34 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     send_notification(analysis.curated_stories.len())?;
 
     let duration = start.elapsed();
-    tracing::info!("Pipeline complete in {:.1}s", duration.as_secs_f64());
+
+    // Pipeline health summary — write to DB and log
+    {
+        let conn = rusqlite::Connection::open(db_path)?;
+        crate::db::run_migrations(&conn)?;
+
+        let total_stories: i64 = conn.query_row("SELECT COUNT(*) FROM stories", [], |r| r.get(0)).unwrap_or(0);
+        let total_embeddings: i64 = conn.query_row("SELECT COUNT(*) FROM story_embeddings WHERE story_id > 0", [], |r| r.get(0)).unwrap_or(0);
+        let emb_pct = if total_stories > 0 { (total_embeddings as f64 / total_stories as f64) * 100.0 } else { 0.0 };
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT INTO pipeline_health (run_date, stories_fetched, stories_summarized, stories_embedded, embedding_coverage_pct, summary_failures, duration_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![today, raw_count, analysis.curated_stories.len(), total_embeddings, emb_pct, sum_failed, duration.as_secs_f64()],
+        ).ok();
+
+        tracing::info!("╔══════════════════════════════════════════╗");
+        tracing::info!("║         PIPELINE HEALTH SUMMARY          ║");
+        tracing::info!("╠══════════════════════════════════════════╣");
+        tracing::info!("║ Articles fetched:    {:>6}              ║", raw_count);
+        tracing::info!("║ Stories summarized:  {:>6}              ║", analysis.curated_stories.len());
+        tracing::info!("║ Summary failures:    {:>6}              ║", sum_failed);
+        tracing::info!("║ Embedding coverage:  {:>5.1}%              ║", emb_pct);
+        tracing::info!("║ Total stories in DB: {:>6}              ║", total_stories);
+        tracing::info!("║ Duration:            {:>5.1}s              ║", duration.as_secs_f64());
+        tracing::info!("╚══════════════════════════════════════════╝");
+    }
 
     Ok(())
 }

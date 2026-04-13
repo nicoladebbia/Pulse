@@ -242,21 +242,69 @@ impl GroqClient {
             article.source_name, article.title, article.url, article.content_snippet, article.sector
         );
 
-        let text = self.call(FAST_MODEL, system, &user_msg, 2000).await?;
-        let parsed: SummaryResponse = serde_json::from_str(&extract_json(&text))?;
+        // Retry once on transient failures (connection errors, 429, 500)
+        let mut last_err = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
 
-        Ok(SummarizedStory {
-            article: article.clone(),
-            headline: parsed.headline,
-            summary: parsed.summary,
-            key_facts: parsed.key_facts,
-            why_it_matters: parsed.why_it_matters,
-            what_to_watch: parsed.what_to_watch,
-            importance_score: parsed.importance_score,
-            sentiment: parsed.sentiment,
-            novelty: parsed.novelty,
-            event_type: parsed.event_type,
-        })
+            let text = match self.call(FAST_MODEL, system, &user_msg, 2000).await {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            let json_str = extract_json(&text);
+            match serde_json::from_str::<SummaryResponse>(&json_str) {
+                Ok(parsed) => {
+                    return Ok(SummarizedStory {
+                        article: article.clone(),
+                        headline: parsed.headline,
+                        summary: parsed.summary,
+                        key_facts: parsed.key_facts,
+                        why_it_matters: parsed.why_it_matters,
+                        what_to_watch: parsed.what_to_watch,
+                        importance_score: parsed.importance_score,
+                        sentiment: parsed.sentiment,
+                        novelty: parsed.novelty,
+                        event_type: parsed.event_type,
+                    });
+                }
+                Err(e) => {
+                    // Try lenient parse: fill missing fields with defaults
+                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        if let Some(obj) = val.as_object_mut() {
+                            obj.entry("importance_score").or_insert(serde_json::json!(5));
+                            obj.entry("sentiment").or_insert(serde_json::json!("neutral"));
+                            obj.entry("novelty").or_insert(serde_json::json!("incremental"));
+                            obj.entry("event_type").or_insert(serde_json::json!("development"));
+                            obj.entry("what_to_watch").or_insert(serde_json::json!(""));
+                            if let Ok(parsed) = serde_json::from_value::<SummaryResponse>(val) {
+                                return Ok(SummarizedStory {
+                                    article: article.clone(),
+                                    headline: parsed.headline,
+                                    summary: parsed.summary,
+                                    key_facts: parsed.key_facts,
+                                    why_it_matters: parsed.why_it_matters,
+                                    what_to_watch: parsed.what_to_watch,
+                                    importance_score: parsed.importance_score,
+                                    sentiment: parsed.sentiment,
+                                    novelty: parsed.novelty,
+                                    event_type: parsed.event_type,
+                                });
+                            }
+                        }
+                    }
+                    last_err = Some(e.into());
+                    continue;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("summarize_story failed after retries")))
     }
 
     pub async fn analyze(&self, stories: &[SummarizedStory]) -> anyhow::Result<AnalysisResult> {

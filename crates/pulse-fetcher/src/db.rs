@@ -12,6 +12,7 @@ const MIGRATION_009: &str = include_str!("../../../migrations/009_multiple_daily
 const MIGRATION_010: &str = include_str!("../../../migrations/010_trajectory_labels.sql");
 const MIGRATION_011: &str = include_str!("../../../migrations/011_rename_financial_to_wealth.sql");
 const MIGRATION_015: &str = include_str!("../../../migrations/015_entity_aliases.sql");
+const MIGRATION_016: &str = include_str!("../../../migrations/016_feed_health.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -158,6 +159,14 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_015)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (15)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 16: Feed health + pipeline health tables
+    if !applied.contains(&16) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_016)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (16)", [])?;
         tx.commit()?;
     }
 

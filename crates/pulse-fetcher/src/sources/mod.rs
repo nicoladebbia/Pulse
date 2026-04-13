@@ -25,9 +25,45 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
     );
 
     let mut articles = Vec::new();
-    articles.extend(google.unwrap_or_default());
-    articles.extend(rss.unwrap_or_default());
-    articles.extend(hn.unwrap_or_default());
+    let mut failed_sources = Vec::new();
+
+    match google {
+        Ok(a) => {
+            tracing::info!("Google News: {} articles", a.len());
+            articles.extend(a);
+        }
+        Err(e) => {
+            tracing::error!("Google News FAILED: {}", e);
+            failed_sources.push("Google News");
+        }
+    }
+    match rss {
+        Ok(a) => {
+            tracing::info!("RSS feeds: {} articles", a.len());
+            articles.extend(a);
+        }
+        Err(e) => {
+            tracing::error!("RSS feeds FAILED: {}", e);
+            failed_sources.push("RSS feeds");
+        }
+    }
+    match hn {
+        Ok(a) => {
+            tracing::info!("Hacker News: {} articles", a.len());
+            articles.extend(a);
+        }
+        Err(e) => {
+            tracing::error!("Hacker News FAILED: {}", e);
+            failed_sources.push("Hacker News");
+        }
+    }
+
+    if !failed_sources.is_empty() {
+        tracing::warn!("SOURCE HEALTH: {} source(s) failed: {}", failed_sources.len(), failed_sources.join(", "));
+    }
+    if articles.len() < 50 {
+        tracing::warn!("SOURCE HEALTH: only {} total articles (expected 100+)", articles.len());
+    }
 
     Ok(articles)
 }
