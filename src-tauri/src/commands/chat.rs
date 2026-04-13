@@ -365,15 +365,28 @@ pub async fn chat_send(
     };
     let (expanded, query_embedding) = tokio::join!(rewrite_fut, embed_fut);
 
+    // HyDE recovery + entity expansion
+    let hyde_embedding: Option<Vec<f32>> = if expanded.semantic_text != expanded.original && expanded.semantic_text.len() > 20 {
+        match embeddings::VoyageProvider::from_env() {
+            Ok(provider) => provider.embed(&[expanded.semantic_text.clone()], "query").await.ok().and_then(|mut e| if e.is_empty() { None } else { Some(e.swap_remove(0)) }),
+            Err(_) => None,
+        }
+    } else { None };
+
+    let expanded_fts = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        search::expand_query_with_entities(&conn, &expanded.fts_keywords)
+    };
+
     let stories = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        search::hybrid_search(&conn, &expanded.fts_keywords, query_embedding.as_deref(), 25, query_type, None)
+        search::hybrid_search_with_hyde(&conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(), 25, query_type, None)
             .map_err(|e| e.to_string())?
     };
 
     // 3.5. Voyage rerank (falls back to Haiku, then to original order)
     let stories = if stories.len() > 6 {
-        let reranked = search::voyage_rerank(&message, stories.clone(), 10).await;
+        let reranked = search::voyage_rerank(&expanded_fts, stories.clone(), 10).await;
         if reranked.len() == stories.len() && reranked.first().map(|s| s.story_id) == stories.first().map(|s| s.story_id) {
             reranking::llm_rerank(&api_key, &message, stories, 10).await
         } else {
@@ -511,8 +524,19 @@ pub async fn chat_send(
         (entity_ctx, signal_ctx, causal_ctx, contrarian_ctx, pattern_ctx, pred_ctx, prof)
     };
 
-    // 5. Build system prompt
-    let stories_context = conversation::format_stories_context(&stories);
+    // 5. Build system prompt with prediction calibration
+    let stories_context = conversation::format_stories_context(&stories, query_type);
+    let prediction_calibration = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        match predictions::get_prediction_stats(&conn) {
+            Ok(stats) if stats.total > 0 => {
+                format!("Predictions made: {} total. Validated: {} ({:.0}% accuracy). Invalidated: {}. Active: {}.",
+                    stats.total, stats.validated + stats.partially_validated,
+                    stats.accuracy_rate * 100.0, stats.invalidated, stats.active)
+            }
+            _ => String::new(),
+        }
+    };
     let system_prompt = conversation::build_system_prompt(
         &profile_str,
         &stories_context,
@@ -522,6 +546,7 @@ pub async fn chat_send(
         &contrarian_context,
         &pattern_context,
         &predictions_context,
+        &prediction_calibration,
     );
 
     // 6. Load conversation history
@@ -740,10 +765,34 @@ pub async fn chat_send_stream(
 
     let (expanded, query_embedding) = tokio::join!(rewrite_fut, embed_fut);
 
+    // 3.1 HyDE recovery: if rewrite produced a meaningfully different semantic text,
+    // do a second embedding and pass both to hybrid_search for merged results
+    let hyde_embedding: Option<Vec<f32>> = if expanded.semantic_text != expanded.original && expanded.semantic_text.len() > 20 {
+        match embeddings::VoyageProvider::from_env() {
+            Ok(provider) => {
+                match provider.embed(&[expanded.semantic_text.clone()], "query").await {
+                    Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
+                    _ => None,
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    // 3.2 Entity alias expansion
+    let expanded_fts = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        search::expand_query_with_entities(&conn, &expanded.fts_keywords)
+    };
+
     let stories = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        search::hybrid_search(&conn, &expanded.fts_keywords, query_embedding.as_deref(), 25, query_type, None)
-            .map_err(|e| e.to_string())?
+        search::hybrid_search_with_hyde(
+            &conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(),
+            25, query_type, None,
+        ).map_err(|e| e.to_string())?
     };
 
     on_event.send(ChatStreamEvent::Searching {
@@ -757,7 +806,7 @@ pub async fn chat_send_stream(
             stage: "reranking".into(),
             detail: "Ranking by relevance...".into(),
         }).ok();
-        let reranked = search::voyage_rerank(&message, stories.clone(), 10).await;
+        let reranked = search::voyage_rerank(&expanded_fts, stories.clone(), 10).await;
         // If Voyage returned same order (fallback), try Haiku as secondary fallback
         if reranked.len() == stories.len() && reranked.first().map(|s| s.story_id) == stories.first().map(|s| s.story_id) {
             reranking::llm_rerank(&api_key, &message, stories, 10).await
@@ -912,11 +961,23 @@ pub async fn chat_send_stream(
         (entity_ctx, signal_ctx, causal_ctx, contrarian_ctx, pattern_ctx, pred_ctx, prof)
     };
 
-    // 5. Build system prompt
-    let stories_context = conversation::format_stories_context(&stories);
+    // 5. Build system prompt with prediction calibration
+    let stories_context = conversation::format_stories_context(&stories, query_type);
+    let prediction_calibration = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        match predictions::get_prediction_stats(&conn) {
+            Ok(stats) if stats.total > 0 => {
+                format!("Predictions made: {} total. Validated: {} ({:.0}% accuracy). Invalidated: {}. Active: {}.",
+                    stats.total, stats.validated + stats.partially_validated,
+                    stats.accuracy_rate * 100.0, stats.invalidated, stats.active)
+            }
+            _ => String::new(),
+        }
+    };
     let mut system_prompt = conversation::build_system_prompt(
         &profile_str, &stories_context, &entity_context, &signal_context,
         &causal_context, &contrarian_context, &pattern_context, &predictions_context,
+        &prediction_calibration,
     );
 
     // Append web search results if available

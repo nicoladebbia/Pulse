@@ -289,13 +289,14 @@ pub fn fts_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(i
     }
 
     let result = (|| -> Result<Vec<(i64, f32)>> {
+        // BM25 with field weights: headline=50, summary=1, key_facts=5, why_it_matters=5
         let mut stmt = conn
             .prepare(
-                "SELECT s.id, rank
+                "SELECT s.id, bm25(stories_fts, 50.0, 1.0, 5.0, 5.0) as score
                  FROM stories_fts
                  JOIN stories s ON s.id = stories_fts.rowid
                  WHERE stories_fts MATCH ?1
-                 ORDER BY rank
+                 ORDER BY score
                  LIMIT ?2",
             )
             .context("failed to prepare FTS5 query")?;
@@ -623,8 +624,56 @@ fn apply_recency_decay(
 // Full hybrid search
 // ---------------------------------------------------------------------------
 
-/// Full hybrid search: FTS5 + semantic (if embeddings available).
-/// Falls back to FTS-only if no embeddings or embedding query fails.
+/// Simple word-overlap similarity between two headlines.
+/// Returns 0.0 to 1.0 (Jaccard similarity on word sets).
+fn headline_word_overlap(a: &str, b: &str) -> f32 {
+    let lower_a = a.to_lowercase();
+    let lower_b = b.to_lowercase();
+    let words_a: std::collections::HashSet<&str> = lower_a.split_whitespace().collect();
+    let words_b: std::collections::HashSet<&str> = lower_b.split_whitespace().collect();
+    if words_a.is_empty() || words_b.is_empty() { return 0.0; }
+    let intersection = words_a.intersection(&words_b).count();
+    let union = words_a.union(&words_b).count();
+    if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+}
+
+/// Expand a query with known entity aliases from the entities table.
+/// E.g., "NVDA earnings" → "NVDA earnings OR Nvidia"
+pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let mut aliases: Vec<String> = Vec::new();
+
+    for word in &words {
+        if word.len() < 2 { continue; }
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if clean.is_empty() { continue; }
+
+        // Look up entities matching this word
+        let pattern = format!("%{}%", clean);
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT name FROM entities WHERE LOWER(name) LIKE LOWER(?1) LIMIT 3"
+        ) {
+            if let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
+                for name in rows.flatten() {
+                    let lower_name = name.to_lowercase();
+                    let lower_query = query.to_lowercase();
+                    if !lower_query.contains(&lower_name) && name.len() > 2 {
+                        aliases.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    if aliases.is_empty() {
+        query.to_string()
+    } else {
+        tracing::info!("Entity expansion: added {} aliases", aliases.len());
+        format!("{} {}", query, aliases.join(" "))
+    }
+}
+
+/// Backward-compatible hybrid search (no HyDE).
 pub fn hybrid_search(
     conn: &Connection,
     query: &str,
@@ -633,22 +682,48 @@ pub fn hybrid_search(
     query_type: QueryType,
     date_from: Option<&str>,
 ) -> Result<Vec<ScoredStory>> {
+    hybrid_search_with_hyde(conn, query, query_embedding, None, limit, query_type, date_from)
+}
+
+/// Full hybrid search with dual semantic embeddings (raw query + HyDE).
+pub fn hybrid_search_with_hyde(
+    conn: &Connection,
+    query: &str,
+    query_embedding: Option<&[f32]>,
+    hyde_embedding: Option<&[f32]>,
+    limit: usize,
+    query_type: QueryType,
+    date_from: Option<&str>,
+) -> Result<Vec<ScoredStory>> {
     // 1. Run FTS search on daily stories
     let fts = fts_search(conn, query, limit * 2)?;
 
-    // 1b. Also search freedom stories (non-fatal if table doesn't exist yet)
+    // 1b. Also search freedom stories
     let fts_freedom = fts_search_freedoms(conn, query, limit).unwrap_or_default();
 
     // 2. Combine daily + freedom FTS results
     let mut all_fts = fts;
     all_fts.extend(fts_freedom);
 
-    // 3. Run semantic search if embedding provided (daily + freedom stories)
-    let semantic = if let Some(emb) = query_embedding {
-        super::embeddings::find_similar(conn, emb, limit * 2, 0.3).unwrap_or_default()
-    } else {
-        vec![]
-    };
+    // 3. Run semantic search — merge raw query + HyDE embeddings
+    let mut semantic: Vec<(i64, f32)> = Vec::new();
+    if let Some(emb) = query_embedding {
+        semantic.extend(super::embeddings::find_similar(conn, emb, limit * 2, 0.3).unwrap_or_default());
+    }
+    if let Some(hyde_emb) = hyde_embedding {
+        let hyde_results = super::embeddings::find_similar(conn, hyde_emb, limit * 2, 0.3).unwrap_or_default();
+        // Merge: keep max score per story
+        for (id, score) in hyde_results {
+            if let Some(existing) = semantic.iter_mut().find(|(eid, _)| *eid == id) {
+                existing.1 = existing.1.max(score);
+            } else {
+                semantic.push((id, score));
+            }
+        }
+        // Re-sort by score
+        semantic.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        semantic.truncate(limit * 2);
+    }
 
     // 4. Merge results
     let mut merged = merge_results(&all_fts, &semantic);
@@ -729,6 +804,25 @@ pub fn hybrid_search(
     // 7. Apply date filter if specified
     if let Some(from) = date_from {
         stories.retain(|s| s.date.as_str() >= from);
+    }
+
+    // 7.5. Deduplicate near-identical stories (max 2 per source, drop >75% headline overlap)
+    if stories.len() > 3 {
+        let mut deduped: Vec<ScoredStory> = Vec::with_capacity(stories.len());
+        let mut source_counts: HashMap<String, usize> = HashMap::new();
+        for story in stories {
+            // Max 2 stories from same source
+            let count = source_counts.entry(story.source_name.clone()).or_insert(0);
+            if *count >= 2 { continue; }
+            // Check headline overlap with already-kept stories
+            let dominated = deduped.iter().any(|kept| {
+                headline_word_overlap(&kept.headline, &story.headline) > 0.75
+            });
+            if dominated { continue; }
+            *count += 1;
+            deduped.push(story);
+        }
+        stories = deduped;
     }
 
     // 8. Apply feedback reputation boost (non-fatal)

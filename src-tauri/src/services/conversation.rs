@@ -260,16 +260,24 @@ pub fn build_system_prompt(
     contrarian_context: &str,
     pattern_context: &str,
     predictions_context: &str,
+    prediction_calibration: &str,
 ) -> String {
     let mut prompt = String::from(
-        r#"You are Pulse, an intelligence analyst. You track AI/LLMs, Miami Beach, Italian politics, and tech/innovation daily. You have deep temporal awareness of how stories evolve.
+        r#"You are Pulse, an intelligence analyst and forecaster. You track AI/LLMs, Miami Beach, Italian politics, and tech/innovation daily. You have deep temporal awareness of how stories evolve over time and make specific, actionable predictions.
 
-The reader is a tech founder in Miami Beach who builds AI/ML apps, Shopify tools, and iOS apps. Italian heritage, follows Serie A.
+The reader is a tech founder in Miami Beach who builds AI/ML apps, Shopify tools, and iOS apps. Italian heritage, follows Serie A. He wants specific, bold analysis — not hedging.
 
 RESPONSE STRUCTURE:
 Start with a direct opening statement — the bottom line, the direct answer, no preamble. Then use --- or ## headers to organize the analysis. End with what to watch going forward.
 
 When expressing uncertainty, use HIGH, MODERATE, or LOW inline.
+
+PREDICTION RULES:
+- When asked about stocks, investments, or future outcomes, give your BEST assessment based on the evidence in your archive. Name specific companies, give direction (bullish/bearish), state confidence, and cite the stories that support your view.
+- You are NOT a financial advisor. But you ARE an intelligence analyst who can say "Based on 15 stories showing X trend, entity Y has momentum, and catalyst Z is coming on [date], I assess [prediction] with [confidence]."
+- Use signal trajectory data (rising/declining/accelerating) to ground temporal predictions.
+- Reference specific upcoming events (earnings dates, policy deadlines, product launches) when they appear in stories.
+- When past predictions are provided, use your accuracy track record to calibrate confidence. If you've been 80% right on AI predictions, lean into those. If 30% on geopolitics, be more cautious.
 
 RULES:
 - Lead with the conclusion, not the setup
@@ -279,7 +287,6 @@ RULES:
 - When you spot a pattern across time, call it out
 - Keep total response under 300 words for simple factual questions, under 500 words for analysis. Be dense, not verbose.
 - Never list more than 5 bullet points in any section.
-- If asked for predictions, include confidence and reasoning
 - Never repeat section headers — one Bottom Line, one Analysis, one What to Watch. No duplicate ## headers.
 
 "#,
@@ -313,6 +320,10 @@ RULES:
         prompt.push_str("\n\nACTIVE PREDICTIONS:\n");
         prompt.push_str(predictions_context);
     }
+    if !prediction_calibration.is_empty() {
+        prompt.push_str("\n\nYOUR PREDICTION TRACK RECORD:\n");
+        prompt.push_str(prediction_calibration);
+    }
     if !profile_summary.is_empty() {
         prompt.push_str("\n\nUSER PROFILE:\n");
         prompt.push_str(profile_summary);
@@ -331,12 +342,15 @@ Suggest 2-4 follow-up questions. Use the types: "deeper" (drill into sub-topic),
 }
 
 /// Format scored stories into a context string for the prompt.
-/// Takes up to 8 stories and reorders them to mitigate the "lost in the
-/// middle" effect: highest-scored stories appear at the start and end.
-/// Research shows 5-8 stories is optimal — beyond that, irrelevant stories
-/// dilute focus and hurt answer faithfulness.
-pub fn format_stories_context(stories: &[super::search::ScoredStory]) -> String {
-    let selected: Vec<_> = stories.iter().take(8).collect();
+/// Format stories for the prompt. Dynamic context size based on query type:
+/// - Breaking/General: 8 stories (focused)
+/// - Analytical/Comparative: 12 stories (more breadth for prediction/analysis)
+pub fn format_stories_context(stories: &[super::search::ScoredStory], query_type: super::search::QueryType) -> String {
+    let max_stories = match query_type {
+        super::search::QueryType::Analytical | super::search::QueryType::Comparative => 12,
+        _ => 8,
+    };
+    let selected: Vec<_> = stories.iter().take(max_stories).collect();
     if selected.is_empty() {
         return "No stories found in archive.".to_string();
     }
@@ -1102,7 +1116,7 @@ mod tests {
                 source: super::super::search::StorySource::Daily,
             },
         ];
-        let formatted = format_stories_context(&stories);
+        let formatted = format_stories_context(&stories, crate::services::search::QueryType::General);
 
         assert!(formatted.contains("[ID:1]"));
         assert!(formatted.contains("[ai]"));
@@ -1176,7 +1190,7 @@ mod tests {
     #[test]
     fn test_format_stories_context_empty() {
         let stories: Vec<super::super::search::ScoredStory> = vec![];
-        let formatted = format_stories_context(&stories);
+        let formatted = format_stories_context(&stories, crate::services::search::QueryType::General);
         assert_eq!(formatted, "No stories found in archive.");
     }
 
@@ -1269,6 +1283,7 @@ mod tests {
             "Contrarian context here",
             "Pattern context here",
             "Predictions context here",
+            "Predictions made: 10 total. Validated: 7 (70% accuracy).",
         );
 
         assert!(prompt.contains("You are Pulse"));
