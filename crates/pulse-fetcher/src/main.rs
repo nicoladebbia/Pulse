@@ -134,8 +134,8 @@ async fn backfill_embeddings(db_path: &std::path::Path) -> anyhow::Result<()> {
 
     tracing::info!("Found {} stories without embeddings", stories.len());
 
-    // Process in batches of 20 (Voyage API limit)
-    for chunk in stories.chunks(20) {
+    // Process in batches of 10 (Voyage free tier: 10K TPM limit)
+    for chunk in stories.chunks(10) {
         let texts: Vec<String> = chunk.iter().map(|(_, headline, summary, key_facts)| {
             format!("{}. {}. {}", headline, summary, key_facts)
         }).collect();

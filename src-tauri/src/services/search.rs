@@ -414,11 +414,13 @@ fn like_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(i64,
 // Result merging
 // ---------------------------------------------------------------------------
 
-/// Merge FTS and semantic search results using Reciprocal Rank Fusion (RRF).
+/// Merge FTS and semantic search results using score-weighted Reciprocal Rank
+/// Fusion. Unlike standard RRF which only uses rank position, this incorporates
+/// the raw similarity scores so high-confidence semantic matches can compete
+/// with weak FTS hits.
 ///
-/// RRF works on rank positions, not raw scores, so there's no need to normalize
-/// across different scoring scales. Formula: score = Σ(1 / (k + rank))
-/// Results appearing in both lists naturally get higher scores.
+/// Formula: score = Σ(raw_score / (k + rank)) weighted by channel multiplier.
+/// Semantic gets a 1.5x boost because FTS produces more low-quality results.
 pub fn merge_results(
     fts_results: &[(i64, f32)],
     semantic_results: &[(i64, f32)],
@@ -431,15 +433,18 @@ pub fn merge_results(
     let mut fts_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut sem_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-    // Build RRF scores: score += 1 / (k + rank) for each list
+    // Build score-weighted RRF: raw_score / (k + rank), with semantic boost
+    const SEMANTIC_BOOST: f32 = 1.3;
     let mut scores: HashMap<i64, f32> = HashMap::new();
 
-    for (rank, &(id, _)) in fts_results.iter().enumerate() {
-        *scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+    for (rank, &(id, raw_score)) in fts_results.iter().enumerate() {
+        let contribution = raw_score.max(0.01) / (RRF_K + rank as f32 + 1.0);
+        *scores.entry(id).or_insert(0.0) += contribution;
         fts_set.insert(id);
     }
-    for (rank, &(id, _)) in semantic_results.iter().enumerate() {
-        *scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+    for (rank, &(id, raw_score)) in semantic_results.iter().enumerate() {
+        let contribution = SEMANTIC_BOOST * raw_score.max(0.01) / (RRF_K + rank as f32 + 1.0);
+        *scores.entry(id).or_insert(0.0) += contribution;
         sem_set.insert(id);
     }
 
@@ -822,10 +827,10 @@ pub fn hybrid_search_with_hyde(
     // 3. Run semantic search — merge raw query + HyDE embeddings
     let mut semantic: Vec<(i64, f32)> = Vec::new();
     if let Some(emb) = query_embedding {
-        semantic.extend(super::embeddings::find_similar(conn, emb, limit * 2, 0.3).unwrap_or_default());
+        semantic.extend(super::embeddings::find_similar(conn, emb, limit * 3, 0.2).unwrap_or_default());
     }
     if let Some(hyde_emb) = hyde_embedding {
-        let hyde_results = super::embeddings::find_similar(conn, hyde_emb, limit * 2, 0.3).unwrap_or_default();
+        let hyde_results = super::embeddings::find_similar(conn, hyde_emb, limit * 3, 0.2).unwrap_or_default();
         // Merge: keep max score per story
         for (id, score) in hyde_results {
             if let Some(existing) = semantic.iter_mut().find(|(eid, _)| *eid == id) {

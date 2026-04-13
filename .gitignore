@@ -12,3 +12,4 @@ src-tauri/binaries/
 
 # Codesight codebase maps
 .codesight/
+.plans/

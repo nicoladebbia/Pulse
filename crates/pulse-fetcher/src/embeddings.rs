@@ -33,7 +33,7 @@ pub async fn generate(
     let api_key = std::env::var("VOYAGE_API_KEY")
         .map_err(|_| anyhow::anyhow!("VOYAGE_API_KEY not set"))?;
 
-    let texts: Vec<String> = stories
+    let texts: Vec<(usize, String)> = stories
         .iter()
         .enumerate()
         .map(|(i, s)| {
@@ -41,7 +41,7 @@ pub async fn generate(
                 .and_then(|p| p.get(i))
                 .and_then(|p| p.as_deref())
                 .unwrap_or("");
-            if prefix.is_empty() {
+            let text = if prefix.is_empty() {
                 format!(
                     "{}. {}. {}",
                     s.headline,
@@ -56,7 +56,8 @@ pub async fn generate(
                     s.summary,
                     s.key_facts.join(", ")
                 )
-            }
+            };
+            (i, text)
         })
         .collect();
 
@@ -64,58 +65,79 @@ pub async fn generate(
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let request = EmbeddingRequest {
-        model: VOYAGE_MODEL.to_string(),
-        input: texts,
-        input_type: "document".to_string(),
-    };
 
-    // Retry once on transient failure
-    let mut last_err = None;
-    let mut response: Option<EmbeddingResponse> = None;
-    for attempt in 0..2 {
-        if attempt > 0 {
-            tracing::info!("Retrying Voyage API (attempt {})", attempt + 1);
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // Batch in chunks of 10 to stay under Voyage free-tier limits (10K TPM, 3 RPM)
+    const BATCH_SIZE: usize = 10;
+    let mut all_embeddings: Vec<StoryEmbedding> = Vec::with_capacity(texts.len());
+
+    for (batch_idx, chunk) in texts.chunks(BATCH_SIZE).enumerate() {
+        if batch_idx > 0 {
+            // Rate limit: free tier = 3 RPM, so wait 21s between batches
+            tracing::info!("Rate limit pause before batch {}...", batch_idx + 1);
+            tokio::time::sleep(std::time::Duration::from_secs(21)).await;
         }
-        match client
-            .post(VOYAGE_API_URL)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
-                    last_err = Some(format!("Voyage API error {}: {}", status, body));
+
+        let batch_texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
+        let batch_indices: Vec<usize> = chunk.iter().map(|(i, _)| *i).collect();
+
+        let request = EmbeddingRequest {
+            model: VOYAGE_MODEL.to_string(),
+            input: batch_texts,
+            input_type: "document".to_string(),
+        };
+
+        // Retry once on transient failure
+        let mut last_err = None;
+        let mut response: Option<EmbeddingResponse> = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tracing::info!("Retrying Voyage API batch {} (attempt {})", batch_idx + 1, attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            match client
+                .post(VOYAGE_API_URL)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let body = resp.text().await.unwrap_or_default();
+                        last_err = Some(format!("Voyage API error {}: {}", status, body));
+                        continue;
+                    }
+                    response = Some(resp.json().await?);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(format!("Voyage API request failed: {}", e));
                     continue;
                 }
-                response = Some(resp.json().await?);
-                break;
             }
-            Err(e) => {
-                last_err = Some(format!("Voyage API request failed: {}", e));
-                continue;
+        }
+
+        match response {
+            Some(resp) => {
+                for (j, d) in resp.data.into_iter().enumerate() {
+                    all_embeddings.push(StoryEmbedding {
+                        story_index: batch_indices[j],
+                        embedding: d.embedding,
+                    });
+                }
+                tracing::info!("Batch {}: embedded {} stories", batch_idx + 1, chunk.len());
+            }
+            None => {
+                tracing::warn!("Batch {} failed: {}", batch_idx + 1, last_err.unwrap_or_default());
+                // Continue with remaining batches — partial success is fine
             }
         }
     }
-    let response = response.ok_or_else(|| anyhow::anyhow!("{}", last_err.unwrap_or_default()))?;
 
-    let embeddings: Vec<StoryEmbedding> = response
-        .data
-        .into_iter()
-        .enumerate()
-        .map(|(i, d)| StoryEmbedding {
-            story_index: i,
-            embedding: d.embedding,
-        })
-        .collect();
-
-    tracing::info!("Generated {} embeddings", embeddings.len());
-    Ok(embeddings)
+    tracing::info!("Generated {} embeddings total", all_embeddings.len());
+    Ok(all_embeddings)
 }
 
 /// Generate embeddings from raw text strings (for backfill)

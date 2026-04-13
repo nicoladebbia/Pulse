@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write as IoWrite};
 use std::path::PathBuf;
 
-use pulse_lib::services::{embeddings, search};
+use pulse_lib::services::{embeddings::{self, EmbeddingProvider}, search};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -149,6 +150,8 @@ fn run_search(
     k: usize,
     no_graph: bool,
     no_entity_expand: bool,
+    query_embedding: Option<&[f32]>,
+    hyde_embedding: Option<&[f32]>,
 ) -> Result<Vec<search::ScoredStory>> {
     // Step 1: Entity alias expansion
     let expanded = if no_entity_expand {
@@ -165,38 +168,152 @@ fn run_search(
         graph_expanded
     };
 
-    // Step 3: Load query embedding from a representative story (no API call)
-    // We search with FTS + whatever embeddings are stored. No Voyage calls.
-    // For semantic search, we need a query embedding. We can approximate by
-    // finding the best FTS match and using its embedding as a proxy.
-    let query_embedding: Option<Vec<f32>> = {
-        let fts_results = search::fts_search(conn, &final_query, 1)?;
-        if let Some((story_id, _)) = fts_results.first() {
-            conn.query_row(
-                "SELECT embedding FROM story_embeddings WHERE story_id = ?1",
-                [story_id],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .ok()
-            .map(|blob| embeddings::deserialize_embedding(&blob))
-        } else {
-            None
-        }
-    };
-
-    // Step 4: Run hybrid search
+    // Step 3: Run hybrid search with pre-computed embeddings
     let query_type = search::classify_query_type(query);
     let stories = search::hybrid_search_with_hyde(
         conn,
         &final_query,
-        query_embedding.as_deref(),
-        None, // No HyDE embedding (would need API call)
-        k * 3, // Fetch more, then truncate
+        query_embedding,
+        hyde_embedding,
+        k * 3,
         query_type,
         None,
     )?;
 
     Ok(stories.into_iter().take(k).collect())
+}
+
+// ---------------------------------------------------------------------------
+// HyDE: generate hypothetical documents via Haiku, then embed via Voyage
+// ---------------------------------------------------------------------------
+
+/// Generate 3 diverse HyDE variants per query, concatenated into one text per query.
+/// Results are cached to eval/hyde_cache.json for reproducible eval runs.
+async fn generate_hyde_texts(queries: &[String], cache_path: &std::path::Path) -> Result<Vec<String>> {
+    // Check cache first
+    if cache_path.exists() {
+        let data = std::fs::read_to_string(cache_path)?;
+        let cached: HashMap<String, String> = serde_json::from_str(&data).unwrap_or_default();
+        if queries.iter().all(|q| cached.contains_key(q)) {
+            println!("  (loaded HyDE texts from cache)");
+            return Ok(queries.iter().map(|q| cached[q].clone()).collect());
+        }
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .context("ANTHROPIC_API_KEY not set")?;
+
+    let queries_text = queries.iter().enumerate()
+        .map(|(i, q)| format!("[{}] {}", i + 1, q))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let body = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 8000,
+        "system": r#"You generate hypothetical news article snippets for search retrieval. For each query, write 3 DIFFERENT news snippets (labeled a, b, c) covering diverse angles of the topic.
+
+For example, "Italian politics latest" should have:
+a) A snippet about parliamentary legislation or Meloni's government
+b) A snippet about Italian court decisions or legal matters
+c) A snippet about Italian elections or referendum results
+
+Each snippet should be 2-3 sentences with specific names, companies, places, and terms that real articles would use.
+
+Format:
+[1a] snippet...
+[1b] snippet...
+[1c] snippet...
+[2a] snippet...
+etc."#,
+        "messages": [{"role": "user", "content": format!("Generate 3 diverse hypothetical news snippets (a, b, c) for each query:\n{}", queries_text)}]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .context("Haiku API request failed")?;
+
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Haiku API error: {}", text);
+    }
+
+    let response: serde_json::Value = resp.json().await?;
+    let text = response["content"][0]["text"].as_str().unwrap_or("");
+
+    // Parse [Na], [Nb], [Nc] lines and concatenate per query
+    let mut per_query: Vec<Vec<String>> = vec![Vec::new(); queries.len()];
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        // Match patterns like [1a], [1b], [2a], etc.
+        if let Some(rest) = trimmed.strip_prefix('[') {
+            if let Some(bracket_end) = rest.find(']') {
+                let tag = &rest[..bracket_end];
+                // Extract number part
+                let num_str: String = tag.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(num) = num_str.parse::<usize>() {
+                    let idx = num.saturating_sub(1);
+                    if idx < queries.len() {
+                        let content = rest[bracket_end + 1..].trim();
+                        if !content.is_empty() {
+                            per_query[idx].push(content.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let hyde_texts: Vec<String> = per_query.iter()
+        .map(|variants| variants.join(" "))
+        .collect();
+
+    // Cache for reproducibility
+    let mut cache: HashMap<String, String> = HashMap::new();
+    for (i, q) in queries.iter().enumerate() {
+        cache.insert(q.clone(), hyde_texts.get(i).cloned().unwrap_or_default());
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&cache) {
+        let _ = std::fs::write(cache_path, json);
+    }
+
+    Ok(hyde_texts)
+}
+
+async fn batch_embed(texts: &[String], input_type: &str) -> Result<Vec<Option<Vec<f32>>>> {
+    let provider = embeddings::VoyageProvider::from_env()?;
+
+    // Filter out empty texts, track indices
+    let non_empty: Vec<(usize, &String)> = texts.iter().enumerate()
+        .filter(|(_, t)| !t.is_empty())
+        .collect();
+
+    if non_empty.is_empty() {
+        return Ok(vec![None; texts.len()]);
+    }
+
+    let batch_texts: Vec<String> = non_empty.iter().map(|(_, t)| (*t).clone()).collect();
+    let batch_indices: Vec<usize> = non_empty.iter().map(|(i, _)| *i).collect();
+
+    // All 14 queries easily fit in one Voyage call (< 10K tokens)
+    let embeddings_result = provider.embed(&batch_texts, input_type).await?;
+
+    let mut result: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+    for (j, emb) in embeddings_result.into_iter().enumerate() {
+        if let Some(&idx) = batch_indices.get(j) {
+            result[idx] = Some(emb);
+        }
+    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +357,7 @@ fn run_judge_mode(conn: &Connection, args: &Args) -> Result<()> {
         }
         println!("{}", "-".repeat(70));
 
-        let results = run_search(conn, query, args.k, args.no_graph, args.no_entity_expand)?;
+        let results = run_search(conn, query, args.k, args.no_graph, args.no_entity_expand, None, None)?;
 
         if results.is_empty() {
             println!("  (no results found)");
@@ -322,7 +439,7 @@ fn run_judge_mode(conn: &Connection, args: &Args) -> Result<()> {
 // Eval mode
 // ---------------------------------------------------------------------------
 
-fn run_eval(conn: &Connection, args: &Args) -> Result<()> {
+fn run_eval(conn: &Connection, args: &Args, rt: &tokio::runtime::Runtime) -> Result<()> {
     let data = std::fs::read_to_string(&args.cases)
         .context("Failed to read cases file. Run with --judge first to create ground truth.")?;
     let cases: EvalCases = serde_json::from_str(&data)?;
@@ -338,10 +455,56 @@ fn run_eval(conn: &Connection, args: &Args) -> Result<()> {
         return Ok(());
     }
 
+    // Pre-compute all query embeddings in one batch
+    let queries: Vec<String> = judged_cases.iter().map(|c| c.query.clone()).collect();
+    println!("Embedding {} queries via Voyage...", queries.len());
+    let query_embeddings = rt.block_on(batch_embed(&queries, "query"))
+        .unwrap_or_else(|e| {
+            eprintln!("  [warn] Query embedding failed: {}", e);
+            vec![None; queries.len()]
+        });
+
+    // Pre-compute HyDE: generate hypothetical docs, then embed
+    let hyde_cache = args.cases.with_file_name("hyde_cache.json");
+    let hyde_embeddings: Vec<Option<Vec<f32>>> = if !args.no_hyde {
+        println!("Generating HyDE texts via Haiku...");
+        match rt.block_on(generate_hyde_texts(&queries, &hyde_cache)) {
+            Ok(hyde_texts) => {
+                for (i, ht) in hyde_texts.iter().enumerate() {
+                    if !ht.is_empty() {
+                        eprintln!("  HyDE [{}]: {}", queries[i], truncate(ht, 80));
+                    }
+                }
+                // Wait for rate limit before second Voyage call
+                println!("Embedding HyDE texts via Voyage...");
+                std::thread::sleep(std::time::Duration::from_secs(21));
+                rt.block_on(batch_embed(&hyde_texts, "document"))
+                    .unwrap_or_else(|e| {
+                        eprintln!("  [warn] HyDE embedding failed: {}", e);
+                        vec![None; queries.len()]
+                    })
+            }
+            Err(e) => {
+                eprintln!("  [warn] HyDE generation failed: {}", e);
+                vec![None; queries.len()]
+            }
+        }
+    } else {
+        vec![None; queries.len()]
+    };
+
     let mut results: Vec<QueryResult> = Vec::new();
 
-    for case in &judged_cases {
-        let stories = run_search(conn, &case.query, args.k, args.no_graph, args.no_entity_expand)?;
+    for (i, case) in judged_cases.iter().enumerate() {
+        let stories = run_search(
+            conn,
+            &case.query,
+            args.k,
+            args.no_graph,
+            args.no_entity_expand,
+            query_embeddings[i].as_deref(),
+            hyde_embeddings[i].as_deref(),
+        )?;
 
         let (recall, found, hits, misses) =
             compute_recall(&case.expected_headlines, &stories, args.k);
@@ -481,10 +644,12 @@ fn main() -> Result<()> {
         story_count, embedding_count, entity_count
     );
 
+    let rt = tokio::runtime::Runtime::new()?;
+
     if args.judge {
         run_judge_mode(&conn, &args)?;
     } else {
-        run_eval(&conn, &args)?;
+        run_eval(&conn, &args, &rt)?;
     }
 
     Ok(())
