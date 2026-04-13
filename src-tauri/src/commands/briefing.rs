@@ -97,6 +97,35 @@ fn log(msg: &str) {
     }
 }
 
+fn load_briefing_by_id(conn: &rusqlite::Connection, briefing_id: i64) -> Result<Option<BriefingWithStories>, String> {
+    log(&format!("Loading briefing by id: {}", briefing_id));
+
+    let briefing: Option<Briefing> = conn
+        .query_row(
+            "SELECT id, date, story_count, ai_count, miami_count, italy_count, tech_count, status, created_at, briefing_type, executive_summary, time_label
+             FROM briefings WHERE id = ?1",
+            [briefing_id],
+            read_briefing,
+        )
+        .ok();
+
+    let Some(briefing) = briefing else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(STORIES_SQL).map_err(|e| e.to_string())?;
+    let stories: Vec<Story> = stmt
+        .query_map([briefing.id], read_story)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let hero_story = stories.iter().find(|s| s.is_hero).cloned();
+    let connections = load_connections(conn, briefing.id);
+
+    Ok(Some(BriefingWithStories { briefing, stories, hero_story, connections }))
+}
+
 fn load_briefing(conn: &rusqlite::Connection, date: &str) -> Result<Option<BriefingWithStories>, String> {
     log(&format!("Loading briefing for date: {}", date));
 
@@ -172,6 +201,12 @@ pub fn get_today_briefing(db: State<DbState>) -> Result<Option<BriefingWithStori
 pub fn get_briefing_by_date(db: State<DbState>, date: String) -> Result<Option<BriefingWithStories>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     load_briefing(&conn, &date)
+}
+
+#[tauri::command]
+pub fn get_briefing_by_id(db: State<DbState>, briefing_id: i64) -> Result<Option<BriefingWithStories>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    load_briefing_by_id(&conn, briefing_id)
 }
 
 #[tauri::command]

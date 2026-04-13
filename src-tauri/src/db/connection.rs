@@ -15,6 +15,8 @@ pub const MIGRATION_008: &str = include_str!("../../../migrations/008_intelligen
 pub const MIGRATION_009: &str = include_str!("../../../migrations/009_multiple_daily_briefings.sql");
 pub const MIGRATION_010: &str = include_str!("../../../migrations/010_trajectory_labels.sql");
 pub const MIGRATION_011: &str = include_str!("../../../migrations/011_rename_financial_to_wealth.sql");
+pub const MIGRATION_012: &str = include_str!("../../../migrations/012_chat_feedback.sql");
+pub const MIGRATION_013: &str = include_str!("../../../migrations/013_feedback_reputation.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -182,6 +184,22 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_011)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 12: Chat feedback table
+    if !applied.contains(&12) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_012)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 13: Feedback reputation cache
+    if !applied.contains(&13) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_013)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
         tx.commit()?;
     }
 

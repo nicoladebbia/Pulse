@@ -31,6 +31,10 @@ export const isFetching = writable(false);
 export const fetchProgress = writable<FetchStatus | null>(null);
 export const fetchDone = writable(false);
 export const fetchError = writable<string | null>(null);
+export const fetchEta = writable<{ eta_secs: number | null; elapsed_secs: number | null }>({ eta_secs: null, elapsed_secs: null });
+
+// Smoothed ETA: only allow increases up to 15% of previous value to prevent bouncing
+let lastSmoothedEta: number | null = null;
 export const stages = writable<StageState[]>(
 	FETCH_STAGES.map(s => ({ id: s.id, label: s.label, status: 'pending' as StageStatus, detail: null, percent: null }))
 );
@@ -42,9 +46,26 @@ function resetStages() {
 	highestSeenStage = -1;
 	animationQueue = [];
 	animating = false;
+	lastSmoothedEta = null;
+	fetchEta.set({ eta_secs: null, elapsed_secs: null });
 	stages.set(
 		FETCH_STAGES.map(s => ({ id: s.id, label: s.label, status: 'pending', detail: null, percent: null }))
 	);
+}
+
+function updateSmoothedEta(rawEta: number | null, elapsed: number | null) {
+	if (rawEta == null) {
+		fetchEta.set({ eta_secs: lastSmoothedEta, elapsed_secs: elapsed });
+		return;
+	}
+	if (lastSmoothedEta == null) {
+		lastSmoothedEta = rawEta;
+	} else {
+		// Allow decreases freely, but cap increases at 15% of previous
+		const maxAllowed = lastSmoothedEta * 1.15;
+		lastSmoothedEta = Math.min(rawEta, maxAllowed);
+	}
+	fetchEta.set({ eta_secs: Math.round(lastSmoothedEta), elapsed_secs: elapsed });
 }
 
 // Track the highest stage index we've seen so we can animate one at a time
@@ -154,6 +175,7 @@ export async function triggerFetch() {
 				const status: FetchStatus = await ipc.invoke('get_fetch_status');
 				fetchProgress.set(status);
 				updateStagesFromProgress(status);
+				updateSmoothedEta(status.eta_secs ?? null, status.elapsed_secs ?? null);
 
 				if (status.stage === 'failed') {
 					stopPolling();

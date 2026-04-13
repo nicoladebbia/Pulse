@@ -277,8 +277,10 @@ RULES:
 - Use concrete details: names, dates, numbers, not vague references
 - If the archive doesn't cover a topic, say so plainly
 - When you spot a pattern across time, call it out
-- Keep it tight: 2-4 paragraphs in the Analysis section for most questions
+- Keep total response under 300 words for simple factual questions, under 500 words for analysis. Be dense, not verbose.
+- Never list more than 5 bullet points in any section.
 - If asked for predictions, include confidence and reasoning
+- Never repeat section headers — one Bottom Line, one Analysis, one What to Watch. No duplicate ## headers.
 
 "#,
     );
@@ -329,10 +331,12 @@ Suggest 2-4 follow-up questions. Use the types: "deeper" (drill into sub-topic),
 }
 
 /// Format scored stories into a context string for the prompt.
-/// Takes up to 15 stories and reorders them to mitigate the "lost in the
+/// Takes up to 8 stories and reorders them to mitigate the "lost in the
 /// middle" effect: highest-scored stories appear at the start and end.
+/// Research shows 5-8 stories is optimal — beyond that, irrelevant stories
+/// dilute focus and hurt answer faithfulness.
 pub fn format_stories_context(stories: &[super::search::ScoredStory]) -> String {
-    let selected: Vec<_> = stories.iter().take(15).collect();
+    let selected: Vec<_> = stories.iter().take(8).collect();
     if selected.is_empty() {
         return "No stories found in archive.".to_string();
     }
@@ -593,6 +597,15 @@ pub fn clean_response(response: &str) -> String {
         }
     }
 
+    // Remove [entity: ...] markers
+    while let Some(start) = result.find("[entity:") {
+        if let Some(end) = result[start..].find(']') {
+            result.replace_range(start..start + end + 1, "");
+        } else {
+            break;
+        }
+    }
+
     // Clean up double spaces and trim
     while result.contains("  ") {
         result = result.replace("  ", " ");
@@ -622,7 +635,8 @@ pub struct ClaudeConversation {
 }
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const CONVERSATION_MODEL: &str = "claude-sonnet-4-6";
+pub const CONVERSATION_MODEL_FAST: &str = "claude-haiku-4-5-20251001";
+pub const CONVERSATION_MODEL_DEEP: &str = "claude-sonnet-4-6";
 
 impl ClaudeConversation {
     pub fn new(api_key: &str) -> Self {
@@ -656,6 +670,18 @@ impl ConversationLLM for ClaudeConversation {
         system: &str,
         messages: &[(String, String)],
     ) -> Result<String> {
+        self.send_message_with_model(system, messages, CONVERSATION_MODEL_FAST, 1200).await
+    }
+}
+
+impl ClaudeConversation {
+    pub async fn send_message_with_model(
+        &self,
+        system: &str,
+        messages: &[(String, String)],
+        model: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|(role, content)| {
@@ -667,8 +693,8 @@ impl ConversationLLM for ClaudeConversation {
             .collect();
 
         let body = serde_json::json!({
-            "model": CONVERSATION_MODEL,
-            "max_tokens": 2000,
+            "model": model,
+            "max_tokens": max_tokens,
             "system": system,
             "messages": api_messages,
         });
@@ -712,6 +738,8 @@ impl ClaudeConversation {
         &self,
         system: &str,
         messages: &[(String, String)],
+        model: &str,
+        max_tokens: u32,
         on_chunk: F,
     ) -> Result<String>
     where
@@ -725,8 +753,8 @@ impl ClaudeConversation {
             .collect();
 
         let body = serde_json::json!({
-            "model": CONVERSATION_MODEL,
-            "max_tokens": 2000,
+            "model": model,
+            "max_tokens": max_tokens,
             "stream": true,
             "system": system,
             "messages": api_messages,

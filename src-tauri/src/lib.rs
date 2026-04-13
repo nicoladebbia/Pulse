@@ -46,6 +46,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::briefing::get_today_briefing,
             commands::briefing::get_briefing_by_date,
+            commands::briefing::get_briefing_by_id,
             commands::briefing::list_briefings,
             commands::stories::get_stories_by_sector,
             commands::stories::get_story_detail,
@@ -61,6 +62,8 @@ pub fn run() {
             commands::chat::chat_get_thread,
             commands::chat::chat_delete_thread,
             commands::chat::get_chat_context,
+            commands::chat::submit_chat_feedback,
+            commands::chat::get_feedback_stats,
             commands::freedoms::get_today_freedoms,
             commands::freedoms::get_freedoms_by_date,
             commands::trends::get_trends,

@@ -2,7 +2,7 @@ use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, State};
 use crate::db::DbState;
-use crate::services::{api_usage, brave_search, conversation, conversation::ConversationLLM, search, reranking, profile, embeddings, embeddings::EmbeddingProvider, entities, signals, causality, contrarian, patterns, predictions};
+use crate::services::{api_usage, brave_search, conversation, search, reranking, profile, embeddings, embeddings::EmbeddingProvider, entities, signals, causality, contrarian, patterns, predictions, feedback};
 
 // ============ Streaming types ============
 
@@ -19,6 +19,8 @@ pub enum ChatStreamEvent {
         thread_title: Option<String>,
         proactive_connections: Vec<conversation::ProactiveInsight>,
         search_source: String, // "archive", "web", or "archive+web"
+        estimated_cost: f64,
+        model_used: String,
     },
     Error { message: String },
 }
@@ -327,35 +329,56 @@ pub async fn chat_send(
         profile::track_interest(&conn, &format!("interest:{}", topic)).ok();
     }
 
-    // 2.5. Query rewriting — expand keywords + generate HyDE answer (non-fatal)
+    // 2.5. Load conversation context for context-aware query rewriting
+    let conversation_context: Option<String> = if !is_new_thread {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let history = conversation::get_thread_messages(&conn, &thread.id)
+            .map_err(|e| e.to_string())?;
+        let recent: Vec<_> = history.iter().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        if recent.is_empty() {
+            None
+        } else {
+            Some(recent.iter().map(|m| format!("{}: {}", m.role, m.content)).collect::<Vec<_>>().join("\n"))
+        }
+    } else {
+        None
+    };
+
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| "ANTHROPIC_API_KEY not set. Add it to .env".to_string())?;
-    let expanded = search::rewrite_query(&api_key, &message).await;
 
-    // 3. Hybrid search — compute embedding on HyDE text for better semantic match
-    let query_embedding: Option<Vec<f32>> = match embeddings::VoyageProvider::from_env() {
-        Ok(provider) => {
-            match provider.embed(&[expanded.semantic_text.clone()], "query").await {
-                Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!("Query embedding failed (non-fatal): {}", e);
-                    None
+    let query_type = search::classify_query_type(&message);
+    tracing::info!("Query type: {:?}", query_type);
+
+    // 3. Parallel: rewrite query + embed raw query concurrently
+    let rewrite_fut = search::rewrite_query(&api_key, &message, conversation_context.as_deref());
+    let embed_fut = async {
+        match embeddings::VoyageProvider::from_env() {
+            Ok(provider) => {
+                match provider.embed(&[message.clone()], "query").await {
+                    Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
+                    _ => None,
                 }
             }
+            Err(_) => None,
         }
-        Err(_) => None,
     };
+    let (expanded, query_embedding) = tokio::join!(rewrite_fut, embed_fut);
 
     let stories = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        search::hybrid_search(&conn, &expanded.fts_keywords, query_embedding.as_deref(), 25)
+        search::hybrid_search(&conn, &expanded.fts_keywords, query_embedding.as_deref(), 25, query_type, None)
             .map_err(|e| e.to_string())?
     };
 
-    // 3.5. LLM rerank — refine top 25 into top 15 by true relevance (non-fatal)
+    // 3.5. Voyage rerank (falls back to Haiku, then to original order)
     let stories = if stories.len() > 6 {
-        reranking::llm_rerank(&api_key, &message, stories, 15).await
+        let reranked = search::voyage_rerank(&message, stories.clone(), 10).await;
+        if reranked.len() == stories.len() && reranked.first().map(|s| s.story_id) == stories.first().map(|s| s.story_id) {
+            reranking::llm_rerank(&api_key, &message, stories, 10).await
+        } else {
+            reranked
+        }
     } else {
         stories
     };
@@ -513,11 +536,18 @@ pub async fn chat_send(
         .map(|m| (m.role.clone(), m.content.clone()))
         .collect();
 
-    // 7. Call Claude
+    // 7. Call Claude (smart model selection)
     let llm = conversation::ClaudeConversation::from_env()
         .map_err(|e| e.to_string())?;
 
-    let raw_response = llm.send_message(&system_prompt, &messages_for_llm)
+    let (chat_model, chat_max_tokens) = match query_type {
+        search::QueryType::Analytical | search::QueryType::Comparative => {
+            (conversation::CONVERSATION_MODEL_DEEP, 2000u32)
+        }
+        _ => (conversation::CONVERSATION_MODEL_FAST, 1200u32),
+    };
+
+    let raw_response = llm.send_message_with_model(&system_prompt, &messages_for_llm, chat_model, chat_max_tokens)
         .await
         .map_err(|e| format!("Claude error: {}", e))?;
 
@@ -673,25 +703,46 @@ pub async fn chat_send_stream(
         detail: "Searching your archive...".into(),
     }).ok();
 
-    // 2.5. Query rewriting
+    // 2.5. Load recent conversation history for context-aware query rewriting
+    let conversation_context: Option<String> = if !is_new_thread {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let history = conversation::get_thread_messages(&conn, &thread.id)
+            .map_err(|e| e.to_string())?;
+        let recent: Vec<_> = history.iter().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        if recent.is_empty() {
+            None
+        } else {
+            Some(recent.iter().map(|m| format!("{}: {}", m.role, m.content)).collect::<Vec<_>>().join("\n"))
+        }
+    } else {
+        None
+    };
+
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| "ANTHROPIC_API_KEY not set. Add it to .env".to_string())?;
-    let expanded = search::rewrite_query(&api_key, &message).await;
 
-    // 3. Compute query embedding + hybrid search
-    let query_embedding: Option<Vec<f32>> = match embeddings::VoyageProvider::from_env() {
-        Ok(provider) => {
-            match provider.embed(&[expanded.semantic_text.clone()], "query").await {
-                Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
-                _ => None,
+    let query_type = search::classify_query_type(&message);
+    tracing::info!("Query type: {:?}", query_type);
+
+    // 3. Parallel: rewrite query + embed raw query concurrently (saves 2-3s)
+    let rewrite_fut = search::rewrite_query(&api_key, &message, conversation_context.as_deref());
+    let embed_fut = async {
+        match embeddings::VoyageProvider::from_env() {
+            Ok(provider) => {
+                match provider.embed(&[message.clone()], "query").await {
+                    Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
+                    _ => None,
+                }
             }
+            Err(_) => None,
         }
-        Err(_) => None,
     };
+
+    let (expanded, query_embedding) = tokio::join!(rewrite_fut, embed_fut);
 
     let stories = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        search::hybrid_search(&conn, &expanded.fts_keywords, query_embedding.as_deref(), 25)
+        search::hybrid_search(&conn, &expanded.fts_keywords, query_embedding.as_deref(), 25, query_type, None)
             .map_err(|e| e.to_string())?
     };
 
@@ -700,13 +751,19 @@ pub async fn chat_send_stream(
         detail: format!("Found {} stories", stories.len()),
     }).ok();
 
-    // 3.5. LLM rerank
+    // 3.5. Voyage rerank (falls back to Haiku, then to original order)
     let stories = if stories.len() > 6 {
         on_event.send(ChatStreamEvent::Searching {
             stage: "reranking".into(),
             detail: "Ranking by relevance...".into(),
         }).ok();
-        reranking::llm_rerank(&api_key, &message, stories, 15).await
+        let reranked = search::voyage_rerank(&message, stories.clone(), 10).await;
+        // If Voyage returned same order (fallback), try Haiku as secondary fallback
+        if reranked.len() == stories.len() && reranked.first().map(|s| s.story_id) == stories.first().map(|s| s.story_id) {
+            reranking::llm_rerank(&api_key, &message, stories, 10).await
+        } else {
+            reranked
+        }
     } else {
         stories
     };
@@ -888,10 +945,24 @@ pub async fn chat_send_stream(
 
     let llm = conversation::ClaudeConversation::from_env().map_err(|e| e.to_string())?;
 
+    // Smart model selection: Haiku for simple queries, Sonnet for complex analysis
+    let (chat_model, chat_max_tokens) = match query_type {
+        search::QueryType::Analytical | search::QueryType::Comparative => {
+            tracing::info!("Using Sonnet (complex query)");
+            (conversation::CONVERSATION_MODEL_DEEP, 2000u32)
+        }
+        _ => {
+            tracing::info!("Using Haiku (simple query)");
+            (conversation::CONVERSATION_MODEL_FAST, 1200u32)
+        }
+    };
+
     let on_event_clone = on_event.clone();
     let raw_response = llm.send_message_stream(
         &system_prompt,
         &messages_for_llm,
+        chat_model,
+        chat_max_tokens,
         move |chunk| {
             if let Err(e) = on_event_clone.send(ChatStreamEvent::Delta { text: chunk.to_string() }) {
                 tracing::warn!("failed to send Delta event: {}", e);
@@ -973,15 +1044,20 @@ pub async fn chat_send_stream(
         }
     }
 
-    // Log token usage (best-effort estimate)
-    {
+    // Log token usage (best-effort estimate) and compute cost
+    let estimated_cost = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        // Rough estimate: 4 chars per token
         let input_est = (system_prompt.len() + message.len()) as i64 / 4;
         let output_est = clean_message.len() as i64 / 4;
-        api_usage::log_usage(&conn, "anthropic", "claude-sonnet", "chat", input_est, output_est).ok();
-        // Tavily usage is logged inside brave_search::search() on success
-    }
+        let model_label = if chat_model.contains("haiku") { "claude-haiku" } else { "claude-sonnet" };
+        api_usage::log_usage(&conn, "anthropic", model_label, "chat", input_est, output_est).ok();
+        // Estimate cost using pricing table
+        let cost = api_usage::estimate_cost("anthropic", model_label, input_est, output_est);
+        // Add ~$0.002 for rewrite + embedding + rerank overhead
+        cost + 0.002
+    };
+
+    let model_label_display = if chat_model.contains("haiku") { "Haiku" } else { "Sonnet" }.to_string();
 
     // Send Complete event with cleaned message text
     if let Err(e) = on_event.send(ChatStreamEvent::Complete {
@@ -992,6 +1068,8 @@ pub async fn chat_send_stream(
         thread_title,
         proactive_connections: proactive,
         search_source,
+        estimated_cost,
+        model_used: model_label_display,
     }) {
         tracing::warn!("failed to send Complete event: {}", e);
     }
@@ -1261,6 +1339,96 @@ async fn generate_thread_title(api_key: &str, question: &str, answer: &str) -> S
 fn keywords_match_text(text: &str, keywords: &[String]) -> bool {
     let lower = text.to_lowercase();
     keywords.iter().any(|kw| lower.contains(kw.as_str()))
+}
+
+// ============ Chat Feedback ============
+
+#[tauri::command]
+pub async fn submit_chat_feedback(
+    db: State<'_, DbState>,
+    message_id: String,
+    thread_id: String,
+    rating: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    if rating != "up" && rating != "down" {
+        return Err("rating must be 'up' or 'down'".to_string());
+    }
+
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO chat_feedback (message_id, thread_id, rating, reason) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![message_id, thread_id, rating, reason],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Propagate feedback to source/sector reputation scores (non-fatal)
+    if let Err(e) = feedback::propagate_feedback(&conn, &message_id) {
+        tracing::warn!("Feedback propagation failed (non-fatal): {}", e);
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_feedback_stats(db: State<'_, DbState>) -> Result<serde_json::Value, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let total_up: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM chat_feedback WHERE rating = 'up'", [], |r| r.get(0),
+    ).unwrap_or(0);
+    let total_down: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM chat_feedback WHERE rating = 'down'", [], |r| r.get(0),
+    ).unwrap_or(0);
+
+    // Top and bottom sources by reputation
+    let mut top_sources = Vec::new();
+    let mut bottom_sources = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT key, reputation, boost, upvotes, downvotes FROM feedback_reputation
+         WHERE kind = 'source' ORDER BY reputation DESC"
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "name": row.get::<_, String>(0)?.replace("source:", ""),
+                "reputation": row.get::<_, f64>(1)?,
+                "boost": row.get::<_, f64>(2)?,
+                "upvotes": row.get::<_, i64>(3)?,
+                "downvotes": row.get::<_, i64>(4)?,
+            }))
+        }) {
+            let all: Vec<_> = rows.flatten().collect();
+            top_sources = all.iter().take(5).cloned().collect();
+            bottom_sources = all.iter().rev().take(5).cloned().collect();
+        }
+    }
+
+    // Sector reputations
+    let mut sectors = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT key, reputation, boost, upvotes, downvotes FROM feedback_reputation
+         WHERE kind = 'sector' ORDER BY reputation DESC"
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "name": row.get::<_, String>(0)?.replace("sector:", ""),
+                "reputation": row.get::<_, f64>(1)?,
+                "boost": row.get::<_, f64>(2)?,
+                "upvotes": row.get::<_, i64>(3)?,
+                "downvotes": row.get::<_, i64>(4)?,
+            }))
+        }) {
+            sectors = rows.flatten().collect();
+        }
+    }
+
+    Ok(serde_json::json!({
+        "total_up": total_up,
+        "total_down": total_down,
+        "top_sources": top_sources,
+        "bottom_sources": bottom_sources,
+        "sectors": sectors,
+    }))
 }
 
 #[cfg(test)]

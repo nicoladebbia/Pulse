@@ -14,7 +14,7 @@ const PRICING: &[(&str, &str, f64, f64)] = &[
     ("tavily", "search", 0.0, 0.0),          // free tier
 ];
 
-fn estimate_cost(provider: &str, model: &str, input_tokens: i64, output_tokens: i64) -> f64 {
+pub fn estimate_cost(provider: &str, model: &str, input_tokens: i64, output_tokens: i64) -> f64 {
     for &(p, m, in_price, out_price) in PRICING {
         if provider == p && model.contains(m) {
             return (input_tokens as f64 * in_price + output_tokens as f64 * out_price) / 1_000_000.0;

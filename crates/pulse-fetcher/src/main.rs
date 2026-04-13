@@ -6,6 +6,7 @@ pub(crate) mod db;
 mod dedup;
 mod embeddings;
 
+use chrono::Timelike;
 use clap::Parser;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -63,22 +64,26 @@ async fn main() -> anyhow::Result<()> {
             extract_entities(&db_path).await?;
         }
         "daily" => {
-            // Skip if today's briefing already exists (unless --force)
+            // Skip if we already have enough briefings for this time of day (unless --force)
+            // Morning run (before 2 PM) needs 1, evening run (after 2 PM) allows 2
             if !args.force && db_path.exists() {
                 let conn = rusqlite::Connection::open_with_flags(
                     &db_path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 )?;
-                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                let exists: bool = conn
+                let now = chrono::Local::now();
+                let today = now.format("%Y-%m-%d").to_string();
+                let hour = now.hour();
+                let max_allowed: i64 = if hour >= 14 { 2 } else { 1 };
+                let count: i64 = conn
                     .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM briefings WHERE date = ?1 AND status = 'complete')",
+                        "SELECT COUNT(*) FROM briefings WHERE date = ?1 AND briefing_type = 'daily' AND status = 'complete'",
                         [&today],
                         |row| row.get(0),
                     )
-                    .unwrap_or(false);
-                if exists {
-                    tracing::info!("Briefing for {} already exists, skipping (use --force to override)", today);
+                    .unwrap_or(0);
+                if count >= max_allowed {
+                    tracing::info!("Already have {}/{} briefings for {}, skipping (use --force to override)", count, max_allowed, today);
                     return Ok(());
                 }
             }

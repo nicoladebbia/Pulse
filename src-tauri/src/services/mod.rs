@@ -4,6 +4,7 @@ pub mod causality;
 #[allow(dead_code)]
 pub mod contrarian;
 pub mod conversation;
+pub mod feedback;
 #[allow(dead_code)]
 pub mod embeddings;
 #[allow(dead_code, unused_imports)]

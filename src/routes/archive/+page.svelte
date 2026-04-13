@@ -39,7 +39,7 @@
 		}
 	}
 
-	async function selectDaily(date: string) {
+	async function selectDaily(briefingId: number) {
 		try {
 			if (!isTauri()) {
 				selectedBriefing = mockBriefingData;
@@ -48,7 +48,7 @@
 				return;
 			}
 			const ipc = (window as any).__TAURI_INTERNALS__;
-			selectedBriefing = await ipc.invoke('get_briefing_by_date', { date });
+			selectedBriefing = await ipc.invoke('get_briefing_by_id', { briefingId });
 			selectedFreedoms = null;
 			viewMode = 'daily';
 		} catch (e) {
@@ -201,7 +201,7 @@
 								<button
 									class="text-xs px-3 py-1.5 rounded-lg border border-border hover:bg-bg-card-hover
 										transition-colors text-text-secondary hover:text-text"
-									onclick={() => selectDaily(date)}
+									onclick={() => selectDaily(daily.id)}
 								>
 									{daily.time_label ?? 'Daily'} · {daily.story_count} stories
 								</button>

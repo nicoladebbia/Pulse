@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { stages, fetchDone, fetchError } from '$lib/stores/fetch';
+	import { stages, fetchDone, fetchError, fetchEta } from '$lib/stores/fetch';
 	import type { StageState } from '$lib/stores/fetch';
 
 	let { compact = false }: { compact?: boolean } = $props();
@@ -11,6 +11,19 @@
 			case 'failed': return 'failed';
 			default: return 'pending';
 		}
+	}
+
+	function formatEta(secs: number): string {
+		if (secs < 60) return 'less than a minute';
+		const mins = Math.round(secs / 60);
+		return `~${mins} min`;
+	}
+
+	function formatElapsed(secs: number): string {
+		const mins = Math.floor(secs / 60);
+		const s = secs % 60;
+		if (mins === 0) return `${s}s`;
+		return `${mins}m ${String(s).padStart(2, '0')}s`;
 	}
 </script>
 
@@ -48,6 +61,16 @@
 			</div>
 		</div>
 	{/each}
+
+	{#if !compact && !$fetchDone && $fetchEta.elapsed_secs != null}
+		<div class="eta-row">
+			<span class="eta-elapsed">{formatElapsed($fetchEta.elapsed_secs)}</span>
+			{#if $fetchEta.eta_secs != null && $fetchEta.eta_secs > 0}
+				<span class="eta-separator">·</span>
+				<span class="eta-remaining">{formatEta($fetchEta.eta_secs)} remaining</span>
+			{/if}
+		</div>
+	{/if}
 
 	{#if $fetchError}
 		<div class="error-row">
@@ -216,6 +239,28 @@
 	@keyframes detailFade {
 		from { opacity: 0; transform: translateY(4px); }
 		to { opacity: 1; transform: translateY(0); }
+	}
+
+	.eta-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 6px 0 2px 28px;
+		font-size: 10px;
+		font-family: var(--font-mono);
+	}
+
+	.eta-elapsed {
+		color: var(--color-text-muted);
+	}
+
+	.eta-separator {
+		color: var(--color-text-muted);
+		opacity: 0.4;
+	}
+
+	.eta-remaining {
+		color: var(--color-text-secondary);
 	}
 
 	.error-row {

@@ -121,6 +121,13 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let unique_articles = crate::dedup::deduplicate_with_history(raw_articles, historical_hashes, historical_titles);
     tracing::info!("{} articles after dedup", unique_articles.len());
 
+    // Abort if too few new articles (not worth API cost for a thin briefing)
+    if unique_articles.len() < 15 {
+        tracing::info!("Only {} new articles after dedup — too few for a quality briefing, skipping", unique_articles.len());
+        progress.finish();
+        return Ok(());
+    }
+
     // Phase 2.5: Pre-curate — pick the best ~90 articles BEFORE expensive summarization
     let articles_to_summarize = if unique_articles.len() > 100 {
         tracing::info!("Pre-curating: selecting best articles from {} candidates...", unique_articles.len());
@@ -1089,29 +1096,36 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Freedom entity extraction failed (non-fatal): {}", e),
     }
 
-    // Phase 8: Generate embeddings for freedom stories in main stories table (non-fatal)
+    // Phase 8: Generate embeddings for freedom stories (non-fatal)
+    // Stored in story_embeddings with encoded ID: -(freedom_id + 100_000) to
+    // distinguish from daily stories. This lets semantic search surface them.
     tracing::info!("Freedoms: Generating embeddings...");
     let freedom_summaries: Vec<crate::claude::SummarizedStory> = curated.iter().map(|(_, s)| (*s).clone()).collect();
     match crate::embeddings::generate(&freedom_summaries, None).await {
         Ok(embs) => {
             if let Ok(conn) = rusqlite::Connection::open(db_path) {
+                let mut stored = 0;
                 for se in &embs {
                     if let Some((_, story)) = curated.get(se.story_index) {
-                        let story_id: Option<i64> = conn.query_row(
-                            "SELECT id FROM stories WHERE headline = ?1 ORDER BY id DESC LIMIT 1",
+                        let freedom_id: Option<i64> = conn.query_row(
+                            "SELECT id FROM freedom_stories WHERE headline = ?1 ORDER BY id DESC LIMIT 1",
                             rusqlite::params![story.headline],
                             |row| row.get(0),
                         ).ok();
-                        if let Some(sid) = story_id {
+                        if let Some(fid) = freedom_id {
+                            let encoded_id = -(fid + 100_000);
                             let blob: Vec<u8> = se.embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
                             conn.execute(
                                 "INSERT OR REPLACE INTO story_embeddings (story_id, embedding) VALUES (?1, ?2)",
-                                rusqlite::params![sid, blob],
+                                rusqlite::params![encoded_id, blob],
                             ).ok();
+                            stored += 1;
                         }
                     }
                 }
+                tracing::info!("Stored {} freedom story embeddings (encoded IDs)", stored);
             }
+            log_usage(db_path, "voyage", "voyage-3-lite", "freedom_embeddings", (embs.len() as i64) * 200, 0);
             tracing::info!("Generated {} freedom story embeddings", embs.len());
         }
         Err(e) => tracing::warn!("Freedom embedding generation failed (non-fatal): {}", e),

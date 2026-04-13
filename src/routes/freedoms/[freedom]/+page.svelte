@@ -5,20 +5,24 @@
 	import { isTauri, mockFreedomsBriefing } from '$lib/tauri/mock';
 
 	let freedom = $derived($page.params.freedom);
+	let dateParam = $derived($page.url.searchParams.get('date'));
 	let config = $derived(FREEDOM_CONFIG[freedom]);
 	let stories = $state<FreedomStory[]>([]);
+	let briefingDate = $state('');
 	let isLoading = $state(true);
 	let error = $state('');
 	let expandedId = $state<number | null>(null);
 	let loaded = $state(false);
 
 	let lastFreedom = $state('');
+	let lastDate = $state('');
 
 	$effect(() => {
-		// Re-trigger when freedom param changes (navigation between sub-pages)
 		const currentFreedom = freedom;
-		if (loaded && stories.length > 0 && currentFreedom === lastFreedom) return;
+		const currentDate = dateParam ?? '';
+		if (loaded && stories.length > 0 && currentFreedom === lastFreedom && currentDate === lastDate) return;
 		lastFreedom = currentFreedom;
+		lastDate = currentDate;
 		loaded = true;
 		loadStories();
 	});
@@ -28,17 +32,24 @@
 		error = '';
 		try {
 			const keyMap: Record<string, keyof FreedomsBriefing> = {
-				time: 'time_stories', financial: 'wealth_stories',
+				time: 'time_stories', wealth: 'wealth_stories',
 				location: 'location_stories', health: 'health_stories',
 			};
 			if (!isTauri()) {
 				stories = (mockFreedomsBriefing[keyMap[freedom]] as FreedomStory[]) ?? [];
+				briefingDate = 'mock';
 				return;
 			}
 			const ipc = (window as any).__TAURI_INTERNALS__;
-			const briefing: FreedomsBriefing | null = await ipc.invoke('get_today_freedoms');
+			let briefing: FreedomsBriefing | null;
+			if (dateParam) {
+				briefing = await ipc.invoke('get_freedoms_by_date', { date: dateParam });
+			} else {
+				briefing = await ipc.invoke('get_today_freedoms');
+			}
 			if (briefing) {
 				stories = (briefing[keyMap[freedom]] as FreedomStory[]) ?? [];
+				briefingDate = briefing.date;
 			}
 		} catch (e: any) {
 			console.error(e);
@@ -79,9 +90,15 @@
 		<div class="max-w-2xl mx-auto pt-6 pb-16">
 
 			<!-- Back + nav -->
-			<a href="/freedoms" class="inline-flex items-center gap-2 text-sm text-text-muted hover:text-text transition-colors mb-8">
+			<a href="/freedoms{dateParam ? `?date=${dateParam}` : ''}" class="inline-flex items-center gap-2 text-sm text-text-muted hover:text-text transition-colors mb-8">
 				← Four Freedoms
 			</a>
+
+			{#if dateParam}
+				<p class="text-[10px] uppercase tracking-[0.2em] text-text-muted mb-4">
+					{new Date(dateParam + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}
+				</p>
+			{/if}
 
 			<!-- Header — unique per freedom -->
 			<header class="mb-10">

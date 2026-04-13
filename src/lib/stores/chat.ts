@@ -14,6 +14,29 @@ export const searchSteps = writable<SearchStep[]>([]);
 export const lastResponse = writable<ConversationResponse | null>(null);
 export const lastSearchSource = writable<string>('archive');
 
+// Cancel flag — when set, streaming stops rendering
+let cancelRequested = false;
+export function cancelStream() {
+	cancelRequested = true;
+}
+
+// Regenerate — re-send the last user message
+export function regenerateLastMessage() {
+	const msgs = get(messages);
+	// Find last user message
+	const lastUserMsg = [...msgs].reverse().find(m => m.role === 'user');
+	if (!lastUserMsg || get(isStreaming)) return;
+
+	// Remove the last assistant message
+	const lastAssistant = [...msgs].reverse().find(m => m.role === 'assistant');
+	if (lastAssistant) {
+		messages.update(m => m.filter(msg => msg.id !== lastAssistant.id));
+	}
+
+	// Re-send
+	sendMessage(lastUserMsg.content);
+}
+
 // Generation counter to prevent stale stream updates after thread switch
 let streamGeneration = 0;
 
@@ -69,6 +92,7 @@ export async function sendMessage(message: string) {
 	isStreaming.set(true);
 	isSearching.set(true);
 	searchSteps.set([]);
+	cancelRequested = false;
 
 	// Add optimistic user message
 	const tempMsg: ChatMessage = {
@@ -118,6 +142,9 @@ export async function sendMessage(message: string) {
 			}
 
 			if (event.event === 'Delta') {
+				// Cancel requested — stop rendering but let backend finish
+				if (cancelRequested) return;
+
 				// First delta means search is done, streaming has started
 				if (get(isSearching)) {
 					isSearching.set(false);
@@ -139,8 +166,12 @@ export async function sendMessage(message: string) {
 					const updated = [...m];
 					const last = updated.find(msg => msg.id === assistantMsgId);
 					if (last) {
-						last.content = event.data.message; // Cleaned: no [story:N] markers
+						last.content = event.data.message;
 						last.sources = event.data.source_story_ids;
+						last.metadata = {
+							estimated_cost: event.data.estimated_cost,
+							model_used: event.data.model_used,
+						};
 					}
 					return updated;
 				});

@@ -21,6 +21,61 @@ pub enum StorySource {
     Freedom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QueryType {
+    /// Wants latest news — heavy recency bias
+    Breaking,
+    /// Wants depth/trends — relevance dominates
+    Analytical,
+    /// Wants breadth across time — almost no recency bias
+    Comparative,
+    /// Default behavior
+    General,
+}
+
+impl QueryType {
+    /// Returns (alpha, half_life_days) for recency decay.
+    pub fn recency_params(&self) -> (f32, f32) {
+        match self {
+            QueryType::Breaking => (0.4, 3.0),
+            QueryType::Analytical => (0.85, 30.0),
+            QueryType::Comparative => (0.95, 60.0),
+            QueryType::General => (RECENCY_ALPHA, RECENCY_HALF_LIFE),
+        }
+    }
+}
+
+/// Classify a user query into a QueryType using keyword heuristics.
+pub fn classify_query_type(message: &str) -> QueryType {
+    let lower = message.to_lowercase();
+
+    let comparative_keywords: &[&str] = &[
+        " vs ", "compare", "better", "alternatives", "difference",
+        "pros ", "cons ", "versus", "compared to", "which is",
+    ];
+    let breaking_keywords: &[&str] = &[
+        "today", "this week", "recent", "latest", "just", "breaking",
+        "new ", "right now", "this morning", "tonight", "yesterday",
+    ];
+    let analytical_keywords: &[&str] = &[
+        "trend", "explain", "why ", "how ", "analysis", "history",
+        "evolution", "overview", "deep dive", "impact", "implications",
+        "behind", "cause", "reason",
+    ];
+
+    // Check comparative first (most specific patterns)
+    if comparative_keywords.iter().any(|kw| lower.contains(kw)) {
+        return QueryType::Comparative;
+    }
+    if breaking_keywords.iter().any(|kw| lower.contains(kw)) {
+        return QueryType::Breaking;
+    }
+    if analytical_keywords.iter().any(|kw| lower.contains(kw)) {
+        return QueryType::Analytical;
+    }
+    QueryType::General
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredStory {
     pub story_id: i64,
@@ -40,9 +95,14 @@ pub struct ScoredStory {
 // Constants
 // ---------------------------------------------------------------------------
 
-const FTS_WEIGHT: f32 = 0.4;
-const SEMANTIC_WEIGHT: f32 = 0.6;
-const OVERLAP_BONUS: f32 = 1.2;
+// RRF (Reciprocal Rank Fusion) constant — industry standard k=60
+const RRF_K: f32 = 60.0;
+
+// Minimum results to keep after score cutoff (protects niche queries)
+const MIN_RESULTS_AFTER_CUTOFF: usize = 3;
+
+// Score cutoff: drop results below top_score * this ratio
+const SCORE_CUTOFF_RATIO: f32 = 0.3;
 
 // Recency decay: final = ALPHA * relevance + (1 - ALPHA) * 0.5^(age_days / HALF_LIFE)
 const RECENCY_ALPHA: f32 = 0.7;
@@ -75,17 +135,44 @@ const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 const HAIKU_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const REWRITE_TIMEOUT_SECS: u64 = 3;
 
+/// Check if a query is simple enough to skip the Haiku rewrite.
+/// Simple queries: short, direct lookups that don't benefit from HyDE expansion.
+fn should_skip_rewrite(message: &str, has_context: bool) -> bool {
+    // Always rewrite follow-ups (need conversation context resolution)
+    if has_context { return false; }
+
+    let words: Vec<&str> = message.split_whitespace().collect();
+    // Very short queries (< 6 words) are usually direct lookups
+    if words.len() < 6 { return true; }
+
+    let lower = message.to_lowercase();
+    // Simple patterns that are already good search queries
+    let simple_patterns = ["what happened", "news about", "tell me about", "latest on", "update on"];
+    if simple_patterns.iter().any(|p| lower.starts_with(p)) { return true; }
+
+    false
+}
+
 /// Use Haiku to expand a user query into richer FTS keywords and a hypothetical
 /// answer (HyDE) for better semantic matching. Non-fatal: returns the original
 /// message on any failure.
-pub async fn rewrite_query(api_key: &str, message: &str) -> ExpandedQuery {
+///
+/// When `conversation_context` is provided, Haiku rewrites follow-up messages
+/// into standalone queries (e.g., "What about the US?" → "AI regulation in the US").
+pub async fn rewrite_query(api_key: &str, message: &str, conversation_context: Option<&str>) -> ExpandedQuery {
     if api_key.is_empty() || message.trim().is_empty() {
+        return ExpandedQuery::from_original(message);
+    }
+
+    // Skip expensive Haiku call for simple queries
+    if should_skip_rewrite(message, conversation_context.is_some()) {
+        tracing::info!("Skipping query rewrite (simple query)");
         return ExpandedQuery::from_original(message);
     }
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(REWRITE_TIMEOUT_SECS),
-        rewrite_query_inner(api_key, message),
+        rewrite_query_inner(api_key, message, conversation_context),
     )
     .await;
 
@@ -102,13 +189,27 @@ pub async fn rewrite_query(api_key: &str, message: &str) -> ExpandedQuery {
     }
 }
 
-async fn rewrite_query_inner(api_key: &str, message: &str) -> anyhow::Result<ExpandedQuery> {
+async fn rewrite_query_inner(api_key: &str, message: &str, conversation_context: Option<&str>) -> anyhow::Result<ExpandedQuery> {
     let client = reqwest::Client::new();
+
+    let system = if let Some(ctx) = conversation_context {
+        format!(
+            "You expand search queries for a news intelligence archive covering AI/LLMs, Miami Beach, Italian politics, and tech/innovation.\n\
+            The user is in an ongoing conversation. Here is the recent conversation:\n{}\n\n\
+            Rewrite the user's latest message as a STANDALONE search query that includes all necessary context from the conversation.\n\
+            Return ONLY valid JSON:\n\
+            {{\"keywords\": \"expanded search keywords with entity names synonyms and related terms\", \"hypothetical_answer\": \"A 2-3 sentence hypothetical answer to this question as if you had the relevant news stories\"}}\n\
+            Be specific: add company names, people, acronyms, related technologies. No explanation, just JSON.",
+            ctx
+        )
+    } else {
+        "You expand search queries for a news intelligence archive covering AI/LLMs, Miami Beach, Italian politics, and tech/innovation.\nGiven a user question, return ONLY valid JSON:\n{\"keywords\": \"expanded search keywords with entity names synonyms and related terms\", \"hypothetical_answer\": \"A 2-3 sentence hypothetical answer to this question as if you had the relevant news stories\"}\nBe specific: add company names, people, acronyms, related technologies. No explanation, just JSON.".to_string()
+    };
 
     let body = serde_json::json!({
         "model": HAIKU_MODEL,
         "max_tokens": 300,
-        "system": "You expand search queries for a news intelligence archive covering AI/LLMs, Miami Beach, Italian politics, and tech/innovation.\nGiven a user question, return ONLY valid JSON:\n{\"keywords\": \"expanded search keywords with entity names synonyms and related terms\", \"hypothetical_answer\": \"A 2-3 sentence hypothetical answer to this question as if you had the relevant news stories\"}\nBe specific: add company names, people, acronyms, related technologies. No explanation, just JSON.",
+        "system": system,
         "messages": [{"role": "user", "content": message}]
     });
 
@@ -277,11 +378,11 @@ fn like_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(i64,
 // Result merging
 // ---------------------------------------------------------------------------
 
-/// Merge FTS and semantic search results using weighted scoring.
+/// Merge FTS and semantic search results using Reciprocal Rank Fusion (RRF).
 ///
-/// - `fts_weight` = 0.4, `semantic_weight` = 0.6
-/// - Results appearing in both sets get a 1.2x bonus
-/// - Scores are normalized to 0..1 within each set before merging
+/// RRF works on rank positions, not raw scores, so there's no need to normalize
+/// across different scoring scales. Formula: score = Σ(1 / (k + rank))
+/// Results appearing in both lists naturally get higher scores.
 pub fn merge_results(
     fts_results: &[(i64, f32)],
     semantic_results: &[(i64, f32)],
@@ -290,53 +391,57 @@ pub fn merge_results(
         return vec![];
     }
 
-    // Normalize helper: divide all scores by the max in the set
-    let normalize = |results: &[(i64, f32)]| -> Vec<(i64, f32)> {
-        let max_score = results
-            .iter()
-            .map(|(_, s)| *s)
-            .fold(0.0f32, f32::max);
-        if max_score <= 0.0 {
-            return results.iter().map(|(id, _)| (*id, 1.0)).collect();
-        }
-        results.iter().map(|(id, s)| (*id, s / max_score)).collect()
-    };
+    // Track which lists each ID appeared in
+    let mut fts_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut sem_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-    let fts_norm = normalize(fts_results);
-    let sem_norm = normalize(semantic_results);
+    // Build RRF scores: score += 1 / (k + rank) for each list
+    let mut scores: HashMap<i64, f32> = HashMap::new();
 
-    // Build combined map: story_id -> (Option<fts_score>, Option<sem_score>)
-    let mut combined: HashMap<i64, (Option<f32>, Option<f32>)> = HashMap::new();
-
-    for &(id, score) in &fts_norm {
-        combined.entry(id).or_insert((None, None)).0 = Some(score);
+    for (rank, &(id, _)) in fts_results.iter().enumerate() {
+        *scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+        fts_set.insert(id);
     }
-    for &(id, score) in &sem_norm {
-        combined.entry(id).or_insert((None, None)).1 = Some(score);
+    for (rank, &(id, _)) in semantic_results.iter().enumerate() {
+        *scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+        sem_set.insert(id);
     }
 
-    let mut results: Vec<(i64, f32, MatchType)> = combined
+    let mut results: Vec<(i64, f32, MatchType)> = scores
         .into_iter()
-        .map(|(id, (fts_score, sem_score))| {
-            let fts = fts_score.unwrap_or(0.0);
-            let sem = sem_score.unwrap_or(0.0);
-            let mut final_score = FTS_WEIGHT * fts + SEMANTIC_WEIGHT * sem;
-
-            let match_type = match (fts_score.is_some(), sem_score.is_some()) {
-                (true, true) => {
-                    final_score *= OVERLAP_BONUS;
-                    MatchType::Both
-                }
+        .map(|(id, score)| {
+            let match_type = match (fts_set.contains(&id), sem_set.contains(&id)) {
+                (true, true) => MatchType::Both,
                 (true, false) => MatchType::Fts,
                 (false, true) => MatchType::Semantic,
                 (false, false) => unreachable!(),
             };
-
-            (id, final_score, match_type)
+            (id, score, match_type)
         })
         .collect();
 
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Apply score cutoff: drop results below top_score * CUTOFF_RATIO,
+    // but always keep at least MIN_RESULTS_AFTER_CUTOFF
+    if let Some(&(_, top_score, _)) = results.first() {
+        let threshold = top_score * SCORE_CUTOFF_RATIO;
+        let cutoff_idx = results.iter()
+            .position(|(_, s, _)| *s < threshold)
+            .unwrap_or(results.len());
+        let keep = cutoff_idx.max(MIN_RESULTS_AFTER_CUTOFF).min(results.len());
+        results.truncate(keep);
+    }
+
+    // Normalize RRF scores to 0..1 (needed for recency decay compatibility)
+    if let Some(&(_, max_score, _)) = results.first() {
+        if max_score > 0.0 {
+            for item in results.iter_mut() {
+                item.1 /= max_score;
+            }
+        }
+    }
+
     results
 }
 
@@ -425,19 +530,21 @@ pub fn decode_story_id(encoded: i64) -> (i64, bool) {
 // ---------------------------------------------------------------------------
 
 /// Pure recency score for a given age in days.
-/// Returns a value in [0, 1] that halves every `RECENCY_HALF_LIFE` days.
-pub fn recency_score(age_days: f32) -> f32 {
+/// Returns a value in [0, 1] that halves every `half_life` days.
+pub fn recency_score(age_days: f32, half_life: f32) -> f32 {
     if age_days <= 0.0 {
         return 1.0;
     }
-    0.5_f32.powf(age_days / RECENCY_HALF_LIFE)
+    0.5_f32.powf(age_days / half_life)
 }
 
 /// Apply time-decay to merged search results using story dates from the DB.
-/// Formula: final = ALPHA * relevance + (1 - ALPHA) * recency_score(age)
+/// Formula: final = alpha * relevance + (1 - alpha) * recency_score(age)
 fn apply_recency_decay(
     conn: &Connection,
     results: &mut Vec<(i64, f32, MatchType)>,
+    alpha: f32,
+    half_life: f32,
 ) -> Result<()> {
     if results.is_empty() {
         return Ok(());
@@ -500,8 +607,8 @@ fn apply_recency_decay(
         if let Some(date_str) = date_map.get(id) {
             if let Ok(story_date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
                 let age_days = (today - story_date).num_days().max(0) as f32;
-                let recency = recency_score(age_days);
-                *score = RECENCY_ALPHA * *score + (1.0 - RECENCY_ALPHA) * recency;
+                let recency = recency_score(age_days, half_life);
+                *score = alpha * *score + (1.0 - alpha) * recency;
             }
         }
         // If date lookup/parse fails, keep original score unchanged
@@ -523,6 +630,8 @@ pub fn hybrid_search(
     query: &str,
     query_embedding: Option<&[f32]>,
     limit: usize,
+    query_type: QueryType,
+    date_from: Option<&str>,
 ) -> Result<Vec<ScoredStory>> {
     // 1. Run FTS search on daily stories
     let fts = fts_search(conn, query, limit * 2)?;
@@ -534,7 +643,7 @@ pub fn hybrid_search(
     let mut all_fts = fts;
     all_fts.extend(fts_freedom);
 
-    // 3. Run semantic search if embedding provided (daily stories only — freedoms don't have embeddings yet)
+    // 3. Run semantic search if embedding provided (daily + freedom stories)
     let semantic = if let Some(emb) = query_embedding {
         super::embeddings::find_similar(conn, emb, limit * 2, 0.3).unwrap_or_default()
     } else {
@@ -545,7 +654,8 @@ pub fn hybrid_search(
     let mut merged = merge_results(&all_fts, &semantic);
 
     // 5. Apply recency decay (non-fatal — keeps original scores on error)
-    if let Err(e) = apply_recency_decay(conn, &mut merged) {
+    let (alpha, half_life) = query_type.recency_params();
+    if let Err(e) = apply_recency_decay(conn, &mut merged, alpha, half_life) {
         tracing::warn!("Recency decay failed (non-fatal): {}", e);
     }
 
@@ -616,7 +726,125 @@ pub fn hybrid_search(
         }
     }
 
+    // 7. Apply date filter if specified
+    if let Some(from) = date_from {
+        stories.retain(|s| s.date.as_str() >= from);
+    }
+
+    // 8. Apply feedback reputation boost (non-fatal)
+    if !stories.is_empty() {
+        let (source_boosts, sector_boosts) = super::feedback::load_reputation_cache(conn);
+        if !source_boosts.is_empty() || !sector_boosts.is_empty() {
+            for story in stories.iter_mut() {
+                let sb = source_boosts.get(&story.source_name).copied().unwrap_or(1.0);
+                let secb = sector_boosts.get(&story.sector).copied().unwrap_or(1.0);
+                story.score *= sb * secb;
+            }
+            // Re-sort by boosted scores
+            stories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+
     Ok(stories)
+}
+
+// ---------------------------------------------------------------------------
+// Voyage reranking
+// ---------------------------------------------------------------------------
+
+const VOYAGE_RERANK_URL: &str = "https://api.voyageai.com/v1/rerank";
+const VOYAGE_RERANK_MODEL: &str = "rerank-2-lite";
+const VOYAGE_RERANK_TIMEOUT_SECS: u64 = 8;
+
+/// Rerank stories using Voyage rerank-2-lite. Falls back to original order on failure.
+/// Returns reordered stories, keeping at most `top_k`.
+pub async fn voyage_rerank(
+    question: &str,
+    stories: Vec<ScoredStory>,
+    top_k: usize,
+) -> Vec<ScoredStory> {
+    if stories.len() <= top_k {
+        return stories;
+    }
+
+    let api_key = match std::env::var("VOYAGE_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return stories.into_iter().take(top_k).collect(),
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(VOYAGE_RERANK_TIMEOUT_SECS),
+        voyage_rerank_inner(&api_key, question, &stories, top_k),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(reranked)) => reranked,
+        Ok(Err(e)) => {
+            tracing::warn!("Voyage reranking failed (non-fatal): {}", e);
+            stories.into_iter().take(top_k).collect()
+        }
+        Err(_) => {
+            tracing::warn!("Voyage reranking timed out after {}s", VOYAGE_RERANK_TIMEOUT_SECS);
+            stories.into_iter().take(top_k).collect()
+        }
+    }
+}
+
+async fn voyage_rerank_inner(
+    api_key: &str,
+    question: &str,
+    stories: &[ScoredStory],
+    top_k: usize,
+) -> anyhow::Result<Vec<ScoredStory>> {
+    // Format each story as rich text for reranking
+    let documents: Vec<String> = stories
+        .iter()
+        .map(|s| format!("{}. {}. {}", s.headline, s.summary, s.key_facts))
+        .collect();
+
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": VOYAGE_RERANK_MODEL,
+        "query": question,
+        "documents": documents,
+        "top_k": top_k,
+    });
+
+    let resp = client
+        .post(VOYAGE_RERANK_URL)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .context("Voyage rerank request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Voyage rerank returned {}: {}", status, body);
+    }
+
+    let response: serde_json::Value = resp.json().await?;
+    let results = response["data"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("No data array in Voyage rerank response"))?;
+
+    let mut reranked = Vec::with_capacity(top_k);
+    for item in results {
+        let idx = item["index"].as_u64().ok_or_else(|| anyhow::anyhow!("missing index"))? as usize;
+        if idx < stories.len() {
+            let mut story = stories[idx].clone();
+            // Update score with Voyage relevance score
+            if let Some(relevance) = item["relevance_score"].as_f64() {
+                story.score = relevance as f32;
+            }
+            reranked.push(story);
+        }
+    }
+
+    Ok(reranked)
 }
 
 // ===========================================================================
@@ -634,31 +862,31 @@ mod tests {
 
     #[test]
     fn test_recency_score_today() {
-        let score = recency_score(0.0);
+        let score = recency_score(0.0, 14.0);
         assert!((score - 1.0).abs() < 1e-5, "today should score 1.0, got {}", score);
     }
 
     #[test]
     fn test_recency_score_half_life() {
-        let score = recency_score(14.0);
+        let score = recency_score(14.0, 14.0);
         assert!((score - 0.5).abs() < 1e-5, "14 days should score 0.5, got {}", score);
     }
 
     #[test]
     fn test_recency_score_two_half_lives() {
-        let score = recency_score(28.0);
+        let score = recency_score(28.0, 14.0);
         assert!((score - 0.25).abs() < 1e-5, "28 days should score 0.25, got {}", score);
     }
 
     #[test]
     fn test_recency_score_old() {
-        let score = recency_score(90.0);
+        let score = recency_score(90.0, 14.0);
         assert!(score < 0.02, "90 days should score near zero, got {}", score);
     }
 
     #[test]
     fn test_recency_score_negative_age() {
-        let score = recency_score(-5.0);
+        let score = recency_score(-5.0, 14.0);
         assert!((score - 1.0).abs() < 1e-5, "negative age should score 1.0");
     }
 
@@ -787,7 +1015,7 @@ mod tests {
         let (_bid, sids) = seed_briefing(&conn, "2026-03-31", &stories);
 
         // No embeddings in DB — should gracefully fall back to FTS-only
-        let results = hybrid_search(&conn, "OpenAI", None, 10).unwrap();
+        let results = hybrid_search(&conn, "OpenAI", None, 10, QueryType::General, None).unwrap();
         assert!(
             !results.is_empty(),
             "should return FTS results even without embeddings"
@@ -829,7 +1057,7 @@ mod tests {
 
         // Search with a query embedding close to story 0
         let query_emb = fake_embedding(100);
-        let results = hybrid_search(&conn, "OpenAI", Some(&query_emb), 10).unwrap();
+        let results = hybrid_search(&conn, "OpenAI", Some(&query_emb), 10, QueryType::General, None).unwrap();
 
         assert!(!results.is_empty(), "should return results");
         // Story 0 should rank highly (matches both FTS keyword and embedding)
@@ -845,7 +1073,7 @@ mod tests {
         let stories = vec![TestStory::new("ai", "OpenAI Launches GPT-5")];
         let (_bid, _sids) = seed_briefing(&conn, "2026-03-31", &stories);
 
-        let results = hybrid_search(&conn, "OpenAI", None, 10).unwrap();
+        let results = hybrid_search(&conn, "OpenAI", None, 10, QueryType::General, None).unwrap();
         assert!(!results.is_empty());
 
         let story = &results[0];

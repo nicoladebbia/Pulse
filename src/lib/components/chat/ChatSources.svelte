@@ -13,6 +13,16 @@
 	let expanded = $state(false);
 
 	const validIds = $derived(storyIds.filter(id => id > 0));
+
+	function relativeDate(dateStr: string): string {
+		const d = new Date(dateStr + 'T12:00:00');
+		const now = new Date();
+		const days = Math.floor((now.getTime() - d.getTime()) / 86400000);
+		if (days === 0) return 'Today';
+		if (days === 1) return 'Yesterday';
+		if (days < 7) return `${days}d ago`;
+		return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+	}
 	const displayCount = $derived(expanded ? headlines.length : Math.min(headlines.length, 4));
 
 	$effect(() => {
@@ -51,7 +61,7 @@
 					>
 						<span class="w-1.5 h-1.5 rounded-full shrink-0" style="background: {color}"></span>
 						<span class="flex-1 truncate">{truncate(story.headline, 70)}</span>
-						<span class="text-[9px] text-text-muted shrink-0">{story.date}</span>
+						<span class="text-[9px] text-text-muted shrink-0">{relativeDate(story.date)}</span>
 					</button>
 				{/each}
 				{#if headlines.length > 4 && !expanded}

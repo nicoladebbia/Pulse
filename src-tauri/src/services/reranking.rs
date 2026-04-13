@@ -134,7 +134,7 @@ fn reorder_by_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::search::MatchType;
+    use super::super::search::{MatchType, StorySource};
 
     fn test_story(id: i64, headline: &str) -> ScoredStory {
         ScoredStory {

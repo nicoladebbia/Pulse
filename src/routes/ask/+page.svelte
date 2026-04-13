@@ -1,8 +1,7 @@
 <script lang="ts">
-	import { messages, isStreaming, isSearching, startNewThread, sendMessage, lastResponse, lastSearchSource } from '$lib/stores/chat';
+	import { messages, isStreaming, isSearching, startNewThread, sendMessage, cancelStream, regenerateLastMessage, lastResponse, lastSearchSource } from '$lib/stores/chat';
 	import ChatMessage from '$lib/components/chat/ChatMessage.svelte';
 	import ChatThinking from '$lib/components/chat/ChatThinking.svelte';
-	import ChatFollowups from '$lib/components/chat/ChatFollowups.svelte';
 	import { getChatContext } from '$lib/tauri/commands';
 	import { isTauri } from '$lib/tauri/mock';
 	import type { ChatContext } from '$lib/tauri/types';
@@ -31,6 +30,17 @@
 		}
 	});
 
+	// Auto-scroll to bottom during searching and streaming
+	$effect(() => {
+		const _ = $messages;
+		const __ = $isSearching;
+		if (($isStreaming || $isSearching) && messagesContainer) {
+			requestAnimationFrame(() => {
+				messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'instant' });
+			});
+		}
+	});
+
 	const CATEGORY_ICONS: Record<string, string> = {
 		signal: '📡',
 		story: '📰',
@@ -51,12 +61,14 @@
 
 		query = '';
 
+		// Scroll to bottom immediately after user message appears
 		requestAnimationFrame(() => {
-			messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+			messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'instant' });
 		});
 
 		await sendMessage(q);
 
+		// Final scroll after streaming completes
 		requestAnimationFrame(() => {
 			messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
 		});
@@ -66,6 +78,20 @@
 		if (event.key === 'Enter' && !event.shiftKey) {
 			event.preventDefault();
 			handleSubmit();
+		} else if (event.key === 'Escape') {
+			event.preventDefault();
+			if ($isStreaming) {
+				cancelStream();
+			} else {
+				query = '';
+			}
+		} else if (event.key === 'ArrowUp' && !query) {
+			// Recall last user message
+			const lastUser = [...$messages].reverse().find(m => m.role === 'user');
+			if (lastUser) {
+				event.preventDefault();
+				query = lastUser.content;
+			}
 		}
 	}
 
@@ -126,23 +152,18 @@
 				{/if}
 			</div>
 		{:else}
-			{#each $messages as msg (msg.id)}
-				<ChatMessage message={msg} />
+			{#each $messages as msg, i (msg.id)}
+				{@const msgIsLast = i === $messages.length - 1 && msg.role === 'assistant'}
+				<ChatMessage
+					message={msg}
+					isLast={msgIsLast}
+					followups={msgIsLast && !$isStreaming ? ($lastResponse?.suggested_followups ?? []) : []}
+					searchSource={msgIsLast && !$isStreaming ? ($lastSearchSource ?? '') : ''}
+					onAsk={askSuggestion}
+				/>
 			{/each}
 			{#if $isSearching}
 				<ChatThinking />
-			{/if}
-			{#if !$isStreaming && $lastSearchSource && $lastSearchSource !== 'archive'}
-				<div class="text-xs text-text-muted mt-1 mb-2 flex items-center gap-1.5">
-					{#if $lastSearchSource === 'web'}
-						<span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span> Answered from web search
-					{:else if $lastSearchSource === 'archive+web'}
-						<span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> Answered from archive + web search
-					{/if}
-				</div>
-			{/if}
-			{#if !$isStreaming && $lastResponse?.suggested_followups?.length}
-				<ChatFollowups followups={$lastResponse.suggested_followups} onAsk={askSuggestion} />
 			{/if}
 		{/if}
 	</div>
@@ -166,14 +187,26 @@
 					placeholder:text-text-muted focus:outline-none focus:border-ai transition-colors
 					disabled:opacity-50"
 			/>
-			<button
-				class="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-ai transition-colors
-					disabled:opacity-30"
-				disabled={!query.trim() || $isStreaming}
-				onclick={handleSubmit}
-			>
-				→
-			</button>
+			{#if $isStreaming}
+				<button
+					class="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-red-400 transition-colors"
+					onclick={cancelStream}
+					title="Stop generating (Esc)"
+				>
+					<svg viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
+						<rect x="3" y="3" width="10" height="10" rx="2" />
+					</svg>
+				</button>
+			{:else}
+				<button
+					class="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-ai transition-colors
+						disabled:opacity-30"
+					disabled={!query.trim()}
+					onclick={handleSubmit}
+				>
+					→
+				</button>
+			{/if}
 		</div>
 	</div>
 </div>

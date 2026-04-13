@@ -129,6 +129,8 @@ export type ChatStreamEvent =
 				thread_title: string | null;
 				proactive_connections: ProactiveInsight[];
 				search_source: string;
+				estimated_cost: number;
+				model_used: string;
 			};
 		}
 	| { event: 'Error'; data: { message: string } };

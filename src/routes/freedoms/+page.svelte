@@ -1,5 +1,6 @@
 <script lang="ts">
-	import type { FreedomsBriefing } from '$lib/tauri/types';
+	import { page } from '$app/stores';
+	import type { FreedomsBriefing, FreedomStory } from '$lib/tauri/types';
 	import { FREEDOM_CONFIG, FREEDOM_ORDER } from '$lib/config';
 	import { isTauri, mockFreedomsBriefing } from '$lib/tauri/mock';
 
@@ -7,8 +8,35 @@
 	let isLoading = $state(true);
 	let error = $state<string | null>(null);
 	let loaded = $state(false);
+	let selectedDate = $state($page.url.searchParams.get('date') ?? todayStr());
 
 	const freedoms = FREEDOM_ORDER.map(id => FREEDOM_CONFIG[id]);
+
+	function todayStr(): string {
+		const d = new Date();
+		return d.toISOString().slice(0, 10);
+	}
+
+	function formatDisplayDate(dateStr: string): string {
+		const d = new Date(dateStr + 'T12:00:00');
+		const today = todayStr();
+		if (dateStr === today) return 'Today';
+		const yesterday = new Date();
+		yesterday.setDate(yesterday.getDate() - 1);
+		if (dateStr === yesterday.toISOString().slice(0, 10)) return 'Yesterday';
+		return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+	}
+
+	function shiftDate(days: number) {
+		const d = new Date(selectedDate + 'T12:00:00');
+		d.setDate(d.getDate() + days);
+		const newDate = d.toISOString().slice(0, 10);
+		if (newDate > todayStr()) return;
+		selectedDate = newDate;
+		loadFreedoms();
+	}
+
+	let isToday = $derived(selectedDate === todayStr());
 
 	$effect(() => {
 		if (loaded) return;
@@ -25,7 +53,11 @@
 				return;
 			}
 			const ipc = (window as any).__TAURI_INTERNALS__;
-			briefing = await ipc.invoke('get_today_freedoms');
+			if (selectedDate === todayStr()) {
+				briefing = await ipc.invoke('get_today_freedoms');
+			} else {
+				briefing = await ipc.invoke('get_freedoms_by_date', { date: selectedDate });
+			}
 		} catch (e: any) {
 			error = String(e?.message ?? e);
 		} finally {
@@ -38,6 +70,15 @@
 			? briefing.time_stories.length + briefing.wealth_stories.length +
 			  briefing.location_stories.length + briefing.health_stories.length
 			: 0
+	);
+
+	// Hero stories — first story from each freedom that has stories
+	let heroStories = $derived<{ story: FreedomStory; config: typeof FREEDOM_CONFIG[keyof typeof FREEDOM_CONFIG] }[]>(
+		briefing
+			? freedoms
+				.filter(f => (briefing![f.key] as FreedomStory[]).length > 0)
+				.map(f => ({ story: (briefing![f.key] as FreedomStory[])[0], config: f }))
+			: []
 	);
 </script>
 
@@ -79,6 +120,24 @@
 			<p class="text-sm text-text-muted font-light">
 				{totalStories} stories across wealth and health
 			</p>
+
+			<!-- Date navigation -->
+			<div class="flex items-center justify-center gap-4 mt-4">
+				<button
+					class="text-text-muted hover:text-text transition-colors p-1"
+					onclick={() => shiftDate(-1)}
+					aria-label="Previous day"
+				>←</button>
+				<span class="text-sm text-text-secondary font-light min-w-[120px]">
+					{formatDisplayDate(selectedDate)}
+				</span>
+				<button
+					class="text-text-muted hover:text-text transition-colors p-1 disabled:opacity-20 disabled:cursor-default"
+					onclick={() => shiftDate(1)}
+					disabled={isToday}
+					aria-label="Next day"
+				>→</button>
+			</div>
 			<div class="w-12 h-px bg-gold mx-auto mt-5 opacity-60"></div>
 		</header>
 
@@ -97,7 +156,7 @@
 				{@const stories = briefing[f.key]}
 				{@const topStory = stories[0]}
 				<a
-					href="/freedoms/{f.id}"
+					href="/freedoms/{f.id}{isToday ? '' : `?date=${selectedDate}`}"
 					class="group relative block rounded-xl overflow-hidden transition-all duration-300
 						hover:scale-[1.02] hover:shadow-lg"
 					style="background: linear-gradient(135deg, {f.dim}, var(--color-bg-card))"
@@ -146,6 +205,36 @@
 				</a>
 			{/each}
 		</div>
+
+		<!-- Today's Highlights — hero story from each freedom -->
+		{#if heroStories.length > 0}
+			<div class="mt-10">
+				<h2 class="text-[10px] uppercase tracking-[0.25em] text-text-muted mb-5 text-center">Highlights</h2>
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+					{#each heroStories as { story, config: fc }}
+						<a
+							href="/freedoms/{fc.id}{isToday ? '' : `?date=${selectedDate}`}"
+							class="group block rounded-xl overflow-hidden transition-all duration-200 hover:scale-[1.01] bg-bg-card border border-border-subtle"
+						>
+							<div class="h-[2px]" style="background: linear-gradient(to right, {fc.color}, transparent)"></div>
+							<div class="p-4">
+								<div class="flex items-center gap-2 mb-2">
+									<span class="text-sm opacity-60" style="color: {fc.color}">{fc.icon}</span>
+									<span class="text-[10px] uppercase tracking-wider text-text-muted">{fc.label}</span>
+								</div>
+								<h3 class="text-sm font-medium text-text leading-snug mb-1.5 line-clamp-2 group-hover:text-white transition-colors">
+									{story.headline}
+								</h3>
+								<p class="text-xs text-text-secondary leading-relaxed line-clamp-2">
+									{story.summary.split(/[.!?]\s/)[0]}.
+								</p>
+								<p class="text-[10px] text-text-muted mt-2">{story.source_name}</p>
+							</div>
+						</a>
+					{/each}
+				</div>
+			</div>
+		{/if}
 
 		<!-- Footer -->
 		<div class="mt-12 pt-6 border-t border-border-subtle">
