@@ -123,15 +123,11 @@
       "query": "what happened in tech this week",
       "expected_headlines": [
         "Meta's Comeback: Muse Spark Puts Zuckerberg Back in the AI Race, Breaks With Open Source",
-        "Closing the Gap Between AI Velocity and Governance to Prevent Incidents",
-        "HP Unveils HP IQ to Revolutionize Connected Ecosystems",
-        "Commentary: Wipe out a 'civility'? Minor stuff compared with what just happened in AI",
-        "Anthropic Expands into Microsoft's Office 365 Ecosystem with Robust Enterprise Workflow Integration",
-        "Meta's Muse Spark AI Model: A Game-Changer in AI Development",
-        "NASA's Artemis II Mission Returns: How to Watch the Splashdown",
-        "AI Agent Operator Calls Defamation Incident a 'Social Experiment'"
+        "Google Unveils Gemma 4 AI Models for Data Centers and Smartphones",
+        "Anthropic Brings Claude's AI Power to Microsoft Word",
+        "OpenAI Launches $100 ChatGPT Pro Plan"
       ],
-      "notes": "Breaking: broad recent tech news"
+      "notes": "Breaking: broad recent tech news — reduced to 4 high-signal stories"
     },
     {
       "query": "Apple product launches",
@@ -149,12 +145,10 @@
       "expected_headlines": [
         "Mistral AI Secures $830M in Debt to Establish Paris Data Center",
         "Samsung and Mistral AI Engage in Crucial Discussions for Potential AI Alliance",
-        "The Chip War: Why Control of Semiconductors Holds the Key to AI's Future",
-        "Starcloud Blasts Off with $170M Series A to Build Space-Based Data Centers",
-        "ScaleOps Secures $130M to Tackle GPU Shortages and AI Cloud Costs",
-        "Amazon Expands into Robotics, Satellites, and AI Chips: A Game-Changer for the Tech Industry?"
+        "Meta Commits Additional $21B to CoreWeave's AI Infrastructure",
+        "Investment and AI Agent Deployment Surge as Execution Becomes Key"
       ],
-      "notes": "Analytical: trend/cause analysis"
+      "notes": "Analytical: trend/cause analysis — focused on investment-specific stories"
     },
     {
       "query": "impact of interest rates on tech stocks",
