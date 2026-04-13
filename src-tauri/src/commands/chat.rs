@@ -373,22 +373,43 @@ pub async fn chat_send(
         }
     } else { None };
 
-    let expanded_fts = {
+    let (expanded_fts, graph_entities_sync) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        search::expand_query_with_entities(&conn, &expanded.fts_keywords)
+        let alias_expanded = search::expand_query_with_entities(&conn, &expanded.fts_keywords);
+        let (graph_expanded, graph_ents) = search::expand_query_with_graph(&conn, &alias_expanded);
+        (graph_expanded, graph_ents)
     };
+    let _ = &graph_entities_sync; // used later for graph context
 
+    let date_from_sync = expanded.date_from.clone();
     let stories = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        search::hybrid_search_with_hyde(&conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(), 25, query_type, None)
-            .map_err(|e| e.to_string())?
+        if expanded.sub_queries.is_empty() {
+            search::hybrid_search_with_hyde(&conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(), 25, query_type, date_from_sync.as_deref())
+                .map_err(|e| e.to_string())?
+        } else {
+            let mut all_stories: Vec<search::ScoredStory> = Vec::new();
+            let mut seen_ids = std::collections::HashSet::new();
+            let primary = search::hybrid_search_with_hyde(&conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(), 15, query_type, date_from_sync.as_deref())
+                .map_err(|e| e.to_string())?;
+            for story in primary { if seen_ids.insert(story.story_id) { all_stories.push(story); } }
+            for sub_q in &expanded.sub_queries {
+                let sub_expanded = search::expand_query_with_entities(&conn, sub_q);
+                let sub_results = search::hybrid_search_with_hyde(&conn, &sub_expanded, None, None, 10, query_type, date_from_sync.as_deref())
+                    .map_err(|e| e.to_string())?;
+                for story in sub_results { if seen_ids.insert(story.story_id) { all_stories.push(story); } }
+            }
+            all_stories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            all_stories.truncate(25);
+            all_stories
+        }
     };
 
     // 3.5. Voyage rerank (falls back to Haiku, then to original order)
     let stories = if stories.len() > 6 {
         let reranked = search::voyage_rerank(&expanded_fts, stories.clone(), 10).await;
         if reranked.len() == stories.len() && reranked.first().map(|s| s.story_id) == stories.first().map(|s| s.story_id) {
-            reranking::llm_rerank(&api_key, &message, stories, 10).await
+            reranking::llm_rerank(&api_key, &expanded_fts, stories, 10).await
         } else {
             reranked
         }
@@ -524,6 +545,17 @@ pub async fn chat_send(
         (entity_ctx, signal_ctx, causal_ctx, contrarian_ctx, pattern_ctx, pred_ctx, prof)
     };
 
+    // 4.5 Retrieval confidence + graph context (non-streaming)
+    let retrieval_confidence_sync = compute_retrieval_confidence(&stories);
+    let graph_context_sync = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut ent_names = Vec::new();
+        if let Ok(ents) = entities::search_entities(&conn, &message) {
+            for ent in ents.into_iter().take(5) { ent_names.push(ent.name.clone()); }
+        }
+        conversation::format_graph_context(&conn, &ent_names)
+    };
+
     // 5. Build system prompt with prediction calibration
     let stories_context = conversation::format_stories_context(&stories, query_type);
     let prediction_calibration = {
@@ -543,7 +575,7 @@ pub async fn chat_send(
             _ => String::new(),
         }
     };
-    let system_prompt = conversation::build_system_prompt(
+    let mut system_prompt = conversation::build_system_prompt(
         &profile_str,
         &stories_context,
         &entity_context,
@@ -554,6 +586,10 @@ pub async fn chat_send(
         &predictions_context,
         &prediction_calibration,
     );
+    system_prompt.push_str(&format_retrieval_confidence(retrieval_confidence_sync, stories.len()));
+    if !graph_context_sync.is_empty() {
+        system_prompt.push_str(&format!("\n\nENTITY NETWORK:\n{}", graph_context_sync));
+    }
 
     // 6. Load conversation history
     let history = {
@@ -787,18 +823,56 @@ pub async fn chat_send_stream(
         None
     };
 
-    // 3.2 Entity alias expansion
-    let expanded_fts = {
+    // 3.2 Entity alias expansion + graph traversal
+    let (expanded_fts, _graph_entities) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        search::expand_query_with_entities(&conn, &expanded.fts_keywords)
+        let alias_expanded = search::expand_query_with_entities(&conn, &expanded.fts_keywords);
+        let (graph_expanded, graph_ents) = search::expand_query_with_graph(&conn, &alias_expanded);
+        (graph_expanded, graph_ents)
     };
 
+    // 3.3 Search with temporal filter + sub-query decomposition
+    let date_from = expanded.date_from.clone();
     let stories = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        search::hybrid_search_with_hyde(
-            &conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(),
-            25, query_type, None,
-        ).map_err(|e| e.to_string())?
+
+        if expanded.sub_queries.is_empty() {
+            // Single query path (most common)
+            search::hybrid_search_with_hyde(
+                &conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(),
+                25, query_type, date_from.as_deref(),
+            ).map_err(|e| e.to_string())?
+        } else {
+            // Multi-query decomposition: search each sub-query, merge results
+            let mut all_stories: Vec<search::ScoredStory> = Vec::new();
+            let mut seen_ids = std::collections::HashSet::new();
+
+            // Primary query first
+            let primary = search::hybrid_search_with_hyde(
+                &conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(),
+                15, query_type, date_from.as_deref(),
+            ).map_err(|e| e.to_string())?;
+            for story in primary {
+                if seen_ids.insert(story.story_id) { all_stories.push(story); }
+            }
+
+            // Sub-queries (FTS only — no extra embedding calls to control cost)
+            for sub_q in &expanded.sub_queries {
+                let sub_expanded = search::expand_query_with_entities(&conn, sub_q);
+                let sub_results = search::hybrid_search_with_hyde(
+                    &conn, &sub_expanded, None, None,
+                    10, query_type, date_from.as_deref(),
+                ).map_err(|e| e.to_string())?;
+                for story in sub_results {
+                    if seen_ids.insert(story.story_id) { all_stories.push(story); }
+                }
+            }
+
+            // Sort by score and take top 25
+            all_stories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            all_stories.truncate(25);
+            all_stories
+        }
     };
 
     on_event.send(ChatStreamEvent::Searching {
@@ -815,7 +889,7 @@ pub async fn chat_send_stream(
         let reranked = search::voyage_rerank(&expanded_fts, stories.clone(), 10).await;
         // If Voyage returned same order (fallback), try Haiku as secondary fallback
         if reranked.len() == stories.len() && reranked.first().map(|s| s.story_id) == stories.first().map(|s| s.story_id) {
-            reranking::llm_rerank(&api_key, &message, stories, 10).await
+            reranking::llm_rerank(&api_key, &expanded_fts, stories, 10).await
         } else {
             reranked
         }
@@ -967,6 +1041,22 @@ pub async fn chat_send_stream(
         (entity_ctx, signal_ctx, causal_ctx, contrarian_ctx, pattern_ctx, pred_ctx, prof)
     };
 
+    // 4.5 Compute retrieval confidence from score distribution
+    let retrieval_confidence = compute_retrieval_confidence(&stories);
+
+    // 4.6 Graph context for detected entities
+    let graph_context = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        // Use entities detected in search + graph-expanded entities
+        let mut entity_names_for_graph: Vec<String> = Vec::new();
+        if let Ok(ents) = entities::search_entities(&conn, &message) {
+            for ent in ents.into_iter().take(5) {
+                entity_names_for_graph.push(ent.name.clone());
+            }
+        }
+        conversation::format_graph_context(&conn, &entity_names_for_graph)
+    };
+
     // 5. Build system prompt with prediction calibration
     let stories_context = conversation::format_stories_context(&stories, query_type);
     let prediction_calibration = {
@@ -991,6 +1081,14 @@ pub async fn chat_send_stream(
         &causal_context, &contrarian_context, &pattern_context, &predictions_context,
         &prediction_calibration,
     );
+
+    // Append retrieval confidence
+    system_prompt.push_str(&format_retrieval_confidence(&retrieval_confidence, stories.len()));
+
+    // Append graph context if available
+    if !graph_context.is_empty() {
+        system_prompt.push_str(&format!("\n\nENTITY NETWORK:\n{}", graph_context));
+    }
 
     // Append web search results if available
     if let Some(ref wc) = web_context {
@@ -1311,9 +1409,10 @@ fn should_trigger_web_search(
         return Ok(true);
     }
 
-    // Rule 3: Low archive confidence
-    if stories.len() < 5 {
-        tracing::info!("Web search triggered: low archive results ({})", stories.len());
+    // Rule 3: Low retrieval confidence (replaces simple count check)
+    let confidence = compute_retrieval_confidence(stories);
+    if confidence == "LOW" || confidence == "NONE" {
+        tracing::info!("Web search triggered: low retrieval confidence ({}, {} stories)", confidence, stories.len());
         return Ok(true);
     }
 
@@ -1360,6 +1459,38 @@ fn extract_keywords(text: &str) -> Vec<String> {
         .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
         .filter(|w| w.len() >= 3 && !STOPWORDS.contains(&w.as_str()))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval confidence
+// ---------------------------------------------------------------------------
+
+/// Compute retrieval confidence from the score distribution of search results.
+fn compute_retrieval_confidence(stories: &[search::ScoredStory]) -> &'static str {
+    if stories.is_empty() {
+        return "NONE";
+    }
+    let count = stories.len();
+    let avg_score: f32 = stories.iter().map(|s| s.score).sum::<f32>() / count as f32;
+    let top_score = stories.first().map(|s| s.score).unwrap_or(0.0);
+
+    if count >= 8 && avg_score > 0.6 && top_score > 0.8 {
+        "HIGH"
+    } else if count >= 4 && avg_score > 0.4 {
+        "MODERATE"
+    } else {
+        "LOW"
+    }
+}
+
+/// Format retrieval confidence as a system prompt section.
+fn format_retrieval_confidence(confidence: &str, count: usize) -> String {
+    let guidance = match confidence {
+        "LOW" | "NONE" => "Your archive has limited coverage of this topic. Be explicit about uncertainty. Say what you DON'T know.",
+        "HIGH" => "Strong archival coverage. Ground your analysis in specific stories.",
+        _ => "Moderate coverage. Cite what you have, flag gaps.",
+    };
+    format!("\n\nRETRIEVAL CONFIDENCE: {} ({} stories found). {}", confidence, count, guidance)
 }
 
 /// Generate a concise thread title using Haiku. Falls back to first words on failure.
@@ -1537,5 +1668,59 @@ mod tests {
     fn test_keywords_match_text_empty() {
         let empty: Vec<String> = vec![];
         assert!(!keywords_match_text("anything", &empty));
+    }
+
+    #[test]
+    fn test_retrieval_confidence_high() {
+        let stories: Vec<search::ScoredStory> = (0..10)
+            .map(|i| search::ScoredStory {
+                story_id: i,
+                headline: format!("Story {}", i),
+                summary: String::new(),
+                key_facts: String::new(),
+                why_it_matters: String::new(),
+                sector: "ai".into(),
+                source_name: "test".into(),
+                date: "2026-04-01".into(),
+                score: 0.9 - (i as f32 * 0.02),
+                match_type: search::MatchType::Both,
+                source: search::StorySource::Daily,
+            })
+            .collect();
+        assert_eq!(compute_retrieval_confidence(&stories), "HIGH");
+    }
+
+    #[test]
+    fn test_retrieval_confidence_low() {
+        let stories: Vec<search::ScoredStory> = (0..2)
+            .map(|i| search::ScoredStory {
+                story_id: i,
+                headline: format!("Story {}", i),
+                summary: String::new(),
+                key_facts: String::new(),
+                why_it_matters: String::new(),
+                sector: "ai".into(),
+                source_name: "test".into(),
+                date: "2026-04-01".into(),
+                score: 0.3,
+                match_type: search::MatchType::Fts,
+                source: search::StorySource::Daily,
+            })
+            .collect();
+        assert_eq!(compute_retrieval_confidence(&stories), "LOW");
+    }
+
+    #[test]
+    fn test_retrieval_confidence_none() {
+        let stories: Vec<search::ScoredStory> = vec![];
+        assert_eq!(compute_retrieval_confidence(&stories), "NONE");
+    }
+
+    #[test]
+    fn test_format_retrieval_confidence() {
+        let result = format_retrieval_confidence("HIGH", 10);
+        assert!(result.contains("HIGH"));
+        assert!(result.contains("10 stories"));
+        assert!(result.contains("Strong archival coverage"));
     }
 }

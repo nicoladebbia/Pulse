@@ -126,6 +126,37 @@ pub fn get_top_relationships(conn: &Connection, limit: usize) -> Result<Vec<Enti
     Ok(relationships)
 }
 
+/// Get entity names related to a given entity name via co-occurrence.
+///
+/// Only returns relationships with strength ≥ `min_strength` (co-occurred in
+/// that many stories). Results sorted by strength descending.
+pub fn get_related_entities(
+    conn: &Connection,
+    entity_name: &str,
+    min_strength: f64,
+    limit: usize,
+) -> Result<Vec<(String, f64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT CASE WHEN ea.name_normalized = ?1 THEN eb.name ELSE ea.name END AS related_name,
+                r.strength
+         FROM entity_relationships r
+         JOIN entities ea ON ea.id = r.entity_a_id
+         JOIN entities eb ON eb.id = r.entity_b_id
+         WHERE (ea.name_normalized = ?1 OR eb.name_normalized = ?1)
+           AND r.strength >= ?2
+         ORDER BY r.strength DESC
+         LIMIT ?3",
+    )?;
+
+    let results = stmt
+        .query_map(params![entity_name.trim().to_lowercase(), min_strength, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -252,5 +283,41 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert!((top[0].strength - 3.0).abs() < 1e-6, "strongest first");
         assert!((top[1].strength - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_get_related_entities_by_name() {
+        let conn = test_db();
+        let stories = vec![TestStory::new("ai", "Story")];
+        let (_bid, sids) = seed_briefing(&conn, "2026-03-31", &stories);
+
+        let id_a = insert_entity(&conn, "OpenAI", sids[0]);
+        let id_b = insert_entity(&conn, "Microsoft", sids[0]);
+        let id_c = insert_entity(&conn, "Google", sids[0]);
+
+        // A-B co-occurs 5 times, A-C co-occurs 2 times
+        for _ in 0..5 { record_co_occurrence(&conn, id_a, id_b, "2026-03-31").unwrap(); }
+        for _ in 0..2 { record_co_occurrence(&conn, id_a, id_c, "2026-03-31").unwrap(); }
+
+        // min_strength=3 → only Microsoft (strength=5), not Google (strength=2)
+        let related = get_related_entities(&conn, "openai", 3.0, 5).unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].0, "Microsoft");
+        assert!((related[0].1 - 5.0).abs() < 1e-6);
+
+        // min_strength=1 → both
+        let related = get_related_entities(&conn, "openai", 1.0, 5).unwrap();
+        assert_eq!(related.len(), 2);
+    }
+
+    #[test]
+    fn test_get_related_entities_empty() {
+        let conn = test_db();
+        let stories = vec![TestStory::new("ai", "Story")];
+        let (_bid, sids) = seed_briefing(&conn, "2026-03-31", &stories);
+        insert_entity(&conn, "LonelyEntity", sids[0]);
+
+        let related = get_related_entities(&conn, "lonelyentity", 1.0, 5).unwrap();
+        assert!(related.is_empty());
     }
 }

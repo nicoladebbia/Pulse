@@ -2948,6 +2948,7 @@ dependencies = [
  "async-trait",
  "bytemuck",
  "chrono",
+ "clap",
  "dirs",
  "dotenvy",
  "futures-util",

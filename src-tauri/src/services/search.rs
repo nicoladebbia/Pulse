@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -119,6 +119,10 @@ pub struct ExpandedQuery {
     pub fts_keywords: String,
     pub semantic_text: String,
     pub original: String,
+    /// Parsed temporal filter from the query (e.g., "last quarter" → "2026-01-01")
+    pub date_from: Option<String>,
+    /// Sub-queries for complex multi-entity/multi-facet questions
+    pub sub_queries: Vec<String>,
 }
 
 impl ExpandedQuery {
@@ -127,6 +131,8 @@ impl ExpandedQuery {
             fts_keywords: message.to_string(),
             semantic_text: message.to_string(),
             original: message.to_string(),
+            date_from: None,
+            sub_queries: vec![],
         }
     }
 }
@@ -192,18 +198,27 @@ pub async fn rewrite_query(api_key: &str, message: &str, conversation_context: O
 async fn rewrite_query_inner(api_key: &str, message: &str, conversation_context: Option<&str>) -> anyhow::Result<ExpandedQuery> {
     let client = reqwest::Client::new();
 
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let base_instruction = format!(
+        "You expand search queries for a news intelligence archive covering AI/LLMs, Miami Beach, Italian politics, and tech/innovation.\n\
+        Today is {}. Return ONLY valid JSON with these fields:\n\
+        {{\"keywords\": \"expanded search keywords with entity names synonyms and related terms\",\n\
+        \"hypothetical_answer\": \"A 2-3 sentence hypothetical answer as if you had the relevant news stories\",\n\
+        \"date_from\": \"YYYY-MM-DD or null — extract temporal references: 'last quarter'→3 months ago, 'since January'→YYYY-01-01, 'this week'→Monday's date, 'yesterday'→yesterday. null if no temporal reference.\",\n\
+        \"sub_queries\": [\"sub-query 1\", \"sub-query 2\"] or [] — ONLY split if the question asks about 2+ DISTINCT topics/entities that need separate searches. Most questions should return []. Max 3 sub-queries.\n\
+        }}\n\
+        Be specific: add company names, people, acronyms, related technologies. No explanation, just JSON.",
+        today
+    );
+
     let system = if let Some(ctx) = conversation_context {
         format!(
-            "You expand search queries for a news intelligence archive covering AI/LLMs, Miami Beach, Italian politics, and tech/innovation.\n\
-            The user is in an ongoing conversation. Here is the recent conversation:\n{}\n\n\
-            Rewrite the user's latest message as a STANDALONE search query that includes all necessary context from the conversation.\n\
-            Return ONLY valid JSON:\n\
-            {{\"keywords\": \"expanded search keywords with entity names synonyms and related terms\", \"hypothetical_answer\": \"A 2-3 sentence hypothetical answer to this question as if you had the relevant news stories\"}}\n\
-            Be specific: add company names, people, acronyms, related technologies. No explanation, just JSON.",
-            ctx
+            "{}\n\nThe user is in an ongoing conversation. Here is the recent context:\n{}\n\n\
+            Rewrite the user's latest message as a STANDALONE search query that includes all necessary context from the conversation.",
+            base_instruction, ctx
         )
     } else {
-        "You expand search queries for a news intelligence archive covering AI/LLMs, Miami Beach, Italian politics, and tech/innovation.\nGiven a user question, return ONLY valid JSON:\n{\"keywords\": \"expanded search keywords with entity names synonyms and related terms\", \"hypothetical_answer\": \"A 2-3 sentence hypothetical answer to this question as if you had the relevant news stories\"}\nBe specific: add company names, people, acronyms, related technologies. No explanation, just JSON.".to_string()
+        base_instruction
     };
 
     let body = serde_json::json!({
@@ -247,15 +262,35 @@ async fn rewrite_query_inner(api_key: &str, message: &str, conversation_context:
     struct RewriteResponse {
         keywords: Option<String>,
         hypothetical_answer: Option<String>,
+        date_from: Option<String>,
+        sub_queries: Option<Vec<String>>,
     }
 
     let parsed: RewriteResponse = serde_json::from_str(json_str)
         .context("failed to parse rewrite response")?;
 
+    // Filter out "null" string values for date_from
+    let date_from = parsed.date_from.filter(|d| d != "null" && !d.is_empty() && d.len() == 10);
+
+    // Filter sub_queries: only keep if 2+ non-empty entries, max 3
+    let sub_queries = parsed.sub_queries
+        .map(|sq| sq.into_iter().filter(|s| !s.is_empty()).take(3).collect::<Vec<_>>())
+        .filter(|sq| sq.len() >= 2)
+        .unwrap_or_default();
+
+    if date_from.is_some() {
+        tracing::info!("Temporal filter parsed: {:?}", date_from);
+    }
+    if !sub_queries.is_empty() {
+        tracing::info!("Query decomposed into {} sub-queries: {:?}", sub_queries.len(), sub_queries);
+    }
+
     Ok(ExpandedQuery {
         fts_keywords: parsed.keywords.unwrap_or_else(|| message.to_string()),
         semantic_text: parsed.hypothetical_answer.unwrap_or_else(|| message.to_string()),
         original: message.to_string(),
+        date_from,
+        sub_queries,
     })
 }
 
@@ -637,18 +672,19 @@ fn headline_word_overlap(a: &str, b: &str) -> f32 {
     if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
 }
 
-/// Expand a query with known entity aliases from the entities table.
-/// E.g., "NVDA earnings" → "NVDA earnings OR Nvidia"
+/// Expand a query with known entity names and aliases (tickers, acronyms, etc.).
+/// E.g., "NVDA earnings" → "NVDA earnings Nvidia"
 pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
     let words: Vec<&str> = query.split_whitespace().collect();
-    let mut aliases: Vec<String> = Vec::new();
+    let mut expansions: Vec<String> = Vec::new();
+    let lower_query = query.to_lowercase();
 
     for word in &words {
         if word.len() < 2 { continue; }
         let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
         if clean.is_empty() { continue; }
 
-        // Look up entities matching this word
+        // Look up entities matching this word by name
         let pattern = format!("%{}%", clean);
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT name FROM entities WHERE LOWER(name) LIKE LOWER(?1) LIMIT 3"
@@ -656,20 +692,98 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
             if let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
                 for name in rows.flatten() {
                     let lower_name = name.to_lowercase();
-                    let lower_query = query.to_lowercase();
-                    if !lower_query.contains(&lower_name) && name.len() > 2 {
-                        aliases.push(name);
+                    if !lower_query.contains(&lower_name) && name.len() > 2
+                        && !expansions.iter().any(|e| e.to_lowercase() == lower_name)
+                    {
+                        expansions.push(name);
+                    }
+                }
+            }
+        }
+
+        // Also look up via entity_aliases table (tickers, acronyms)
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT e.name FROM entity_aliases ea
+             JOIN entities e ON e.id = ea.entity_id
+             WHERE LOWER(ea.alias) = LOWER(?1) LIMIT 3"
+        ) {
+            if let Ok(rows) = stmt.query_map(params![clean], |row| row.get::<_, String>(0)) {
+                for name in rows.flatten() {
+                    let lower_name = name.to_lowercase();
+                    if !lower_query.contains(&lower_name)
+                        && !expansions.iter().any(|e| e.to_lowercase() == lower_name)
+                    {
+                        expansions.push(name);
+                    }
+                }
+            }
+        }
+
+        // Reverse: if query contains entity name, find its aliases/tickers
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT ea.alias FROM entity_aliases ea
+             JOIN entities e ON e.id = ea.entity_id
+             WHERE LOWER(e.name) LIKE LOWER(?1) LIMIT 3"
+        ) {
+            if let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
+                for alias in rows.flatten() {
+                    let lower_alias = alias.to_lowercase();
+                    if !lower_query.contains(&lower_alias)
+                        && !expansions.iter().any(|e| e.to_lowercase() == lower_alias)
+                    {
+                        expansions.push(alias);
                     }
                 }
             }
         }
     }
 
-    if aliases.is_empty() {
+    if expansions.is_empty() {
         query.to_string()
     } else {
-        tracing::info!("Entity expansion: added {} aliases", aliases.len());
-        format!("{} {}", query, aliases.join(" "))
+        tracing::info!("Entity expansion: added {} terms: {:?}", expansions.len(), expansions);
+        format!("{} {}", query, expansions.join(" "))
+    }
+}
+
+/// Expand a query with graph-connected entities (1-hop co-occurrence traversal).
+/// For each entity detected in the query, finds related entities with strength ≥ 3
+/// and appends their names to the search query.
+pub fn expand_query_with_graph(conn: &Connection, query: &str) -> (String, Vec<String>) {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let mut graph_entities: Vec<String> = Vec::new();
+    let lower_query = query.to_lowercase();
+
+    for word in &words {
+        if word.len() < 3 { continue; }
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if clean.is_empty() { continue; }
+
+        // Check if this word matches an entity name
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT name_normalized FROM entities WHERE name_normalized LIKE ?1 LIMIT 1"
+        ) {
+            let pattern = format!("%{}%", clean);
+            if let Ok(Some(entity_norm)) = stmt.query_row(params![pattern], |row| row.get::<_, String>(0)).optional() {
+                // Found an entity — traverse its graph
+                if let Ok(related) = super::relationships::get_related_entities(conn, &entity_norm, 3.0, 5) {
+                    for (name, _strength) in related {
+                        let lower_name = name.to_lowercase();
+                        if !lower_query.contains(&lower_name) && !graph_entities.iter().any(|g| g.to_lowercase() == lower_name) {
+                            graph_entities.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if graph_entities.is_empty() {
+        (query.to_string(), vec![])
+    } else {
+        tracing::info!("Graph expansion: added {} related entities: {:?}", graph_entities.len(), graph_entities);
+        let expanded = format!("{} {}", query, graph_entities.join(" "));
+        (expanded, graph_entities)
     }
 }
 
@@ -821,19 +935,47 @@ pub fn hybrid_search_with_hyde(
         stories.retain(|s| s.date.as_str() >= from);
     }
 
-    // 7.5. Deduplicate near-identical stories (max 2 per source, drop >75% headline overlap)
+    // 7.5. Deduplicate: headline overlap + semantic similarity + source diversity
     if stories.len() > 3 {
+        // Load embeddings for semantic dedup (cheap — already in DB)
+        let story_embeddings: HashMap<i64, Vec<f32>> = {
+            let mut embs = HashMap::new();
+            for story in &stories {
+                let real_id = decode_story_id(story.story_id).0;
+                if let Ok(blob) = conn.query_row(
+                    "SELECT embedding FROM story_embeddings WHERE story_id = ?1",
+                    params![real_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                ) {
+                    embs.insert(story.story_id, super::embeddings::deserialize_embedding(&blob));
+                }
+            }
+            embs
+        };
+
         let mut deduped: Vec<ScoredStory> = Vec::with_capacity(stories.len());
         let mut source_counts: HashMap<String, usize> = HashMap::new();
         for story in stories {
             // Max 2 stories from same source
             let count = source_counts.entry(story.source_name.clone()).or_insert(0);
             if *count >= 2 { continue; }
-            // Check headline overlap with already-kept stories
-            let dominated = deduped.iter().any(|kept| {
+            // Check headline word overlap with already-kept stories
+            let headline_dup = deduped.iter().any(|kept| {
                 headline_word_overlap(&kept.headline, &story.headline) > 0.75
             });
-            if dominated { continue; }
+            if headline_dup { continue; }
+            // Check semantic similarity (same event, different headline) — only across sources
+            if let Some(emb) = story_embeddings.get(&story.story_id) {
+                let semantic_dup = deduped.iter().any(|kept| {
+                    if kept.source_name == story.source_name { return false; } // same source handled above
+                    if let Some(kept_emb) = story_embeddings.get(&kept.story_id) {
+                        super::embeddings::cosine_similarity(emb, kept_emb) > 0.85
+                    } else {
+                        false
+                    }
+                });
+                if semantic_dup { continue; }
+            }
             *count += 1;
             deduped.push(story);
         }

@@ -1,0 +1,172 @@
+{
+  "cases": [
+    {
+      "query": "NVIDIA AI chips",
+      "expected_headlines": [
+        "Amazon Eyes Trainium AI Chip Sales to Third Parties, Taking Aim at Nvidia",
+        "Amazon CEO Says Chip Business 'On Fire' as AWS Challenges Nvidia",
+        "SiFive Secures $400 Million from Atreides and Nvidia for Data-Center Chip Tech",
+        "Nvidia Invests $2 Billion in Marvell, Spurring AI ASIC Competition",
+        "Rebellions Raises $400M at $2.3B Valuation in Pre-IPO Round, Challenging Nvidia"
+      ],
+      "notes": ""
+    },
+    {
+      "query": "compare cloud providers AWS Azure Google Cloud",
+      "expected_headlines": [],
+      "notes": "Comparative: multi-entity comparison"
+    },
+    {
+      "query": "AI regulation in Europe",
+      "expected_headlines": [
+        "WhiteHawk Enters AI Governance with Quixxi Acquisition",
+        "India's AI Governance Focuses on Consent: dqindia.com",
+        "Washington Enacts New AI Laws Targeting Chatbots, Deepfakes, and Disclosure",
+        "OpenAI Halts UK Data Centre Deal Due to Energy Costs and Regulatory Concerns"
+      ],
+      "notes": "Analytical: EU AI Act, regulation trends"
+    },
+    {
+      "query": "OpenAI vs Anthropic",
+      "expected_headlines": [
+        "Anthropic vs. OpenAI: Secondary Market Dynamics Shift in 2026",
+        "OpenAI Enters the Fray with ChatGPT Pro, Targeting Claude Code's Territory",
+        "OpenAI Spud Model Takes Significant Leap Towards Achieving Artificial General Intelligence (AGI)",
+        "Anthropic leaks Claude Mythos with dramatically higher benchmark scores",
+        "Anthropic Surpasses $30B ARR, Unveils Project GlassWing and Claude Mythos Preview",
+        "OpenAI Unveils $100 ChatGPT Pro Tier Amid Escalating AI Coding Battle with Anthropic",
+        "OpenAI Claims Infrastructure Advantage Over Anthropic, Pauses UK Data Center Project",
+        "OpenAI Cuts Pro Price to $100, Undercuts Anthropic and Google for Heavy Codex Users"
+      ],
+      "notes": "Comparative: should find stories about both companies"
+    },
+    {
+      "query": "Miami real estate market",
+      "expected_headlines": [
+        "Miami's Real Estate Market Sees Shift in Capital Flows Amid Development Trends",
+        "Miami-Dade Unveils Ambitious Plan to Build 10,000 New Affordable Housing Units",
+        "Miami Beach Real Estate Firm Acquired for $1.2 Billion",
+        "13th Floor Secures $105M for Casa Cipriani Project in Miami Beach",
+        "Cofe Properties Acquires Doral Office Building for $63M",
+        "CIM Group Sells Miami Worldcenter Retail for $210M"
+      ],
+      "notes": "Entity-specific: Miami sector stories"
+    },
+    {
+      "query": "startup funding rounds series A",
+      "expected_headlines": [
+        "Venture Funding to Foundational AI Startups Doubles in Q1 2026 Compared to 2025",
+        "OpenAI Backs New AI Startup Seeking Bot Army Breakthroughs",
+        "Whoop's Valuation Triples to $10 Billion After $575M Series G Funding Round",
+        "OpenAI Secures $122 Billion Funding Round Amid AI Boom",
+        "Startup Funding Shatters Records in Q1, Fueled by Mega-Deals",
+        "Miami Area Startups Secure $4.13B in VC Funding in 2025, eMerge Insights Report Reveals",
+        "OpenAI Closes Record-Breaking Funding Round at $852 Billion Valuation"
+      ],
+      "notes": "Analytical: venture capital trends"
+    },
+    {
+      "query": "NVIDIA earnings and AI chip demand",
+      "expected_headlines": [
+        "Intel Stock Surges 40%, Driven by Strong Demand for Chips and AI Applications",
+        "Amazon Eyes Trainium AI Chip Sales to Third Parties, Taking Aim at Nvidia",
+        "Amazon CEO Says Chip Business 'On Fire' as AWS Challenges Nvidia",
+        "Alphabet, Intel Chip Alliance to Shape Future AI Economics",
+        "AWS Considers Selling Custom Chips, Reports Near-Sold-Out AI Capacity",
+        "Memory Demand Skyrockets in Hyperscalers, Nvidia Secures Preferential Supply"
+      ],
+      "notes": "Entity-specific: should find NVIDIA stories and related supply chain"
+    },
+    {
+      "query": "Italian politics latest",
+      "expected_headlines": [
+        "Italian Court Orders Netflix to Refund Subscribers Over Unlawful Price Hikes",
+        "Italian Courts Issue Record 18,780 Citizenship Rulings in Q1 2026",
+        "Italy's Opposition Warns Meloni Against Forcing Electoral Reform"
+      ],
+      "notes": "Breaking: recent Italian political news"
+    },
+    {
+      "query": "cryptocurrency and bitcoin trends",
+      "expected_headlines": [
+        "Google Warns Quantum Computers Will Crack Bitcoin Encryption by 2029, Urges Preparations",
+        "FBI Reports Record $11 Billion in Cryptocurrency Fraud Losses as AI Enhances Cybercrime"
+      ],
+      "notes": "Analytical: crypto sector coverage"
+    },
+    {
+      "query": "Tesla self driving autonomous vehicles",
+      "expected_headlines": [
+        "Tesla Stock: Electric Vehicle Demand and Autopilot Advancements Drive Growth",
+        "Tesla Releases 2026.8 Software Update, Enhancing Vehicle Performance and Safety",
+        "Self-Driving Vehicle Talent Poaching Heats Up as Companies Vie for Dominance",
+        "Uber Invests $1.25B in Partnership to Launch Robotaxis by 2031",
+        "Tesla's Unsold EV Inventory Hits Record 50,000 Units in Q1 2026"
+      ],
+      "notes": "Entity-specific: Tesla + autonomous driving"
+    },
+    {
+      "query": "How does the AI chip shortage affect both Nvidia and Apple",
+      "expected_headlines": [
+        "Apple's M5 Max Pushes Pro Laptop Limits",
+        "Global Chip Race Heats Up as AI, Supply Chains, and New Entrants Intensify Competition",
+        "ScaleOps Secures $130M to Tackle GPU Shortages and AI Cloud Costs",
+        "Rebellions Raises $400M at $2.3B Valuation in Pre-IPO Round, Challenging Nvidia",
+        "Broadcom secures OpenAI chip deal as AI infrastructure demand accelerates",
+        "TSMC Warns AI Silicon Shortage Will Worsen, Impacting Global Tech Supply Chains",
+        "New M5-based MacBook Air Combines Durability and Performance",
+        "Global Helium Shortage Threatens Chipmaking Supply Chain"
+      ],
+      "notes": "Multi-entity: should trigger query decomposition"
+    },
+    {
+      "query": "what happened in tech this week",
+      "expected_headlines": [
+        "Meta's Comeback: Muse Spark Puts Zuckerberg Back in the AI Race, Breaks With Open Source",
+        "Closing the Gap Between AI Velocity and Governance to Prevent Incidents",
+        "HP Unveils HP IQ to Revolutionize Connected Ecosystems",
+        "Commentary: Wipe out a 'civility'? Minor stuff compared with what just happened in AI",
+        "Anthropic Expands into Microsoft's Office 365 Ecosystem with Robust Enterprise Workflow Integration",
+        "Meta's Muse Spark AI Model: A Game-Changer in AI Development",
+        "NASA's Artemis II Mission Returns: How to Watch the Splashdown",
+        "AI Agent Operator Calls Defamation Incident a 'Social Experiment'"
+      ],
+      "notes": "Breaking: broad recent tech news"
+    },
+    {
+      "query": "Apple product launches",
+      "expected_headlines": [
+        "New M5-based MacBook Air Combines Durability and Performance",
+        "Hands-on Review: A PC User's 2-Week Experience with the MacBook Neo",
+        "Apple's M5 Max Pushes Pro Laptop Limits, Redefining Performance and Power",
+        "Apple's M5 Max Pushes Pro Laptop Limits",
+        "Leaked Video Reveals iPhone 18 Pro Max and iPhone Fold Dummy Models"
+      ],
+      "notes": "Entity-specific: Apple news"
+    },
+    {
+      "query": "why is AI investment accelerating",
+      "expected_headlines": [
+        "Mistral AI Secures $830M in Debt to Establish Paris Data Center",
+        "Samsung and Mistral AI Engage in Crucial Discussions for Potential AI Alliance",
+        "The Chip War: Why Control of Semiconductors Holds the Key to AI's Future",
+        "Starcloud Blasts Off with $170M Series A to Build Space-Based Data Centers",
+        "ScaleOps Secures $130M to Tackle GPU Shortages and AI Cloud Costs",
+        "Amazon Expands into Robotics, Satellites, and AI Chips: A Game-Changer for the Tech Industry?"
+      ],
+      "notes": "Analytical: trend/cause analysis"
+    },
+    {
+      "query": "impact of interest rates on tech stocks",
+      "expected_headlines": [],
+      "notes": "Analytical: macro + tech intersection"
+    },
+    {
+      "query": "Meta AI open source models",
+      "expected_headlines": [
+        "Meta's Comeback: Muse Spark Puts Zuckerberg Back in the AI Race, Breaks With Open Source"
+      ],
+      "notes": "Entity-specific: Meta/Llama coverage"
+    }
+  ]
+}

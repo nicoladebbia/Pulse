@@ -18,6 +18,7 @@ pub const MIGRATION_011: &str = include_str!("../../../migrations/011_rename_fin
 pub const MIGRATION_012: &str = include_str!("../../../migrations/012_chat_feedback.sql");
 pub const MIGRATION_013: &str = include_str!("../../../migrations/013_feedback_reputation.sql");
 pub const MIGRATION_014: &str = include_str!("../../../migrations/014_intelligence_upgrade.sql");
+pub const MIGRATION_015: &str = include_str!("../../../migrations/015_entity_aliases.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -209,6 +210,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_014)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (14)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 15: Entity aliases table
+    if !applied.contains(&15) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_015)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (15)", [])?;
         tx.commit()?;
     }
 

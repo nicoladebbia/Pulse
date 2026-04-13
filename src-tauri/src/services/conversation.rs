@@ -447,6 +447,32 @@ pub fn format_signal_context(signals: &[super::signals::Signal]) -> String {
         .join("\n")
 }
 
+/// Format entity graph context showing co-occurrence relationships.
+/// Shows which entities are most frequently mentioned together.
+pub fn format_graph_context(
+    conn: &rusqlite::Connection,
+    entity_names: &[String],
+) -> String {
+    let mut lines = Vec::new();
+    for name in entity_names {
+        if let Ok(related) = super::relationships::get_related_entities(
+            conn,
+            &name.trim().to_lowercase(),
+            3.0,
+            5,
+        ) {
+            if !related.is_empty() {
+                let rels: Vec<String> = related
+                    .iter()
+                    .map(|(rname, strength)| format!("{} ({}x)", rname, *strength as i64))
+                    .collect();
+                lines.push(format!("{} — most often mentioned with: {}", name, rels.join(", ")));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 // ---------------------------------------------------------------------------
 // Response parsing
 // ---------------------------------------------------------------------------
