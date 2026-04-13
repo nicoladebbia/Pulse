@@ -311,7 +311,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 11: Validate predictions against new stories (non-fatal)
     tracing::info!("Phase 11: Validating predictions...");
-    match validate_and_expire_predictions(db_path) {
+    match validate_and_expire_predictions(db_path).await {
         Ok((validated, expired)) => {
             if validated > 0 || expired > 0 {
                 tracing::info!("Predictions: {} validated/updated, {} expired", validated, expired);
@@ -331,9 +331,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
 }
 
 /// Validate active predictions against recent stories using embedding similarity.
-/// Much more accurate than keyword matching — semantically compares prediction text
-/// against story content using the same Voyage embeddings infrastructure.
-fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::Result<(usize, usize)> {
+/// Embeds prediction texts via Voyage (1 API call for all predictions), then
+/// compares against today's story embeddings using cosine similarity.
+async fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::Result<(usize, usize)> {
     let conn = rusqlite::Connection::open(db_path)?;
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -356,7 +356,7 @@ fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::Result<
         })?.filter_map(|r| r.ok()).collect()
     };
 
-    // 2. Load active predictions with their embeddings (embed prediction text)
+    // 2. Load active predictions
     let mut pred_stmt = conn.prepare(
         "SELECT id, title, content, confidence FROM insights WHERE insight_type = 'prediction' AND status = 'active'"
     )?;
@@ -369,55 +369,56 @@ fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::Result<
         return Ok((0, 0));
     }
 
-    // 3. For each prediction, compute cosine similarity against today's story embeddings
-    // Use the prediction's title+content as a simple text embedding proxy:
-    // compare word overlap (fast, no API call needed) + entity co-occurrence
+    // 3. Embed prediction texts via Voyage (1 API call for all predictions)
+    let pred_texts: Vec<String> = predictions.iter()
+        .map(|(_, title, content, _)| format!("{}. {}", title, content))
+        .collect();
+
+    let pred_embeddings = match crate::embeddings::generate_from_texts(&pred_texts).await {
+        Ok(embs) => {
+            tracing::info!("Embedded {} prediction texts for validation", embs.len());
+            log_usage(db_path, "voyage", "voyage-3-lite", "prediction_validation", (embs.len() as i64) * 100, 0);
+            embs
+        }
+        Err(e) => {
+            tracing::warn!("Failed to embed predictions (falling back to keyword matching): {}", e);
+            return validate_predictions_keyword_fallback(&conn, &predictions, &story_embeddings, &today);
+        }
+    };
+
+    // 4. For each prediction, find best semantic match against today's stories
     let mut validated = 0usize;
-    for (pred_id, title, content, confidence) in &predictions {
-        let pred_text = format!("{} {}", title, content).to_lowercase();
-        // Extract significant terms (4+ chars, no stopwords)
-        let pred_terms: std::collections::HashSet<String> = pred_text.split_whitespace()
-            .filter(|w| w.len() >= 4)
-            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
-            .filter(|w| !w.is_empty() && !["this", "that", "will", "with", "from", "have", "been",
-                "more", "than", "about", "would", "could", "should", "their", "these", "those",
-                "when", "what", "which", "there", "based", "likely", "expect"].contains(&w.as_str()))
-            .collect();
+    for (i, (pred_id, title, _content, confidence)) in predictions.iter().enumerate() {
+        let pred_emb = match pred_embeddings.get(i) {
+            Some(e) => e,
+            None => continue,
+        };
 
-        if pred_terms.len() < 3 { continue; }
-
-        // Find best matching story — need 40%+ term overlap (much stricter than 3 keywords)
+        // Cosine similarity against each of today's story embeddings
         let mut best_match: Option<(i64, f32)> = None;
-        for &sid in story_embeddings.iter().map(|(id, _)| id) {
-            let story_text: Option<String> = conn.query_row(
-                "SELECT LOWER(headline || ' ' || summary || ' ' || key_facts) FROM stories WHERE id = ?1",
-                [sid], |row| row.get(0),
-            ).ok();
-
-            if let Some(text) = story_text {
-                let story_terms: std::collections::HashSet<&str> = text.split_whitespace()
-                    .filter(|w| w.len() >= 4)
-                    .collect();
-                let overlap = pred_terms.iter()
-                    .filter(|t| story_terms.contains(t.as_str()))
-                    .count();
-                let overlap_ratio = overlap as f32 / pred_terms.len() as f32;
-
-                if overlap_ratio > 0.4 {
-                    if best_match.is_none() || overlap_ratio > best_match.unwrap().1 {
-                        best_match = Some((sid, overlap_ratio));
-                    }
+        for (sid, story_emb) in &story_embeddings {
+            let sim = cosine_similarity(pred_emb, story_emb);
+            if sim > 0.5 { // Threshold: meaningful semantic similarity
+                if best_match.is_none() || sim > best_match.unwrap().1 {
+                    best_match = Some((*sid, sim));
                 }
             }
         }
 
-        if let Some((sid, overlap)) = best_match {
-            // Update probability based on strength of evidence
-            // Weak evidence (40-60% overlap): nudge +0.03
-            // Strong evidence (60-80%): nudge +0.06
-            // Very strong (80%+): nudge +0.10
-            let nudge = if overlap > 0.8 { 0.10 } else if overlap > 0.6 { 0.06 } else { 0.03 };
+        if let Some((sid, similarity)) = best_match {
+            // Nudge confidence based on similarity strength
+            // 0.5-0.65: weak evidence → +0.02
+            // 0.65-0.8: moderate evidence → +0.05
+            // 0.8+: strong evidence → +0.08
+            let nudge = if similarity > 0.8 { 0.08 } else if similarity > 0.65 { 0.05 } else { 0.02 };
             let new_prob = (confidence + nudge).min(0.95);
+
+            let story_headline: String = conn.query_row(
+                "SELECT headline FROM stories WHERE id = ?1", [sid], |row| row.get(0),
+            ).unwrap_or_default();
+
+            tracing::info!("Prediction #{} matched story (sim={:.3}): \"{}\" ↔ \"{}\"",
+                pred_id, similarity, truncate_str(title, 50), truncate_str(&story_headline, 50));
 
             let history: String = conn.query_row(
                 "SELECT COALESCE(probability_history, '[]') FROM insights WHERE id = ?1",
@@ -428,9 +429,10 @@ fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::Result<
             entries.push(serde_json::json!({
                 "date": today,
                 "probability": new_prob,
-                "overlap": overlap,
+                "similarity": similarity,
                 "story_id": sid,
-                "reason": format!("Supporting evidence ({:.0}% term overlap)", overlap * 100.0)
+                "story_headline": story_headline,
+                "reason": format!("Semantic match ({:.0}% similarity)", similarity * 100.0)
             }));
 
             conn.execute(
@@ -441,13 +443,13 @@ fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::Result<
         }
     }
 
-    // 4. Expire stale predictions (past their predicted_date with no resolution)
+    // 5. Expire stale predictions (past their predicted_date with no resolution)
     let expired: usize = conn.execute(
         "UPDATE insights SET status = 'expired' WHERE insight_type = 'prediction' AND status = 'active' AND predicted_date IS NOT NULL AND predicted_date < date('now', '-7 days')",
         [],
     ).unwrap_or(0);
 
-    // 5. Compute Brier scores for resolved predictions
+    // 6. Compute Brier scores for resolved predictions
     let mut brier_stmt = conn.prepare(
         "SELECT id, confidence, status FROM insights WHERE insight_type = 'prediction' AND status IN ('validated', 'invalidated') AND brier_score IS NULL"
     )?;
@@ -463,6 +465,101 @@ fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::Result<
     }
 
     Ok((validated, expired))
+}
+
+/// Keyword-based fallback when Voyage API is unavailable.
+fn validate_predictions_keyword_fallback(
+    conn: &rusqlite::Connection,
+    predictions: &[(i64, String, String, f64)],
+    story_embeddings: &[(i64, Vec<f32>)],
+    today: &str,
+) -> anyhow::Result<(usize, usize)> {
+    let mut validated = 0usize;
+
+    for (pred_id, title, content, confidence) in predictions {
+        let pred_text = format!("{} {}", title, content).to_lowercase();
+        let pred_terms: std::collections::HashSet<String> = pred_text.split_whitespace()
+            .filter(|w| w.len() >= 4)
+            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+            .filter(|w| !w.is_empty() && !["this", "that", "will", "with", "from", "have", "been",
+                "more", "than", "about", "would", "could", "should", "their", "these", "those",
+                "when", "what", "which", "there", "based", "likely", "expect"].contains(&w.as_str()))
+            .collect();
+
+        if pred_terms.len() < 3 { continue; }
+
+        let mut best_match: Option<(i64, f32)> = None;
+        for &(sid, _) in story_embeddings {
+            let story_text: Option<String> = conn.query_row(
+                "SELECT LOWER(headline || ' ' || summary || ' ' || key_facts) FROM stories WHERE id = ?1",
+                [sid], |row| row.get(0),
+            ).ok();
+
+            if let Some(text) = story_text {
+                let story_terms: std::collections::HashSet<&str> = text.split_whitespace()
+                    .filter(|w| w.len() >= 4).collect();
+                let overlap = pred_terms.iter()
+                    .filter(|t| story_terms.contains(t.as_str())).count();
+                let overlap_ratio = overlap as f32 / pred_terms.len() as f32;
+
+                if overlap_ratio > 0.4 {
+                    if best_match.is_none() || overlap_ratio > best_match.unwrap().1 {
+                        best_match = Some((sid, overlap_ratio));
+                    }
+                }
+            }
+        }
+
+        if let Some((sid, overlap)) = best_match {
+            let nudge = if overlap > 0.8 { 0.10 } else if overlap > 0.6 { 0.06 } else { 0.03 };
+            let new_prob = (confidence + nudge).min(0.95);
+
+            let history: String = conn.query_row(
+                "SELECT COALESCE(probability_history, '[]') FROM insights WHERE id = ?1",
+                [pred_id], |row| row.get(0),
+            ).unwrap_or_else(|_| "[]".to_string());
+
+            let mut entries: Vec<serde_json::Value> = serde_json::from_str(&history).unwrap_or_default();
+            entries.push(serde_json::json!({
+                "date": today,
+                "probability": new_prob,
+                "overlap": overlap,
+                "story_id": sid,
+                "reason": format!("Keyword fallback ({:.0}% term overlap)", overlap * 100.0)
+            }));
+
+            conn.execute(
+                "UPDATE insights SET probability_history = ?1, confidence = ?2 WHERE id = ?3",
+                rusqlite::params![serde_json::to_string(&entries).unwrap_or_default(), new_prob, pred_id],
+            ).ok();
+            validated += 1;
+        }
+    }
+
+    let expired: usize = conn.execute(
+        "UPDATE insights SET status = 'expired' WHERE insight_type = 'prediction' AND status = 'active' AND predicted_date IS NOT NULL AND predicted_date < date('now', '-7 days')",
+        [],
+    ).unwrap_or(0);
+
+    Ok((validated, expired))
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max.min(s.len())]) }
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 { 0.0 } else { (dot / denom) as f32 }
 }
 
 async fn generate_freedoms_summary(curated: &[(&str, &crate::claude::SummarizedStory)]) -> anyhow::Result<String> {
