@@ -1551,8 +1551,13 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
                 curated
             }
             Err(e) => {
-                tracing::warn!("Freedoms pre-curation failed, summarizing all: {}", e);
-                unique
+                tracing::warn!("Freedoms pre-curation failed (non-fatal): {}", e);
+                let mut fallback = unique;
+                if fallback.len() > 150 {
+                    tracing::info!("Freedoms: Capping from {} to 150 articles (pre-curation fallback)", fallback.len());
+                    fallback.truncate(150);
+                }
+                fallback
             }
         }
     } else {
@@ -3046,8 +3051,21 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
             }
 
             if filled_price <= 0.0 {
-                tracing::warn!("Auto-trade: could not get fill price for {} ({}), skipping DB record", ticker, order_id);
-                continue;
+                // Order submitted but fill price unknown — use latest known price as estimate
+                // to avoid ghost positions (Alpaca has it, but we don't track it)
+                filled_price = conn.query_row(
+                    "SELECT close FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
+                    [ticker.as_str()], |row| row.get(0),
+                ).unwrap_or(0.0);
+                tracing::warn!("Auto-trade: fill price unknown for {} ({}), using estimate ${:.2}", ticker, order_id, filled_price);
+                if filled_price <= 0.0 {
+                    tracing::warn!("Auto-trade: no price data for {}, cancelling order {}", ticker, order_id);
+                    client.delete(format!("https://paper-api.alpaca.markets/v2/orders/{}", order_id))
+                        .header("APCA-API-KEY-ID", &alpaca_key)
+                        .header("APCA-API-SECRET-KEY", &alpaca_secret)
+                        .send().await.ok();
+                    continue;
+                }
             }
 
             // Build signal_profile JSON matching calibration keys
