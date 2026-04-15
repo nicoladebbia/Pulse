@@ -2485,23 +2485,17 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
         // (regulatory_sentiment feeds into government_signal normalization)
         let reg_composite = reg_count + (event_severity_boost * 3.0); // 8-K severity scaled to same range
 
-        // Institutional flow — 13F holdings filings (SEC Form 13F-HR)
-        // Sum of reported market values from institutional investors
+        // Institutional flow — count of 13F filing activity around this entity
+        // More filings = more institutional attention (can't parse individual holdings)
         let inst_flow: f64 = conn.query_row(
-            &format!("SELECT COALESCE(SUM(
-                CASE WHEN json_valid(s.financial_metadata)
-                     AND json_extract(s.financial_metadata, '$.filing_type') IN ('13F-HR', '13F-HR/A')
-                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.total_value') AS REAL),
-                              CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
-                ELSE 0 END
-            ), 0) FROM entity_mentions em
-            JOIN stories s ON em.story_id = s.id
-            JOIN entities e ON em.entity_id = e.id
-            WHERE {} AND s.source_type = 'financial'
-              AND em.mentioned_at >= date(?2, '-90 days')", entity_match_clause),
+            &format!("SELECT COUNT(*) FROM entity_mentions em
+             JOIN stories s ON em.story_id = s.id
+             JOIN entities e ON em.entity_id = e.id
+             WHERE {} AND s.source_name LIKE '%13F%'
+               AND em.mentioned_at >= date(?2, '-90 days')", entity_match_clause),
             rusqlite::params![topic, today],
-            |row| row.get(0),
-        ).unwrap_or(0.0);
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as f64;
 
         // Search trend — Wikipedia page views as proxy for search interest
         // Count of Wikipedia-sourced mentions (populated by fetch_wikipedia_pageviews)
@@ -2601,7 +2595,7 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
     {
         // Normalize each dimension — same scales as cross_signals.rs
         let insider_norm = normalize_signal(*insider_vol, 1_000_000.0);
-        let inst_norm = normalize_signal(*inst_flow, 500_000.0);
+        let inst_norm = normalize_signal(*inst_flow, 10.0); // Count of 13F filings, not dollar amount
         let news_norm = normalize_signal(*acceleration * *w7 as f64, 20.0);
         // Government signal: contract value + regulatory/8-K severity composite
         let contract_norm = normalize_signal(*contract_val, 10_000_000.0);
@@ -2949,7 +2943,7 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
                 let mut ents = Vec::new();
                 if let Some(name) = meta.get("entity_name").and_then(|v| v.as_str()) {
                     if !name.is_empty() {
-                        ents.push((name, "search_trend", 0.0));
+                        ents.push((name, "company", 0.0)); // Use 'company' — matches CHECK constraint
                     }
                 }
                 ents
@@ -2958,7 +2952,7 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
                 let mut ents = Vec::new();
                 if let Some(product) = meta.get("product").and_then(|v| v.as_str()) {
                     if !product.is_empty() {
-                        ents.push((product, "commodity", 0.0));
+                        ents.push((product, "topic", 0.0)); // Use 'topic' — matches CHECK constraint
                     }
                 }
                 ents
