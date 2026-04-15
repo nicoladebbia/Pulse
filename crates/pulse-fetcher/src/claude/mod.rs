@@ -132,10 +132,38 @@ pub async fn analyze_cross_sector(stories: &[SummarizedStory]) -> anyhow::Result
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
     let client = client::GroqClient::new(&api_key);
 
-    // Sort by importance and take top 120 for curation
+    // Sector-balanced selection: ensure each sector has at least 25 stories in the 120-story input
     let mut sorted = stories.to_vec();
     sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
-    sorted.truncate(120);
 
-    client.analyze(&sorted).await
+    let sectors = ["ai", "miami", "italy", "tech"];
+    let mut balanced = Vec::with_capacity(120);
+    let min_per_sector = 25;
+
+    // First: take top stories per sector
+    for sector in &sectors {
+        let sector_stories: Vec<_> = sorted.iter()
+            .filter(|s| s.article.sector == *sector)
+            .take(min_per_sector)
+            .cloned()
+            .collect();
+        balanced.extend(sector_stories);
+    }
+
+    // Fill remaining slots with top stories from any sector (by importance)
+    let already: std::collections::HashSet<String> = balanced.iter().map(|s| s.article.url.clone()).collect();
+    for s in &sorted {
+        if balanced.len() >= 120 { break; }
+        if !already.contains(&s.article.url) {
+            balanced.push(s.clone());
+        }
+    }
+
+    // Log sector distribution
+    for sector in &sectors {
+        let count = balanced.iter().filter(|s| s.article.sector == *sector).count();
+        tracing::info!("Analysis input: {} = {} stories", sector, count);
+    }
+
+    client.analyze(&balanced).await
 }

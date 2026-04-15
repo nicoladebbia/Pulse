@@ -222,7 +222,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                 let curated: Vec<_> = indices.into_iter()
                     .filter_map(|i| news_articles.get(i).cloned())
                     .collect();
-                log_usage(db_path, "groq", "llama-3.3-70b-versatile", "pre_curate",
+                log_usage(db_path, "groq", "llama-3.1-70b-versatile", "pre_curate",
                     (news_articles.len() * 30) as i64, 500);
                 tracing::info!("Pre-curated to {} articles (saved {} summarization calls)",
                     curated.len(), news_articles.len() - curated.len());
@@ -230,12 +230,36 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::warn!("Pre-curation failed (non-fatal): {}", e);
-                // Cap at 150 articles when pre-curation fails to avoid wasting API calls
-                let mut fallback = news_articles;
-                if fallback.len() > 150 {
-                    tracing::info!("Capping from {} to 150 articles (pre-curation fallback)", fallback.len());
-                    fallback.truncate(150);
-                }
+                // Sector-balanced cap: ensure each sector is represented
+                let mut fallback = if news_articles.len() > 150 {
+                    tracing::info!("Sector-balanced cap from {} to ~150 articles", news_articles.len());
+                    let sectors = ["ai", "miami", "italy", "tech"];
+                    let mut balanced = Vec::with_capacity(150);
+                    let per_sector = 37; // ~150 / 4
+                    for sector in &sectors {
+                        let sector_articles: Vec<_> = news_articles.iter()
+                            .filter(|a| a.sector == *sector)
+                            .take(per_sector)
+                            .cloned()
+                            .collect();
+                        tracing::info!("  {}: {} articles (of {} available)", sector, sector_articles.len(),
+                            news_articles.iter().filter(|a| a.sector == *sector).count());
+                        balanced.extend(sector_articles);
+                    }
+                    // Fill remaining slots with any sector
+                    if balanced.len() < 150 {
+                        let already: std::collections::HashSet<String> = balanced.iter().map(|a| a.url.clone()).collect();
+                        for a in &news_articles {
+                            if balanced.len() >= 150 { break; }
+                            if !already.contains(&a.url) {
+                                balanced.push(a.clone());
+                            }
+                        }
+                    }
+                    balanced
+                } else {
+                    news_articles
+                };
                 fallback
             }
         }
@@ -266,7 +290,20 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     progress.start_stage(4);
     tracing::info!("Phase 4: Cross-sector analysis...");
     let mut analysis = crate::claude::analyze_cross_sector(&summaries).await?;
-    log_usage(db_path, "groq", "llama-3.3-70b-versatile", "analyze", 8000, 2000);
+    log_usage(db_path, "groq", "llama-3.1-70b-versatile", "analyze", 8000, 2000);
+
+    // Log sector distribution in curated stories
+    {
+        let sectors = ["ai", "miami", "italy", "tech"];
+        for sector in &sectors {
+            let count = analysis.curated_stories.iter().filter(|s| s.article.sector == *sector).count();
+            tracing::info!("Briefing curation: {} = {} stories", sector, count);
+        }
+        let total = analysis.curated_stories.len();
+        if total < 60 {
+            tracing::warn!("Briefing has only {} stories (expected ~80)", total);
+        }
+    }
 
     // Phase 5: Executive summary (non-fatal)
     progress.start_stage(5);
@@ -1591,7 +1628,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
     let curation_text = client
         .call(
-            "llama-3.3-70b-versatile",
+            "llama-3.1-70b-versatile",
             crate::claude::prompts::FREEDOMS_ANALYSIS_SYSTEM,
             &user_msg,
             2000,
@@ -1616,30 +1653,28 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     let parsed: FreedomsResponse = serde_json::from_str(json_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse freedoms curation: {} — raw: {}", e, json_str))?;
 
-    // Build curated list with freedom labels
+    // Build curated list with freedom labels, cap at 10 per freedom
+    let max_per_freedom = 10;
     let mut curated: Vec<(&str, &crate::claude::SummarizedStory)> = Vec::new();
-    for &idx in &parsed.curation.time {
-        if let Some(s) = sorted.get(idx) {
-            curated.push(("time", s));
+    let freedom_lists = [
+        ("time", &parsed.curation.time),
+        ("wealth", &parsed.curation.wealth),
+        ("location", &parsed.curation.location),
+        ("health", &parsed.curation.health),
+    ];
+    for (label, indices) in &freedom_lists {
+        let mut count = 0;
+        for &idx in *indices {
+            if count >= max_per_freedom { break; }
+            if let Some(s) = sorted.get(idx) {
+                curated.push((label, s));
+                count += 1;
+            }
         }
-    }
-    for &idx in &parsed.curation.wealth {
-        if let Some(s) = sorted.get(idx) {
-            curated.push(("wealth", s));
-        }
-    }
-    for &idx in &parsed.curation.location {
-        if let Some(s) = sorted.get(idx) {
-            curated.push(("location", s));
-        }
-    }
-    for &idx in &parsed.curation.health {
-        if let Some(s) = sorted.get(idx) {
-            curated.push(("health", s));
-        }
+        tracing::info!("Freedoms: {} = {} stories (LLM returned {})", label, count, indices.len());
     }
 
-    tracing::info!("Freedoms: {} curated stories", curated.len());
+    tracing::info!("Freedoms: {} curated stories total", curated.len());
 
     // Phase 5: Write to database
     tracing::info!("Freedoms: Writing to database...");

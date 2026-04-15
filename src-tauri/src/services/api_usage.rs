@@ -9,7 +9,7 @@ const PRICING: &[(&str, &str, f64, f64)] = &[
     ("anthropic", "claude-sonnet", 3.0, 15.0),
     ("anthropic", "claude-opus", 15.0, 75.0),
     ("groq", "llama-3.1-8b", 0.05, 0.08),
-    ("groq", "llama-3.3-70b", 0.59, 0.79),
+    ("groq", "llama-3.1-70b", 0.88, 0.88),
     ("voyage", "voyage-3-lite", 0.02, 0.0), // embeddings: input only
     ("tavily", "search", 0.0, 0.0),          // free tier
     // Financial data APIs (all free)

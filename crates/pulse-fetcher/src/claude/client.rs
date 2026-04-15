@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 // Groq models — fast inference, OpenAI-compatible API
 const FAST_MODEL: &str = "llama-3.1-8b-instant";
-const STRONG_MODEL: &str = "llama-3.3-70b-versatile";
+const STRONG_MODEL: &str = "llama-3.1-70b-versatile";
 const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 
 pub struct GroqClient {
