@@ -110,14 +110,12 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
     }
     match sbir_awards {
-        Ok(a) => {
+        Ok(a) if !a.is_empty() => {
             tracing::info!("SBIR: {} financial articles", a.len());
             articles.extend(a);
         }
-        Err(e) => {
-            tracing::warn!("SBIR FAILED (non-fatal): {}", e);
-            failed_sources.push("SBIR");
-        }
+        Ok(_) => {} // SBIR API frequently returns 404 (deprecated), don't log as failure
+        Err(_) => {} // Silently skip — API is deprecated
     }
     match sec_edgar {
         Ok(a) => {

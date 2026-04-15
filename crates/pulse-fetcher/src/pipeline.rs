@@ -218,8 +218,14 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                 curated
             }
             Err(e) => {
-                tracing::warn!("Pre-curation failed (non-fatal), summarizing all: {}", e);
-                news_articles
+                tracing::warn!("Pre-curation failed (non-fatal): {}", e);
+                // Cap at 150 articles when pre-curation fails to avoid wasting API calls
+                let mut fallback = news_articles;
+                if fallback.len() > 150 {
+                    tracing::info!("Capping from {} to 150 articles (pre-curation fallback)", fallback.len());
+                    fallback.truncate(150);
+                }
+                fallback
             }
         }
     } else {
@@ -1003,8 +1009,30 @@ async fn backfill_missing_embeddings(db_path: &Path, max_stories: usize) -> anyh
                 }
             }
             Err(e) => {
-                tracing::warn!("Auto-backfill batch failed: {}", e);
-                break; // Stop on first failure to avoid burning rate limit
+                if e.to_string().contains("429") {
+                    tracing::info!("Auto-backfill: rate limited, waiting 60s before retry...");
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    // Retry once
+                    match crate::embeddings::generate_from_texts(&texts).await {
+                        Ok(embeddings) => {
+                            for (i, emb) in embeddings.iter().enumerate() {
+                                let blob: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO story_embeddings (story_id, embedding) VALUES (?1, ?2)",
+                                    rusqlite::params![ids[i], blob],
+                                )?;
+                                filled += 1;
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!("Auto-backfill: retry also failed, stopping (filled {} so far)", filled);
+                            break;
+                        }
+                    }
+                } else {
+                    tracing::warn!("Auto-backfill batch failed: {}", e);
+                    break;
+                }
             }
         }
     }
@@ -2089,7 +2117,7 @@ fn populate_tickers(db_path: &Path) -> anyhow::Result<usize> {
     Ok(mapped)
 }
 
-/// Download SEC company_tickers.json synchronously using tokio block_on.
+/// Download SEC company_tickers.json with 7-day file cache.
 fn download_sec_tickers() -> anyhow::Result<std::collections::HashMap<String, (String, String)>> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(download_sec_tickers_async())
@@ -2097,6 +2125,27 @@ fn download_sec_tickers() -> anyhow::Result<std::collections::HashMap<String, (S
 }
 
 async fn download_sec_tickers_async() -> anyhow::Result<std::collections::HashMap<String, (String, String)>> {
+    // Check file cache first (7-day TTL)
+    let cache_dir = dirs::home_dir().unwrap_or_default().join(".pulse");
+    let cache_path = cache_dir.join("sec_tickers.json");
+
+    if cache_path.exists() {
+        if let Ok(metadata) = std::fs::metadata(&cache_path) {
+            if let Ok(modified) = metadata.modified() {
+                let age = std::time::SystemTime::now().duration_since(modified).unwrap_or_default();
+                if age < std::time::Duration::from_secs(7 * 86400) {
+                    // Cache hit
+                    if let Ok(data) = std::fs::read_to_string(&cache_path) {
+                        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, (String, String)>>(&data) {
+                            tracing::info!("SEC tickers: loaded {} from cache (age: {}h)", map.len(), age.as_secs() / 3600);
+                            return Ok(map);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let url = "https://www.sec.gov/files/company_tickers.json";
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -2109,6 +2158,15 @@ async fn download_sec_tickers_async() -> anyhow::Result<std::collections::HashMa
         .await?;
 
     if !resp.status().is_success() {
+        // Try cache even if expired
+        if cache_path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&cache_path) {
+                if let Ok(map) = serde_json::from_str(&data) {
+                    tracing::warn!("SEC tickers: API returned {}, using stale cache", resp.status());
+                    return Ok(map);
+                }
+            }
+        }
         anyhow::bail!("SEC company_tickers.json returned {}", resp.status());
     }
 
@@ -2121,7 +2179,11 @@ async fn download_sec_tickers_async() -> anyhow::Result<std::collections::HashMa
         map.insert(entry.title.to_lowercase(), (entry.ticker.clone(), entry.cik_str.clone()));
     }
 
-    tracing::info!("Loaded {} SEC company-to-ticker mappings", map.len());
+    // Write cache
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = std::fs::write(&cache_path, serde_json::to_string(&map).unwrap_or_default());
+
+    tracing::info!("SEC tickers: downloaded {} mappings (cached)", map.len());
     Ok(map)
 }
 
@@ -2436,7 +2498,8 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
         let positive = [insider_norm, inst_norm, news_norm, gov_norm,
             search_norm, patent_norm, supply_norm, political_norm]
             .iter().filter(|&&v| v > 0.3).count();
-        let convergence = positive >= 3 && *src_diversity >= 3;
+        // Convergence: 2+ signals > 0.3 AND diversity >= 2, OR very high compound score
+        let convergence = (positive >= 2 && *src_diversity >= 2) || compound >= 0.40;
 
         if compound < 0.01 && !convergence {
             continue;

@@ -69,11 +69,21 @@ async fn fetch_petroleum(client: &reqwest::Client, api_key: &str) -> anyhow::Res
     }
 
     let body = resp.text().await?;
-    let data: EiaResponse = serde_json::from_str(&body)?;
+    let data: EiaResponse = match serde_json::from_str(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("EIA petroleum parse error: {} (body: {})", e, &body[..body.len().min(200)]);
+            return Ok(Vec::new());
+        }
+    };
 
     let entries = data.response
         .and_then(|r| r.data)
         .unwrap_or_default();
+
+    if entries.is_empty() {
+        tracing::warn!("EIA petroleum: API returned 0 data entries");
+    }
 
     let mut articles = Vec::new();
     let mut seen_products = std::collections::HashSet::new();
@@ -137,7 +147,13 @@ async fn fetch_natgas(client: &reqwest::Client, api_key: &str) -> anyhow::Result
     }
 
     let body = resp.text().await?;
-    let data: EiaResponse = serde_json::from_str(&body)?;
+    let data: EiaResponse = match serde_json::from_str(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("EIA natgas parse error: {} (body: {})", e, &body[..body.len().min(200)]);
+            return Ok(Vec::new());
+        }
+    };
 
     let entries = data.response
         .and_then(|r| r.data)

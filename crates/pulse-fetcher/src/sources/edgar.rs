@@ -154,8 +154,24 @@ async fn fetch_filing_type(
         let eight_k_data = if form == "8-K" && eight_k_parsed < 20 {
             match download_8k_items(client, &base_url).await {
                 Ok(data) => { eight_k_parsed += 1; Some(data) }
-                Err(_) => None,
+                Err(_) => {
+                    // Fallback: set default classification so classify_ambiguous_8ks can find it
+                    Some(EightKData {
+                        item_numbers: vec![],
+                        event_classification: "other_event".to_string(),
+                        event_severity: 0.3,
+                        content_preview: String::new(),
+                    })
+                }
             }
+        } else if form == "8-K" {
+            // Over the parse limit — still tag as other_event for later LLM classification
+            Some(EightKData {
+                item_numbers: vec![],
+                event_classification: "other_event".to_string(),
+                event_severity: 0.3,
+                content_preview: String::new(),
+            })
         } else { None };
 
         let (title, content_snippet) = if let Some(ref f4) = form4_data {

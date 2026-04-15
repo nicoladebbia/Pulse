@@ -262,13 +262,15 @@ async fn fetch_single(
     url: &str,
     lang: &str,
 ) -> anyhow::Result<Vec<RawArticle>> {
-    let response = client
-        .get(url)
-        .header("User-Agent", "Pulse/0.1")
-        .send()
-        .await?
-        .bytes()
-        .await?;
+    // Try with retry on connection errors
+    let response = match client.get(url).header("User-Agent", "Pulse/0.1").send().await {
+        Ok(r) => r.bytes().await?,
+        Err(_) => {
+            // Single retry after 3s
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            client.get(url).header("User-Agent", "Pulse/0.1").send().await?.bytes().await?
+        }
+    };
 
     let feed = feed_rs::parser::parse(&response[..])?;
     let mut articles = Vec::new();
