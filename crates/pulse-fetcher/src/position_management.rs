@@ -206,8 +206,11 @@ pub fn check_signal_decay(
 }
 
 fn days_held(entry_date: &str, today: &str) -> Option<i64> {
-    let entry = chrono::NaiveDate::parse_from_str(entry_date, "%Y-%m-%d").ok()?;
-    let now = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok()?;
+    // Accept both "2026-04-15" and "2026-04-15T15:41:05" formats
+    let entry_str = entry_date.split('T').next().unwrap_or(entry_date);
+    let today_str = today.split('T').next().unwrap_or(today);
+    let entry = chrono::NaiveDate::parse_from_str(entry_str, "%Y-%m-%d").ok()?;
+    let now = chrono::NaiveDate::parse_from_str(today_str, "%Y-%m-%d").ok()?;
     Some((now - entry).num_days())
 }
 

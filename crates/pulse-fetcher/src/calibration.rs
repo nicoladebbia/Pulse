@@ -27,14 +27,14 @@ const DEFAULT_WEIGHTS: &[(&str, f64)] = &[
 ];
 
 /// Run the full calibration pipeline.
-pub fn run_calibration(db_path: &Path) -> anyhow::Result<CalibrationReport> {
+pub async fn run_calibration(db_path: &Path) -> anyhow::Result<CalibrationReport> {
     let conn = Connection::open(db_path)?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
     let mut report = CalibrationReport::default();
 
     // 1. Evaluate open paper trades against current prices
-    report.positions_evaluated = evaluate_open_positions(&conn, &today)?;
+    report.positions_evaluated = evaluate_open_positions(&conn, &today).await?;
 
     // 2. Compute Brier scores for predictions
     report.brier_scores_updated = compute_brier_scores(&conn)?;
@@ -71,22 +71,37 @@ pub struct SignalAnalysis {
 }
 
 /// Evaluate open paper trades using ATR-based position management.
-/// Replaces the primitive -10% stop-loss + 90-day expiry with adaptive exits.
-fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Result<usize> {
-    let open_trades: Vec<(i64, String, f64, String, f64)> = {
+/// Closes positions via Alpaca API when exit conditions are met.
+async fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Result<usize> {
+    let open_trades: Vec<(i64, String, f64, String, f64, f64)> = {
         let mut stmt = conn.prepare(
-            "SELECT id, ticker, entry_price, entry_date, COALESCE(original_compound_score, confidence)
+            "SELECT id, ticker, entry_price, entry_date, COALESCE(original_compound_score, confidence), position_size
              FROM paper_trades WHERE status = 'open'"
         )?;
         stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, f64>(4).unwrap_or(0.5)))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get::<_, f64>(4).unwrap_or(0.5), row.get::<_, f64>(5).unwrap_or(0.0)))
         })?
         .filter_map(|r| r.ok())
         .collect()
     };
 
+    if open_trades.is_empty() {
+        return Ok(0);
+    }
+
+    tracing::info!("Calibration: evaluating {} open positions", open_trades.len());
+
+    // Set up Alpaca client for selling
+    let alpaca_key = std::env::var("ALPACA_API_KEY").unwrap_or_default();
+    let alpaca_secret = std::env::var("ALPACA_SECRET_KEY").unwrap_or_default();
+    let has_alpaca = !alpaca_key.is_empty() && !alpaca_secret.is_empty();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
     let mut evaluated = 0;
-    for (trade_id, ticker, entry_price, entry_date, original_score) in &open_trades {
+    for (trade_id, ticker, entry_price, entry_date, original_score, position_size) in &open_trades {
         let current_price: f64 = conn
             .query_row(
                 "SELECT close FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
@@ -100,57 +115,92 @@ fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Result<usi
         }
 
         let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
+        let pnl_dollars = pnl_pct / 100.0 * position_size;
 
-        // Use ATR-based position management
         use crate::position_management::{evaluate_position, check_signal_decay, PositionAction};
 
         let action = evaluate_position(conn, *trade_id, ticker, *entry_price, entry_date, current_price, today);
-
-        // Also check signal decay
         let signal_decayed = check_signal_decay(conn, ticker, *original_score);
 
-        match action {
-            PositionAction::CloseAll { reason } => {
-                conn.execute(
-                    "UPDATE paper_trades SET status = 'stopped_out', exit_price = ?1, exit_date = ?2, pnl = ?3, pnl_pct = ?4 WHERE id = ?5",
-                    rusqlite::params![current_price, today, current_price - entry_price, pnl_pct, trade_id],
-                )?;
-                tracing::info!("Position closed: {} at {:.1}% — {}", ticker, pnl_pct, reason);
-                evaluated += 1;
-            }
-            PositionAction::CloseHalf { reason } => {
-                // For paper trading, we just log the half-close and reduce position_size
-                let half_size: f64 = conn.query_row(
-                    "SELECT position_size / 2.0 FROM paper_trades WHERE id = ?1",
-                    [trade_id], |row| row.get(0),
-                ).unwrap_or(0.0);
-
-                conn.execute(
-                    "UPDATE paper_trades SET position_size = ?1 WHERE id = ?2",
-                    rusqlite::params![half_size, trade_id],
-                )?;
-                tracing::info!("Position halved: {} at {:.1}% — {}", ticker, pnl_pct, reason);
-                evaluated += 1;
+        // Determine if we need to close (full or half)
+        let (should_close, close_fraction, status_str, reason) = match &action {
+            PositionAction::CloseAll { reason } => (true, 1.0, "stopped_out", reason.clone()),
+            PositionAction::CloseHalf { reason } => (true, 0.5, "open", reason.clone()),
+            PositionAction::Hold if signal_decayed => {
+                let s = if pnl_pct > 0.0 { "closed" } else { "expired" };
+                (true, 1.0, s, "signal_decay".to_string())
             }
             PositionAction::TightenStop { new_stop } => {
                 conn.execute(
                     "UPDATE paper_trades SET trailing_stop = ?1 WHERE id = ?2",
                     rusqlite::params![new_stop, trade_id],
                 )?;
+                (false, 0.0, "", String::new())
             }
-            PositionAction::Hold => {
-                // Check signal decay separately
-                if signal_decayed {
-                    let status = if pnl_pct > 0.0 { "closed" } else { "expired" };
-                    conn.execute(
-                        "UPDATE paper_trades SET status = ?1, exit_price = ?2, exit_date = ?3, pnl = ?4, pnl_pct = ?5 WHERE id = ?6",
-                        rusqlite::params![status, current_price, today, current_price - entry_price, pnl_pct, trade_id],
-                    )?;
-                    tracing::info!("Signal decay exit: {} at {:.1}% (score dropped below threshold)", ticker, pnl_pct);
-                    evaluated += 1;
+            _ => (false, 0.0, "", String::new()),
+        };
+
+        if !should_close {
+            // Update live P&L for tracking even on Hold
+            conn.execute(
+                "UPDATE paper_trades SET pnl = ?1, pnl_pct = ?2 WHERE id = ?3",
+                rusqlite::params![pnl_dollars, pnl_pct, trade_id],
+            ).ok();
+            tracing::info!("Position hold: {} — {:.1}% (${:.2})", ticker, pnl_pct, pnl_dollars);
+            evaluated += 1;
+            continue;
+        }
+
+        // Send sell order to Alpaca
+        if has_alpaca {
+            let sell_notional = position_size * close_fraction;
+            let sell_order = serde_json::json!({
+                "symbol": ticker,
+                "notional": format!("{:.2}", sell_notional),
+                "side": "sell",
+                "type": "market",
+                "time_in_force": "day"
+            });
+
+            match client
+                .post("https://paper-api.alpaca.markets/v2/orders")
+                .header("APCA-API-KEY-ID", &alpaca_key)
+                .header("APCA-API-SECRET-KEY", &alpaca_secret)
+                .json(&sell_order)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!("Alpaca sell order placed: {} ${:.2} ({})", ticker, sell_notional, reason);
+                }
+                Ok(resp) => {
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!("Alpaca sell failed for {}: {}", ticker, body);
+                }
+                Err(e) => {
+                    tracing::warn!("Alpaca sell request failed for {}: {}", ticker, e);
                 }
             }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+
+        // Update DB
+        if close_fraction >= 1.0 {
+            conn.execute(
+                "UPDATE paper_trades SET status = ?1, exit_price = ?2, exit_date = ?3, pnl = ?4, pnl_pct = ?5 WHERE id = ?6",
+                rusqlite::params![status_str, current_price, today, pnl_dollars, pnl_pct, trade_id],
+            )?;
+            tracing::info!("Position closed: {} — {:.1}% (${:.2}) — {}", ticker, pnl_pct, pnl_dollars, reason);
+        } else {
+            // Half close — reduce position size, don't change status
+            let new_size = position_size * (1.0 - close_fraction);
+            conn.execute(
+                "UPDATE paper_trades SET position_size = ?1 WHERE id = ?2",
+                rusqlite::params![new_size, trade_id],
+            )?;
+            tracing::info!("Position halved: {} — {:.1}% — {}", ticker, pnl_pct, reason);
+        }
+        evaluated += 1;
     }
 
     Ok(evaluated)

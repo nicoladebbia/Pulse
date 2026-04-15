@@ -514,7 +514,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 14: Automated calibration (non-fatal)
     tracing::info!("Phase 14: Running signal calibration...");
-    match crate::calibration::run_calibration(db_path) {
+    match crate::calibration::run_calibration(db_path).await {
         Ok(report) => {
             if report.positions_evaluated > 0 {
                 tracing::info!("Calibration: evaluated {} positions", report.positions_evaluated);
@@ -2976,7 +2976,8 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
         return Ok(0);
     }
 
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let now = chrono::Local::now();
+    let entry_datetime = now.format("%Y-%m-%dT%H:%M:%S").to_string();
     let mut traded = 0;
 
     for (entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political) in &candidates {
@@ -3004,17 +3005,50 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
 
         if resp.status().is_success() {
             let order_resp: serde_json::Value = resp.json().await?;
-            let order_id = order_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let filled_price = order_resp.get("filled_avg_price")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or_else(|| {
-                    // Fallback: get latest price from entity_prices
-                    conn.query_row(
-                        "SELECT close FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
-                        [ticker], |row| row.get(0),
-                    ).unwrap_or(0.0)
-                });
+            let order_id = order_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+
+            // Poll for fill — market orders fill within seconds
+            let mut filled_price = 0.0;
+            let mut filled_qty = 0.0;
+            let mut fill_time = entry_datetime.clone();
+            for attempt in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if let Ok(check_resp) = client
+                    .get(format!("https://paper-api.alpaca.markets/v2/orders/{}", order_id))
+                    .header("APCA-API-KEY-ID", &alpaca_key)
+                    .header("APCA-API-SECRET-KEY", &alpaca_secret)
+                    .send().await
+                {
+                    if let Ok(check) = check_resp.json::<serde_json::Value>().await {
+                        let status = check.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        if status == "filled" {
+                            filled_price = check.get("filled_avg_price")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.0);
+                            filled_qty = check.get("filled_qty")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.0);
+                            if let Some(ft) = check.get("filled_at").and_then(|v| v.as_str()) {
+                                // Parse ISO 8601 to local datetime
+                                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ft) {
+                                    fill_time = dt.with_timezone(&chrono::Local).format("%Y-%m-%dT%H:%M:%S").to_string();
+                                }
+                            }
+                            break;
+                        }
+                        if attempt == 4 {
+                            tracing::warn!("Auto-trade: order {} not filled after 5s (status: {})", order_id, status);
+                        }
+                    }
+                }
+            }
+
+            if filled_price <= 0.0 {
+                tracing::warn!("Auto-trade: could not get fill price for {} ({}), skipping DB record", ticker, order_id);
+                continue;
+            }
 
             // Build signal_profile JSON matching calibration keys
             let signal_profile = serde_json::json!({
@@ -3032,12 +3066,12 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
             if let Err(e) = conn.execute(
                 "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status, high_water_mark, original_compound_score)
                  VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6)",
-                rusqlite::params![entity_id, ticker, filled_price, today, notional, score, signal_profile.to_string(), order_id],
+                rusqlite::params![entity_id, ticker, filled_price, fill_time, notional, score, signal_profile.to_string(), order_id],
             ) {
                 tracing::warn!("Auto-trade: failed to record trade for {}: {}", ticker, e);
             }
 
-            tracing::info!("Auto-trade: placed order {} for {} (${:.2} @ ${:.2})", order_id, ticker, notional, filled_price);
+            tracing::info!("Auto-trade: placed order {} for {} (${:.2} @ ${:.2}, qty {:.4})", order_id, ticker, notional, filled_price, filled_qty);
             traded += 1;
         } else {
             let status = resp.status();
