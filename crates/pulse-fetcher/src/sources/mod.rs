@@ -179,13 +179,13 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
     match patent_data {
         Ok(a) => {
             if !a.is_empty() {
-                tracing::info!("USPTO: {} financial articles", a.len());
+                tracing::info!("Patents: {} financial articles", a.len());
                 articles.extend(a);
             }
         }
         Err(e) => {
-            tracing::warn!("USPTO FAILED (non-fatal): {}", e);
-            failed_sources.push("USPTO");
+            tracing::warn!("Patents FAILED (non-fatal): {}", e);
+            failed_sources.push("Patents");
         }
     }
 

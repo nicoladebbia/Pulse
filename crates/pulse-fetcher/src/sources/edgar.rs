@@ -130,6 +130,7 @@ async fn fetch_filing_type(
     let mut articles = Vec::new();
     let mut form4_xml_count = 0;
     let mut eight_k_parsed = 0;
+    let mut thirteenf_parsed = 0;
 
     for hit in data.hits.hits {
         let src = hit._source;
@@ -153,7 +154,8 @@ async fn fetch_filing_type(
         );
 
         // For Form 4: download and parse the actual XML for transaction details
-        let form4_data = if form == "4" && form4_xml_count < 30 {
+        // Cap at 15 to leave rate-limit budget for 13F infotable downloads
+        let form4_data = if form == "4" && form4_xml_count < 15 {
             match download_form4_xml(client, &base_url, &accession).await {
                 Ok(data) => { form4_xml_count += 1; Some(data) }
                 Err(_) => None,
@@ -161,7 +163,8 @@ async fn fetch_filing_type(
         } else { None };
 
         // For 8-K: download HTML and parse Item numbers
-        let eight_k_data = if form == "8-K" && eight_k_parsed < 20 {
+        // Cap at 10 to leave rate-limit budget for 13F infotable downloads
+        let eight_k_data = if form == "8-K" && eight_k_parsed < 10 {
             match download_8k_items(client, &base_url).await {
                 Ok(data) => { eight_k_parsed += 1; Some(data) }
                 Err(_) => {
@@ -184,10 +187,23 @@ async fn fetch_filing_type(
             })
         } else { None };
 
+        // For 13F-HR: download and parse informationTable.xml for holdings
+        let holdings_data = if (form == "13F-HR" || form == "13F") && thirteenf_parsed < 15 {
+            match download_13f_holdings(client, &accession, cik.as_deref().unwrap_or("0")).await {
+                Ok(holdings) => { thirteenf_parsed += 1; Some(holdings) }
+                Err(e) => {
+                    tracing::warn!("13F holdings failed for {}: {}", entity, e);
+                    None
+                }
+            }
+        } else { None };
+
         let (title, content_snippet) = if let Some(ref f4) = form4_data {
             build_form4_text(&entity, f4)
         } else if let Some(ref ek) = eight_k_data {
             build_8k_text(&entity, ek)
+        } else if let Some(ref holdings) = holdings_data {
+            build_13f_text(&entity, holdings)
         } else {
             build_filing_text(&form, &entity, &src)
         };
@@ -226,6 +242,23 @@ async fn fetch_filing_type(
             metadata["content_preview"] = serde_json::json!(ek.content_preview);
         }
 
+        // Merge 13F holdings data
+        if let Some(ref holdings) = holdings_data {
+            let holdings_json: Vec<serde_json::Value> = holdings.iter().map(|h| {
+                serde_json::json!({
+                    "issuer": h.issuer_name,
+                    "class": h.title_of_class,
+                    "cusip": h.cusip,
+                    "value_thousands": h.value_thousands,
+                    "shares": h.shares,
+                })
+            }).collect();
+            metadata["holdings"] = serde_json::json!(holdings_json);
+            metadata["total_holdings_count"] = serde_json::json!(holdings.len());
+            let total_value: f64 = holdings.iter().map(|h| h.value_thousands).sum();
+            metadata["total_portfolio_value_thousands"] = serde_json::json!(total_value);
+        }
+
         articles.push(RawArticle {
             title,
             url: base_url,
@@ -246,6 +279,9 @@ async fn fetch_filing_type(
     }
     if eight_k_parsed > 0 {
         tracing::info!("SEC EDGAR: parsed {} 8-K filings with event classification", eight_k_parsed);
+    }
+    if thirteenf_parsed > 0 {
+        tracing::info!("SEC EDGAR: parsed {} 13F filings with holdings data", thirteenf_parsed);
     }
 
     Ok(articles)
@@ -744,6 +780,200 @@ fn build_8k_text(entity: &str, ek: &EightKData) -> (String, String) {
         } else {
             String::new()
         }
+    );
+
+    (title, snippet)
+}
+
+// --- 13F-HR: Institutional Holdings ---
+
+/// Parsed 13F holding entry.
+struct Holding {
+    issuer_name: String,
+    title_of_class: String,
+    cusip: String,
+    value_thousands: f64,   // Market value in thousands of dollars
+    shares: f64,
+}
+
+/// Download and parse 13F informationTable.xml for top holdings.
+/// Uses EFTS search to find the infotable filename, then downloads from data.sec.gov.
+async fn download_13f_holdings(
+    client: &reqwest::Client,
+    accession: &str,
+    cik: &str,
+) -> anyhow::Result<Vec<Holding>> {
+    // Search EFTS for infotable documents matching this accession
+    let efts_url = format!(
+        "https://efts.sec.gov/LATEST/search-index?q=%22{}%22&forms=13F-HR&from=0&size=5",
+        accession
+    );
+
+    let resp = client
+        .get(&efts_url)
+        .header("User-Agent", SEC_USER_AGENT)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("EFTS search failed for 13F accession {}", accession);
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let hits = body.get("hits")
+        .and_then(|h| h.get("hits"))
+        .and_then(|h| h.as_array())
+        .ok_or_else(|| anyhow::anyhow!("No EFTS hits for accession {}", accession))?;
+
+    // Find the infotable document from the _id fields
+    // Format: "accession:filename.xml"
+    let infotable_filename = hits.iter()
+        .filter_map(|hit| hit.get("_id").and_then(|id| id.as_str()))
+        .find(|id| {
+            let lower = id.to_lowercase();
+            lower.contains("infotable") || lower.contains("information_table")
+                || lower.contains("informationtable")
+                || (lower.ends_with(".xml") && !lower.contains("primary_doc"))
+        })
+        .and_then(|id| id.split(':').nth(1))
+        .ok_or_else(|| anyhow::anyhow!("No infotable found in EFTS for accession {}", accession))?
+        .to_string();
+
+    // Build the download URL from www.sec.gov (archives only served here)
+    let cik_trimmed = cik.trim_start_matches('0');
+    let acc_nodash = accession.replace('-', "");
+    let download_url = format!(
+        "https://www.sec.gov/Archives/edgar/data/{}/{}/{}",
+        cik_trimmed, acc_nodash, infotable_filename
+    );
+
+    // Rate limit: SEC allows 10 req/sec, stay well under (budget shared with Form 4 + 8-K)
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let doc_resp = client
+        .get(&download_url)
+        .header("User-Agent", SEC_USER_AGENT)
+        .send()
+        .await?;
+
+    if !doc_resp.status().is_success() {
+        anyhow::bail!("13F infotable download failed: HTTP {}", doc_resp.status());
+    }
+
+    let xml = doc_resp.text().await?;
+
+    // Check for rate-limit HTML response (SEC returns HTML when rate-limited)
+    if xml.contains("Request Rate Threshold Exceeded") || xml.contains("SEC.gov | Request Rate") {
+        anyhow::bail!("SEC rate limit hit during 13F infotable download");
+    }
+    // Check for non-XML response (e.g., error page)
+    if !xml.trim_start().starts_with("<?xml") && !xml.trim_start().starts_with("<informationTable")
+        && !xml.trim_start().starts_with("<ns1:informationTable") {
+        anyhow::bail!("13F infotable response is not XML");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    parse_13f_xml(&xml)
+}
+
+/// Parse 13F informationTable.xml to extract top holdings by value.
+fn parse_13f_xml(xml: &str) -> anyhow::Result<Vec<Holding>> {
+    let mut holdings = Vec::new();
+
+    // Split on <infoTable> entries (namespace variations: ns1:infoTable, infoTable)
+    // The XML uses either <infoTable> or <ns1:infoTable> depending on the filer
+    let entry_splits: Vec<&str> = if xml.contains("<ns1:infoTable>") {
+        xml.split("<ns1:infoTable>").skip(1).collect()
+    } else if xml.contains("<infoTable>") {
+        xml.split("<infoTable>").skip(1).collect()
+    } else {
+        // Try case-insensitive search for the tag
+        Vec::new()
+    };
+
+    for entry in entry_splits {
+        let issuer = extract_13f_field(entry, "nameOfIssuer")
+            .unwrap_or_default();
+        let class = extract_13f_field(entry, "titleOfClass")
+            .unwrap_or_default();
+        let cusip = extract_13f_field(entry, "cusip")
+            .unwrap_or_default();
+        let value = extract_13f_field(entry, "value")
+            .and_then(|s| s.replace(',', "").parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let shares = extract_13f_field(entry, "sshPrnamt")
+            .and_then(|s| s.replace(',', "").parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        if !issuer.is_empty() && value > 0.0 {
+            holdings.push(Holding {
+                issuer_name: issuer,
+                title_of_class: class,
+                cusip,
+                value_thousands: value,
+                shares,
+            });
+        }
+    }
+
+    // Sort by value descending, keep top 50
+    holdings.sort_by(|a, b| b.value_thousands.partial_cmp(&a.value_thousands).unwrap_or(std::cmp::Ordering::Equal));
+    holdings.truncate(50);
+
+    if holdings.is_empty() {
+        anyhow::bail!("No holdings found in 13F XML");
+    }
+
+    tracing::debug!("13F: parsed {} holdings (top by value)", holdings.len());
+    Ok(holdings)
+}
+
+/// Extract field from 13F XML entry, handling namespace prefixes.
+fn extract_13f_field(entry: &str, field: &str) -> Option<String> {
+    // Try with ns1: prefix first, then without
+    let prefixed = format!("ns1:{}", field);
+    extract_xml_field(entry, &prefixed)
+        .or_else(|| extract_xml_field(entry, field))
+}
+
+/// Build human-readable title/snippet for a 13F filing with holdings.
+fn build_13f_text(entity: &str, holdings: &[Holding]) -> (String, String) {
+    let total_value: f64 = holdings.iter().map(|h| h.value_thousands).sum();
+    let total_value_display = if total_value >= 1_000_000.0 {
+        format!("${:.1}B", total_value / 1_000_000.0)
+    } else if total_value >= 1_000.0 {
+        format!("${:.0}M", total_value / 1_000.0)
+    } else {
+        format!("${:.0}K", total_value)
+    };
+
+    let top_names: Vec<&str> = holdings.iter()
+        .take(5)
+        .map(|h| h.issuer_name.as_str())
+        .collect();
+
+    let title = format!(
+        "{} reports {} portfolio ({} holdings) — top: {}",
+        entity, total_value_display, holdings.len(),
+        top_names.join(", ")
+    );
+
+    let snippet = format!(
+        "13F institutional holdings: {} reported {} total portfolio value across {} positions. \
+         Top holdings: {}.",
+        entity, total_value_display, holdings.len(),
+        holdings.iter().take(10).map(|h| {
+            let val = if h.value_thousands >= 1_000_000.0 {
+                format!("${:.1}B", h.value_thousands / 1_000_000.0)
+            } else if h.value_thousands >= 1_000.0 {
+                format!("${:.0}M", h.value_thousands / 1_000.0)
+            } else {
+                format!("${:.0}K", h.value_thousands)
+            };
+            format!("{} ({})", h.issuer_name, val)
+        }).collect::<Vec<_>>().join(", ")
     );
 
     (title, snippet)

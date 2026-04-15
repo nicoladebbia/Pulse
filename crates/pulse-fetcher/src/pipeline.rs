@@ -2453,12 +2453,12 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
             |row| row.get::<_, i64>(0),
         ).unwrap_or(0) as f64;
 
-        // Patent filings (USPTO)
+        // Patent filings (Google Patents or USPTO)
         let patent_count: f64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM entity_mentions em
              JOIN stories s ON em.story_id = s.id
              JOIN entities e ON em.entity_id = e.id
-             WHERE {} AND s.source_name = 'USPTO'
+             WHERE {} AND (s.source_name = 'USPTO' OR s.source_name = 'Google Patents')
                AND em.mentioned_at >= date(?2, '-30 days')", entity_match_clause),
             rusqlite::params![topic, today],
             |row| row.get::<_, i64>(0),
@@ -2485,17 +2485,59 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
         // (regulatory_sentiment feeds into government_signal normalization)
         let reg_composite = reg_count + (event_severity_boost * 3.0); // 8-K severity scaled to same range
 
-        // Institutional flow — count of 13F filing activity around this entity
-        // More filings = more institutional attention (can't parse individual holdings)
-        let inst_flow: f64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM entity_mentions em
-             JOIN stories s ON em.story_id = s.id
-             JOIN entities e ON em.entity_id = e.id
-             WHERE {} AND s.source_name LIKE '%13F%'
-               AND em.mentioned_at >= date(?2, '-90 days')", entity_match_clause),
-            rusqlite::params![topic, today],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as f64;
+        // Institutional flow — count distinct 13F filers holding this entity's stock
+        // Parses holdings JSON from 13F financial_metadata to match by issuer name
+        let inst_flow: f64 = {
+            let topic_upper = topic.to_uppercase();
+            // Normalize: strip common suffixes for matching
+            let topic_normalized = topic_upper
+                .replace(" INC", "").replace(" CORP", "").replace(" CO", "")
+                .replace(" LTD", "").replace(" LLC", "").replace(" PLC", "")
+                .replace(",", "").replace(".", "").trim().to_string();
+
+            let mut stmt = conn.prepare(
+                "SELECT s.financial_metadata FROM stories s
+                 WHERE s.source_name LIKE '%13F%'
+                   AND s.financial_metadata IS NOT NULL
+                   AND json_valid(s.financial_metadata)
+                   AND json_extract(s.financial_metadata, '$.holdings') IS NOT NULL
+                   AND s.published_at >= date(?1, '-90 days')"
+            ).ok();
+
+            let mut holder_count = 0i64;
+            if let Some(ref mut stmt) = stmt {
+                let rows: Vec<String> = stmt.query_map(
+                    rusqlite::params![today],
+                    |row| row.get::<_, String>(0),
+                ).ok()
+                    .map(|iter| iter.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default();
+
+                for metadata_str in &rows {
+                    if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(metadata_str) {
+                        if let Some(holdings) = metadata.get("holdings").and_then(|h| h.as_array()) {
+                            let holds_entity = holdings.iter().any(|h| {
+                                if let Some(issuer) = h.get("issuer").and_then(|i| i.as_str()) {
+                                    let issuer_norm = issuer.to_uppercase()
+                                        .replace(" INC", "").replace(" CORP", "").replace(" CO", "")
+                                        .replace(" LTD", "").replace(" LLC", "").replace(" PLC", "")
+                                        .replace(",", "").replace(".", "").trim().to_string();
+                                    issuer_norm == topic_normalized
+                                        || issuer_norm.contains(&topic_normalized)
+                                        || topic_normalized.contains(&issuer_norm)
+                                } else {
+                                    false
+                                }
+                            });
+                            if holds_entity {
+                                holder_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            holder_count as f64
+        };
 
         // Search trend — Wikipedia page views as proxy for search interest
         // Count of Wikipedia-sourced mentions (populated by fetch_wikipedia_pageviews)
@@ -2593,7 +2635,7 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
     {
         // Normalize each dimension — same scales as cross_signals.rs
         let insider_norm = normalize_signal(*insider_vol, 1_000_000.0);
-        let inst_norm = normalize_signal(*inst_flow, 10.0); // Count of 13F filings, not dollar amount
+        let inst_norm = normalize_signal(*inst_flow, 15.0); // Count of distinct 13F filers holding this stock
         let news_norm = normalize_signal(*acceleration * *w7 as f64, 20.0);
         // Government signal: contract value + regulatory/8-K severity composite
         let contract_norm = normalize_signal(*contract_val, 10_000_000.0);
@@ -2928,7 +2970,7 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
                 }
                 ents
             }
-            "USPTO" => {
+            "USPTO" | "Google Patents" => {
                 let mut ents = Vec::new();
                 if let Some(name) = meta.get("assignee").and_then(|v| v.as_str()) {
                     if !name.is_empty() {

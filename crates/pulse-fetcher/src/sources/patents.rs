@@ -1,12 +1,22 @@
 use super::RawArticle;
 
-/// USPTO Patents — Patent filing clusters.
+/// Google Patents — Recent patent publications.
 ///
-/// STATUS: PatentsView API migrating to USPTO Open Data Portal (data.uspto.gov).
-/// Both the old (api.patentsview.org) and intermediate (search.patentsview.org) are down.
-/// This module tries the new endpoint and gracefully degrades if unavailable.
+/// Uses Google Patents' internal XHR endpoint to search recent patent
+/// publications by major tech companies. No API key required.
 ///
-/// Once data.uspto.gov API goes live, this will auto-activate.
+/// This replaces the defunct PatentsView API (migrating to data.uspto.gov).
+/// The XHR endpoint is undocumented — if it breaks, fetch() returns empty vec.
+
+/// Top assignees to search — covers major tech companies that file frequently.
+/// We search these explicitly, then match any results to our entity database.
+/// Grouped into 2 batches to minimize requests to Google.
+const PATENT_ASSIGNEES: &[&str] = &[
+    "Apple", "Google", "Microsoft", "Amazon", "Meta",
+    "NVIDIA", "Intel", "AMD", "Qualcomm", "Tesla",
+    "Samsung", "IBM", "Oracle", "Cisco", "Adobe",
+    "Salesforce", "Boeing", "Lockheed Martin",
+];
 
 pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
     let client = reqwest::Client::builder()
@@ -14,168 +24,199 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    // Try USPTO Open Data Portal (new endpoint)
-    match fetch_from_odp(&client).await {
-        Ok(articles) if !articles.is_empty() => {
-            tracing::info!("USPTO ODP: {} patent articles", articles.len());
-            return Ok(articles);
+    let mut articles = Vec::new();
+
+    // Search in 2 large batches to minimize requests to Google
+    for chunk in PATENT_ASSIGNEES.chunks(9) {
+        match fetch_patents_batch(&client, chunk).await {
+            Ok(batch) => articles.extend(batch),
+            Err(e) => tracing::debug!("Google Patents batch failed: {}", e),
         }
-        Ok(_) => tracing::info!("USPTO ODP: no data returned (API may not be live yet)"),
-        Err(e) => tracing::info!("USPTO ODP unavailable (expected during migration): {}", e),
+        // Rate limit: 2 seconds between requests to avoid Google blocking
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 
-    // Try PatentsView search API (intermediate)
-    match fetch_from_patentsview(&client).await {
-        Ok(articles) if !articles.is_empty() => {
-            tracing::info!("PatentsView: {} patent articles", articles.len());
-            return Ok(articles);
-        }
-        Ok(_) => {}
-        Err(e) => tracing::debug!("PatentsView unavailable: {}", e),
+    if articles.is_empty() {
+        tracing::info!("Google Patents: no results (endpoint may be unavailable)");
+    } else {
+        tracing::info!("Google Patents: {} patent articles", articles.len());
     }
 
-    tracing::info!("USPTO: all patent APIs unavailable (migration in progress), skipping");
-    Ok(Vec::new())
+    Ok(articles)
 }
 
-/// Try the new USPTO Open Data Portal API.
-async fn fetch_from_odp(client: &reqwest::Client) -> anyhow::Result<Vec<RawArticle>> {
-    // The ODP API structure is TBD — try common REST patterns
-    let url = "https://data.uspto.gov/api/v1/patent/grant?limit=50&sort=-grantDate";
+/// Fetch recent patents for a batch of assignees via Google Patents XHR.
+async fn fetch_patents_batch(
+    client: &reqwest::Client,
+    assignees: &[&str],
+) -> anyhow::Result<Vec<RawArticle>> {
+    // Build OR query: (assignee:Apple OR assignee:Google OR ...)
+    let assignee_query: String = assignees.iter()
+        .map(|a| format!("assignee:\"{}\"", a))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    // Date range: last 30 days
+    let end_date = chrono::Local::now().format("%Y%m%d").to_string();
+    let start_date = (chrono::Local::now() - chrono::Duration::days(30))
+        .format("%Y%m%d")
+        .to_string();
+
+    let query = format!(
+        "q=({})&num=20&type=PATENT&country=US&dates={}-{}&sort=new",
+        assignee_query, start_date, end_date
+    );
+
+    // URL-encode the query using percent-encoding (re-exported by reqwest)
+    use std::fmt::Write;
+    let mut encoded_query = String::new();
+    for byte in query.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded_query.push(byte as char);
+            }
+            _ => {
+                let _ = write!(encoded_query, "%{:02X}", byte);
+            }
+        }
+    }
+    let url = format!(
+        "https://patents.google.com/xhr/query?url={}",
+        encoded_query
+    );
 
     let resp = client
-        .get(url)
-        .header("User-Agent", "Pulse/1.0 (news aggregator)")
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
         .header("Accept", "application/json")
         .send()
         .await?;
 
     if !resp.status().is_success() {
-        anyhow::bail!("USPTO ODP returned {}", resp.status());
+        anyhow::bail!("Google Patents returned {}", resp.status());
     }
 
     let body = resp.text().await?;
 
-    // Try to parse as JSON — if it's HTML, the API isn't live yet
+    // Check if we got HTML instead of JSON (sometimes returns challenge page)
     if body.starts_with("<!") || body.starts_with("<html") {
-        anyhow::bail!("USPTO ODP returned HTML (API not live yet)");
+        anyhow::bail!("Google Patents returned HTML (possible rate limit)");
     }
 
     let data: serde_json::Value = serde_json::from_str(&body)?;
 
-    let patents = data
+    let results = data
         .get("results")
-        .or_else(|| data.get("patents"))
-        .or_else(|| data.get("data"))
-        .and_then(|v| v.as_array())
+        .and_then(|r| r.get("cluster"))
+        .and_then(|c| c.as_array())
+        .and_then(|clusters| clusters.first())
+        .and_then(|cluster| cluster.get("result"))
+        .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
 
-    let articles: Vec<RawArticle> = patents
+    let articles: Vec<RawArticle> = results
         .into_iter()
-        .filter_map(|p| parse_patent_to_article(&p, "USPTO ODP"))
+        .filter_map(|r| parse_google_patent(&r))
         .collect();
 
     Ok(articles)
 }
 
-/// Try the PatentsView search API (may still work).
-async fn fetch_from_patentsview(client: &reqwest::Client) -> anyhow::Result<Vec<RawArticle>> {
-    let url = "https://search.patentsview.org/api/v1/patent/?per_page=50&sort=-patent_date";
+/// Parse a Google Patents XHR result into a RawArticle.
+fn parse_google_patent(result: &serde_json::Value) -> Option<RawArticle> {
+    let patent = result.get("patent")?;
 
-    let resp = client
-        .get(url)
-        .header("User-Agent", "Pulse/1.0")
-        .header("Accept", "application/json")
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("PatentsView returned {}", resp.status());
-    }
-
-    let body = resp.text().await?;
-    if body.starts_with("<!") || body.starts_with("<html") {
-        anyhow::bail!("PatentsView returned HTML");
-    }
-
-    let data: serde_json::Value = serde_json::from_str(&body)?;
-    let patents = data
-        .get("patents")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let articles: Vec<RawArticle> = patents
-        .into_iter()
-        .filter_map(|p| parse_patent_to_article(&p, "PatentsView"))
-        .collect();
-
-    Ok(articles)
-}
-
-/// Parse a patent JSON object into a RawArticle.
-fn parse_patent_to_article(patent: &serde_json::Value, source: &str) -> Option<RawArticle> {
-    let patent_number = patent
-        .get("patent_number")
-        .or_else(|| patent.get("patentNumber"))
-        .or_else(|| patent.get("number"))
+    let publication_number = patent.get("publication_number")
         .and_then(|v| v.as_str())?;
 
-    let title = patent
-        .get("patent_title")
-        .or_else(|| patent.get("inventionTitle"))
-        .or_else(|| patent.get("title"))
+    let title_raw = patent.get("title")
         .and_then(|v| v.as_str())
         .unwrap_or("Untitled Patent");
+    // Strip HTML tags (Google returns <b> tags in results)
+    let title = clean_html(title_raw);
 
-    let date = patent
-        .get("patent_date")
-        .or_else(|| patent.get("grantDate"))
-        .or_else(|| patent.get("date"))
-        .and_then(|v| v.as_str());
-
-    let assignee = patent
-        .get("assignee_organization")
-        .or_else(|| patent.get("assigneeEntityName"))
-        .or_else(|| patent.get("assignee"))
+    let assignee = patent.get("assignee")
         .and_then(|v| v.as_str())
         .unwrap_or("Unknown Assignee");
 
-    let abstract_text = patent
-        .get("patent_abstract")
-        .or_else(|| patent.get("abstract"))
+    let grant_date = patent.get("grant_date")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let pub_date = patent.get("publication_date")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let date = grant_date.or(pub_date);
+
+    let snippet_raw = patent.get("snippet")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let snippet = clean_html(snippet_raw);
+
+    let inventor = patent.get("inventor")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let headline = format!("{} granted patent: {}", assignee, truncate(title, 100));
+    let is_grant = grant_date.is_some();
+    let doc_type = if is_grant { "patent grant" } else { "patent application" };
+
+    let headline = format!("{} {} — {}: {}", assignee, doc_type, publication_number, truncate(&title, 100));
     let content_snippet = format!(
-        "Patent granted: {} ({}). Assignee: {}. Abstract: {}",
-        title, patent_number, assignee,
-        truncate(abstract_text, 300),
+        "Patent {}: {} ({}). Assignee: {}.{} {}",
+        doc_type, title, publication_number, assignee,
+        if !inventor.is_empty() { format!(" Inventor: {}.", inventor) } else { String::new() },
+        truncate(&snippet, 300),
     );
 
     let metadata = serde_json::json!({
-        "patent_number": patent_number,
+        "publication_number": publication_number,
         "assignee": assignee,
         "title": title,
         "date": date,
-        "source_api": source,
+        "inventor": inventor,
+        "is_grant": is_grant,
+        "source_api": "google_patents",
     });
 
     Some(RawArticle {
         title: headline,
-        url: format!("https://patents.google.com/patent/US{}", patent_number),
-        source_name: "USPTO".to_string(),
-        source_url: "https://data.uspto.gov".to_string(),
-        published_at: date.map(|d| d.to_string()),
+        url: format!("https://patents.google.com/patent/{}/en", publication_number),
+        source_name: "Google Patents".to_string(),
+        source_url: "https://patents.google.com".to_string(),
+        published_at: date.map(|d| {
+            // Convert YYYY-MM-DD format if needed (Google returns YYYY-MM-DD)
+            d.to_string()
+        }),
         content_snippet,
         sector: "tech".to_string(),
-        feed_id: format!("patent_{}", patent_number),
+        feed_id: format!("patent_{}", publication_number),
         language: "en".to_string(),
         source_type: "financial".to_string(),
         financial_metadata: Some(serde_json::to_string(&metadata).unwrap_or_default()),
     })
+}
+
+/// Strip HTML tags from text.
+fn clean_html(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(c),
+            _ => {}
+        }
+    }
+    // Also decode common HTML entities
+    result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&hellip;", "...")
+        .trim()
+        .to_string()
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
