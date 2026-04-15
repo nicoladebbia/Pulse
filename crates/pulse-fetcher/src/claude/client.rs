@@ -133,15 +133,26 @@ impl GroqClient {
             response_format: ResponseFormat { fmt_type: "json_object".to_string() },
         };
 
-        // Retry with backoff for rate limits
+        // Retry with backoff for rate limits and transient connection errors
+        let mut last_err = None;
         for attempt in 0..4u32 {
-            let resp = self.http
+            let resp = match self.http
                 .post(API_URL)
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .header("Content-Type", "application/json")
                 .json(&request)
                 .send()
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let delay = 10 * (attempt + 1) as u64;
+                    tracing::warn!("Groq connection error (attempt {}): {}, retrying in {}s", attempt + 1, e, delay);
+                    last_err = Some(format!("{}", e));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+            };
 
             let status = resp.status();
             if status.as_u16() == 429 {
@@ -156,7 +167,16 @@ impl GroqClient {
                 anyhow::bail!("Groq API error {}: {}", status, body);
             }
 
-            let response: ChatResponse = resp.json().await?;
+            let response: ChatResponse = match resp.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let delay = 10 * (attempt + 1) as u64;
+                    tracing::warn!("Groq response parse error (attempt {}): {}, retrying in {}s", attempt + 1, e, delay);
+                    last_err = Some(format!("{}", e));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+            };
 
             if let Some(err) = response.error {
                 anyhow::bail!("Groq API error: {}", err.message);
@@ -171,7 +191,7 @@ impl GroqClient {
             return Ok(text);
         }
 
-        anyhow::bail!("Groq API: max retries exceeded due to rate limiting")
+        anyhow::bail!("Groq API: max retries exceeded (last error: {})", last_err.unwrap_or_else(|| "rate limiting".into()))
     }
 
     /// Like `call()` but returns plain text (no JSON response_format constraint).
@@ -188,14 +208,25 @@ impl GroqClient {
             response_format: ResponseFormat { fmt_type: "text".to_string() },
         };
 
+        let mut last_err = None;
         for attempt in 0..4u32 {
-            let resp = self.http
+            let resp = match self.http
                 .post(API_URL)
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .header("Content-Type", "application/json")
                 .json(&request)
                 .send()
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let delay = 10 * (attempt + 1) as u64;
+                    tracing::warn!("Groq connection error (attempt {}): {}, retrying in {}s", attempt + 1, e, delay);
+                    last_err = Some(format!("{}", e));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+            };
 
             let status = resp.status();
             if status.as_u16() == 429 {
@@ -210,7 +241,17 @@ impl GroqClient {
                 anyhow::bail!("Groq API error {}: {}", status, body);
             }
 
-            let response: ChatResponse = resp.json().await?;
+            let response: ChatResponse = match resp.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let delay = 10 * (attempt + 1) as u64;
+                    tracing::warn!("Groq response parse error (attempt {}): {}, retrying in {}s", attempt + 1, e, delay);
+                    last_err = Some(format!("{}", e));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+            };
+
             if let Some(err) = response.error {
                 anyhow::bail!("Groq API error: {}", err.message);
             }
@@ -224,7 +265,7 @@ impl GroqClient {
             return Ok(text.trim().to_string());
         }
 
-        anyhow::bail!("Groq API: max retries exceeded due to rate limiting")
+        anyhow::bail!("Groq API: max retries exceeded (last error: {})", last_err.unwrap_or_else(|| "rate limiting".into()))
     }
 
     pub async fn translate(&self, title: &str, snippet: &str) -> anyhow::Result<(String, String)> {
@@ -321,10 +362,20 @@ impl GroqClient {
                 i, story.article.sector, story.headline, story.summary, story.importance_score
             ));
         }
-        user_msg.push_str("\nReturn valid JSON with keys: connections, relevance_scores, trends, curation.");
+        user_msg.push_str(&format!(
+            "\nReturn valid JSON with keys: connections, relevance_scores, trends, curation.\nYou MUST return exactly {} relevance_scores entries — one for EVERY story listed above. Do not skip any.",
+            stories.len()
+        ));
 
-        let text = self.call(STRONG_MODEL, system, &user_msg, 4000).await?;
+        let text = self.call(STRONG_MODEL, system, &user_msg, 8000).await?;
         let parsed: AnalysisResponse = serde_json::from_str(&extract_json(&text))?;
+
+        if parsed.relevance_scores.len() < stories.len() {
+            tracing::warn!(
+                "Analysis returned {}/{} relevance_scores — some stories will lack relevance data",
+                parsed.relevance_scores.len(), stories.len()
+            );
+        }
 
         // Validate and log per-sector curation
         tracing::info!("Curation response: ai={}, miami={}, italy={}, tech={}",
@@ -449,13 +500,17 @@ Select ~90 total. No explanation, just the JSON array."#;
     }
 }
 
-/// Extract JSON array from response text
+/// Extract JSON array from response text, handling truncation
 fn extract_json_array(text: &str) -> String {
     let trimmed = text.trim();
     if let Some(start) = trimmed.find('[') {
         if let Some(end) = trimmed.rfind(']') {
             return trimmed[start..=end].to_string();
         }
+        // Truncated response — no closing bracket. Trim trailing comma/whitespace and close it.
+        let partial = trimmed[start..].trim_end_matches([',', ' ', '\n', '\r']);
+        tracing::warn!("JSON array truncated — closing bracket missing, attempting recovery");
+        return format!("{}]", partial);
     }
     trimmed.to_string()
 }
