@@ -5,6 +5,8 @@ mod contextual;
 pub(crate) mod db;
 mod dedup;
 mod embeddings;
+pub(crate) mod market_prices;
+pub(crate) mod calibration;
 
 use chrono::Timelike;
 use clap::Parser;

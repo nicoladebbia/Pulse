@@ -1,5 +1,5 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, UsageStats, TavilyQuota, TrendThread, ChatContext } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth } from './types';
 
 export async function getTodayBriefing(): Promise<BriefingWithStories | null> {
 	return invoke('get_today_briefing');
@@ -77,6 +77,20 @@ export async function updateIdeaStatus(id: number, status: string): Promise<void
 	return invoke('update_idea_status', { id, status });
 }
 
+// === Predictions ===
+
+export async function getAllPredictions(): Promise<Prediction[]> {
+	return invoke('get_all_predictions');
+}
+
+export async function getPredictionStats(): Promise<PredictionStats> {
+	return invoke('get_prediction_stats');
+}
+
+export async function manuallyValidatePrediction(id: number, outcome: string): Promise<void> {
+	return invoke('manually_validate_prediction', { id, outcome });
+}
+
 // === Trend Badges ===
 
 export async function getStoryTrendBadges(storyIds: number[]): Promise<StoryTrendBadge[]> {
@@ -95,6 +109,10 @@ export async function getTrends(): Promise<TrendThread[]> {
 	return invoke('get_trends');
 }
 
+export async function getIntelligenceCounts(): Promise<IntelligenceCounts> {
+	return invoke('get_intelligence_counts');
+}
+
 // === API Usage ===
 
 export async function getApiUsage(days: number): Promise<UsageStats> {
@@ -103,4 +121,48 @@ export async function getApiUsage(days: number): Promise<UsageStats> {
 
 export async function getTavilyQuota(): Promise<TavilyQuota> {
 	return invoke('get_tavily_quota');
+}
+
+export async function getFinancialQuotas(): Promise<FinancialApiQuota[]> {
+	return invoke('get_financial_quotas');
+}
+
+// === Cross-Signal Intelligence ===
+
+export async function getCrossSignals(limit?: number): Promise<CrossSignal[]> {
+	return invoke('get_cross_signals', { limit: limit ?? 20 });
+}
+
+export async function getConvergenceAlerts(limit?: number): Promise<CrossSignal[]> {
+	return invoke('get_convergence_alerts', { limit: limit ?? 10 });
+}
+
+export async function getEntityPrices(limit?: number): Promise<EntityPrice[]> {
+	return invoke('get_entity_prices', { limit: limit ?? 50 });
+}
+
+export async function getFinancialEvents(limit?: number): Promise<FinancialEvent[]> {
+	return invoke('get_financial_events', { limit: limit ?? 30 });
+}
+
+export async function getSignalEvidence(limit?: number): Promise<SignalEvidence[]> {
+	return invoke('get_signal_evidence', { limit: limit ?? 10 });
+}
+
+export async function getSourceHealth(): Promise<SourceHealth[]> {
+	return invoke('get_source_health');
+}
+
+// === Paper Trading ===
+
+export async function getPortfolio(): Promise<Portfolio> {
+	return invoke('get_portfolio');
+}
+
+export async function getPaperTrades(status?: string): Promise<PaperTrade[]> {
+	return invoke('get_paper_trades', { status: status ?? 'open' });
+}
+
+export async function executeTrade(ticker: string, confidence: number): Promise<PaperTrade | null> {
+	return invoke('execute_trade', { ticker, confidence });
 }

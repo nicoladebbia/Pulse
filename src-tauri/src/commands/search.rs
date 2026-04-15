@@ -26,7 +26,8 @@ pub fn full_text_search(db: State<DbState>, query: String) -> Result<Vec<Story>,
             "SELECT s.id, s.briefing_id, s.sector, s.headline, s.summary, s.key_facts,
                     s.why_it_matters, s.what_to_watch, s.importance_score, s.relevance_score,
                     s.relevance_reason, s.is_hero, s.display_order, s.original_url, s.source_name,
-                    s.published_at, s.created_at, s.summary_depth, s.deep_summary
+                    s.published_at, s.created_at, s.summary_depth, s.deep_summary,
+                    s.source_type, s.financial_metadata
              FROM stories_fts fts
              JOIN stories s ON s.id = fts.rowid
              WHERE stories_fts MATCH ?1
@@ -60,6 +61,8 @@ pub fn full_text_search(db: State<DbState>, query: String) -> Result<Vec<Story>,
                 created_at: row.get(16)?,
                 summary_depth: row.get(17).ok(),
                 deep_summary: row.get(18).ok(),
+                source_type: row.get(19).ok(),
+                financial_metadata: row.get(20).ok(),
             })
         })
         .map_err(|e| e.to_string())?

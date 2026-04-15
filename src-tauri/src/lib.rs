@@ -4,6 +4,10 @@ mod models;
 pub mod services;
 
 use tauri::Manager;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+pub struct ChatAbortFlag(pub Arc<AtomicBool>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -40,6 +44,7 @@ pub fn run() {
             let conn = db::connection::initialize(&db_path)
                 .map_err(|e| format!("failed to initialize database: {e}"))?;
             app.manage(db::DbState(std::sync::Mutex::new(conn)));
+            app.manage(ChatAbortFlag(Arc::new(AtomicBool::new(false))));
 
             Ok(())
         })
@@ -64,15 +69,31 @@ pub fn run() {
             commands::chat::get_chat_context,
             commands::chat::submit_chat_feedback,
             commands::chat::get_feedback_stats,
+            commands::chat::chat_cancel_stream,
             commands::freedoms::get_today_freedoms,
             commands::freedoms::get_freedoms_by_date,
             commands::trends::get_trends,
             commands::trends::get_story_trend_badges,
+            commands::trends::get_intelligence_counts,
+            commands::trends::get_story_entities,
             commands::ideas::generate_ideas,
             commands::ideas::get_ideas,
             commands::ideas::update_idea_status,
+            commands::predictions::get_all_predictions,
+            commands::predictions::get_prediction_stats,
+            commands::predictions::manually_validate_prediction,
             commands::usage::get_api_usage,
             commands::usage::get_tavily_quota,
+            commands::usage::get_financial_quotas,
+            commands::cross_signals::get_cross_signals,
+            commands::cross_signals::get_convergence_alerts,
+            commands::cross_signals::get_entity_prices,
+            commands::cross_signals::get_financial_events,
+            commands::cross_signals::get_signal_evidence,
+            commands::cross_signals::get_source_health,
+            commands::trading::get_portfolio,
+            commands::trading::get_paper_trades,
+            commands::trading::execute_trade,
         ])
         .build(tauri::generate_context!())
         .expect("error building Pulse")

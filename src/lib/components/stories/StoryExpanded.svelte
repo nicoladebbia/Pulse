@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { SECTORS, type SectorId } from '$lib/config';
 	import RelevanceBadge from './RelevanceBadge.svelte';
-	import type { Story, ChatStreamEvent } from '$lib/tauri/types';
+	import type { Story, ChatStreamEvent, StoryEntityContext } from '$lib/tauri/types';
 	import { chatSendStream } from '$lib/tauri/commands';
 	import { isTauri, simulateChatStream } from '$lib/tauri/mock';
 
@@ -19,6 +19,16 @@
 
 	let aiMessages = $state<AiMessage[]>([]);
 	let isAsking = $state(false);
+	let storyEntities = $state<StoryEntityContext[]>([]);
+
+	// Load entity context
+	$effect(() => {
+		if (!isTauri()) return;
+		const ipc = (window as any).__TAURI_INTERNALS__;
+		ipc?.invoke('get_story_entities', { storyId: story.id })
+			.then((e: StoryEntityContext[]) => { storyEntities = e; })
+			.catch(() => {});
+	});
 	let followUpQuery = $state('');
 	let conversationEl = $state<HTMLElement | null>(null);
 
@@ -186,6 +196,35 @@
 			{story.why_it_matters}
 		</p>
 	</div>
+
+	<!-- Entity Context -->
+	{#if storyEntities.length > 0}
+		<div class="mb-6">
+			<h3 class="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Key Entities</h3>
+			<div class="flex flex-wrap gap-1.5">
+				{#each storyEntities as entity}
+					{@const trajColors: Record<string, string> = {
+						dominant: 'bg-ai/15 text-ai border-ai/30',
+						hot: 'bg-amber-500/15 text-amber-400 border-amber-500/30',
+						rising: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30',
+						fading: 'bg-red-500/15 text-red-400 border-red-500/30',
+					}}
+					{@const cls = trajColors[entity.trajectory] ?? 'bg-bg-card text-text-secondary border-border'}
+					<span
+						class="text-[10px] px-2 py-0.5 rounded border inline-flex items-center gap-1 {cls}"
+						title="{entity.entity_type ?? 'entity'} · {entity.trajectory} · sentiment: {entity.sentiment.toFixed(2)}"
+					>
+						{entity.name}
+						{#if entity.trajectory !== 'unknown' && entity.trajectory !== 'dormant'}
+							<span class="text-[8px] opacity-70">
+								{entity.trajectory === 'dominant' ? '◉' : entity.trajectory === 'hot' ? '▲' : entity.trajectory === 'rising' ? '↗' : '↘'}
+							</span>
+						{/if}
+					</span>
+				{/each}
+			</div>
+		</div>
+	{/if}
 
 	<!-- Watch Next — clickable deep dive -->
 	<div class="mb-6 bg-bg-card border border-border rounded-lg p-4 group">

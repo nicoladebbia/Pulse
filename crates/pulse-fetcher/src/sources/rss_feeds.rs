@@ -313,6 +313,8 @@ async fn fetch_single(
                 sector: sector.to_string(),
                 feed_id: format!("rss_{}", name.to_lowercase().replace(' ', "_")),
                 language: lang.to_string(),
+                source_type: "news".to_string(),
+                financial_metadata: None,
             });
         }
     }

@@ -13,6 +13,8 @@ const MIGRATION_010: &str = include_str!("../../../migrations/010_trajectory_lab
 const MIGRATION_011: &str = include_str!("../../../migrations/011_rename_financial_to_wealth.sql");
 const MIGRATION_015: &str = include_str!("../../../migrations/015_entity_aliases.sql");
 const MIGRATION_016: &str = include_str!("../../../migrations/016_feed_health.sql");
+const MIGRATION_017: &str = include_str!("../../../migrations/017_financial_data.sql");
+const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_resolution.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -167,6 +169,296 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_016)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (16)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 17: Financial data support — table recreation + new tables + signal columns
+    if !applied.contains(&17) {
+        // Disable foreign keys during table recreation
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+        // Step 1: Recreate stories table with finance sector + source_type + financial_metadata
+        if !column_exists(conn, "stories", "source_type") {
+            conn.execute_batch(
+                "CREATE TABLE stories_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    briefing_id     INTEGER NOT NULL REFERENCES briefings(id),
+                    sector          TEXT NOT NULL CHECK(sector IN ('ai', 'miami', 'italy', 'tech', 'finance')),
+                    original_title  TEXT NOT NULL,
+                    original_url    TEXT NOT NULL,
+                    original_language TEXT NOT NULL DEFAULT 'en',
+                    content_snippet TEXT,
+                    source_name     TEXT NOT NULL,
+                    published_at    TEXT,
+                    headline        TEXT NOT NULL,
+                    summary         TEXT NOT NULL,
+                    key_facts       TEXT NOT NULL,
+                    why_it_matters  TEXT NOT NULL,
+                    what_to_watch   TEXT NOT NULL,
+                    importance_score INTEGER NOT NULL DEFAULT 5,
+                    relevance_score  INTEGER,
+                    relevance_reason TEXT,
+                    is_hero         INTEGER NOT NULL DEFAULT 0,
+                    display_order   INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    url_hash        TEXT NOT NULL,
+                    title_hash      TEXT NOT NULL,
+                    context_prefix  TEXT,
+                    summary_depth   TEXT DEFAULT 'standard',
+                    deep_summary    TEXT,
+                    sentiment       REAL,
+                    novelty         REAL,
+                    event_type      TEXT,
+                    source_type     TEXT NOT NULL DEFAULT 'news' CHECK(source_type IN ('news', 'financial')),
+                    financial_metadata TEXT
+                );
+
+                INSERT INTO stories_new (
+                    id, briefing_id, sector, original_title, original_url, original_language,
+                    content_snippet, source_name, published_at, headline, summary, key_facts,
+                    why_it_matters, what_to_watch, importance_score, relevance_score, relevance_reason,
+                    is_hero, display_order, created_at, url_hash, title_hash,
+                    context_prefix, summary_depth, deep_summary, sentiment, novelty, event_type,
+                    source_type, financial_metadata
+                )
+                SELECT
+                    id, briefing_id, sector, original_title, original_url, original_language,
+                    content_snippet, source_name, published_at, headline, summary, key_facts,
+                    why_it_matters, what_to_watch, importance_score, relevance_score, relevance_reason,
+                    is_hero, display_order, created_at, url_hash, title_hash,
+                    context_prefix, summary_depth, deep_summary, sentiment, novelty, event_type,
+                    'news', NULL
+                FROM stories;
+
+                DROP TABLE stories;
+                ALTER TABLE stories_new RENAME TO stories;
+
+                CREATE INDEX IF NOT EXISTS idx_stories_briefing ON stories(briefing_id);
+                CREATE INDEX IF NOT EXISTS idx_stories_sector ON stories(sector);
+                CREATE INDEX IF NOT EXISTS idx_stories_date ON stories(created_at);
+                CREATE INDEX IF NOT EXISTS idx_stories_url_hash ON stories(url_hash);
+                CREATE INDEX IF NOT EXISTS idx_stories_title_hash ON stories(title_hash);
+                CREATE INDEX IF NOT EXISTS idx_stories_source_type ON stories(source_type);
+                CREATE INDEX IF NOT EXISTS idx_stories_published_at ON stories(published_at);"
+            )?;
+        }
+
+        // Step 2: Recreate FTS table and triggers
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS stories_fts;
+            CREATE VIRTUAL TABLE stories_fts USING fts5(
+                headline, summary, key_facts, why_it_matters, context_prefix,
+                content='stories',
+                content_rowid='id'
+            );
+            INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                SELECT id, headline, summary, key_facts, why_it_matters, context_prefix FROM stories;
+
+            DROP TRIGGER IF EXISTS stories_fts_insert;
+            DROP TRIGGER IF EXISTS stories_fts_delete;
+            DROP TRIGGER IF EXISTS stories_fts_update;
+
+            CREATE TRIGGER stories_fts_insert AFTER INSERT ON stories BEGIN
+                INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+            END;
+
+            CREATE TRIGGER stories_fts_delete AFTER DELETE ON stories BEGIN
+                INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+            END;
+
+            CREATE TRIGGER stories_fts_update AFTER UPDATE ON stories BEGIN
+                INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+                INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+            END;"
+        )?;
+
+        // Step 3: Recreate entities table with expanded entity types
+        let mut needs_entity_rebuild = false;
+        if let Ok(mut stmt) = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'") {
+            if let Ok(sql) = stmt.query_row([], |row| row.get::<_, String>(0)) {
+                needs_entity_rebuild = !sql.contains("insider_trade");
+            }
+        }
+
+        if needs_entity_rebuild {
+            conn.execute_batch(
+                "CREATE TABLE entities_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            TEXT NOT NULL,
+                    name_normalized TEXT NOT NULL,
+                    entity_type     TEXT NOT NULL CHECK(entity_type IN (
+                        'company', 'person', 'topic', 'product', 'regulation',
+                        'insider_trade', 'contract_award', 'patent_cluster',
+                        'lobbying_disclosure', 'institutional_holding',
+                        'private_placement', 'material_event', 'regulatory_action'
+                    )),
+                    sector          TEXT,
+                    first_seen      TEXT NOT NULL,
+                    last_seen       TEXT NOT NULL,
+                    mention_count   INTEGER NOT NULL DEFAULT 1,
+                    sentiment_avg   REAL NOT NULL DEFAULT 0.0,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                INSERT INTO entities_new (
+                    id, name, name_normalized, entity_type, sector,
+                    first_seen, last_seen, mention_count, sentiment_avg, created_at
+                )
+                SELECT
+                    id, name, name_normalized, entity_type, sector,
+                    first_seen, last_seen, mention_count, sentiment_avg, created_at
+                FROM entities;
+
+                DROP TABLE entities;
+                ALTER TABLE entities_new RENAME TO entities;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_name_type ON entities(name_normalized, entity_type);
+                CREATE INDEX IF NOT EXISTS idx_entities_sector ON entities(sector);
+                CREATE INDEX IF NOT EXISTS idx_entities_mention_count ON entities(mention_count DESC);
+                CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);"
+            )?;
+        }
+
+        // Step 4: Create financial infrastructure tables
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS entity_tickers (
+                entity_id   INTEGER PRIMARY KEY REFERENCES entities(id),
+                ticker      TEXT NOT NULL,
+                exchange    TEXT,
+                cik         TEXT,
+                is_public   INTEGER DEFAULT 1,
+                confidence  REAL DEFAULT 1.0,
+                last_verified TEXT,
+                created_at  TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_tickers_ticker ON entity_tickers(ticker);
+            CREATE INDEX IF NOT EXISTS idx_entity_tickers_cik ON entity_tickers(cik);
+
+            CREATE TABLE IF NOT EXISTS entity_prices (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id   INTEGER REFERENCES entities(id),
+                ticker      TEXT NOT NULL,
+                date        TEXT NOT NULL,
+                open        REAL,
+                close       REAL NOT NULL,
+                high        REAL,
+                low         REAL,
+                volume      INTEGER,
+                change_1d   REAL,
+                change_7d   REAL,
+                change_30d  REAL,
+                created_at  TEXT DEFAULT (datetime('now')),
+                UNIQUE(ticker, date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_prices_entity ON entity_prices(entity_id, date);
+            CREATE INDEX IF NOT EXISTS idx_entity_prices_ticker ON entity_prices(ticker, date);
+
+            CREATE TABLE IF NOT EXISTS cross_signals (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id           INTEGER REFERENCES entities(id),
+                ticker              TEXT,
+                compound_score      REAL NOT NULL,
+                insider_signal      REAL DEFAULT 0,
+                institutional_flow  REAL DEFAULT 0,
+                news_momentum       REAL DEFAULT 0,
+                government_signal   REAL DEFAULT 0,
+                search_trend        REAL DEFAULT 0,
+                patent_signal       REAL DEFAULT 0,
+                supply_chain        REAL DEFAULT 0,
+                political_signal    REAL DEFAULT 0,
+                source_diversity    INTEGER DEFAULT 0,
+                convergence_detected INTEGER DEFAULT 0,
+                computed_at         TEXT DEFAULT (datetime('now'))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cross_signals_entity_date ON cross_signals(entity_id, date(computed_at));
+            CREATE INDEX IF NOT EXISTS idx_cross_signals_entity ON cross_signals(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_cross_signals_convergence ON cross_signals(convergence_detected);
+            CREATE INDEX IF NOT EXISTS idx_cross_signals_score ON cross_signals(compound_score);
+
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id       INTEGER REFERENCES entities(id),
+                ticker          TEXT NOT NULL,
+                direction       TEXT NOT NULL CHECK(direction IN ('long', 'short')),
+                entry_price     REAL NOT NULL,
+                entry_date      TEXT NOT NULL,
+                exit_price      REAL,
+                exit_date       TEXT,
+                position_size   REAL NOT NULL,
+                confidence      REAL NOT NULL,
+                signal_profile  TEXT NOT NULL,
+                prediction_id   INTEGER REFERENCES insights(id),
+                alpaca_order_id TEXT,
+                status          TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'closed', 'stopped_out', 'expired')),
+                pnl             REAL,
+                pnl_pct         REAL,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status);
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_entity ON paper_trades(entity_id);
+
+            CREATE TABLE IF NOT EXISTS backtest_results (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_profile  TEXT NOT NULL,
+                start_date      TEXT NOT NULL,
+                end_date        TEXT NOT NULL,
+                total_signals   INTEGER NOT NULL,
+                hit_rate        REAL NOT NULL,
+                avg_return      REAL,
+                max_drawdown    REAL,
+                sharpe_ratio    REAL,
+                avg_holding_days REAL,
+                details         TEXT,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS financial_dedup (
+                source_type TEXT NOT NULL,
+                source_id   TEXT NOT NULL,
+                story_id    INTEGER REFERENCES stories(id),
+                fetched_at  TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (source_type, source_id)
+            );"
+        )?;
+
+        // Step 5: Add signal dimension columns
+        let signal_cols = [
+            "insider_buy_volume", "institutional_flow", "contract_value",
+            "patent_filing_rate", "search_trend_delta", "import_volume_delta",
+            "regulatory_sentiment", "lobbying_spend_delta", "source_diversity",
+        ];
+        for col in &signal_cols {
+            if !column_exists(conn, "signals", col) {
+                let col_type = if *col == "source_diversity" { "INTEGER" } else { "REAL" };
+                conn.execute_batch(&format!(
+                    "ALTER TABLE signals ADD COLUMN {} {} DEFAULT 0;", col, col_type
+                ))?;
+            }
+        }
+
+        // Re-enable foreign keys
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+        // Record migration
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (17)", [])?;
+    }
+
+    // Migration 18: Entity resolution — canonical entity deduplication
+    if !applied.contains(&18) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_018)?;
+
+        // Add canonical_id column to entities if not exists
+        if !column_exists(&tx, "entities", "canonical_id") {
+            tx.execute_batch("ALTER TABLE entities ADD COLUMN canonical_id INTEGER REFERENCES entity_canonical(id);")?;
+            tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_entities_canonical ON entities(canonical_id);")?;
+        }
+
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (18)", [])?;
         tx.commit()?;
     }
 

@@ -3,13 +3,16 @@
 	import { activeSectors, currentBriefing } from '$lib/stores/briefing';
 	import { page } from '$app/stores';
 	import { isTauri, mockBriefingData, mockUsageStats, mockTavilyQuota } from '$lib/tauri/mock';
-	import type { UsageStats, TavilyQuota } from '$lib/tauri/types';
+	import type { UsageStats, TavilyQuota, IntelligenceCounts, FinancialApiQuota } from '$lib/tauri/types';
 	import { isFetching, fetchDone, fetchError, triggerFetch as storeTriggerFetch } from '$lib/stores/fetch';
 	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
 
 	let usageStats = $state<UsageStats | null>(null);
 	let tavilyQuota = $state<TavilyQuota | null>(null);
+	let financialQuotas = $state<FinancialApiQuota[]>([]);
+	let intel = $state<IntelligenceCounts | null>(null);
 	let showUsageDetail = $state(false);
+	let showFinancialApis = $state(false);
 	let prevCost = $state(0);
 	let costAnimating = $state(false);
 
@@ -37,9 +40,10 @@
 				return;
 			}
 			const ipc = (window as any).__TAURI_INTERNALS__;
-			const [usage, quota] = await Promise.all([
+			const [usage, quota, finQuotas] = await Promise.all([
 				ipc.invoke('get_api_usage', { days: 30 }),
 				ipc.invoke('get_tavily_quota'),
+				ipc.invoke('get_financial_quotas').catch(() => []),
 			]);
 			// Animate if cost increased
 			if (usageStats && usage.total_cost_usd > usageStats.total_cost_usd) {
@@ -49,6 +53,9 @@
 			}
 			usageStats = usage;
 			tavilyQuota = quota;
+			financialQuotas = finQuotas.filter((q: FinancialApiQuota) => q.calls_today > 0 || q.limit_per_minute > 0);
+			// Also load intelligence counts
+			ipc.invoke('get_intelligence_counts').then((c: IntelligenceCounts) => { intel = c; }).catch(() => {});
 		} catch (_) {}
 	}
 
@@ -82,8 +89,9 @@
 		{ href: '/', label: 'Today', icon: '◉' },
 		{ href: '/archive', label: 'Archive', icon: '◫' },
 		{ href: '/trends', label: 'Trends', icon: '◈' },
+		{ href: '/signals', label: 'Signals', icon: '⬡' },
 		{ href: '/freedoms', label: 'Freedoms', icon: '◇' },
-		{ href: '/ideas', label: 'Ideas', icon: '~' },
+		{ href: '/predictions', label: 'Predictions', icon: '⊕' },
 		{ href: '/ask', label: 'Ask Pulse', icon: '◎' },
 	];
 
@@ -157,6 +165,27 @@
 			</button>
 		{/each}
 	</div>
+
+	<!-- Intelligence Summary -->
+	{#if intel && (intel.entity_count > 0 || intel.active_prediction_count > 0)}
+		<div class="px-3 py-4 border-t border-border">
+			<p class="px-3 text-xs font-medium text-text-muted uppercase tracking-wider mb-3">Intelligence</p>
+			<div class="space-y-1.5 px-3">
+				<div class="flex items-center justify-between">
+					<span class="text-xs text-text-muted">Entities tracked</span>
+					<span class="text-xs font-semibold font-mono text-text">{intel.entity_count}</span>
+				</div>
+				<div class="flex items-center justify-between">
+					<span class="text-xs text-text-muted">Active predictions</span>
+					<span class="text-xs font-semibold font-mono text-text">{intel.active_prediction_count}</span>
+				</div>
+				<div class="flex items-center justify-between">
+					<span class="text-xs text-text-muted">Hot signals</span>
+					<span class="text-xs font-semibold font-mono text-ai">{intel.hot_signal_count}</span>
+				</div>
+			</div>
+		</div>
+	{/if}
 
 	<!-- Spacer to push footer down when sidebar is short -->
 	<div class="flex-1"></div>
@@ -246,6 +275,37 @@
 							<div class="h-full {barColor} rounded-full transition-all duration-700" style="width: {pct}%"></div>
 						</div>
 					</div>
+				{/if}
+
+				<!-- Financial APIs section -->
+				{#if financialQuotas.length > 0}
+					<button
+						class="w-full px-3 py-1.5 text-[10px] text-text-muted hover:text-text transition-colors text-left"
+						onclick={() => { showFinancialApis = !showFinancialApis; }}
+					>
+						{showFinancialApis ? '▾ Hide data APIs' : '▸ Data APIs'} <span class="font-mono text-text-secondary">{financialQuotas.reduce((s, q) => s + q.calls_today, 0)} calls today</span>
+					</button>
+
+					{#if showFinancialApis}
+						<div class="px-3 pt-1 space-y-1.5 mb-2">
+							{#each financialQuotas as q}
+								{@const hasLimit = q.limit_per_minute > 0 || q.limit_per_day > 0}
+								{@const hourPct = q.limit_per_minute > 0 ? Math.round((q.calls_this_hour / (q.limit_per_minute * 60)) * 100) : 0}
+								<div class="space-y-0.5">
+									<div class="flex items-center justify-between text-[10px]">
+										<span class="text-text-muted truncate mr-1">{q.description}</span>
+										<span class="font-mono text-text-secondary shrink-0">{q.calls_today}</span>
+									</div>
+									{#if hasLimit}
+										{@const barColor = hourPct > 80 ? 'bg-amber-400' : 'bg-emerald-400/60'}
+										<div class="w-full h-0.5 bg-border rounded-full overflow-hidden">
+											<div class="h-full {barColor} rounded-full transition-all" style="width: {Math.min(hourPct, 100)}%"></div>
+										</div>
+									{/if}
+								</div>
+							{/each}
+						</div>
+					{/if}
 				{/if}
 
 				<!-- Expandable provider detail -->

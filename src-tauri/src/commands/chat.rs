@@ -2,6 +2,7 @@ use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, State};
 use crate::db::DbState;
+use crate::ChatAbortFlag;
 use crate::services::{api_usage, brave_search, conversation, search, reranking, profile, embeddings, embeddings::EmbeddingProvider, entities, signals, causality, contrarian, patterns, predictions, feedback};
 
 // ============ Streaming types ============
@@ -585,6 +586,7 @@ pub async fn chat_send(
         &pattern_context,
         &predictions_context,
         &prediction_calibration,
+        query_type.format_label(),
     );
     system_prompt.push_str(&format_retrieval_confidence(retrieval_confidence_sync, stories.len()));
     if !graph_context_sync.is_empty() {
@@ -704,6 +706,7 @@ pub async fn chat_send(
                 predicted_timeframe: timeframe.clone(),
                 sector: Some(topic.to_string()),
                 status: "active".to_string(),
+                probability_history: Vec::new(),
             };
             predictions::store_prediction(&conn, &pred).ok();
         }
@@ -720,11 +723,19 @@ pub async fn chat_send(
 }
 
 /// Streaming version of chat_send. Sends text deltas as they arrive from Claude,
+/// Cancel an in-progress stream. Sets the abort flag so the streaming callback stops sending deltas.
+#[tauri::command]
+pub fn chat_cancel_stream(abort_flag: State<'_, ChatAbortFlag>) -> Result<(), String> {
+    abort_flag.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 /// then sends a Complete event with metadata (sources, followups, etc).
 /// Steps 1-6 are identical to chat_send. Step 7 streams instead of blocking.
 #[tauri::command]
 pub async fn chat_send_stream(
     db: State<'_, DbState>,
+    abort_flag: State<'_, ChatAbortFlag>,
     thread_id: Option<String>,
     message: String,
     on_event: Channel<ChatStreamEvent>,
@@ -732,6 +743,9 @@ pub async fn chat_send_stream(
     if message.len() > 20_000 {
         return Err("Message too long".to_string());
     }
+
+    // Reset abort flag at start of new stream
+    abort_flag.0.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // --- Steps 1-6 identical to chat_send ---
 
@@ -897,8 +911,8 @@ pub async fn chat_send_stream(
         stories
     };
 
-    // 3.6. Smart web search trigger (4 rules)
-    let should_web_search = should_trigger_web_search(&message, &stories, &db)?;
+    // 3.6. Smart web search trigger (4 rules + advisory always triggers)
+    let should_web_search = should_trigger_web_search(&message, &stories, &db, query_type)?;
 
     if should_web_search {
         on_event.send(ChatStreamEvent::Searching {
@@ -917,7 +931,13 @@ pub async fn chat_send_stream(
             tracing::info!("Web search skipped: Tavily monthly limit reached");
             (None, "archive".to_string())
         } else {
-            match brave_search::search(&message, 5).await {
+            // For advisory queries, reformulate toward actionable market data
+            let web_query = if query_type == search::QueryType::Advisory {
+                format!("{} market size pricing competition realistic", message)
+            } else {
+                message.clone()
+            };
+            match brave_search::search(&web_query, 5).await {
                 Ok(results) if !results.is_empty() => {
                     let conn = db.0.lock().map_err(|e| e.to_string())?;
                     brave_search::log_call(&conn);
@@ -1079,7 +1099,7 @@ pub async fn chat_send_stream(
     let mut system_prompt = conversation::build_system_prompt(
         &profile_str, &stories_context, &entity_context, &signal_context,
         &causal_context, &contrarian_context, &pattern_context, &predictions_context,
-        &prediction_calibration,
+        &prediction_calibration, query_type.format_label(),
     );
 
     // Append retrieval confidence
@@ -1122,6 +1142,10 @@ pub async fn chat_send_stream(
             tracing::info!("Using Sonnet (complex query)");
             (conversation::CONVERSATION_MODEL_DEEP, 2000u32)
         }
+        search::QueryType::Advisory => {
+            tracing::info!("Using Sonnet (advisory query)");
+            (conversation::CONVERSATION_MODEL_DEEP, 2000u32)
+        }
         _ => {
             tracing::info!("Using Haiku (simple query)");
             (conversation::CONVERSATION_MODEL_FAST, 1200u32)
@@ -1129,12 +1153,16 @@ pub async fn chat_send_stream(
     };
 
     let on_event_clone = on_event.clone();
+    let abort_clone = abort_flag.0.clone();
     let raw_response = llm.send_message_stream(
         &system_prompt,
         &messages_for_llm,
         chat_model,
         chat_max_tokens,
         move |chunk| {
+            if abort_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                return; // Abort requested — stop sending deltas
+            }
             if let Err(e) = on_event_clone.send(ChatStreamEvent::Delta { text: chunk.to_string() }) {
                 tracing::warn!("failed to send Delta event: {}", e);
             }
@@ -1210,6 +1238,7 @@ pub async fn chat_send_stream(
                 predicted_timeframe: timeframe.clone(),
                 sector: Some(topic.to_string()),
                 status: "active".to_string(),
+                probability_history: Vec::new(),
             };
             predictions::store_prediction(&conn, &pred).ok();
         }
@@ -1374,7 +1403,8 @@ pub fn chat_delete_thread(db: State<'_, DbState>, thread_id: String) -> Result<(
 // Smart web search trigger
 // ---------------------------------------------------------------------------
 
-/// Decide whether to trigger a web search based on 4 rules:
+/// Decide whether to trigger a web search based on 5 rules:
+/// 0. Advisory queries always trigger (archive unlikely to have how-to content)
 /// 1. Comparison questions ("X vs Y", "best tools", "alternatives to")
 /// 2. Time-sensitive words ("latest", "today", "just released", "new")
 /// 3. Low archive confidence (<5 results)
@@ -1383,7 +1413,14 @@ fn should_trigger_web_search(
     message: &str,
     stories: &[search::ScoredStory],
     db: &State<'_, crate::db::DbState>,
+    query_type: search::QueryType,
 ) -> Result<bool, String> {
+    // Rule 0: Advisory queries always trigger web search for market context
+    if query_type == search::QueryType::Advisory {
+        tracing::info!("Web search triggered: advisory query (needs market context)");
+        return Ok(true);
+    }
+
     let lower = message.to_lowercase();
 
     // Rule 1: Comparison questions

@@ -13,3 +13,9 @@ pub fn get_tavily_quota(db: State<DbState>) -> Result<brave_search::TavilyQuota,
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     Ok(brave_search::get_quota(&conn))
 }
+
+#[tauri::command]
+pub fn get_financial_quotas(db: State<DbState>) -> Result<Vec<api_usage::FinancialApiQuota>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    api_usage::get_financial_quotas(&conn).map_err(|e| e.to_string())
+}

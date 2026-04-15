@@ -29,6 +29,8 @@ pub enum QueryType {
     Analytical,
     /// Wants breadth across time — almost no recency bias
     Comparative,
+    /// Wants actionable advice — strategy, how-to, planning
+    Advisory,
     /// Default behavior
     General,
 }
@@ -40,7 +42,19 @@ impl QueryType {
             QueryType::Breaking => (0.4, 3.0),
             QueryType::Analytical => (0.85, 30.0),
             QueryType::Comparative => (0.95, 60.0),
+            QueryType::Advisory => (RECENCY_ALPHA, RECENCY_HALF_LIFE),
             QueryType::General => (RECENCY_ALPHA, RECENCY_HALF_LIFE),
+        }
+    }
+
+    /// Returns a label for the FORMAT instruction in the system prompt.
+    pub fn format_label(&self) -> &'static str {
+        match self {
+            QueryType::Breaking => "breaking",
+            QueryType::Analytical => "analytical",
+            QueryType::Comparative => "comparative",
+            QueryType::Advisory => "advisory",
+            QueryType::General => "general",
         }
     }
 }
@@ -52,6 +66,13 @@ pub fn classify_query_type(message: &str) -> QueryType {
     let comparative_keywords: &[&str] = &[
         " vs ", "compare", "better", "alternatives", "difference",
         "pros ", "cons ", "versus", "compared to", "which is",
+    ];
+    // Advisory checked before analytical — "how do I" is advisory, "how does X work" is analytical
+    let advisory_keywords: &[&str] = &[
+        "how do i", "how can i", "how should i", "what should i",
+        "help me", "strategy for", "plan for", "advice",
+        "recommend", "make money", "build a ", "steps to",
+        "guide me", "teach me", "should i ",
     ];
     let breaking_keywords: &[&str] = &[
         "today", "this week", "recent", "latest", "just", "breaking",
@@ -66,6 +87,10 @@ pub fn classify_query_type(message: &str) -> QueryType {
     // Check comparative first (most specific patterns)
     if comparative_keywords.iter().any(|kw| lower.contains(kw)) {
         return QueryType::Comparative;
+    }
+    // Advisory before analytical — "how do I" is advisory, not analytical
+    if advisory_keywords.iter().any(|kw| lower.contains(kw)) {
+        return QueryType::Advisory;
     }
     if breaking_keywords.iter().any(|kw| lower.contains(kw)) {
         return QueryType::Breaking;

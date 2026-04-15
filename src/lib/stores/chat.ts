@@ -14,10 +14,15 @@ export const searchSteps = writable<SearchStep[]>([]);
 export const lastResponse = writable<ConversationResponse | null>(null);
 export const lastSearchSource = writable<string>('archive');
 
-// Cancel flag — when set, streaming stops rendering
+// Cancel flag — when set, streaming stops rendering + signals backend to stop sending deltas
 let cancelRequested = false;
 export function cancelStream() {
 	cancelRequested = true;
+	// Signal backend to stop sending delta events
+	if (isTauri()) {
+		const ipc = (window as any).__TAURI_INTERNALS__;
+		ipc?.invoke('chat_cancel_stream').catch(() => {});
+	}
 }
 
 // Regenerate — re-send the last user message
@@ -171,6 +176,7 @@ export async function sendMessage(message: string) {
 						last.metadata = {
 							estimated_cost: event.data.estimated_cost,
 							model_used: event.data.model_used,
+							search_source: event.data.search_source,
 						};
 					}
 					return updated;

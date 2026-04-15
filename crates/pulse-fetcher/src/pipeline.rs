@@ -105,9 +105,78 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let raw_count = raw_articles.len();
     tracing::info!("Collected {} raw articles (excluding freedom sources)", raw_count);
 
-    // Phase 2: Deduplicate
+    // Split financial articles OUT before dedup — they have their own dedup mechanism
+    // and should NOT go through the O(n²) trigram comparison designed for news
+    let (raw_news, raw_financial): (Vec<_>, Vec<_>) = raw_articles
+        .into_iter()
+        .partition(|a| a.source_type != "financial");
+
+    // Log financial API calls for quota tracking
+    {
+        let mut feed_counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+        for a in &raw_financial {
+            let provider = match a.feed_id.as_str() {
+                id if id.starts_with("edgar") => "sec_edgar",
+                "usaspending" => "usaspending",
+                "federal_register" => "federal_register",
+                id if id.starts_with("fred") => "fred",
+                id if id.starts_with("sbir") => "sbir",
+                id if id.starts_with("fec") => "fec",
+                id if id.starts_with("eia") => "eia",
+                id if id.starts_with("lda") => "lda",
+                id if id.starts_with("patent") => "uspto",
+                _ => "financial_other",
+            };
+            *feed_counts.entry(provider).or_insert(0) += 1;
+        }
+        for (provider, count) in &feed_counts {
+            log_usage(db_path, provider, "fetch", "collect", *count, 0);
+        }
+    }
+
+    // FINANCIAL PATH: dedup + convert + write to DB IMMEDIATELY (before news dedup)
+    // This ensures financial data is stored even if the news pipeline times out
+    let financial_articles = if !raw_financial.is_empty() && db_path.exists() {
+        let pre_count = raw_financial.len();
+        let deduped = dedup_financial_articles(db_path, raw_financial);
+        tracing::info!("{} financial articles after dedup (from {})", deduped.len(), pre_count);
+        deduped
+    } else {
+        raw_financial
+    };
+
+    let financial_stories: Vec<crate::claude::SummarizedStory> = financial_articles
+        .into_iter()
+        .map(|article| {
+            let (key_facts, why_it_matters, what_to_watch) = generate_financial_fts_fields(&article);
+            crate::claude::SummarizedStory {
+                headline: article.title.clone(),
+                summary: article.content_snippet.clone(),
+                key_facts,
+                why_it_matters,
+                what_to_watch,
+                importance_score: 5,
+                sentiment: None,
+                novelty: None,
+                event_type: Some("financial_data".to_string()),
+                article,
+            }
+        })
+        .collect();
+
+    if !financial_stories.is_empty() {
+        tracing::info!("Writing {} financial stories to database (instant, no LLM needed)...", financial_stories.len());
+        match write_financial_stories(db_path, &financial_stories) {
+            Ok(count) => tracing::info!("Stored {} financial stories successfully", count),
+            Err(e) => tracing::warn!("Financial story write failed: {}", e),
+        }
+        record_financial_dedup(db_path, &financial_stories);
+    }
+
+    // NEWS PATH: dedup (slow O(n²) trigram comparison)
     progress.start_stage(2);
-    tracing::info!("Phase 2: Deduplicating...");
+    tracing::info!("Phase 2: Deduplicating {} news articles ({} financial already stored)...",
+        raw_news.len(), financial_stories.len());
     let (historical_hashes, historical_titles) = if db_path.exists() {
         match rusqlite::Connection::open(db_path) {
             Ok(conn) => crate::dedup::load_recent_hashes(&conn, 7),
@@ -119,44 +188,46 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     } else {
         (std::collections::HashSet::new(), Vec::new())
     };
-    let unique_articles = crate::dedup::deduplicate_with_history(raw_articles, historical_hashes, historical_titles);
-    tracing::info!("{} articles after dedup", unique_articles.len());
+    let news_articles = crate::dedup::deduplicate_with_history(raw_news, historical_hashes, historical_titles);
+    tracing::info!("{} news articles after dedup", news_articles.len());
 
     // Abort if too few new articles (not worth API cost for a thin briefing)
-    if unique_articles.len() < 15 {
-        tracing::info!("Only {} new articles after dedup — too few for a quality briefing, skipping", unique_articles.len());
+    let total_unique = news_articles.len() + financial_stories.len();
+    if total_unique < 15 && news_articles.len() < 15 {
+        tracing::info!("Only {} new articles after dedup — too few for a quality briefing, skipping", total_unique);
         progress.finish();
         return Ok(());
     }
 
-    // Phase 2.5: Pre-curate — pick the best ~90 articles BEFORE expensive summarization
-    let articles_to_summarize = if unique_articles.len() > 100 {
-        tracing::info!("Pre-curating: selecting best articles from {} candidates...", unique_articles.len());
+    // Phase 2.5: Pre-curate — pick the best ~90 NEWS articles BEFORE expensive summarization
+    // (Financial articles skip this — they're already structured data)
+    let articles_to_summarize = if news_articles.len() > 100 {
+        tracing::info!("Pre-curating: selecting best articles from {} candidates...", news_articles.len());
         let api_key = std::env::var("GROQ_API_KEY")
             .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
         let client = crate::claude::client::GroqClient::new(&api_key);
-        match client.pre_curate(&unique_articles).await {
+        match client.pre_curate(&news_articles).await {
             Ok(indices) => {
                 let curated: Vec<_> = indices.into_iter()
-                    .filter_map(|i| unique_articles.get(i).cloned())
+                    .filter_map(|i| news_articles.get(i).cloned())
                     .collect();
                 log_usage(db_path, "groq", "llama-3.3-70b-versatile", "pre_curate",
-                    (unique_articles.len() * 30) as i64, 500);
+                    (news_articles.len() * 30) as i64, 500);
                 tracing::info!("Pre-curated to {} articles (saved {} summarization calls)",
-                    curated.len(), unique_articles.len() - curated.len());
+                    curated.len(), news_articles.len() - curated.len());
                 curated
             }
             Err(e) => {
                 tracing::warn!("Pre-curation failed (non-fatal), summarizing all: {}", e);
-                unique_articles
+                news_articles
             }
         }
     } else {
-        tracing::info!("Skipping pre-curation ({} articles, threshold 100)", unique_articles.len());
-        unique_articles
+        tracing::info!("Skipping pre-curation ({} articles, threshold 100)", news_articles.len());
+        news_articles
     };
 
-    // Phase 3: Summarize pre-curated articles (not ALL articles)
+    // Phase 3: Summarize pre-curated NEWS articles (not financial — they're already structured)
     progress.start_stage(3);
     tracing::info!("Phase 3: Summarizing {} stories...", articles_to_summarize.len());
     let summaries = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress)).await?;
@@ -170,14 +241,14 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         tracing::info!("Summarized all {} stories successfully", sum_count);
     }
 
-    if summaries.is_empty() {
+    if summaries.is_empty() && financial_stories.is_empty() {
         anyhow::bail!("No stories could be summarized — all API calls failed. Aborting to avoid storing empty briefing.");
     }
 
-    // Phase 4: Cross-sector analysis
+    // Phase 4: Cross-sector analysis (news only)
     progress.start_stage(4);
     tracing::info!("Phase 4: Cross-sector analysis...");
-    let analysis = crate::claude::analyze_cross_sector(&summaries).await?;
+    let mut analysis = crate::claude::analyze_cross_sector(&summaries).await?;
     log_usage(db_path, "groq", "llama-3.3-70b-versatile", "analyze", 8000, 2000);
 
     // Phase 5: Executive summary (non-fatal)
@@ -253,9 +324,10 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         }
     };
 
-    // Phase 7: Embeddings (non-fatal)
+    // Phase 7: Generate embeddings for NEWS stories only (financial already written)
     progress.start_stage(7);
-    tracing::info!("Phase 7: Generating embeddings...");
+    let news_count = analysis.curated_stories.len();
+    tracing::info!("Phase 7.5: Generating embeddings for {} news stories...", news_count);
     let embeddings = match crate::embeddings::generate(&analysis.curated_stories, prefixes.as_deref()).await {
         Ok(embs) => {
             tracing::info!("Generated {} embeddings", embs.len());
@@ -268,9 +340,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         }
     };
 
-    // Phase 8: Write to database
+    // Phase 8: Write NEWS stories to database (with embeddings)
     progress.start_stage(8);
-    tracing::info!("Phase 8: Writing to database...");
+    tracing::info!("Phase 8: Writing {} news stories to database...", analysis.curated_stories.len());
     write_to_db(db_path, &analysis, embeddings.as_deref(), prefixes.as_deref(), executive_summary.as_deref())?;
 
     // Phase 8.5: Auto-backfill missing embeddings from previous failed runs (non-fatal)
@@ -309,6 +381,28 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Entity extraction failed (non-fatal): {}", e),
     }
 
+    // Phase 9.5: Extract entities from financial_metadata (no LLM, instant)
+    tracing::info!("Phase 9.5: Extracting entities from financial stories...");
+    match extract_entities_from_financial_metadata(db_path) {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("Extracted {} entity mentions from financial metadata", count);
+            }
+        }
+        Err(e) => tracing::warn!("Financial entity extraction failed (non-fatal): {}", e),
+    }
+
+    // Phase 9.7: Classify ambiguous 8-K filings via Haiku (non-fatal)
+    tracing::info!("Phase 9.7: Classifying ambiguous 8-K filings...");
+    match classify_ambiguous_8ks(db_path).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("Classified {} ambiguous 8-K filings via Haiku", count);
+            }
+        }
+        Err(e) => tracing::warn!("8-K classification failed (non-fatal): {}", e),
+    }
+
     // Phase 10: Deep summaries for top stories (non-fatal)
     progress.start_stage(10);
     tracing::info!("Phase 10: Generating deep summaries for top stories...");
@@ -326,6 +420,105 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
             }
         }
         Err(e) => tracing::warn!("Prediction validation failed (non-fatal): {}", e),
+    }
+
+    // Phase 11.5: Entity resolution — merge duplicate entities into canonical records
+    tracing::info!("Phase 11.5: Resolving entities...");
+    match resolve_entities(db_path) {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("Resolved {} entities to canonical records", count);
+            }
+        }
+        Err(e) => tracing::warn!("Entity resolution failed (non-fatal): {}", e),
+    }
+
+    // Phase 12: Auto-populate ticker mappings + fetch market prices (non-fatal)
+    tracing::info!("Phase 12: Fetching market prices...");
+    {
+        // First populate ticker mappings from SEC data
+        match populate_tickers(db_path) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!("Mapped {} entities to tickers", count);
+                }
+            }
+            Err(e) => tracing::warn!("Ticker mapping failed (non-fatal): {}", e),
+        }
+        // Then fetch prices for mapped entities
+        match crate::market_prices::fetch_prices(db_path).await {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!("Fetched {} market prices", count);
+                }
+            }
+            Err(e) => tracing::warn!("Market price fetch failed (non-fatal): {}", e),
+        }
+    }
+
+    // Phase 12.5: Recompute entity signals before cross-signal detection
+    tracing::info!("Phase 12.5: Recomputing entity signals...");
+    {
+        let conn = rusqlite::Connection::open(db_path)?;
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        match recompute_signals_pipeline(&conn, &today) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!("Recomputed {} entity signals", count);
+                }
+            }
+            Err(e) => tracing::warn!("Signal recomputation failed (non-fatal): {}", e),
+        }
+    }
+
+    // Phase 13: Cross-signal detection (non-fatal)
+    tracing::info!("Phase 13: Computing cross-signal scores...");
+    match compute_cross_signals(db_path) {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("Computed {} cross-signal scores", count);
+            }
+        }
+        Err(e) => tracing::warn!("Cross-signal computation failed (non-fatal): {}", e),
+    }
+
+    // Phase 13.5: Auto paper trade on convergence (non-fatal)
+    tracing::info!("Phase 13.5: Checking for auto-trade opportunities...");
+    match auto_trade_on_convergence(db_path).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("Executed {} auto paper trades from convergence signals", count);
+            } else {
+                tracing::info!("No convergence signals meeting trade criteria");
+            }
+        }
+        Err(e) => tracing::warn!("Auto-trade failed (non-fatal): {}", e),
+    }
+
+    // Phase 14: Automated calibration (non-fatal)
+    tracing::info!("Phase 14: Running signal calibration...");
+    match crate::calibration::run_calibration(db_path) {
+        Ok(report) => {
+            if report.positions_evaluated > 0 {
+                tracing::info!("Calibration: evaluated {} positions", report.positions_evaluated);
+            }
+            if report.brier_scores_updated > 0 {
+                tracing::info!("Calibration: updated {} Brier scores", report.brier_scores_updated);
+            }
+            if report.signal_analysis.total_resolved > 0 {
+                tracing::info!("Calibration: {:.0}% overall hit rate ({} resolved trades)",
+                    report.signal_analysis.overall_hit_rate * 100.0,
+                    report.signal_analysis.total_resolved);
+            }
+            if report.weights_adjusted {
+                tracing::info!("Calibration: signal weights auto-adjusted");
+            }
+            if !report.signal_analysis.dead_signals.is_empty() {
+                tracing::warn!("Calibration: dead signals detected: {}",
+                    report.signal_analysis.dead_signals.join(", "));
+            }
+        }
+        Err(e) => tracing::warn!("Calibration failed (non-fatal): {}", e),
     }
 
     // Done
@@ -887,8 +1080,8 @@ fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddi
                 content_snippet, source_name, published_at, headline, summary,
                 key_facts, why_it_matters, what_to_watch, importance_score,
                 is_hero, display_order, url_hash, title_hash, context_prefix,
-                sentiment, novelty, event_type
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                sentiment, novelty, event_type, source_type, financial_metadata
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             rusqlite::params![
                 briefing_id,
                 story.article.sector,
@@ -912,6 +1105,8 @@ fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddi
                 story.sentiment,
                 story.novelty,
                 story.event_type,
+                story.article.source_type,
+                story.article.financial_metadata,
             ],
         )?;
         story_db_ids.push(tx.last_insert_rowid());
@@ -1013,7 +1208,12 @@ async fn extract_entities_from_stories(db_path: &Path, analysis: &crate::claude:
         result
     };
 
-    let valid_types = ["company", "person", "topic", "product", "regulation"];
+    let valid_types = [
+        "company", "person", "topic", "product", "regulation",
+        "insider_trade", "contract_award", "patent_cluster",
+        "lobbying_disclosure", "institutional_holding",
+        "private_placement", "material_event", "regulatory_action",
+    ];
     let mut total_stored = 0;
 
     // Process stories in batches of 15
@@ -1177,7 +1377,12 @@ async fn extract_entities_from_freedoms(
         .build()?;
     let conn = rusqlite::Connection::open(db_path)?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let valid_types = ["company", "person", "topic", "product", "regulation"];
+    let valid_types = [
+        "company", "person", "topic", "product", "regulation",
+        "insider_trade", "contract_award", "patent_cluster",
+        "lobbying_disclosure", "institutional_holding",
+        "private_placement", "material_event", "regulatory_action",
+    ];
     let mut total_stored = 0;
 
     // Build stories text
@@ -1647,6 +1852,1428 @@ fn write_freedoms_to_db(
     );
 
     Ok(())
+}
+
+/// Dedup financial articles against the financial_dedup table.
+/// Uses feed_id as source_type and url as source_id for dedup.
+/// Returns only articles not previously seen.
+fn dedup_financial_articles(
+    db_path: &Path,
+    articles: Vec<sources::RawArticle>,
+) -> Vec<sources::RawArticle> {
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Could not open DB for financial dedup: {}", e);
+            return articles;
+        }
+    };
+
+    // Check if financial_dedup table exists
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='financial_dedup')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !table_exists {
+        return articles;
+    }
+
+    articles
+        .into_iter()
+        .filter(|article| {
+            // Use feed_id as source_type and url as source_id for dedup
+            let source_type = &article.feed_id;
+            let source_id = &article.url;
+
+            let already_seen: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM financial_dedup WHERE source_type = ?1 AND source_id = ?2)",
+                    rusqlite::params![source_type, source_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+
+            !already_seen
+        })
+        .collect()
+}
+
+/// Write financial stories directly to the database without embeddings.
+/// These are structured data (SEC filings, contracts, etc.) that don't need LLM summarization.
+fn write_financial_stories(
+    db_path: &Path,
+    stories: &[crate::claude::SummarizedStory],
+) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    crate::db::run_migrations(&conn)?;
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // Get or create today's briefing
+    let briefing_id: i64 = conn
+        .query_row(
+            "SELECT id FROM briefings WHERE date = ?1 ORDER BY created_at DESC LIMIT 1",
+            [&today],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| {
+            conn.execute(
+                "INSERT INTO briefings (date, story_count, ai_count, miami_count, italy_count, tech_count, status)
+                 VALUES (?1, 0, 0, 0, 0, 0, 'complete')",
+                [&today],
+            ).ok();
+            conn.last_insert_rowid()
+        });
+
+    let mut stored = 0;
+    for story in stories {
+        if story.article.source_type != "financial" {
+            continue;
+        }
+
+        let key_facts_json = serde_json::to_string(&story.key_facts).unwrap_or_else(|_| "[]".to_string());
+
+        conn.execute(
+            "INSERT INTO stories (
+                briefing_id, sector, original_title, original_url, original_language,
+                content_snippet, source_name, published_at, headline, summary,
+                key_facts, why_it_matters, what_to_watch, importance_score,
+                is_hero, display_order, url_hash, title_hash,
+                source_type, financial_metadata
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0, ?15, ?16, ?17, ?18, ?19)",
+            rusqlite::params![
+                briefing_id,
+                story.article.sector,
+                story.article.title,
+                story.article.url,
+                story.article.language,
+                story.article.content_snippet,
+                story.article.source_name,
+                story.article.published_at,
+                story.headline,
+                story.summary,
+                key_facts_json,
+                story.why_it_matters,
+                story.what_to_watch,
+                story.importance_score,
+                stored as i32,
+                crate::dedup::url_hash(&story.article.url),
+                crate::dedup::title_hash(&story.article.title),
+                story.article.source_type,
+                story.article.financial_metadata,
+            ],
+        ).ok(); // Non-fatal per story — dedup might reject
+        stored += 1;
+    }
+
+    // Update briefing story count
+    conn.execute(
+        "UPDATE briefings SET story_count = (SELECT COUNT(*) FROM stories WHERE briefing_id = ?1) WHERE id = ?1",
+        [briefing_id],
+    ).ok();
+
+    Ok(stored)
+}
+
+/// Record financial articles in the dedup table after they're stored.
+fn record_financial_dedup(db_path: &Path, articles: &[crate::claude::SummarizedStory]) {
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    for story in articles {
+        if story.article.source_type != "financial" {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO financial_dedup (source_type, source_id) VALUES (?1, ?2)",
+            rusqlite::params![story.article.feed_id, story.article.url],
+        )
+        .ok();
+    }
+}
+
+/// Compute cross-signal scores for entities after signal recomputation.
+/// This is called from the pipeline after entity extraction.
+/// Auto-populate entity_tickers from SEC company_tickers.json.
+fn populate_tickers(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    // Check if entity_tickers table exists
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_tickers')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(0);
+    }
+
+    // Get unmapped entities that could be companies (multiple entity types)
+    let unmapped: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.name FROM entities e
+             WHERE e.entity_type IN ('company', 'insider_trade', 'contract_award',
+                   'patent_cluster', 'material_event', 'private_placement')
+             AND e.id NOT IN (SELECT entity_id FROM entity_tickers)
+             LIMIT 200"
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    if unmapped.is_empty() {
+        return Ok(0);
+    }
+
+    // Step 1: Map from financial_metadata (CIK/ticker from SEC filings = highest confidence)
+    let mut mapped = 0;
+    let mut still_unmapped = Vec::new();
+
+    for (entity_id, name) in &unmapped {
+        let ticker_from_metadata: Option<(String, String)> = conn.query_row(
+            "SELECT
+                json_extract(s.financial_metadata, '$.ticker'),
+                json_extract(s.financial_metadata, '$.cik')
+             FROM entity_mentions em
+             JOIN stories s ON em.story_id = s.id
+             WHERE em.entity_id = ?1
+               AND s.financial_metadata IS NOT NULL
+               AND json_valid(s.financial_metadata)
+               AND json_extract(s.financial_metadata, '$.ticker') IS NOT NULL
+             LIMIT 1",
+            [entity_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1).unwrap_or_default())),
+        ).ok();
+
+        if let Some((ticker, cik)) = ticker_from_metadata {
+            conn.execute(
+                "INSERT OR IGNORE INTO entity_tickers (entity_id, ticker, cik, confidence)
+                 VALUES (?1, ?2, ?3, 1.0)",
+                rusqlite::params![entity_id, ticker, cik],
+            )?;
+            mapped += 1;
+        } else {
+            still_unmapped.push((*entity_id, name.clone()));
+        }
+    }
+
+    // Step 2: Download SEC company_tickers.json and match remaining
+    if !still_unmapped.is_empty() {
+        match download_sec_tickers() {
+            Ok(sec_map) => {
+                for (entity_id, name) in &still_unmapped {
+                    if let Some((ticker, cik, confidence)) = resolve_ticker_sec(name, &sec_map) {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO entity_tickers (entity_id, ticker, cik, confidence)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![entity_id, ticker, cik, confidence],
+                        )?;
+                        mapped += 1;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("SEC ticker download failed (non-fatal): {}", e),
+        }
+    }
+
+    Ok(mapped)
+}
+
+/// Download SEC company_tickers.json synchronously using tokio block_on.
+fn download_sec_tickers() -> anyhow::Result<std::collections::HashMap<String, (String, String)>> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(download_sec_tickers_async())
+    })
+}
+
+async fn download_sec_tickers_async() -> anyhow::Result<std::collections::HashMap<String, (String, String)>> {
+    let url = "https://www.sec.gov/files/company_tickers.json";
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let resp = client
+        .get(url)
+        .header("User-Agent", "Pulse/1.0 (pulse-app@example.com)")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("SEC company_tickers.json returned {}", resp.status());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SecEntry { cik_str: String, ticker: String, title: String }
+
+    let raw: std::collections::HashMap<String, SecEntry> = resp.json().await?;
+    let mut map = std::collections::HashMap::with_capacity(raw.len());
+    for entry in raw.values() {
+        map.insert(entry.title.to_lowercase(), (entry.ticker.clone(), entry.cik_str.clone()));
+    }
+
+    tracing::info!("Loaded {} SEC company-to-ticker mappings", map.len());
+    Ok(map)
+}
+
+/// Resolve entity name to ticker using SEC data.
+/// Tries: exact match → suffix-stripped match → contains match.
+fn resolve_ticker_sec(
+    name: &str,
+    sec_map: &std::collections::HashMap<String, (String, String)>,
+) -> Option<(String, String, f64)> {
+    let name_lower = name.to_lowercase().trim().to_string();
+
+    // 1. Exact match
+    if let Some((ticker, cik)) = sec_map.get(&name_lower) {
+        return Some((ticker.clone(), cik.clone(), 1.0));
+    }
+
+    // 2. Strip common suffixes
+    let suffixes = [
+        " inc", " inc.", " corp", " corp.", " ltd", " ltd.", " llc",
+        " co", " co.", " plc", " sa", " ag", " se", " nv",
+        " holdings", " group", " technologies", " technology",
+        " international", " solutions", " systems", " enterprises",
+    ];
+    let stripped = suffixes.iter().fold(name_lower.as_str(), |s, sfx| s.trim_end_matches(sfx));
+    if stripped != name_lower {
+        for (key, (ticker, cik)) in sec_map.iter() {
+            let key_stripped = suffixes.iter().fold(key.as_str(), |s, sfx| s.trim_end_matches(sfx));
+            if key_stripped == stripped {
+                return Some((ticker.clone(), cik.clone(), 0.8));
+            }
+        }
+    }
+
+    // 3. Contains match (min 5 chars to avoid false positives)
+    if name_lower.len() >= 5 {
+        for (key, (ticker, cik)) in sec_map.iter() {
+            if key.contains(&name_lower) || name_lower.contains(key.as_str()) {
+                return Some((ticker.clone(), cik.clone(), 0.6));
+            }
+        }
+    }
+
+    None
+}
+
+/// Recompute all entity signals from entity_mentions data.
+/// Pipeline version — matches src-tauri/src/services/signals.rs::recompute_signals
+/// plus new dimensions (lobbying, regulatory, patent).
+fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyhow::Result<usize> {
+    // Check if entity_canonical table exists for canonical grouping
+    let has_canonical: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_canonical')",
+        [], |row| row.get(0),
+    ).unwrap_or(false);
+
+    // Group by canonical entity when available — merges "NVIDIA Corp" + "Nvidia" + "NVIDIA CORPORATION"
+    let query = if has_canonical {
+        "SELECT COALESCE(ec.canonical_name, e.name) as topic, COALESCE(ec.sector, e.sector) as sector,
+            SUM(CASE WHEN em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END) AS w7,
+            SUM(CASE WHEN em.mentioned_at >= date(?1, '-30 days') THEN 1 ELSE 0 END) AS w30,
+            SUM(CASE WHEN em.mentioned_at >= date(?1, '-90 days') THEN 1 ELSE 0 END) AS w90,
+            COUNT(DISTINCT em.mentioned_at) AS days_active
+         FROM entities e
+         JOIN entity_mentions em ON em.entity_id = e.id
+         LEFT JOIN entity_canonical ec ON ec.id = e.canonical_id
+         WHERE em.mentioned_at >= date(?1, '-90 days')
+         GROUP BY COALESCE(ec.canonical_name, e.name), COALESCE(ec.sector, e.sector)"
+    } else {
+        "SELECT e.name, e.sector,
+            SUM(CASE WHEN em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END) AS w7,
+            SUM(CASE WHEN em.mentioned_at >= date(?1, '-30 days') THEN 1 ELSE 0 END) AS w30,
+            SUM(CASE WHEN em.mentioned_at >= date(?1, '-90 days') THEN 1 ELSE 0 END) AS w90,
+            COUNT(DISTINCT em.mentioned_at) AS days_active
+         FROM entities e
+         JOIN entity_mentions em ON em.entity_id = e.id
+         WHERE em.mentioned_at >= date(?1, '-90 days')
+         GROUP BY e.name, e.sector"
+    };
+
+    let mut stmt = conn.prepare(query)?;
+
+    let rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = stmt
+        .query_map([today], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut count = 0usize;
+
+    for (topic, sector, w7, w30, w90, days_active) in &rows {
+        let rate_7d = *w7 as f64 / 7.0;
+        let rate_30d = *w30 as f64 / 30.0;
+        let acc = if *w30 == 0 { if *w7 > 0 { 10.0 } else { 0.0 } }
+            else if rate_30d < 0.001 { if *w7 > 0 { 10.0 } else { 0.0 } }
+            else { rate_7d / rate_30d };
+
+        let total = (*w30).max(*w7);
+        let traj = if *w7 == 0 && *w30 == 0 { "dormant" }
+            else if total >= 14 && *days_active >= 10 { "dominant" }
+            else if total >= 7 && *days_active >= 5 { "hot" }
+            else if acc < 0.8 && total >= 3 { "fading" }
+            else if total >= 3 || *days_active >= 2 { "rising" }
+            else if *w7 > 0 { "rising" }
+            else { "dormant" };
+
+        conn.execute(
+            "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+             ON CONFLICT(topic, sector) DO UPDATE SET
+                 window_7d = excluded.window_7d, window_30d = excluded.window_30d,
+                 window_90d = excluded.window_90d, acceleration = excluded.acceleration,
+                 trajectory = excluded.trajectory, updated_at = datetime('now')",
+            rusqlite::params![topic, sector, w7, w30, w90, acc, traj],
+        ).ok();
+
+        // Build entity match clause: match by canonical group if available, else by name
+        // This ensures all variants (NVIDIA Corp, Nvidia, NVIDIA CORPORATION) contribute to one signal
+        let entity_match_clause = if has_canonical {
+            "e.id IN (SELECT e2.id FROM entities e2 LEFT JOIN entity_canonical ec2 ON ec2.id = e2.canonical_id WHERE COALESCE(ec2.canonical_name, e2.name) = ?1)"
+        } else {
+            "LOWER(e.name) = LOWER(?1)"
+        };
+
+        // Source diversity — count distinct source_names across ALL linked entities
+        let diversity: i64 = conn.query_row(
+            &format!("SELECT COUNT(DISTINCT s.source_name) FROM entity_mentions em
+             JOIN stories s ON em.story_id = s.id
+             JOIN entities e ON em.entity_id = e.id
+             WHERE {} AND em.mentioned_at >= date(?2, '-7 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        // Insider buy volume (SEC Form 4) — weighted by trade classification
+        // Uses signal_weight from classify_insider_trade: strong_buy=1.0, moderate=0.6-0.7, sale=-0.3
+        let insider_vol: f64 = conn.query_row(
+            &format!("SELECT COALESCE(SUM(
+                CASE WHEN json_valid(s.financial_metadata)
+                     AND json_extract(s.financial_metadata, '$.filing_type') IN ('4', 'form4')
+                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.total_value') AS REAL), 0)
+                     * COALESCE(CAST(json_extract(s.financial_metadata, '$.signal_weight') AS REAL), 0.0)
+                ELSE 0 END
+            ), 0) FROM entity_mentions em
+            JOIN stories s ON em.story_id = s.id
+            JOIN entities e ON em.entity_id = e.id
+            WHERE {} AND s.source_type = 'financial'
+              AND em.mentioned_at >= date(?2, '-30 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+
+        // Government contract value (USASpending)
+        let contract_val: f64 = conn.query_row(
+            &format!("SELECT COALESCE(SUM(
+                CASE WHEN json_valid(s.financial_metadata)
+                     AND s.source_name LIKE '%USASpending%'
+                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
+                ELSE 0 END
+            ), 0) FROM entity_mentions em
+            JOIN stories s ON em.story_id = s.id
+            JOIN entities e ON em.entity_id = e.id
+            WHERE {} AND s.source_type = 'financial'
+              AND em.mentioned_at >= date(?2, '-90 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+
+        // Lobbying spend (LDA)
+        let lobby_spend: f64 = conn.query_row(
+            &format!("SELECT COALESCE(SUM(
+                CASE WHEN json_valid(s.financial_metadata)
+                     AND (s.source_name LIKE '%LDA%' OR s.source_name LIKE '%Senate%')
+                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
+                ELSE 0 END
+            ), 0) FROM entity_mentions em
+            JOIN stories s ON em.story_id = s.id
+            JOIN entities e ON em.entity_id = e.id
+            WHERE {} AND s.source_type = 'financial'
+              AND em.mentioned_at >= date(?2, '-90 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+
+        // Regulatory mentions (Federal Register)
+        let reg_count: f64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM entity_mentions em
+             JOIN stories s ON em.story_id = s.id
+             JOIN entities e ON em.entity_id = e.id
+             WHERE {} AND s.source_name LIKE '%Federal Register%'
+               AND em.mentioned_at >= date(?2, '-30 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as f64;
+
+        // Patent filings (USPTO)
+        let patent_count: f64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM entity_mentions em
+             JOIN stories s ON em.story_id = s.id
+             JOIN entities e ON em.entity_id = e.id
+             WHERE {} AND s.source_name = 'USPTO'
+               AND em.mentioned_at >= date(?2, '-30 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as f64;
+
+        // 8-K event severity — max severity from recent 8-K filings for this entity
+        // Positive = bullish events (acquisition, earnings), Negative = bearish (impairment, delisting)
+        let event_severity_boost: f64 = conn.query_row(
+            &format!("SELECT COALESCE(MAX(
+                CASE WHEN json_valid(s.financial_metadata)
+                     AND json_extract(s.financial_metadata, '$.event_severity') IS NOT NULL
+                THEN CAST(json_extract(s.financial_metadata, '$.event_severity') AS REAL)
+                ELSE 0 END
+            ), 0) FROM entity_mentions em
+            JOIN stories s ON em.story_id = s.id
+            JOIN entities e ON em.entity_id = e.id
+            WHERE {} AND s.source_name LIKE '%EDGAR 8-K%'
+              AND em.mentioned_at >= date(?2, '-14 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+
+        // Composite regulatory_sentiment: Fed Reg count + 8-K event boost
+        // (regulatory_sentiment feeds into government_signal normalization)
+        let reg_composite = reg_count + (event_severity_boost * 3.0); // 8-K severity scaled to same range
+
+        conn.execute(
+            "UPDATE signals SET source_diversity = ?1, insider_buy_volume = ?2, contract_value = ?3,
+                 lobbying_spend_delta = ?4, regulatory_sentiment = ?5, patent_filing_rate = ?6
+             WHERE topic = ?7 AND (sector = ?8 OR (?8 IS NULL AND sector IS NULL))",
+            rusqlite::params![diversity, insider_vol, contract_val, lobby_spend, reg_composite, patent_count, topic, sector],
+        ).ok();
+
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Sigmoid normalization: maps raw value to [0, 1]. Matches cross_signals.rs.
+fn normalize_signal(value: f64, scale: f64) -> f64 {
+    if value <= 0.0 { return 0.0; }
+    1.0 - (-value / scale).exp()
+}
+
+/// Compute cross-signal scores for all entities.
+/// Unified with src-tauri/src/services/cross_signals.rs — same 8 dimensions,
+/// same weights, same convergence threshold (3+ signals > 0.3, diversity >= 3).
+fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // Load calibrated weights if available, else use defaults
+    let weights = load_calibrated_weights(&conn);
+
+    // Get all non-dormant signals with ALL 8 dimensions
+    let mut stmt = conn.prepare(
+        "SELECT s.topic, s.sector, s.window_7d, s.window_30d, s.acceleration,
+                COALESCE(s.source_diversity, 0),
+                COALESCE(s.insider_buy_volume, 0),
+                COALESCE(s.institutional_flow, 0),
+                COALESCE(s.contract_value, 0),
+                COALESCE(s.patent_filing_rate, 0),
+                COALESCE(s.search_trend_delta, 0),
+                COALESCE(s.import_volume_delta, 0),
+                COALESCE(s.regulatory_sentiment, 0),
+                COALESCE(s.lobbying_spend_delta, 0)
+         FROM signals s
+         WHERE s.trajectory != 'dormant'
+         ORDER BY s.window_30d DESC"
+    )?;
+
+    let rows: Vec<(String, Option<String>, i64, i64, f64, i64, f64, f64, f64, f64, f64, f64, f64, f64)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
+                row.get(12)?, row.get(13)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut count = 0;
+    for (topic, _sector, w7, _w30, acceleration, src_diversity,
+         insider_vol, inst_flow, contract_val, patent_rate,
+         search_delta, import_delta, reg_sentiment, lobby_delta) in &rows
+    {
+        // Normalize each dimension — same scales as cross_signals.rs
+        let insider_norm = normalize_signal(*insider_vol, 1_000_000.0);
+        let inst_norm = normalize_signal(*inst_flow, 500_000.0);
+        let news_norm = normalize_signal(*acceleration * *w7 as f64, 20.0);
+        // Government signal: contract value + regulatory/8-K severity composite
+        let contract_norm = normalize_signal(*contract_val, 10_000_000.0);
+        let reg_norm = normalize_signal(*reg_sentiment, 3.0);
+        let gov_norm = (contract_norm * 0.6 + reg_norm * 0.4).min(1.0);
+        let search_norm = normalize_signal(*search_delta, 50.0);
+        let patent_norm = normalize_signal(*patent_rate, 5.0);
+        let supply_norm = normalize_signal(*import_delta, 30.0);
+        let political_norm = normalize_signal(*lobby_delta, 100_000.0);
+
+        // Weighted compound score
+        let compound = (insider_norm * weights[0]
+            + inst_norm * weights[1]
+            + news_norm * weights[2]
+            + gov_norm * weights[3]
+            + search_norm * weights[4]
+            + patent_norm * weights[5]
+            + supply_norm * weights[6]
+            + political_norm * weights[7])
+            .max(0.0).min(1.0);
+
+        // Convergence: 3+ signals > 0.3 AND source_diversity >= 3
+        let positive = [insider_norm, inst_norm, news_norm, gov_norm,
+            search_norm, patent_norm, supply_norm, political_norm]
+            .iter().filter(|&&v| v > 0.3).count();
+        let convergence = positive >= 3 && *src_diversity >= 3;
+
+        if compound < 0.01 && !convergence {
+            continue;
+        }
+
+        // Look up entity_id and ticker — prefer canonical entity for lookup
+        let (eid, ticker) = {
+            // Try canonical first
+            let canonical: Option<(i64, Option<String>)> = conn.query_row(
+                "SELECT ec.id, ec.ticker FROM entity_canonical ec WHERE ec.canonical_name = ?1",
+                [topic], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).ok();
+
+            if let Some((cid, ct)) = canonical {
+                // Get first linked entity_id for the cross_signals table
+                let eid: i64 = conn.query_row(
+                    "SELECT id FROM entities WHERE canonical_id = ?1 LIMIT 1",
+                    [cid], |row| row.get(0),
+                ).unwrap_or(0);
+                // Prefer canonical ticker, fall back to entity_tickers
+                let ticker = ct.or_else(|| {
+                    conn.query_row(
+                        "SELECT et.ticker FROM entity_tickers et JOIN entities e ON e.id = et.entity_id WHERE e.canonical_id = ?1 LIMIT 1",
+                        [cid], |row| row.get(0),
+                    ).ok()
+                });
+                (eid, ticker)
+            } else {
+                // Fall back to direct name match
+                let eid: i64 = conn.query_row(
+                    "SELECT id FROM entities WHERE LOWER(name) = LOWER(?1) LIMIT 1",
+                    [topic], |row| row.get(0),
+                ).unwrap_or(0);
+                let ticker: Option<String> = if eid > 0 {
+                    conn.query_row("SELECT ticker FROM entity_tickers WHERE entity_id = ?1", [eid], |row| row.get(0)).ok()
+                } else { None };
+                (eid, ticker)
+            }
+        };
+
+        conn.execute(
+            "INSERT INTO cross_signals (entity_id, ticker, compound_score,
+                insider_signal, institutional_flow, news_momentum, government_signal,
+                search_trend, patent_signal, supply_chain, political_signal,
+                source_diversity, convergence_detected, computed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                eid, ticker, compound,
+                insider_norm, inst_norm, news_norm, gov_norm,
+                search_norm, patent_norm, supply_norm, political_norm,
+                src_diversity, convergence as i32, today,
+            ],
+        ).ok();
+
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Load calibrated weights from DB, or return defaults.
+/// Matches the weight order: [insider, institutional, news, government, search, patent, supply_chain, political]
+fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
+    // [insider, institutional(0), news, government, search(0), patent, supply(0), political]
+    let defaults = [0.25, 0.0, 0.25, 0.20, 0.0, 0.10, 0.0, 0.20];
+
+    let json: Option<String> = conn.query_row(
+        "SELECT value FROM user_profile WHERE key = 'calibrated_weights'",
+        [], |row| row.get(0),
+    ).ok();
+
+    if let Some(json_str) = json {
+        if let Ok(pairs) = serde_json::from_str::<Vec<(String, f64)>>(&json_str) {
+            let mut w = defaults;
+            for (key, val) in &pairs {
+                match key.as_str() {
+                    "insider_signal" => w[0] = *val,
+                    "institutional_flow" => w[1] = *val,
+                    "news_momentum" => w[2] = *val,
+                    "government_signal" => w[3] = *val,
+                    "search_trend" => w[4] = *val,
+                    "patent_signal" => w[5] = *val,
+                    "supply_chain" => w[6] = *val,
+                    "political_signal" => w[7] = *val,
+                    _ => {}
+                }
+            }
+            return w;
+        }
+    }
+
+    defaults
+}
+
+/// Generate key_facts, why_it_matters, what_to_watch from financial_metadata.
+/// No LLM needed — structured data → structured FTS fields.
+fn generate_financial_fts_fields(article: &crate::sources::RawArticle) -> (Vec<String>, String, String) {
+    let meta: serde_json::Value = article.financial_metadata
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    if meta.is_null() {
+        return (Vec::new(), String::new(), String::new());
+    }
+
+    let source = article.source_name.as_str();
+    let mut facts = Vec::new();
+    let mut why = String::new();
+    let mut watch = String::new();
+
+    match source {
+        s if s.contains("EDGAR") => {
+            let filing = meta.get("filing_type").and_then(|v| v.as_str()).unwrap_or("filing");
+            let entity = meta.get("entity_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
+            facts.push(format!("SEC {} filing by {}", filing, entity));
+            if let Some(cik) = meta.get("cik").and_then(|v| v.as_str()) {
+                facts.push(format!("CIK: {}", cik));
+            }
+            why = match filing {
+                "4" => format!("{} insider trading activity detected — insiders buying or selling their own stock", entity),
+                "8-K" => format!("{} filed a material event disclosure — potential market-moving information", entity),
+                "D" => format!("{} filed a private placement — raising capital outside public markets", entity),
+                _ => format!("{} SEC filing may indicate significant corporate activity", entity),
+            };
+            watch = format!("Monitor {} stock price and subsequent filings for pattern confirmation", entity);
+        }
+        s if s.contains("USASpending") => {
+            let recipient = meta.get("recipient").and_then(|v| v.as_str()).unwrap_or("Unknown");
+            let agency = meta.get("agency").and_then(|v| v.as_str()).unwrap_or("Unknown agency");
+            let amount = meta.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            facts.push(format!("Government contract awarded to {}", recipient));
+            facts.push(format!("Awarding agency: {}", agency));
+            if amount > 0.0 { facts.push(format!("Value: ${:.0}", amount)); }
+            why = format!("{} received a government contract — signals revenue pipeline and government trust", recipient);
+            watch = format!("Track {} for additional contract awards and revenue impact", recipient);
+        }
+        "FEC" => {
+            let contributor = meta.get("contributor").and_then(|v| v.as_str()).unwrap_or("Unknown");
+            let recipient = meta.get("recipient").and_then(|v| v.as_str()).unwrap_or("Unknown");
+            let amount = meta.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            facts.push(format!("Political contribution: {} → {}", contributor, recipient));
+            if amount > 0.0 { facts.push(format!("Amount: ${:.0}", amount)); }
+            if let Some(party) = meta.get("party").and_then(|v| v.as_str()) {
+                facts.push(format!("Party: {}", party));
+            }
+            why = format!("Large political donations can signal industry lobbying priorities and regulatory expectations");
+            watch = format!("Monitor related regulatory actions and policy changes affecting {}'s industry", contributor);
+        }
+        s if s.contains("LDA") || s.contains("Senate") => {
+            let client = meta.get("client").and_then(|v| v.as_str()).unwrap_or("Unknown");
+            let registrant = meta.get("registrant").and_then(|v| v.as_str()).unwrap_or("Unknown");
+            facts.push(format!("Lobbying: {} via {}", client, registrant));
+            if let Some(issues) = meta.get("issues").and_then(|v| v.as_str()) {
+                if !issues.is_empty() { facts.push(format!("Issues: {}", issues)); }
+            }
+            why = format!("{} is lobbying — indicates they're trying to influence policy that affects their business", client);
+            watch = format!("Track related legislation and regulatory actions in lobbied areas");
+        }
+        "FRED" => {
+            let series = meta.get("series_name").and_then(|v| v.as_str()).unwrap_or("indicator");
+            let value = meta.get("value").and_then(|v| v.as_f64());
+            let change = meta.get("change_pct").and_then(|v| v.as_f64());
+            facts.push(format!("Economic indicator: {}", series));
+            if let Some(v) = value { facts.push(format!("Current value: {:.2}", v)); }
+            if let Some(c) = change { facts.push(format!("Change: {:.1}%", c)); }
+            why = format!("{} is a key macro indicator — changes affect market sentiment and Fed policy expectations", series);
+            watch = format!("Monitor for trend continuation and divergence from market expectations");
+        }
+        "EIA" => {
+            let value = meta.get("value").and_then(|v| v.as_f64());
+            let unit = meta.get("unit").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(v) = value { facts.push(format!("Price: {:.2} {}", v, unit)); }
+            why = "Energy prices directly impact transportation, manufacturing, and consumer costs".to_string();
+            watch = "Track supply disruptions, OPEC decisions, and seasonal demand patterns".to_string();
+        }
+        "USPTO" => {
+            let assignee = meta.get("assignee").and_then(|v| v.as_str()).unwrap_or("Unknown");
+            facts.push(format!("Patent filed by {}", assignee));
+            why = format!("{} patent activity may indicate R&D direction and competitive positioning", assignee);
+            watch = format!("Monitor {} patent cluster for technology trend signals", assignee);
+        }
+        s if s.contains("Federal Register") => {
+            let rule_type = meta.get("rule_type").and_then(|v| v.as_str()).unwrap_or("rule");
+            let agencies = meta.get("agencies").and_then(|v| v.as_str()).unwrap_or("Unknown");
+            facts.push(format!("{} by {}", rule_type, agencies));
+            why = format!("Regulatory action by {} — may create compliance requirements or market opportunities", agencies);
+            watch = "Track comment periods, effective dates, and industry response".to_string();
+        }
+        _ => {}
+    }
+
+    (facts, why, watch)
+}
+
+/// Extract entities from financial_metadata JSON without LLM.
+/// Parses entity_name/recipient/client/assignee/contributor from structured metadata
+/// and creates entity + entity_mention records.
+fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // Get financial stories that don't yet have entity_mentions
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.source_name, s.financial_metadata, s.sector
+         FROM stories s
+         WHERE s.source_type = 'financial'
+           AND s.financial_metadata IS NOT NULL
+           AND json_valid(s.financial_metadata)
+           AND s.id NOT IN (SELECT DISTINCT story_id FROM entity_mentions)
+         ORDER BY s.id DESC
+         LIMIT 500"
+    )?;
+
+    let rows: Vec<(i64, String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total = 0usize;
+
+    for (story_id, source_name, metadata_str, sector) in &rows {
+        let meta: serde_json::Value = match serde_json::from_str(metadata_str) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Determine entity type and extract names based on source
+        let entities: Vec<(&str, &str, f64)> = match source_name.as_str() {
+            s if s.contains("EDGAR") => {
+                let mut ents = Vec::new();
+                if let Some(name) = meta.get("entity_name").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        let etype = match meta.get("filing_type").and_then(|v| v.as_str()).unwrap_or("") {
+                            "4" => "insider_trade",
+                            "8-K" => "material_event",
+                            "D" => "private_placement",
+                            _ => "company",
+                        };
+                        ents.push((name, etype, 0.0));
+                    }
+                }
+                // Also extract from display_names array
+                if let Some(names) = meta.get("display_names").and_then(|v| v.as_array()) {
+                    for n in names.iter().take(3) {
+                        if let Some(name) = n.as_str() {
+                            if !name.is_empty() && ents.iter().all(|(e, _, _)| *e != name) {
+                                ents.push((name, "company", 0.0));
+                            }
+                        }
+                    }
+                }
+                ents
+            }
+            s if s.contains("USASpending") => {
+                let mut ents = Vec::new();
+                if let Some(name) = meta.get("recipient").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        ents.push((name, "contract_award", 0.5));
+                    }
+                }
+                if let Some(name) = meta.get("agency").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        ents.push((name, "company", 0.0));
+                    }
+                }
+                ents
+            }
+            "FEC" => {
+                let mut ents = Vec::new();
+                if let Some(name) = meta.get("recipient").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        ents.push((name, "person", 0.0));
+                    }
+                }
+                if let Some(name) = meta.get("contributor").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        ents.push((name, "person", 0.0));
+                    }
+                }
+                if let Some(name) = meta.get("employer").and_then(|v| v.as_str()) {
+                    if !name.is_empty() && name != "SELF-EMPLOYED" && name != "NOT EMPLOYED" && name != "RETIRED" {
+                        ents.push((name, "company", 0.0));
+                    }
+                }
+                ents
+            }
+            s if s.contains("LDA") || s.contains("Senate") => {
+                let mut ents = Vec::new();
+                if let Some(name) = meta.get("client").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        ents.push((name, "lobbying_disclosure", 0.0));
+                    }
+                }
+                if let Some(name) = meta.get("registrant").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        ents.push((name, "company", 0.0));
+                    }
+                }
+                ents
+            }
+            "USPTO" => {
+                let mut ents = Vec::new();
+                if let Some(name) = meta.get("assignee").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        ents.push((name, "patent_cluster", 0.3));
+                    }
+                }
+                ents
+            }
+            s if s.contains("Federal Register") => {
+                let mut ents = Vec::new();
+                if let Some(agencies) = meta.get("agencies").and_then(|v| v.as_str()) {
+                    for agency in agencies.split(',').map(|s| s.trim()) {
+                        if !agency.is_empty() {
+                            ents.push((agency, "regulatory_action", 0.0));
+                        }
+                    }
+                }
+                ents
+            }
+            _ => Vec::new(),
+        };
+
+        for (name, entity_type, sentiment) in &entities {
+            let nn = name.to_lowercase().trim().to_string();
+            if nn.is_empty() || nn.len() < 2 { continue; }
+
+            // Upsert entity
+            conn.execute(
+                "INSERT INTO entities (name, name_normalized, entity_type, sector, first_seen, last_seen, mention_count, sentiment_avg)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, ?6)
+                 ON CONFLICT(name_normalized, entity_type) DO UPDATE SET
+                   last_seen = MAX(last_seen, ?5),
+                   sentiment_avg = (sentiment_avg * mention_count + ?6) / (mention_count + 1),
+                   mention_count = mention_count + 1",
+                rusqlite::params![name, nn, entity_type, sector, today, sentiment],
+            ).ok();
+
+            // Get entity_id and insert mention
+            let entity_id: Option<i64> = conn.query_row(
+                "SELECT id FROM entities WHERE name_normalized = ?1 AND entity_type = ?2",
+                rusqlite::params![nn, entity_type],
+                |row| row.get(0),
+            ).ok();
+
+            if let Some(eid) = entity_id {
+                conn.execute(
+                    "INSERT INTO entity_mentions (entity_id, story_id, sentiment, context, mentioned_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![eid, story_id, sentiment, format!("From {} financial data", source_name), today],
+                ).ok();
+                total += 1;
+            }
+        }
+    }
+
+    // Update source_diversity in signals table for entities with financial mentions
+    let mut div_stmt = conn.prepare(
+        "SELECT e.name, COUNT(DISTINCT s.source_name) as src_count
+         FROM entity_mentions em
+         JOIN entities e ON e.id = em.entity_id
+         JOIN stories s ON s.id = em.story_id
+         WHERE em.mentioned_at >= date(?1, '-30 days')
+         GROUP BY e.name
+         HAVING src_count >= 2"
+    )?;
+
+    let diversity_rows: Vec<(String, i64)> = div_stmt
+        .query_map([&today], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (topic, src_count) in &diversity_rows {
+        conn.execute(
+            "UPDATE signals SET source_diversity = ?1 WHERE topic = ?2",
+            rusqlite::params![src_count, topic],
+        ).ok();
+    }
+
+    if !diversity_rows.is_empty() {
+        tracing::info!("Updated source_diversity for {} entities", diversity_rows.len());
+    }
+
+    Ok(total)
+}
+
+/// Auto-execute paper trades when convergence signals are detected.
+/// Only trades entities with tickers, not already held, with convergence_detected = true.
+async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
+    let alpaca_key = match std::env::var("ALPACA_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            tracing::info!("Auto-trade: skipping (ALPACA_API_KEY not set)");
+            return Ok(0);
+        }
+    };
+    let alpaca_secret = std::env::var("ALPACA_SECRET_KEY")
+        .map_err(|_| anyhow::anyhow!("ALPACA_SECRET_KEY not set"))?;
+
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    // Find convergence signals with tickers, not already in open trades
+    // Fetch all 8 signal dimensions for signal_profile JSON
+    let mut stmt = conn.prepare(
+        "SELECT cs.entity_id, cs.ticker, cs.compound_score, e.name,
+                cs.insider_signal, cs.institutional_flow, cs.news_momentum,
+                cs.government_signal, cs.search_trend, cs.patent_signal,
+                cs.supply_chain, cs.political_signal
+         FROM cross_signals cs
+         JOIN entities e ON e.id = cs.entity_id
+         WHERE cs.convergence_detected = 1
+           AND cs.ticker IS NOT NULL
+           AND cs.compound_score > 0.3
+           AND cs.ticker NOT IN (
+               SELECT ticker FROM paper_trades WHERE status = 'open'
+           )
+         ORDER BY cs.compound_score DESC
+         LIMIT 5"
+    )?;
+
+    #[allow(clippy::type_complexity)]
+    let candidates: Vec<(i64, String, f64, String, f64, f64, f64, f64, f64, f64, f64, f64)> = stmt
+        .query_map([], |row| Ok((
+            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+            row.get::<_, f64>(4).unwrap_or(0.0), row.get::<_, f64>(5).unwrap_or(0.0),
+            row.get::<_, f64>(6).unwrap_or(0.0), row.get::<_, f64>(7).unwrap_or(0.0),
+            row.get::<_, f64>(8).unwrap_or(0.0), row.get::<_, f64>(9).unwrap_or(0.0),
+            row.get::<_, f64>(10).unwrap_or(0.0), row.get::<_, f64>(11).unwrap_or(0.0),
+        )))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    // Get account buying power
+    let account: serde_json::Value = client
+        .get("https://paper-api.alpaca.markets/v2/account")
+        .header("APCA-API-KEY-ID", &alpaca_key)
+        .header("APCA-API-SECRET-KEY", &alpaca_secret)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let buying_power: f64 = account.get("buying_power")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    if buying_power < 100.0 {
+        tracing::info!("Auto-trade: insufficient buying power (${:.2})", buying_power);
+        return Ok(0);
+    }
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut traded = 0;
+
+    for (entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political) in &candidates {
+        // Position sizing: 1-5% based on confidence
+        let pct = if *score > 0.6 { 0.05 } else if *score > 0.4 { 0.02 } else { 0.01 };
+        let notional = (buying_power * pct).min(10000.0).max(50.0);
+
+        tracing::info!("Auto-trade: {} ({}) — score {:.2}, notional ${:.2}", name, ticker, score, notional);
+
+        let order = serde_json::json!({
+            "symbol": ticker,
+            "notional": format!("{:.2}", notional),
+            "side": "buy",
+            "type": "market",
+            "time_in_force": "day"
+        });
+
+        let resp = client
+            .post("https://paper-api.alpaca.markets/v2/orders")
+            .header("APCA-API-KEY-ID", &alpaca_key)
+            .header("APCA-API-SECRET-KEY", &alpaca_secret)
+            .json(&order)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            let order_resp: serde_json::Value = resp.json().await?;
+            let order_id = order_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let filled_price = order_resp.get("filled_avg_price")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or_else(|| {
+                    // Fallback: get latest price from entity_prices
+                    conn.query_row(
+                        "SELECT close FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
+                        [ticker], |row| row.get(0),
+                    ).unwrap_or(0.0)
+                });
+
+            // Build signal_profile JSON matching calibration keys
+            let signal_profile = serde_json::json!({
+                "insider": insider,
+                "institutional": inst,
+                "news": news,
+                "government": gov,
+                "search": search,
+                "patent": patent,
+                "supply_chain": supply,
+                "political": political,
+            });
+
+            // Record in paper_trades — matching schema: direction, entry_price, entry_date, position_size, confidence, signal_profile
+            if let Err(e) = conn.execute(
+                "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status)
+                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open')",
+                rusqlite::params![entity_id, ticker, filled_price, today, notional, score, signal_profile.to_string(), order_id],
+            ) {
+                tracing::warn!("Auto-trade: failed to record trade for {}: {}", ticker, e);
+            }
+
+            tracing::info!("Auto-trade: placed order {} for {} (${:.2} @ ${:.2})", order_id, ticker, notional, filled_price);
+            traded += 1;
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("Auto-trade: order failed for {} — {} {}", ticker, status, body);
+        }
+
+        // Rate limit
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    Ok(traded)
+}
+
+/// Classify ambiguous 8-K filings (Item 8.01 "other_event") using Claude Haiku.
+/// Only processes recent unclassified 8-Ks. ~$0.0005 per call.
+async fn classify_ambiguous_8ks(db_path: &Path) -> anyhow::Result<usize> {
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return Ok(0),
+    };
+
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    // Find 8-K stories with "other_event" classification and content_preview
+    let mut stmt = conn.prepare(
+        "SELECT id, financial_metadata FROM stories
+         WHERE source_type = 'financial'
+           AND source_name LIKE '%EDGAR 8-K%'
+           AND json_valid(financial_metadata)
+           AND json_extract(financial_metadata, '$.event_classification') = 'other_event'
+           AND json_extract(financial_metadata, '$.content_preview') IS NOT NULL
+           AND json_extract(financial_metadata, '$.llm_classification') IS NULL
+           AND created_at >= datetime('now', '-3 days')
+         LIMIT 15"
+    )?;
+
+    let candidates: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if candidates.is_empty() { return Ok(0); }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let mut classified = 0;
+
+    for (story_id, metadata_str) in &candidates {
+        let meta: serde_json::Value = serde_json::from_str(metadata_str)?;
+        let preview = meta.get("content_preview").and_then(|v| v.as_str()).unwrap_or("");
+        let entity = meta.get("entity_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
+
+        if preview.len() < 20 { continue; }
+
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 150,
+            "system": "Classify this SEC 8-K filing into exactly one category. Return only valid JSON.\n\nCategories:\n- earnings_surprise: unexpected financial results\n- acquisition: M&A activity, merger, purchase\n- partnership: strategic alliance, joint venture\n- restructuring: layoffs, cost cuts, exit activities\n- product_launch: new product, service, or technology\n- regulatory: FDA approval, compliance action, government\n- executive_change: C-suite departure or hire\n- bankruptcy_risk: going concern, debt default\n- shareholder_action: buyback, dividend, activist\n- capital_raise: debt offering, equity raise, IPO\n- litigation: lawsuit, settlement, legal action\n- other: none of the above\n\nReturn: {\"category\": \"...\", \"severity\": 0.0-1.0, \"summary\": \"one sentence\"}",
+            "messages": [{"role": "user", "content": format!("Company: {}\n\n8-K content:\n{}", entity, &preview[..preview.len().min(1500)])}]
+        });
+
+        let resp = client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() { continue; }
+
+        let response: serde_json::Value = resp.json().await?;
+        let text = response["content"][0]["text"].as_str().unwrap_or("{}");
+
+        // Parse the JSON response
+        let json_str = if let Some(start) = text.find('{') {
+            if let Some(end) = text.rfind('}') { &text[start..=end] } else { text }
+        } else { text };
+
+        if let Ok(result) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let category = result.get("category").and_then(|v| v.as_str()).unwrap_or("other");
+            let severity = result.get("severity").and_then(|v| v.as_f64()).unwrap_or(0.3);
+            let summary = result.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Map to actual severity sign (some categories are negative)
+            let signed_severity = match category {
+                "restructuring" | "bankruptcy_risk" | "litigation" => -severity,
+                _ => severity,
+            };
+
+            // Update the financial_metadata JSON with LLM classification
+            let mut updated_meta: serde_json::Value = serde_json::from_str(metadata_str)?;
+            updated_meta["llm_classification"] = serde_json::json!(category);
+            updated_meta["event_classification"] = serde_json::json!(category);
+            updated_meta["event_severity"] = serde_json::json!(signed_severity);
+            updated_meta["llm_summary"] = serde_json::json!(summary);
+
+            conn.execute(
+                "UPDATE stories SET financial_metadata = ?1 WHERE id = ?2",
+                rusqlite::params![serde_json::to_string(&updated_meta)?, story_id],
+            ).ok();
+
+            classified += 1;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    if classified > 0 {
+        log_usage(db_path, "anthropic", "claude-haiku", "8k_classification",
+            (classified * 500) as i64, (classified * 50) as i64);
+    }
+
+    Ok(classified)
+}
+
+/// Resolve entities to canonical records.
+/// Merges duplicates like "NVIDIA Corp", "Nvidia", "NVIDIA CORPORATION" into one canonical entity.
+/// Strategy: CIK match → ticker match → normalized name match → suffix-stripped match.
+fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    crate::db::run_migrations(&conn)?;
+
+    // Check if entity_canonical table exists
+    let table_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_canonical')",
+        [], |row| row.get(0),
+    ).unwrap_or(false);
+    if !table_exists { return Ok(0); }
+
+    // Check if canonical_id column exists on entities
+    let col_exists: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(entities)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .any(|r| r.as_deref() == Ok("canonical_id"))
+    };
+    if !col_exists { return Ok(0); }
+
+    // Get all entities without a canonical_id
+    let unresolved: Vec<(i64, String, String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.name, e.entity_type, et.ticker
+             FROM entities e
+             LEFT JOIN entity_tickers et ON et.entity_id = e.id
+             WHERE e.canonical_id IS NULL
+             ORDER BY e.mention_count DESC
+             LIMIT 500"
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    if unresolved.is_empty() { return Ok(0); }
+
+    // Load existing canonical entities for matching
+    let existing_canonicals: Vec<(i64, String, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, canonical_name, ticker, cik FROM entity_canonical"
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    // Common suffixes to strip for matching
+    let suffixes = [
+        " inc", " inc.", " corp", " corp.", " corporation", " ltd", " ltd.",
+        " llc", " co", " co.", " plc", " sa", " ag", " se", " nv",
+        " holdings", " group", " technologies", " technology",
+        " international", " solutions", " systems", " enterprises",
+        " company", " partners", " capital", " industries",
+    ];
+
+    let normalize = |name: &str| -> String {
+        let mut n = name.to_lowercase().trim().to_string();
+        // Strip CIK suffix like "(CIK 0001234567)"
+        if let Some(idx) = n.find("(cik") {
+            n = n[..idx].trim().to_string();
+        }
+        // Strip common suffixes
+        for suffix in &suffixes {
+            n = n.trim_end_matches(suffix).to_string();
+        }
+        n.trim().to_string()
+    };
+
+    let mut resolved = 0usize;
+
+    for (entity_id, name, entity_type, ticker) in &unresolved {
+        let name_norm = normalize(name);
+        if name_norm.len() < 2 { continue; }
+
+        // Skip non-company-like entities (topics, generic terms)
+        if matches!(entity_type.as_str(), "topic" | "regulation") { continue; }
+
+        let mut matched_canonical_id: Option<i64> = None;
+
+        // 1. Try CIK match (highest confidence)
+        let entity_cik: Option<String> = conn.query_row(
+            "SELECT cik FROM entity_tickers WHERE entity_id = ?1 AND cik IS NOT NULL AND cik != ''",
+            [entity_id], |row| row.get(0),
+        ).ok();
+
+        if let Some(ref cik) = entity_cik {
+            for (cid, _, _, c_cik) in &existing_canonicals {
+                if c_cik.as_deref() == Some(cik) {
+                    matched_canonical_id = Some(*cid);
+                    break;
+                }
+            }
+        }
+
+        // 2. Try ticker match
+        if matched_canonical_id.is_none() {
+            if let Some(t) = ticker {
+                for (cid, _, c_ticker, _) in &existing_canonicals {
+                    if c_ticker.as_deref() == Some(t.as_str()) {
+                        matched_canonical_id = Some(*cid);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 3. Try normalized name match against existing canonicals
+        if matched_canonical_id.is_none() {
+            for (cid, c_name, _, _) in &existing_canonicals {
+                let c_norm = normalize(c_name);
+                if c_norm == name_norm {
+                    matched_canonical_id = Some(*cid);
+                    break;
+                }
+                // Also try contains for short names (>= 5 chars)
+                if name_norm.len() >= 5 && (c_norm.contains(&name_norm) || name_norm.contains(&c_norm)) {
+                    matched_canonical_id = Some(*cid);
+                    break;
+                }
+            }
+        }
+
+        // 4. No match — create a new canonical entity
+        if matched_canonical_id.is_none() {
+            // Use the best name we have
+            let canon_name = name.trim().to_string();
+            conn.execute(
+                "INSERT OR IGNORE INTO entity_canonical (canonical_name, ticker, cik, sector, entity_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    canon_name,
+                    ticker,
+                    entity_cik,
+                    conn.query_row("SELECT sector FROM entities WHERE id = ?1", [entity_id], |row| row.get::<_, Option<String>>(0)).ok().flatten(),
+                    if matches!(entity_type.as_str(), "company" | "insider_trade" | "contract_award" | "patent_cluster" | "material_event" | "private_placement") { "company" } else { entity_type.as_str() },
+                ],
+            ).ok();
+
+            matched_canonical_id = conn.query_row(
+                "SELECT id FROM entity_canonical WHERE canonical_name = ?1",
+                [&canon_name], |row| row.get(0),
+            ).ok();
+        }
+
+        // Link entity to canonical
+        if let Some(cid) = matched_canonical_id {
+            conn.execute(
+                "UPDATE entities SET canonical_id = ?1 WHERE id = ?2",
+                rusqlite::params![cid, entity_id],
+            ).ok();
+
+            // Also populate entity_aliases
+            let alias_norm = name.to_lowercase().trim().to_string();
+            conn.execute(
+                "INSERT OR IGNORE INTO entity_aliases (entity_id, alias, alias_type)
+                 VALUES (?1, ?2, 'alternate_name')",
+                rusqlite::params![entity_id, alias_norm],
+            ).ok();
+
+            // If we have a ticker, add it as an alias too
+            if let Some(t) = ticker {
+                conn.execute(
+                    "INSERT OR IGNORE INTO entity_aliases (entity_id, alias, alias_type)
+                     VALUES (?1, ?2, 'ticker')",
+                    rusqlite::params![entity_id, t],
+                ).ok();
+            }
+
+            resolved += 1;
+        }
+    }
+
+    // Update canonical entities with best available ticker/CIK from linked entities
+    conn.execute_batch(
+        "UPDATE entity_canonical SET ticker = (
+            SELECT et.ticker FROM entity_tickers et
+            JOIN entities e ON e.id = et.entity_id
+            WHERE e.canonical_id = entity_canonical.id
+            LIMIT 1
+        ) WHERE ticker IS NULL AND id IN (
+            SELECT DISTINCT e.canonical_id FROM entities e
+            JOIN entity_tickers et ON et.entity_id = e.id
+            WHERE e.canonical_id IS NOT NULL
+        )"
+    ).ok();
+
+    Ok(resolved)
 }
 
 fn send_notification(story_count: usize) -> anyhow::Result<()> {

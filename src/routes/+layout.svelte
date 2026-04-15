@@ -3,10 +3,12 @@
 	import Sidebar from '$lib/components/layout/Sidebar.svelte';
 	import Header from '$lib/components/layout/Header.svelte';
 	import KeyboardHandler from '$lib/components/layout/KeyboardHandler.svelte';
+	import ShortcutHelp from '$lib/components/layout/ShortcutHelp.svelte';
 	let { children } = $props();
 </script>
 
 <KeyboardHandler />
+<ShortcutHelp />
 
 <div class="flex h-screen overflow-hidden bg-bg">
 	<Sidebar />

@@ -21,6 +21,8 @@ pub struct Story {
     pub created_at: String,
     pub summary_depth: Option<String>,
     pub deep_summary: Option<String>,
+    pub source_type: Option<String>,
+    pub financial_metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

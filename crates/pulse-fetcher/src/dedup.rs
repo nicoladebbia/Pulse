@@ -8,6 +8,7 @@ pub fn deduplicate(articles: Vec<RawArticle>) -> Vec<RawArticle> {
 
 /// Deduplicate articles, also checking against historical url_hashes and titles
 /// from previous briefings (typically the last 7 days).
+/// Uses O(n) hash-based dedup: URL hash + exact title hash + word-set hash.
 pub fn deduplicate_with_history(
     articles: Vec<RawArticle>,
     historical_url_hashes: HashSet<String>,
@@ -15,8 +16,16 @@ pub fn deduplicate_with_history(
 ) -> Vec<RawArticle> {
     let total = articles.len();
     let mut seen_urls: HashSet<String> = historical_url_hashes;
-    let mut seen_titles: Vec<String> = historical_titles;
+    let mut seen_exact_titles: HashSet<String> = HashSet::new();
+    let mut seen_word_sets: HashSet<String> = HashSet::new();
     let mut result = Vec::new();
+
+    // Pre-hash historical titles into both sets
+    for title in &historical_titles {
+        let normalized = normalize_title(title);
+        seen_exact_titles.insert(normalized.clone());
+        seen_word_sets.insert(word_set_hash(&normalized));
+    }
 
     for article in articles {
         let url_hash = hash_url(&article.url);
@@ -27,15 +36,21 @@ pub fn deduplicate_with_history(
             continue;
         }
 
-        // Skip near-title matches (including from previous days)
-        if seen_titles.iter().any(|existing| {
-            trigram_similarity(existing, &title_normalized) > 0.75
-        }) {
+        // Skip exact title duplicates (fast O(1) check)
+        if seen_exact_titles.contains(&title_normalized) {
+            continue;
+        }
+
+        // Skip near-duplicate titles via word-set hash (O(1) check)
+        // Catches reworded titles like "Apple reports Q4" vs "Q4 reported by Apple"
+        let ws_hash = word_set_hash(&title_normalized);
+        if seen_word_sets.contains(&ws_hash) {
             continue;
         }
 
         seen_urls.insert(url_hash);
-        seen_titles.push(title_normalized);
+        seen_exact_titles.insert(title_normalized.clone());
+        seen_word_sets.insert(ws_hash);
         result.push(article);
     }
 
@@ -122,27 +137,33 @@ fn normalize_title(title: &str) -> String {
         .join(" ")
 }
 
-fn trigram_similarity(a: &str, b: &str) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
+/// Hash based on sorted unique content words (ignoring stop words + word order).
+/// "Apple reports Q4 earnings" and "Q4 earnings reported by Apple" → same hash.
+fn word_set_hash(normalized_title: &str) -> String {
+    let stop_words: HashSet<&str> = [
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+        "has", "have", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "can", "shall", "not", "no", "its", "it",
+        "this", "that", "as", "up", "out", "about", "into", "over", "after",
+        "says", "said", "new", "how", "what", "why", "who", "when", "where",
+    ].into_iter().collect();
+
+    let mut words: Vec<&str> = normalized_title
+        .split_whitespace()
+        .filter(|w| w.len() >= 3 && !stop_words.contains(w))
+        .collect();
+    words.sort_unstable();
+    words.dedup();
+
+    // Need at least 3 content words for a meaningful hash
+    if words.len() < 3 {
+        return format!("__short_{}", normalized_title);
     }
 
-    let trigrams_a: HashSet<&str> = a.as_bytes().windows(3).map(|w| {
-        std::str::from_utf8(w).unwrap_or("")
-    }).collect();
-
-    let trigrams_b: HashSet<&str> = b.as_bytes().windows(3).map(|w| {
-        std::str::from_utf8(w).unwrap_or("")
-    }).collect();
-
-    let intersection = trigrams_a.intersection(&trigrams_b).count();
-    let union = trigrams_a.union(&trigrams_b).count();
-
-    if union == 0 {
-        0.0
-    } else {
-        intersection as f64 / union as f64
-    }
+    let mut hasher = Sha256::new();
+    hasher.update(words.join(" ").as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Returns the SHA-256 hash of a normalized URL (for DB storage)

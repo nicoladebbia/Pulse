@@ -261,15 +261,30 @@ pub fn build_system_prompt(
     pattern_context: &str,
     predictions_context: &str,
     prediction_calibration: &str,
+    query_type: &str,
 ) -> String {
-    let mut prompt = String::from(
-        r#"You are Pulse, an intelligence analyst. You have a news archive with entity tracking, signal velocity, causal patterns, and prediction history. You make specific, sourced, bold assessments.
+    let format_instruction = match query_type {
+        "breaking" => "FORMAT: Lead with the headline — what just happened. Then context: why it matters, who's affected. Keep it tight and urgent. End with what to watch next.",
+        "analytical" => "FORMAT: Bottom line first (no preamble). Then ## headers for deep analysis. Cite specific stories and signals with evidence. End with what to watch.",
+        "comparative" => "FORMAT: Open with a decisive verdict — which is better and why. Then compare point-by-point with ## headers. End with your recommendation.",
+        "advisory" => "FORMAT: The reader is asking for strategic advice. You MUST engage with the question — do NOT refuse or deflect. Use your knowledge of their profile (tech founder, AI/ML, iOS, ships fast) and your signal/trend data to give informed, actionable strategy. Open with your recommended approach as numbered action steps. Be specific — name tools, prices, timelines, realistic conversion rates. If a specific claim is unrealistic, flag it with evidence but still provide the best path forward. End with risks and realistic expectations. You are a strategic advisor backed by data, not a cheerleader — but also not a cop-out artist who refuses to engage.",
+        _ => "FORMAT: Bottom line first (no preamble). Then ## headers for analysis. End with what to watch.",
+    };
+
+    let mut prompt = format!(
+        r#"You are Pulse, an intelligence analyst and strategic advisor. You have a news archive with entity tracking, signal velocity, causal patterns, and prediction history. You make specific, sourced, bold assessments — but you challenge weak premises honestly. You ALWAYS engage with the question — never refuse to answer or deflect to "that's outside my scope."
 
 Reader: tech founder, Miami Beach, builds AI/ML + iOS apps, Italian heritage.
 
-FORMAT: Bottom line first (no preamble). Then ## headers for analysis. End with what to watch. Use HIGH/MODERATE/LOW for confidence. Max 5 bullets per section. No duplicate headers.
+{format_instruction}
 
-PREDICTION STANCE: When asked about stocks, future events, or outcomes — give your BEST assessment. Name specific companies, direction (bullish/bearish), confidence level, and cite the exact stories + signals. You're an analyst, not a disclaimer generator. Use signal trajectories (rising/fading/accelerating) and upcoming catalysts to ground predictions. When your track record is provided, calibrate accordingly.
+CONFIDENCE RULES:
+- Use HIGH/MODERATE/LOW for qualitative assessments
+- Only cite specific percentages when referencing: (a) your prediction track record data, or (b) explicit numbers from stories/signals (mention counts, acceleration values)
+- Never invent probability numbers. If uncertain, say "MODERATE confidence" not "67% likely"
+- If you lack sufficient data to give reliable advice, say so explicitly
+
+PREDICTION STANCE: When asked about stocks, future events, or outcomes — give your BEST assessment. Name specific companies, direction (bullish/bearish), confidence level, and cite the exact stories + signals. You're an analyst, not a disclaimer generator. Use signal trajectories (rising/fading/accelerating) and upcoming catalysts to ground predictions. When your track record is provided, calibrate accordingly. If the premise of the question is flawed, challenge it before answering.
 
 "#,
     );
@@ -331,6 +346,7 @@ Suggest 2-4 follow-ups."#);
 pub fn format_stories_context(stories: &[super::search::ScoredStory], query_type: super::search::QueryType) -> String {
     let max_stories = match query_type {
         super::search::QueryType::Analytical | super::search::QueryType::Comparative => 12,
+        super::search::QueryType::Advisory => 10,
         _ => 8,
     };
     let selected: Vec<_> = stories.iter().take(max_stories).collect();
@@ -344,8 +360,8 @@ pub fn format_stories_context(stories: &[super::search::ScoredStory], query_type
         .iter()
         .map(|s| {
             format!(
-                "[ID:{}] [{}] {} ({}, {})\n  {}\n  Why it matters: {}",
-                s.story_id, s.sector, s.headline, s.date, s.source_name,
+                "[ID:{}] [{}] [relevance:{:.2}] {} ({}, {})\n  {}\n  Why it matters: {}",
+                s.story_id, s.sector, s.score, s.headline, s.date, s.source_name,
                 s.summary, s.why_it_matters
             )
         })
@@ -1237,7 +1253,7 @@ mod tests {
         assert!(formatted.contains("OpenAI"));
         assert!(formatted.contains("emerging"));
         assert!(formatted.contains("2.1"));
-        assert!(formatted.contains("7d: 10"));
+        assert!(formatted.contains("7d:10"));
     }
 
     #[test]
@@ -1308,6 +1324,7 @@ mod tests {
             "Pattern context here",
             "Predictions context here",
             "Predictions made: 10 total. Validated: 7 (70% accuracy).",
+            "general",
         );
 
         assert!(prompt.contains("You are Pulse"));

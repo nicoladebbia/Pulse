@@ -15,6 +15,7 @@
 	let loaded = $state(false);
 	let error = $state<string | null>(null);
 	let viewMode = $state<'list' | 'daily' | 'freedoms'>('list');
+	let dateRange = $state<'7' | '30' | 'all'>('all');
 
 	$effect(() => {
 		if (loaded) return;
@@ -90,8 +91,16 @@
 		return date === new Date().toISOString().split('T')[0];
 	}
 
+	function truncateSentences(text: string, count: number): string {
+		const sentences = text.match(/[^.!?]+[.!?]+/g);
+		if (!sentences) return text;
+		return sentences.slice(0, count).join(' ').trim();
+	}
+
+	const sectorNames: Record<string, string> = { ai: 'AI', miami: 'Miami', italy: 'Italy', tech: 'Tech' };
+
 	// Group briefings by date — supports multiple daily briefings
-	let groupedByDate = $derived(() => {
+	const groupedByDate = $derived.by(() => {
 		const groups: Record<string, { dailies: Briefing[]; freedoms?: Briefing }> = {};
 		for (const b of briefings) {
 			if (!groups[b.date]) groups[b.date] = { dailies: [] };
@@ -101,18 +110,47 @@
 		return Object.entries(groups).sort((a, b) => b[0].localeCompare(a[0]));
 	});
 
+	const filteredByDate = $derived.by(() => {
+		if (dateRange === 'all') return groupedByDate;
+		const days = parseInt(dateRange);
+		const cutoff = new Date();
+		cutoff.setDate(cutoff.getDate() - days);
+		const cutoffStr = cutoff.toISOString().split('T')[0];
+		return groupedByDate.filter(([date]) => date >= cutoffStr);
+	});
+
 	const freedomDefs = [
 		{ key: 'time_stories' as const, freedom: 'time', label: 'Time Freedom', color: 'var(--color-freedom-time)' },
 		{ key: 'wealth_stories' as const, freedom: 'wealth', label: 'Wealth Freedom', color: 'var(--color-freedom-financial)' },
 		{ key: 'location_stories' as const, freedom: 'location', label: 'Location Freedom', color: 'var(--color-freedom-location)' },
 		{ key: 'health_stories' as const, freedom: 'health', label: 'Health Freedom', color: 'var(--color-freedom-health)' },
 	];
+
+	const rangeOptions = [
+		{ value: '7' as const, label: 'Last 7 days' },
+		{ value: '30' as const, label: 'Last 30 days' },
+		{ value: 'all' as const, label: 'All' },
+	];
 </script>
 
 <div class="space-y-6 pt-2">
 	<div class="flex items-center justify-between">
 		<h2 class="text-xl font-semibold text-text">Archive</h2>
-		<p class="text-sm text-text-muted">{groupedByDate().length} day{groupedByDate().length !== 1 ? 's' : ''}</p>
+		{#if viewMode === 'list'}
+			<div class="flex items-center gap-2">
+				{#each rangeOptions as opt}
+					<button
+						class="text-[10px] px-2 py-1 rounded transition-colors {dateRange === opt.value
+							? 'bg-bg-card text-text border border-border'
+							: 'text-text-muted hover:text-text'}"
+						onclick={() => dateRange = opt.value}
+					>
+						{opt.label}
+					</button>
+				{/each}
+				<span class="text-sm text-text-muted ml-2">{filteredByDate.length} day{filteredByDate.length !== 1 ? 's' : ''}</span>
+			</div>
+		{/if}
 	</div>
 
 	{#if expandedStory}
@@ -183,56 +221,72 @@
 			</div>
 		</div>
 
-	{:else if groupedByDate().length > 0}
+	{:else if filteredByDate.length > 0}
 		<div class="space-y-2">
-			{#each groupedByDate() as [date, group]}
-				<div class="bg-bg-card border border-border rounded-lg p-4">
-					<div class="flex items-center justify-between">
-						<div>
-							<div class="flex items-center gap-2">
-								<p class="text-sm font-medium text-text">{formatDate(date)}</p>
-								{#if isToday(date)}
-									<span class="text-[10px] uppercase tracking-wider bg-ai/10 text-ai px-1.5 py-0.5 rounded">Today</span>
+			{#each filteredByDate as [date, group]}
+				{@const latestDaily = group.dailies[0]}
+				<div class="bg-bg-card border border-border rounded-lg overflow-hidden transition-colors hover:border-border-hover">
+					<div class="p-4">
+						<div class="flex items-center justify-between">
+							<div class="flex-1 min-w-0">
+								<div class="flex items-center gap-2">
+									<p class="text-sm font-medium text-text">{formatDate(date)}</p>
+									{#if isToday(date)}
+										<span class="text-[10px] uppercase tracking-wider bg-ai/10 text-ai px-1.5 py-0.5 rounded">Today</span>
+									{/if}
+								</div>
+
+								<!-- Hero headline preview -->
+								{#if latestDaily?.hero_headline}
+									<p class="text-xs text-text-secondary mt-1 truncate">{latestDaily.hero_headline}</p>
+								{/if}
+
+								<!-- Executive summary preview -->
+								{#if latestDaily?.executive_summary}
+									<p class="text-[11px] text-text-muted mt-1.5 line-clamp-2 leading-relaxed">
+										{truncateSentences(latestDaily.executive_summary, 2)}
+									</p>
+								{/if}
+							</div>
+							<div class="flex items-center gap-2 flex-wrap shrink-0 ml-4">
+								{#each group.dailies as daily}
+									<button
+										class="text-xs px-3 py-1.5 rounded-lg border border-border hover:bg-bg-card-hover
+											transition-colors text-text-secondary hover:text-text"
+										onclick={() => selectDaily(daily.id)}
+									>
+										{daily.time_label ?? 'Daily'} · {daily.story_count}
+									</button>
+								{/each}
+								{#if group.freedoms}
+									<button
+										class="text-xs px-3 py-1.5 rounded-lg border transition-colors hover:opacity-90"
+										style="border-color: var(--color-gold-dim); color: var(--color-gold); background: var(--color-gold-dim)"
+										onclick={() => selectFreedoms(date)}
+									>
+										Freedoms · {group.freedoms.story_count}
+									</button>
 								{/if}
 							</div>
 						</div>
-						<div class="flex items-center gap-2 flex-wrap">
-							{#each group.dailies as daily}
-								<button
-									class="text-xs px-3 py-1.5 rounded-lg border border-border hover:bg-bg-card-hover
-										transition-colors text-text-secondary hover:text-text"
-									onclick={() => selectDaily(daily.id)}
-								>
-									{daily.time_label ?? 'Daily'} · {daily.story_count} stories
-								</button>
-							{/each}
-							{#if group.freedoms}
-								<button
-									class="text-xs px-3 py-1.5 rounded-lg border transition-colors hover:opacity-90"
-									style="border-color: var(--color-gold-dim); color: var(--color-gold); background: var(--color-gold-dim)"
-									onclick={() => selectFreedoms(date)}
-								>
-									Freedoms · {group.freedoms.story_count}
-								</button>
-							{/if}
-						</div>
-					</div>
 
-					{#if group.dailies.length > 0}
-						{@const totalStories = group.dailies.reduce((s, d) => s + d.story_count, 0)}
-						{@const latestDaily = group.dailies[0]}
-						<div class="flex gap-1.5 mt-2">
-							{#each ['ai', 'miami', 'italy', 'tech'] as sector}
-								{@const count = sector === 'ai' ? latestDaily.ai_count : sector === 'miami' ? latestDaily.miami_count : sector === 'italy' ? latestDaily.italy_count : latestDaily.tech_count}
-								<span
-									class="text-xs font-mono px-1.5 py-0.5 rounded min-w-[24px] text-center"
-									style="color: {SECTORS[sector as SectorId].color}; background: {SECTORS[sector as SectorId].dimColor}"
-								>
-									{count}
-								</span>
-							{/each}
-						</div>
-					{/if}
+						<!-- Sector breakdown with labels -->
+						{#if group.dailies.length > 0 && latestDaily}
+							<div class="flex gap-2 mt-2.5">
+								{#each ['ai', 'miami', 'italy', 'tech'] as sector}
+									{@const count = sector === 'ai' ? latestDaily.ai_count : sector === 'miami' ? latestDaily.miami_count : sector === 'italy' ? latestDaily.italy_count : latestDaily.tech_count}
+									{#if count > 0}
+										<span
+											class="text-[10px] font-mono px-1.5 py-0.5 rounded inline-flex items-center gap-1"
+											style="color: {SECTORS[sector as SectorId].color}; background: {SECTORS[sector as SectorId].dimColor}"
+										>
+											{sectorNames[sector]} {count}
+										</span>
+									{/if}
+								{/each}
+							</div>
+						{/if}
+					</div>
 				</div>
 			{/each}
 		</div>

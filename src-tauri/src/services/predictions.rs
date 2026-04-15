@@ -18,6 +18,7 @@ pub struct Prediction {
     pub predicted_timeframe: String,
     pub sector: Option<String>,
     pub status: String,
+    pub probability_history: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -96,10 +97,48 @@ pub fn store_prediction(conn: &Connection, prediction: &Prediction) -> Result<i6
 // Queries
 // ---------------------------------------------------------------------------
 
+/// Get all predictions regardless of status.
+pub fn get_all_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date, probability_history
+         FROM insights
+         WHERE insight_type = 'prediction'
+         ORDER BY
+           CASE status
+             WHEN 'active' THEN 0
+             WHEN 'partially_validated' THEN 1
+             WHEN 'validated' THEN 2
+             WHEN 'invalidated' THEN 3
+             WHEN 'expired' THEN 4
+           END,
+           confidence DESC",
+    )?;
+
+    let predictions = stmt
+        .query_map([], |row| {
+            Ok(RawInsightRow {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                content: row.get(2)?,
+                confidence: row.get(3)?,
+                evidence: row.get(4)?,
+                sector: row.get(5)?,
+                status: row.get(6)?,
+                predicted_date: row.get(7)?,
+                probability_history: row.get(8)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .map(|r| row_to_prediction(r))
+        .collect();
+
+    Ok(predictions)
+}
+
 /// Get all active predictions.
 pub fn get_active_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date
+        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date, probability_history
          FROM insights
          WHERE insight_type = 'prediction' AND status = 'active'
          ORDER BY confidence DESC",
@@ -116,6 +155,7 @@ pub fn get_active_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
                 sector: row.get(5)?,
                 status: row.get(6)?,
                 predicted_date: row.get(7)?,
+                probability_history: row.get(8)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -130,7 +170,7 @@ pub fn get_predictions_for_topic(conn: &Connection, topic: &str) -> Result<Vec<P
     let pattern = format!("%{}%", topic.to_lowercase());
 
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date
+        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date, probability_history
          FROM insights
          WHERE insight_type = 'prediction'
            AND (LOWER(title) LIKE ?1 OR LOWER(content) LIKE ?1)
@@ -148,6 +188,7 @@ pub fn get_predictions_for_topic(conn: &Connection, topic: &str) -> Result<Vec<P
                 sector: row.get(5)?,
                 status: row.get(6)?,
                 predicted_date: row.get(7)?,
+                probability_history: row.get(8)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -250,6 +291,23 @@ pub fn validate_predictions(
     Ok(updates)
 }
 
+/// Manually validate or invalidate a prediction.
+pub fn manually_validate_prediction(conn: &Connection, id: i64, outcome: &str) -> Result<()> {
+    let valid_outcomes = ["validated", "partially_validated", "invalidated"];
+    if !valid_outcomes.contains(&outcome) {
+        anyhow::bail!("Invalid outcome '{}'. Must be one of: {:?}", outcome, valid_outcomes);
+    }
+
+    conn.execute(
+        "UPDATE insights SET status = ?1, actual_outcome = ?2, updated_at = datetime('now')
+         WHERE id = ?3 AND insight_type = 'prediction'",
+        params![outcome, outcome, id],
+    )
+    .context("failed to update prediction")?;
+
+    Ok(())
+}
+
 /// Expire predictions whose `predicted_date` has passed without validation.
 /// Returns the number of expired predictions.
 pub fn expire_stale_predictions(conn: &Connection) -> Result<usize> {
@@ -327,6 +385,7 @@ struct RawInsightRow {
     sector: Option<String>,
     status: String,
     predicted_date: Option<String>,
+    probability_history: Option<String>,
 }
 
 fn row_to_prediction(row: RawInsightRow) -> Prediction {
@@ -376,6 +435,11 @@ fn row_to_prediction(row: RawInsightRow) -> Prediction {
         predicted_timeframe: row.predicted_date.unwrap_or_default(),
         sector: row.sector,
         status: row.status,
+        probability_history: row
+            .probability_history
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<f64>>(json).ok())
+            .unwrap_or_default(),
     }
 }
 
@@ -400,6 +464,7 @@ mod tests {
             predicted_timeframe: predicted_date.unwrap_or("2026-06-01").to_string(),
             sector: Some(sector.to_string()),
             status: status.to_string(),
+            probability_history: Vec::new(),
         }
     }
 

@@ -1,7 +1,7 @@
 use serde::Serialize;
 use tauri::State;
 use crate::db::DbState;
-use crate::services::signals;
+use crate::services::{causality, predictions, relationships, signals};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrendPoint {
@@ -9,6 +9,12 @@ pub struct TrendPoint {
     pub date: String,
     pub headline: String,
     pub significance: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedEntity {
+    pub name: String,
+    pub strength: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +29,21 @@ pub struct TrendThread {
     /// Mentions per day for the last 14 days (index 0 = 13 days ago, index 13 = today)
     pub sparkline: Vec<i32>,
     pub points: Vec<TrendPoint>,
+    // --- Enrichment fields ---
+    pub sentiment_avg: f64,
+    pub related_entities: Vec<RelatedEntity>,
+    /// All sectors this entity appears in (for cross-sector badge)
+    pub sectors: Vec<String>,
+    /// Top causal chain consequence, if any
+    pub causal_consequence: Option<String>,
+    /// Related prediction, if any
+    pub prediction: Option<TrendPrediction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TrendPrediction {
+    pub title: String,
+    pub confidence: f32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,7 +70,7 @@ pub fn get_story_trend_badges(db: State<'_, DbState>, story_ids: Vec<i64>) -> Re
          JOIN entities e ON e.id = em.entity_id
          JOIN signals sig ON LOWER(sig.topic) = LOWER(e.name)
          WHERE em.story_id IN ({})
-           AND sig.trajectory IN ('dominant', 'hot')
+           AND sig.trajectory IN ('dominant', 'hot', 'rising', 'fading')
          ORDER BY sig.window_30d DESC",
         placeholders
     );
@@ -77,6 +98,73 @@ pub fn get_story_trend_badges(db: State<'_, DbState>, story_ids: Vec<i64>) -> Re
     Ok(badges)
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct IntelligenceCounts {
+    pub entity_count: i64,
+    pub active_prediction_count: i64,
+    pub hot_signal_count: i64,
+}
+
+#[tauri::command]
+pub fn get_intelligence_counts(db: State<'_, DbState>) -> Result<IntelligenceCounts, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let entity_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entities", [], |r| r.get(0),
+    ).unwrap_or(0);
+
+    let active_prediction_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM insights WHERE insight_type = 'prediction' AND status = 'active'",
+        [], |r| r.get(0),
+    ).unwrap_or(0);
+
+    let hot_signal_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM signals WHERE trajectory IN ('dominant', 'hot')",
+        [], |r| r.get(0),
+    ).unwrap_or(0);
+
+    Ok(IntelligenceCounts { entity_count, active_prediction_count, hot_signal_count })
+}
+
+/// Get entities mentioned in a specific story with their signal trajectories.
+#[tauri::command]
+pub fn get_story_entities(db: State<'_, DbState>, story_id: i64) -> Result<Vec<StoryEntityContext>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let mut stmt = conn.prepare(
+        "SELECT e.name, e.entity_type, COALESCE(sig.trajectory, 'unknown'), COALESCE(sig.acceleration, 0.0), em.sentiment
+         FROM entity_mentions em
+         JOIN entities e ON e.id = em.entity_id
+         LEFT JOIN signals sig ON LOWER(sig.topic) = LOWER(e.name)
+         WHERE em.story_id = ?1
+         ORDER BY sig.window_30d DESC NULLS LAST
+         LIMIT 10",
+    ).map_err(|e| e.to_string())?;
+
+    let entities = stmt.query_map([story_id], |row| {
+        Ok(StoryEntityContext {
+            name: row.get(0)?,
+            entity_type: row.get(1)?,
+            trajectory: row.get(2)?,
+            acceleration: row.get(3)?,
+            sentiment: row.get(4)?,
+        })
+    }).map_err(|e| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    Ok(entities)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoryEntityContext {
+    pub name: String,
+    pub entity_type: Option<String>,
+    pub trajectory: String,
+    pub acceleration: f64,
+    pub sentiment: f64,
+}
+
 /// Get trending entities for the Trends page.
 /// Ranks by days_active * mention_count * acceleration to surface entities
 /// with real momentum across multiple days, not single-mention noise.
@@ -89,6 +177,20 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
     match signals::recompute_signals(&conn, &today) {
         Ok(count) => tracing::debug!("Recomputed {} signals", count),
         Err(e) => tracing::warn!("Signal recompute failed: {}", e),
+    }
+
+    // Build alias map: alias → canonical entity name (for dedup)
+    let mut alias_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(mut alias_stmt) = conn.prepare(
+        "SELECT LOWER(ea.alias), e.name FROM entity_aliases ea JOIN entities e ON e.id = ea.entity_id"
+    ) {
+        if let Ok(rows) = alias_stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for row in rows.flatten() {
+                alias_map.insert(row.0, row.1);
+            }
+        }
     }
 
     // Find trending entities: must have ≥3 mentions or appear on ≥2 distinct days
@@ -106,7 +208,7 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
              GROUP BY sig.id
              HAVING COUNT(em.id) >= 3 OR COUNT(DISTINCT em.mentioned_at) >= 2
              ORDER BY (COUNT(DISTINCT em.mentioned_at) * COUNT(em.id) * sig.acceleration) DESC
-             LIMIT 15",
+             LIMIT 25",
         )
         .map_err(|e| e.to_string())?;
 
@@ -119,6 +221,22 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
+        .collect();
+
+    // Filter out alias duplicates: if topic is a known alias, skip it if the canonical is already present
+    let canonical_topics: std::collections::HashSet<String> = ranked.iter()
+        .map(|(_, topic, _, _, _, _, _)| topic.to_lowercase())
+        .collect();
+
+    let ranked: Vec<_> = ranked.into_iter()
+        .filter(|(_, topic, _, _, _, _, _)| {
+            if let Some(canonical) = alias_map.get(&topic.to_lowercase()) {
+                // Skip this alias if the canonical entity is already in the list
+                !canonical_topics.contains(&canonical.to_lowercase()) || canonical.to_lowercase() == topic.to_lowercase()
+            } else {
+                true
+            }
+        })
         .collect();
 
     // For each ranked entity, fetch story headlines and sparkline data
@@ -193,6 +311,56 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
             })
             .collect();
 
+        // --- Enrichment: sentiment ---
+        let sentiment_avg: f64 = conn
+            .query_row(
+                "SELECT COALESCE(AVG(em.sentiment), 0.0)
+                 FROM entity_mentions em
+                 JOIN entities e ON e.id = em.entity_id
+                 WHERE LOWER(e.name) = LOWER(?1)
+                   AND em.mentioned_at >= date('now', '-14 days')",
+                [&topic],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+
+        // --- Enrichment: related entities (top 5 by strength, min 2 co-occurrences) ---
+        let related_entities = relationships::get_related_entities(&conn, &topic, 2.0, 5)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, strength)| RelatedEntity { name, strength })
+            .collect();
+
+        // --- Enrichment: cross-sector detection ---
+        let mut sectors_stmt = conn
+            .prepare(
+                "SELECT DISTINCT s.sector
+                 FROM entity_mentions em
+                 JOIN entities e ON e.id = em.entity_id
+                 JOIN stories s ON s.id = em.story_id
+                 WHERE LOWER(e.name) = LOWER(?1)
+                   AND em.mentioned_at >= date('now', '-14 days')",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let sectors: Vec<String> = sectors_stmt
+            .query_map([&topic], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // --- Enrichment: top causal consequence (min 2 occurrences, 14-day window) ---
+        let causal_consequence = causality::find_causal_chains(&conn, &topic, 14, 2)
+            .ok()
+            .and_then(|chains| chains.into_iter().next())
+            .map(|chain| chain.consequence);
+
+        // --- Enrichment: related prediction ---
+        let prediction: Option<TrendPrediction> = predictions::get_predictions_for_topic(&conn, &topic)
+            .ok()
+            .and_then(|preds| preds.into_iter().find(|p| p.status == "active"))
+            .map(|p| TrendPrediction { title: p.title, confidence: p.confidence });
+
         threads.push(TrendThread {
             id: sig_id,
             title: topic,
@@ -203,6 +371,11 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
             days_active,
             sparkline,
             points,
+            sentiment_avg,
+            related_entities,
+            sectors,
+            causal_consequence,
+            prediction,
         });
     }
 

@@ -2,6 +2,7 @@ import { writable, derived, get } from 'svelte/store';
 import { expandedStoryId } from './briefing';
 import type { Story } from '$lib/tauri/types';
 
+export const showShortcutHelp = writable(false);
 export const storyIds = writable<number[]>([]);
 export const focusedIndex = writable(0);
 

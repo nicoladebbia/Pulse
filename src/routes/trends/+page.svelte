@@ -11,6 +11,7 @@
 	let loaded = $state(false);
 	let error = $state<string | null>(null);
 	let sectorFilter = $state<string>('all');
+	let sortBy = $state<'hottest' | 'fastest' | 'connected'>('hottest');
 
 	$effect(() => {
 		if (loaded) return;
@@ -34,11 +35,20 @@
 		}
 	}
 
-	const filtered = $derived(
-		sectorFilter === 'all'
+	const sorted = $derived.by(() => {
+		const base = sectorFilter === 'all'
 			? threads
-			: threads.filter(t => t.sector === sectorFilter)
-	);
+			: threads.filter(t => t.sector === sectorFilter);
+
+		if (sortBy === 'fastest') {
+			return [...base].sort((a, b) => b.acceleration - a.acceleration);
+		}
+		if (sortBy === 'connected') {
+			return [...base].sort((a, b) => b.related_entities.length - a.related_entities.length);
+		}
+		// hottest = default order from backend
+		return base;
+	});
 
 	const sectors = ['all', 'ai', 'miami', 'italy', 'tech'] as const;
 	const sectorLabels: Record<string, string> = {
@@ -51,10 +61,16 @@
 
 	const trajectoryMeta: Record<string, { icon: string; label: string; class: string }> = {
 		dominant: { icon: '◉', label: 'Dominant', class: 'bg-ai/15 text-ai' },
-		hot: { icon: '🔥', label: 'Hot', class: 'bg-amber-500/15 text-amber-400' },
+		hot: { icon: '▲', label: 'Hot', class: 'bg-amber-500/15 text-amber-400' },
 		rising: { icon: '↗', label: 'Rising', class: 'bg-emerald-500/15 text-emerald-400' },
 		fading: { icon: '↘', label: 'Fading', class: 'bg-red-500/15 text-red-400' },
 	};
+
+	const sortOptions = [
+		{ value: 'hottest' as const, label: 'Hottest' },
+		{ value: 'fastest' as const, label: 'Rising Fastest' },
+		{ value: 'connected' as const, label: 'Most Connected' },
+	];
 
 	function navigateToStory(storyId: number) {
 		expandedStoryId.set(storyId);
@@ -75,6 +91,18 @@
 		if (diffDays < 7) return `${diffDays}d ago`;
 		return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 	}
+
+	function sentimentColor(val: number): string {
+		if (val > 0.2) return 'text-emerald-400';
+		if (val < -0.2) return 'text-rose-400';
+		return 'text-text-muted';
+	}
+
+	function sentimentIcon(val: number): string {
+		if (val > 0.2) return '▲';
+		if (val < -0.2) return '▼';
+		return '─';
+	}
 </script>
 
 <div class="space-y-4 pt-2">
@@ -86,25 +114,39 @@
 		</div>
 	</div>
 
-	<!-- Sector filters -->
-	<div class="flex gap-1.5">
-		{#each sectors as s}
-			{@const isActive = sectorFilter === s}
-			<button
-				class="text-xs px-3 py-1.5 rounded-lg transition-colors {isActive
-					? 'bg-ai/15 text-ai border border-ai/30'
-					: 'bg-bg-card border border-border text-text-muted hover:text-text hover:bg-bg-card-hover'}"
-				onclick={() => sectorFilter = s}
-			>
-				{sectorLabels[s]}
-				{#if s !== 'all'}
-					{@const count = threads.filter(t => t.sector === s).length}
-					{#if count > 0}
-						<span class="ml-1 text-[10px] opacity-60">{count}</span>
+	<!-- Sector filters + Sort -->
+	<div class="flex items-center justify-between gap-3">
+		<div class="flex gap-1.5">
+			{#each sectors as s}
+				{@const isActive = sectorFilter === s}
+				<button
+					class="text-xs px-3 py-1.5 rounded-lg transition-colors {isActive
+						? 'bg-ai/15 text-ai border border-ai/30'
+						: 'bg-bg-card border border-border text-text-muted hover:text-text hover:bg-bg-card-hover'}"
+					onclick={() => sectorFilter = s}
+				>
+					{sectorLabels[s]}
+					{#if s !== 'all'}
+						{@const count = threads.filter(t => t.sector === s).length}
+						{#if count > 0}
+							<span class="ml-1 text-[10px] opacity-60">{count}</span>
+						{/if}
 					{/if}
-				{/if}
-			</button>
-		{/each}
+				</button>
+			{/each}
+		</div>
+		<div class="flex gap-1">
+			{#each sortOptions as opt}
+				<button
+					class="text-[10px] px-2 py-1 rounded transition-colors {sortBy === opt.value
+						? 'bg-bg-card text-text border border-border'
+						: 'text-text-muted hover:text-text'}"
+					onclick={() => sortBy = opt.value}
+				>
+					{opt.label}
+				</button>
+			{/each}
+		</div>
 	</div>
 
 	{#if isLoading}
@@ -132,18 +174,19 @@
 				<button class="text-sm text-ai hover:underline" onclick={loadTrends}>Retry</button>
 			</div>
 		</div>
-	{:else if filtered.length > 0}
+	{:else if sorted.length > 0}
 		<div class="space-y-3">
-			{#each filtered as thread (thread.id)}
+			{#each sorted as thread (thread.id)}
 				{@const color = SECTORS[thread.sector as SectorId]?.color ?? 'var(--color-text-muted)'}
-				{@const traj = trajectoryMeta[thread.trajectory] ?? trajectoryMeta.emerging}
+				{@const traj = trajectoryMeta[thread.trajectory] ?? trajectoryMeta.rising}
 				{@const maxSpark = Math.max(...thread.sparkline, 1)}
+				{@const isCrossSector = thread.sectors.length >= 2}
 
 				<div class="bg-bg-card border border-border rounded-xl overflow-hidden">
 					<!-- Card header -->
 					<div class="px-4 pt-3 pb-2 border-l-2" style="border-left-color: {color}">
 						<div class="flex items-center justify-between">
-							<div class="flex items-center gap-2.5">
+							<div class="flex items-center gap-2 flex-wrap">
 								<button
 									class="text-sm font-semibold text-text hover:text-ai transition-colors"
 									onclick={() => askAbout(thread.title)}
@@ -154,8 +197,27 @@
 								<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium {traj.class}">
 									{traj.icon} {traj.label}
 								</span>
+
+								<!-- Acceleration badge -->
+								{#if thread.acceleration >= 1.5}
+									<span class="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-400 font-mono">
+										{thread.acceleration.toFixed(1)}x
+									</span>
+								{/if}
+
+								<!-- Sentiment indicator -->
+								<span class="text-[10px] {sentimentColor(thread.sentiment_avg)}" title="Sentiment: {thread.sentiment_avg.toFixed(2)}">
+									{sentimentIcon(thread.sentiment_avg)}
+								</span>
+
+								<!-- Cross-sector badge -->
+								{#if isCrossSector}
+									<span class="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-400" title="Appears in: {thread.sectors.join(', ')}">
+										⊕ {thread.sectors.length} sectors
+									</span>
+								{/if}
 							</div>
-							<div class="flex items-center gap-3 text-[10px] text-text-muted">
+							<div class="flex items-center gap-3 text-[10px] text-text-muted shrink-0">
 								<span>{thread.mention_count} mentions</span>
 								<span>{thread.days_active}d active</span>
 							</div>
@@ -172,6 +234,43 @@
 								></div>
 							{/each}
 						</div>
+
+						<!-- Related entities pills -->
+						{#if thread.related_entities.length > 0}
+							<div class="flex items-center gap-1.5 mt-2 flex-wrap">
+								<span class="text-[9px] text-text-muted uppercase tracking-wider">Related:</span>
+								{#each thread.related_entities.slice(0, 4) as rel}
+									<button
+										class="text-[10px] px-1.5 py-0.5 rounded bg-bg border border-border text-text-secondary hover:text-text hover:border-ai/30 transition-colors"
+										onclick={() => askAbout(rel.name)}
+										title="Co-mentioned {rel.strength} times"
+									>
+										{rel.name}
+									</button>
+								{/each}
+							</div>
+						{/if}
+
+						<!-- Causal consequence -->
+						{#if thread.causal_consequence}
+							<div class="mt-2 flex items-center gap-1.5">
+								<span class="text-[9px] text-text-muted">→</span>
+								<span class="text-[10px] text-amber-400/80 italic">Expect: {thread.causal_consequence}</span>
+							</div>
+						{/if}
+
+						<!-- Linked prediction -->
+						{#if thread.prediction}
+							<div class="mt-2 flex items-center gap-1.5">
+								<span class="text-[9px] text-violet-400">⊕</span>
+								<a
+									href="/predictions"
+									class="text-[10px] text-violet-400/80 hover:text-violet-400 transition-colors"
+								>
+									Prediction: {thread.prediction.title} ({Math.round(thread.prediction.confidence * 100)}%)
+								</a>
+							</div>
+						{/if}
 					</div>
 
 					<!-- Story timeline -->

@@ -215,10 +215,10 @@
 		out = out.replace(/\*(.+?)\*/g, '<em class="italic text-text-secondary">$1</em>');
 		// Inline code
 		out = out.replace(/`(.+?)`/g, '<code class="text-xs bg-bg-card-hover px-1 py-0.5 rounded font-mono">$1</code>');
-		// Confidence badges — match "HIGH CONFIDENCE", "HIGH:", "Confidence: HIGH", "HIGH confidence", etc.
-		out = out.replace(/\b(HIGH)\s*(CONFIDENCE|confidence)?:?/g, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/15 text-emerald-400">HIGH</span>');
-		out = out.replace(/\b(MODERATE)\s*(CONFIDENCE|confidence)?:?/g, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/15 text-amber-400">MODERATE</span>');
-		out = out.replace(/\b(LOW)\s*(CONFIDENCE|confidence)?:?/g, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-500/15 text-red-400">LOW</span>');
+		// Confidence badges — match "HIGH CONFIDENCE", "High confidence", "HIGH:", "high", etc.
+		out = out.replace(/\b(HIGH)\s*(CONFIDENCE)?:?/gi, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/15 text-emerald-400">HIGH</span>');
+		out = out.replace(/\b(MODERATE)\s*(CONFIDENCE)?:?/gi, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/15 text-amber-400">MODERATE</span>');
+		out = out.replace(/\b(LOW)\s*(CONFIDENCE)?:?/gi, '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-500/15 text-red-400">LOW</span>');
 		// Restore links
 		for (let i = 0; i < links.length; i++) {
 			const [text, url] = links[i];

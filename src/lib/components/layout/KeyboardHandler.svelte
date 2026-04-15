@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { activeSectors, expandedStoryId } from '$lib/stores/briefing';
-	import { navigateDown, navigateUp, expandFocused } from '$lib/stores/navigation';
+	import { navigateDown, navigateUp, expandFocused, showShortcutHelp } from '$lib/stores/navigation';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import type { SectorId } from '$lib/config';
@@ -75,7 +75,7 @@
 				break;
 			case '?':
 				event.preventDefault();
-				goto('/ask');
+				showShortcutHelp.update(v => !v);
 				break;
 			case 'f':
 				event.preventDefault();

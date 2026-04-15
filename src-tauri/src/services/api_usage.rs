@@ -12,6 +12,28 @@ const PRICING: &[(&str, &str, f64, f64)] = &[
     ("groq", "llama-3.3-70b", 0.59, 0.79),
     ("voyage", "voyage-3-lite", 0.02, 0.0), // embeddings: input only
     ("tavily", "search", 0.0, 0.0),          // free tier
+    // Financial data APIs (all free)
+    ("fred", "economic", 0.0, 0.0),
+    ("finnhub", "quote", 0.0, 0.0),
+    ("fec", "campaign", 0.0, 0.0),
+    ("eia", "energy", 0.0, 0.0),
+    ("sec_edgar", "filing", 0.0, 0.0),
+    ("usaspending", "contract", 0.0, 0.0),
+    ("federal_register", "rule", 0.0, 0.0),
+    ("alpaca", "trading", 0.0, 0.0),
+];
+
+/// Rate limits for financial APIs (calls per minute unless noted)
+/// (provider, calls_per_minute, calls_per_day, description)
+pub const FINANCIAL_RATE_LIMITS: &[(&str, i64, i64, &str)] = &[
+    ("fred",              120,   -1,     "FRED (120/min)"),
+    ("finnhub",            60,   -1,     "Finnhub (60/min)"),
+    ("fec",                60, 1000,     "FEC (1000/hr)"),
+    ("eia",                -1,   -1,     "EIA (no limit)"),
+    ("sec_edgar",         600,   -1,     "SEC EDGAR (10/sec)"),
+    ("usaspending",        -1,   -1,     "USASpending (no limit)"),
+    ("federal_register",   -1,   -1,     "Federal Register (no limit)"),
+    ("alpaca",            200,   -1,     "Alpaca (200/min)"),
 ];
 
 pub fn estimate_cost(provider: &str, model: &str, input_tokens: i64, output_tokens: i64) -> f64 {
@@ -137,4 +159,56 @@ pub fn get_usage(conn: &Connection, days: u32) -> Result<UsageStats> {
         by_provider: rows,
         daily,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Financial API quota tracking
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinancialApiQuota {
+    pub provider: String,
+    pub description: String,
+    pub calls_today: i64,
+    pub calls_this_hour: i64,
+    pub limit_per_minute: i64,   // -1 = no limit
+    pub limit_per_day: i64,      // -1 = no limit
+    pub last_call_at: Option<String>,
+}
+
+/// Get usage quotas for all financial APIs.
+pub fn get_financial_quotas(conn: &Connection) -> Result<Vec<FinancialApiQuota>> {
+    let mut quotas = Vec::new();
+
+    for &(provider, rpm, daily_limit, desc) in FINANCIAL_RATE_LIMITS {
+        let calls_today: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM api_usage WHERE provider = ?1 AND DATE(created_at) = DATE('now')",
+            params![provider],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        let calls_this_hour: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM api_usage WHERE provider = ?1 AND created_at >= datetime('now', '-1 hour')",
+            params![provider],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        let last_call: Option<String> = conn.query_row(
+            "SELECT MAX(created_at) FROM api_usage WHERE provider = ?1",
+            params![provider],
+            |row| row.get(0),
+        ).unwrap_or(None);
+
+        quotas.push(FinancialApiQuota {
+            provider: provider.to_string(),
+            description: desc.to_string(),
+            calls_today,
+            calls_this_hour,
+            limit_per_minute: rpm,
+            limit_per_day: daily_limit,
+            last_call_at: last_call,
+        });
+    }
+
+    Ok(quotas)
 }

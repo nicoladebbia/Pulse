@@ -6,4 +6,7 @@ pub mod chat;
 pub mod freedoms;
 pub mod trends;
 pub mod ideas;
+pub mod predictions;
 pub mod usage;
+pub mod cross_signals;
+pub mod trading;

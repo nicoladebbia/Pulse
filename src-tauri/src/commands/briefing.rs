@@ -26,6 +26,8 @@ fn read_story(row: &rusqlite::Row) -> rusqlite::Result<Story> {
         created_at: row.get(16)?,
         summary_depth: row.get(17).ok(),
         deep_summary: row.get(18).ok(),
+        source_type: row.get(19).ok(),
+        financial_metadata: row.get(20).ok(),
     })
 }
 
@@ -43,13 +45,15 @@ fn read_briefing(row: &rusqlite::Row) -> rusqlite::Result<Briefing> {
         briefing_type: row.get::<_, String>(9).unwrap_or_else(|_| "daily".to_string()),
         executive_summary: row.get(10).ok(),
         time_label: row.get(11).ok(),
+        hero_headline: row.get(12).ok(),
     })
 }
 
 const BRIEFING_SQL: &str =
-    "SELECT id, date, story_count, ai_count, miami_count, italy_count, tech_count, status, created_at, briefing_type, executive_summary, time_label
-     FROM briefings WHERE date = ?1 AND briefing_type = 'daily'
-     ORDER BY created_at DESC LIMIT 1";
+    "SELECT b.id, b.date, b.story_count, b.ai_count, b.miami_count, b.italy_count, b.tech_count, b.status, b.created_at, b.briefing_type, b.executive_summary, b.time_label,
+            (SELECT s.headline FROM stories s WHERE s.briefing_id = b.id AND s.is_hero = 1 LIMIT 1)
+     FROM briefings b WHERE b.date = ?1 AND b.briefing_type = 'daily'
+     ORDER BY b.created_at DESC LIMIT 1";
 
 fn load_connections(conn: &rusqlite::Connection, briefing_id: i64) -> Vec<BriefingConnection> {
     let mut stmt = match conn.prepare(
@@ -85,7 +89,8 @@ const STORIES_SQL: &str =
     "SELECT id, briefing_id, sector, headline, summary, key_facts,
             why_it_matters, what_to_watch, importance_score, relevance_score,
             relevance_reason, is_hero, display_order, original_url, source_name,
-            published_at, created_at, summary_depth, deep_summary
+            published_at, created_at, summary_depth, deep_summary,
+            source_type, financial_metadata
      FROM stories WHERE briefing_id = ?1
      ORDER BY display_order ASC";
 
@@ -102,8 +107,9 @@ fn load_briefing_by_id(conn: &rusqlite::Connection, briefing_id: i64) -> Result<
 
     let briefing: Option<Briefing> = conn
         .query_row(
-            "SELECT id, date, story_count, ai_count, miami_count, italy_count, tech_count, status, created_at, briefing_type, executive_summary, time_label
-             FROM briefings WHERE id = ?1",
+            "SELECT b.id, b.date, b.story_count, b.ai_count, b.miami_count, b.italy_count, b.tech_count, b.status, b.created_at, b.briefing_type, b.executive_summary, b.time_label,
+                    (SELECT s.headline FROM stories s WHERE s.briefing_id = b.id AND s.is_hero = 1 LIMIT 1)
+             FROM briefings b WHERE b.id = ?1",
             [briefing_id],
             read_briefing,
         )
@@ -215,8 +221,9 @@ pub fn list_briefings(db: State<DbState>) -> Result<Vec<Briefing>, String> {
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, date, story_count, ai_count, miami_count, italy_count, tech_count, status, created_at, briefing_type, executive_summary, time_label
-             FROM briefings ORDER BY date DESC, created_at DESC LIMIT 100",
+            "SELECT b.id, b.date, b.story_count, b.ai_count, b.miami_count, b.italy_count, b.tech_count, b.status, b.created_at, b.briefing_type, b.executive_summary, b.time_label,
+                    (SELECT s.headline FROM stories s WHERE s.briefing_id = b.id AND s.is_hero = 1 LIMIT 1)
+             FROM briefings b ORDER BY b.date DESC, b.created_at DESC LIMIT 100",
         )
         .map_err(|e| e.to_string())?;
 

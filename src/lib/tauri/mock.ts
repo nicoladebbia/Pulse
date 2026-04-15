@@ -1,4 +1,4 @@
-import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread } from './types';
+import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread } from './types';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -14,7 +14,7 @@ const mockStories: Story[] = [
 		is_hero: true, display_order: 1,
 		original_url: 'https://example.com/gpt5', source_name: 'TechCrunch',
 		published_at: today, created_at: today,
-		summary_depth: 'deep',
+		summary_depth: 'deep', source_type: 'news', financial_metadata: null,
 		deep_summary: '**Background**: OpenAI has been racing to maintain its lead in the foundation model space since ChatGPT\'s breakout in late 2022. GPT-4, released in March 2023, set the benchmark for multimodal AI but faced increasing competition from Anthropic\'s Claude, Google\'s Gemini, and open-source models like Llama.\n\n**Key Players**: Sam Altman positioned GPT-5 as a "paradigm shift" in reasoning. Microsoft, as OpenAI\'s primary investor, gains immediate enterprise distribution advantages. Anthropic and Google are likely weeks away from counter-announcements.\n\n**Multiple Angles**: Enterprise users see the reasoning capability as a potential replacement for expensive human review processes. AI safety researchers have expressed concern about the model\'s ability to chain multi-step reasoning without oversight. Open-source advocates argue this widens the capability gap between proprietary and open models.\n\n**Implications**: For AI app builders, GPT-5\'s reasoning API opens new product categories — automated due diligence, real-time strategy analysis, and code architecture planning. The 40% MATH improvement suggests it could handle financial modeling tasks previously requiring specialized systems.\n\n**What Happens Next**: Expect Anthropic to accelerate Claude 4 release timeline. Enterprise adoption will hinge on pricing — if OpenAI maintains GPT-4 pricing levels, expect rapid migration within 90 days.',
 	},
 	{
@@ -28,7 +28,7 @@ const mockStories: Story[] = [
 		is_hero: false, display_order: 2,
 		original_url: 'https://example.com/apple-robotics', source_name: 'Bloomberg',
 		published_at: today, created_at: today,
-		summary_depth: null, deep_summary: null,
+		summary_depth: null, deep_summary: null, source_type: 'news', financial_metadata: null,
 	},
 	{
 		id: 3, briefing_id: 1, sector: 'miami',
@@ -41,7 +41,7 @@ const mockStories: Story[] = [
 		is_hero: false, display_order: 3,
 		original_url: 'https://example.com/miami-tech', source_name: 'Miami Herald',
 		published_at: today, created_at: today,
-		summary_depth: null, deep_summary: null,
+		summary_depth: null, deep_summary: null, source_type: 'news', financial_metadata: null,
 	},
 	{
 		id: 4, briefing_id: 1, sector: 'italy',
@@ -54,7 +54,7 @@ const mockStories: Story[] = [
 		is_hero: false, display_order: 4,
 		original_url: 'https://example.com/italy-ai', source_name: 'Corriere della Sera',
 		published_at: today, created_at: today,
-		summary_depth: null, deep_summary: null,
+		summary_depth: null, deep_summary: null, source_type: 'news', financial_metadata: null,
 	},
 	{
 		id: 5, briefing_id: 1, sector: 'ai',
@@ -67,7 +67,7 @@ const mockStories: Story[] = [
 		is_hero: false, display_order: 5,
 		original_url: 'https://example.com/anthropic', source_name: 'The Information',
 		published_at: today, created_at: today,
-		summary_depth: null, deep_summary: null,
+		summary_depth: null, deep_summary: null, source_type: 'news', financial_metadata: null,
 	},
 	{
 		id: 6, briefing_id: 1, sector: 'tech',
@@ -80,7 +80,7 @@ const mockStories: Story[] = [
 		is_hero: false, display_order: 6,
 		original_url: 'https://example.com/rust', source_name: 'Stack Overflow Blog',
 		published_at: today, created_at: today,
-		summary_depth: null, deep_summary: null,
+		summary_depth: null, deep_summary: null, source_type: 'news', financial_metadata: null,
 	},
 	{
 		id: 7, briefing_id: 1, sector: 'miami',
@@ -93,7 +93,7 @@ const mockStories: Story[] = [
 		is_hero: false, display_order: 7,
 		original_url: 'https://example.com/climate', source_name: 'South Florida Business Journal',
 		published_at: today, created_at: today,
-		summary_depth: null, deep_summary: null,
+		summary_depth: null, deep_summary: null, source_type: 'news', financial_metadata: null,
 	},
 ];
 
@@ -153,37 +153,49 @@ export const mockArchiveBriefings: Briefing[] = [
 
 export const mockTrends: TrendThread[] = [
 	{
-		id: 1, title: 'Anthropic', sector: 'ai', trajectory: 'emerging', acceleration: 2.5,
+		id: 1, title: 'Anthropic', sector: 'ai', trajectory: 'dominant', acceleration: 2.5,
 		mention_count: 29, days_active: 14, sparkline: [2, 3, 1, 2, 3, 2, 1, 3, 2, 2, 1, 3, 2, 2],
 		points: [
 			{ story_id: 1, date: daysAgo(0), headline: 'Claude gains computer control capability for task automation', significance: 8 },
 			{ story_id: 2, date: daysAgo(1), headline: 'Anthropic leaks Claude Mythos with dramatically higher benchmarks', significance: 9 },
 			{ story_id: 3, date: daysAgo(3), headline: 'Anthropic raises $5B Series E at $60B valuation', significance: 7 },
 		],
+		sentiment_avg: 0.65, related_entities: [{ name: 'OpenAI', strength: 8 }, { name: 'Google DeepMind', strength: 5 }, { name: 'Claude', strength: 4 }],
+		sectors: ['ai', 'tech'], causal_consequence: 'GPU demand',
+		prediction: { title: 'Claude will become the default coding assistant', confidence: 0.60 },
 	},
 	{
-		id: 2, title: 'OpenAI', sector: 'ai', trajectory: 'emerging', acceleration: 2.4,
+		id: 2, title: 'OpenAI', sector: 'ai', trajectory: 'hot', acceleration: 2.4,
 		mention_count: 25, days_active: 14, sparkline: [1, 2, 3, 2, 1, 2, 2, 1, 3, 2, 1, 2, 1, 2],
 		points: [
 			{ story_id: 4, date: daysAgo(0), headline: 'OpenAI preps Operator agentic AI launch', significance: 8 },
 			{ story_id: 5, date: daysAgo(2), headline: 'GPT-5 timeline confirmed for Q2 release', significance: 9 },
 		],
+		sentiment_avg: 0.35, related_entities: [{ name: 'Anthropic', strength: 8 }, { name: 'Microsoft', strength: 7 }],
+		sectors: ['ai', 'tech', 'miami'], causal_consequence: 'AI regulation',
+		prediction: null,
 	},
 	{
-		id: 3, title: 'Giorgia Meloni', sector: 'italy', trajectory: 'emerging', acceleration: 2.6,
+		id: 3, title: 'Giorgia Meloni', sector: 'italy', trajectory: 'rising', acceleration: 2.6,
 		mention_count: 11, days_active: 9, sparkline: [0, 1, 0, 1, 2, 0, 1, 1, 0, 1, 1, 1, 1, 0],
 		points: [
 			{ story_id: 6, date: daysAgo(1), headline: 'Meloni pushes new AI governance framework in EU', significance: 6 },
 			{ story_id: 7, date: daysAgo(4), headline: 'Italy-US tech partnership announced at bilateral summit', significance: 5 },
 		],
+		sentiment_avg: -0.15, related_entities: [{ name: 'EU', strength: 4 }],
+		sectors: ['italy'], causal_consequence: null,
+		prediction: null,
 	},
 	{
-		id: 4, title: 'SpaceX', sector: 'tech', trajectory: 'emerging', acceleration: 3.8,
+		id: 4, title: 'SpaceX', sector: 'tech', trajectory: 'rising', acceleration: 3.8,
 		mention_count: 7, days_active: 7, sparkline: [0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1],
 		points: [
 			{ story_id: 8, date: daysAgo(0), headline: 'SpaceX Starship completes first orbital refueling test', significance: 9 },
 			{ story_id: 9, date: daysAgo(3), headline: 'SpaceX wins $3B NASA Artemis lunar cargo contract', significance: 7 },
 		],
+		sentiment_avg: 0.8, related_entities: [{ name: 'NASA', strength: 6 }, { name: 'Blue Origin', strength: 3 }],
+		sectors: ['tech'], causal_consequence: 'Satellite internet',
+		prediction: null,
 	},
 ];
 
@@ -384,6 +396,31 @@ export function simulateIdeaGeneration(onEvent: (event: IdeaStreamEvent) => void
 	};
 	next();
 }
+
+// === Mock Predictions ===
+
+export const mockPredictions: Prediction[] = [
+	{ id: 1, title: 'GPT-5 will surpass human performance on ARC-AGI', prediction: 'Within 6 months of release, GPT-5 will achieve >90% on ARC-AGI benchmark', confidence: 0.72, reasoning: 'Based on trajectory of improvements and OpenAI\'s focus on reasoning', evidence_types: ['signal', 'causal_chain'], evidence_story_ids: [1, 3], predicted_timeframe: '2026-09-01', sector: 'ai', status: 'active', probability_history: [0.55, 0.60, 0.65, 0.68, 0.72] },
+	{ id: 2, title: 'Miami tech hub will attract 3 major AI companies', prediction: 'At least 3 AI companies valued >$1B will establish Miami offices', confidence: 0.65, reasoning: 'Tax incentives + growing talent pool + recent announcements', evidence_types: ['signal'], evidence_story_ids: [5], predicted_timeframe: '2026-12-31', sector: 'miami', status: 'active', probability_history: [0.50, 0.55, 0.60, 0.65] },
+	{ id: 3, title: 'EU AI Act enforcement will cause compliance rush', prediction: 'Major SaaS companies will scramble to comply with EU AI Act by Q3 2026', confidence: 0.85, reasoning: 'Regulatory deadline approaching with most companies unprepared', evidence_types: ['pattern', 'signal'], evidence_story_ids: [2, 7], predicted_timeframe: '2026-08-01', sector: 'tech', status: 'active', probability_history: [0.70, 0.75, 0.80, 0.82, 0.85] },
+	{ id: 4, title: 'Italy Serie A streaming deal will double in value', prediction: 'Next Serie A broadcast rights deal will exceed €2B', confidence: 0.55, reasoning: 'Growing international interest and streaming competition', evidence_types: ['signal'], evidence_story_ids: [8], predicted_timeframe: '2027-01-01', sector: 'italy', status: 'active', probability_history: [0.60, 0.58, 0.55] },
+	{ id: 5, title: 'Claude will become the default coding assistant', prediction: 'Anthropic\'s Claude will surpass GitHub Copilot in developer adoption', confidence: 0.60, reasoning: 'Claude Code adoption rate and developer satisfaction metrics', evidence_types: ['causal_chain', 'pattern'], evidence_story_ids: [1, 4], predicted_timeframe: '2026-06-15', sector: 'ai', status: 'partially_validated', probability_history: [0.40, 0.45, 0.50, 0.55, 0.58, 0.60] },
+	{ id: 6, title: 'Apple Vision Pro price drop', prediction: 'Apple will release a sub-$2000 Vision Pro variant', confidence: 0.78, reasoning: 'Supply chain leaks and competitive pressure from Meta Quest', evidence_types: ['signal'], evidence_story_ids: [6], predicted_timeframe: '2026-03-01', sector: 'tech', status: 'validated', probability_history: [0.65, 0.70, 0.75, 0.78] },
+	{ id: 7, title: 'Crypto winter ends with ETF approvals', prediction: 'Bitcoin will reach new ATH following spot ETF approval wave', confidence: 0.70, reasoning: 'Institutional demand + regulatory clarity', evidence_types: ['pattern', 'signal'], evidence_story_ids: [9], predicted_timeframe: '2025-12-01', sector: 'tech', status: 'invalidated', probability_history: [0.80, 0.75, 0.70, 0.60, 0.50] },
+	{ id: 8, title: 'Remote work mandate reversal in Big Tech', prediction: 'At least 2 FAANG companies will reverse RTO mandates', confidence: 0.40, reasoning: 'Employee pushback and productivity data', evidence_types: ['contrarian'], evidence_story_ids: [10], predicted_timeframe: '2026-01-01', sector: 'tech', status: 'expired', probability_history: [0.55, 0.50, 0.45, 0.40] },
+	{ id: 9, title: 'Italian fintech regulation modernization', prediction: 'Italy will pass comprehensive fintech sandbox legislation', confidence: 0.50, reasoning: 'EU pressure and competition from other member states', evidence_types: ['pattern'], evidence_story_ids: [11], predicted_timeframe: '2026-07-01', sector: 'italy', status: 'active', probability_history: [0.50] },
+];
+
+export const mockPredictionStats: PredictionStats = {
+	total: 9,
+	active: 5,
+	validated: 1,
+	partially_validated: 1,
+	invalidated: 1,
+	expired: 1,
+	accuracy_rate: 0.667,
+	avg_brier_score: null,
+};
 
 // === Mock Usage Stats ===
 

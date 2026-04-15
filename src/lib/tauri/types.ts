@@ -18,6 +18,8 @@ export interface Story {
 	created_at: string;
 	summary_depth: string | null;
 	deep_summary: string | null;
+	source_type: string | null;
+	financial_metadata: string | null;
 }
 
 export interface StorySource {
@@ -52,6 +54,7 @@ export interface Briefing {
 	briefing_type: string;
 	executive_summary: string | null;
 	time_label: string | null;
+	hero_headline: string | null;
 }
 
 export interface BriefingConnection {
@@ -234,6 +237,43 @@ export type IdeaStreamEvent =
 	| { event: 'Complete'; data: { ideas: ProjectIdea[] } }
 	| { event: 'Error'; data: { message: string } };
 
+// === Prediction Types ===
+
+export interface Prediction {
+	id: number;
+	title: string;
+	prediction: string;
+	confidence: number;
+	reasoning: string;
+	evidence_types: string[];
+	evidence_story_ids: number[];
+	predicted_timeframe: string;
+	sector: string | null;
+	status: 'active' | 'validated' | 'partially_validated' | 'invalidated' | 'expired';
+	probability_history: number[];
+}
+
+export interface PredictionStats {
+	total: number;
+	active: number;
+	validated: number;
+	partially_validated: number;
+	invalidated: number;
+	expired: number;
+	accuracy_rate: number;
+	avg_brier_score: number | null;
+}
+
+// === Story Entity Context ===
+
+export interface StoryEntityContext {
+	name: string;
+	entity_type: string | null;
+	trajectory: string;
+	acceleration: number;
+	sentiment: number;
+}
+
 // === Trend Types ===
 
 export interface TrendPoint {
@@ -241,6 +281,11 @@ export interface TrendPoint {
 	date: string;
 	headline: string;
 	significance: number;
+}
+
+export interface RelatedEntity {
+	name: string;
+	strength: number;
 }
 
 export interface TrendThread {
@@ -253,6 +298,22 @@ export interface TrendThread {
 	days_active: number;
 	sparkline: number[];
 	points: TrendPoint[];
+	sentiment_avg: number;
+	related_entities: RelatedEntity[];
+	sectors: string[];
+	causal_consequence: string | null;
+	prediction: TrendPrediction | null;
+}
+
+export interface TrendPrediction {
+	title: string;
+	confidence: number;
+}
+
+export interface IntelligenceCounts {
+	entity_count: number;
+	active_prediction_count: number;
+	hot_signal_count: number;
 }
 
 // === API Usage Types ===
@@ -287,4 +348,130 @@ export interface UsageStats {
 	total_calls: number;
 	by_provider: ProviderUsage[];
 	daily: DailyCost[];
+}
+
+// === Financial API Quota Types ===
+
+export interface FinancialApiQuota {
+	provider: string;
+	description: string;
+	calls_today: number;
+	calls_this_hour: number;
+	limit_per_minute: number;  // -1 = no limit
+	limit_per_day: number;     // -1 = no limit
+	last_call_at: string | null;
+}
+
+// === Paper Trading Types ===
+
+export interface Portfolio {
+	equity: number;
+	cash: number;
+	buying_power: number;
+	portfolio_value: number;
+	positions: Position[];
+	open_trades: PaperTrade[];
+	closed_trades: PaperTrade[];
+}
+
+export interface Position {
+	symbol: string;
+	qty: number;
+	avg_entry_price: number;
+	current_price: number;
+	market_value: number;
+	unrealized_pl: number;
+	unrealized_pl_pct: number;
+	side: string;
+}
+
+export interface PaperTrade {
+	id: number;
+	entity_id: number;
+	ticker: string;
+	direction: string;
+	entry_price: number;
+	entry_date: string;
+	exit_price: number | null;
+	exit_date: string | null;
+	position_size: number;
+	confidence: number;
+	signal_profile: string;
+	status: string;
+	pnl: number | null;
+	pnl_pct: number | null;
+}
+
+// === Financial Events ===
+
+export interface FinancialEvent {
+	id: number;
+	source_name: string;
+	feed_id: string;
+	headline: string;
+	summary: string;
+	published_at: string | null;
+	sector: string;
+	financial_metadata: string | null;
+}
+
+// === Signal Evidence (Buy Reasons) ===
+
+export interface SignalEvidence {
+	entity_name: string;
+	ticker: string | null;
+	compound_score: number;
+	reasons: string[];
+	source_stories: EvidenceStory[];
+	price: number | null;
+	price_change_1d: number | null;
+	recommendation: string;
+	position_size_pct: number;
+}
+
+export interface EvidenceStory {
+	headline: string;
+	source_name: string;
+	published_at: string | null;
+}
+
+// === Source Health ===
+
+export interface SourceHealth {
+	name: string;
+	status: string;
+	last_count: number;
+	last_fetch: string | null;
+	description: string;
+}
+
+// === Market Price Types ===
+
+export interface EntityPrice {
+	ticker: string;
+	date: string;
+	close: number;
+	change_1d: number | null;
+	change_7d: number | null;
+	change_30d: number | null;
+	entity_name: string | null;
+}
+
+// === Cross-Signal Types ===
+
+export interface CrossSignal {
+	entity_id: number;
+	entity_name: string;
+	ticker: string | null;
+	compound_score: number;
+	insider_signal: number;
+	institutional_flow: number;
+	news_momentum: number;
+	government_signal: number;
+	search_trend: number;
+	patent_signal: number;
+	supply_chain: number;
+	political_signal: number;
+	source_diversity: number;
+	convergence_detected: boolean;
 }

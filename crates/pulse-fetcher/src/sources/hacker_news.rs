@@ -69,6 +69,8 @@ async fn fetch_endpoint(
                 sector: sector.to_string(),
                 feed_id: format!("hn_{}", sector),
                 language: "en".to_string(),
+                source_type: "news".to_string(),
+                financial_metadata: None,
             })
         })
         .collect();

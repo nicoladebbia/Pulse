@@ -1,7 +1,8 @@
 <script lang="ts">
-	import { messages, isStreaming, isSearching, startNewThread, sendMessage, cancelStream, regenerateLastMessage, lastResponse, lastSearchSource } from '$lib/stores/chat';
+	import { messages, isStreaming, isSearching, startNewThread, sendMessage, cancelStream, regenerateLastMessage, lastResponse } from '$lib/stores/chat';
 	import ChatMessage from '$lib/components/chat/ChatMessage.svelte';
 	import ChatThinking from '$lib/components/chat/ChatThinking.svelte';
+	import ChatInsights from '$lib/components/chat/ChatInsights.svelte';
 	import { getChatContext } from '$lib/tauri/commands';
 	import { isTauri } from '$lib/tauri/mock';
 	import type { ChatContext } from '$lib/tauri/types';
@@ -9,14 +10,17 @@
 	let query = $state('');
 	let messagesContainer: HTMLElement;
 	let chatContext = $state<ChatContext | null>(null);
+	let feedbackStats = $state<any>(null);
 	let contextLoaded = $state(false);
 
-	// Load dynamic suggestions
+	// Load dynamic suggestions and feedback stats
 	$effect(() => {
 		if (contextLoaded) return;
 		contextLoaded = true;
 		if (isTauri()) {
 			getChatContext().then(ctx => { chatContext = ctx; }).catch(() => {});
+			const ipc = (window as any).__TAURI_INTERNALS__;
+			ipc?.invoke('get_feedback_stats').then((s: any) => { feedbackStats = s; }).catch(() => {});
 		}
 	});
 
@@ -150,20 +154,55 @@
 						{/each}
 					</div>
 				{/if}
+
+				<!-- Feedback stats: most reliable sources -->
+				{#if feedbackStats?.top_sources?.length > 0}
+					<div class="max-w-sm mx-auto mt-8 bg-bg-card border border-border rounded-xl p-3">
+						<p class="text-[10px] font-medium uppercase tracking-wider text-text-muted mb-2">Your Most Reliable Sources</p>
+						<div class="space-y-1.5">
+							{#each feedbackStats.top_sources.slice(0, 5) as source}
+								{@const repPct = Math.round((source.reputation ?? 0.5) * 100)}
+								<div class="flex items-center justify-between">
+									<span class="text-xs text-text-secondary truncate mr-2">{source.name}</span>
+									<div class="flex items-center gap-2">
+										<div class="w-12 h-1 bg-border rounded-full overflow-hidden">
+											<div
+												class="h-full rounded-full {repPct >= 70 ? 'bg-emerald-400' : repPct >= 50 ? 'bg-amber-400' : 'bg-rose-400'}"
+												style="width: {repPct}%"
+											></div>
+										</div>
+										<span class="text-[10px] font-mono text-text-muted w-7 text-right">{repPct}%</span>
+									</div>
+								</div>
+							{/each}
+						</div>
+						{#if feedbackStats.total_up + feedbackStats.total_down > 0}
+							<p class="text-[9px] text-text-muted mt-2 text-center">
+								Based on {feedbackStats.total_up + feedbackStats.total_down} feedback ratings
+							</p>
+						{/if}
+					</div>
+				{/if}
 			</div>
 		{:else}
 			{#each $messages as msg, i (msg.id)}
 				{@const msgIsLast = i === $messages.length - 1 && msg.role === 'assistant'}
+				{@const msgSearchSource = (msg.metadata as Record<string, unknown>)?.search_source as string ?? ''}
 				<ChatMessage
 					message={msg}
 					isLast={msgIsLast}
 					followups={msgIsLast && !$isStreaming ? ($lastResponse?.suggested_followups ?? []) : []}
-					searchSource={msgIsLast && !$isStreaming ? ($lastSearchSource ?? '') : ''}
+					searchSource={!$isStreaming ? msgSearchSource : ''}
 					onAsk={askSuggestion}
 				/>
 			{/each}
 			{#if $isSearching}
 				<ChatThinking />
+			{/if}
+			{#if !$isStreaming && $lastResponse?.proactive_connections?.length}
+				<div class="px-4">
+					<ChatInsights insights={$lastResponse.proactive_connections} />
+				</div>
 			{/if}
 		{/if}
 	</div>

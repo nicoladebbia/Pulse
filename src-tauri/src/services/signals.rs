@@ -124,6 +124,14 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
 
     let mut count = 0usize;
 
+    // Check if source_diversity column exists (added by migration 017)
+    let has_source_diversity = {
+        let mut pragma = conn.prepare("PRAGMA table_info(signals)")?;
+        pragma
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|r| r.as_deref() == Ok("source_diversity"))
+    };
+
     for (topic, sector, w7, w30, w90, days_active) in &rows {
         let acc = compute_acceleration(*w7, *w30);
         let traj = classify_trajectory(*w7, *w30, acc, *days_active);
@@ -141,6 +149,95 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
             params![topic, sector, w7, w30, w90, acc, traj],
         )
         .context("failed to upsert signal")?;
+
+        // Compute source diversity: count distinct feed_ids mentioning this entity in last 7 days
+        if has_source_diversity {
+            let diversity: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT s.feed_id) FROM entity_mentions em
+                 JOIN stories s ON em.story_id = s.id
+                 JOIN entities e ON em.entity_id = e.id
+                 WHERE LOWER(e.name) = LOWER(?1) AND em.mentioned_at >= date(?2, '-7 days')",
+                params![topic, today],
+                |row| row.get(0),
+            ).unwrap_or(0);
+
+            // Insider buy volume — weighted by trade classification signal_weight
+            let insider_vol: f64 = conn.query_row(
+                "SELECT COALESCE(SUM(
+                    CASE WHEN json_valid(s.financial_metadata)
+                         AND json_extract(s.financial_metadata, '$.filing_type') IN ('4', 'form4')
+                    THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.total_value') AS REAL), 0)
+                         * COALESCE(CAST(json_extract(s.financial_metadata, '$.signal_weight') AS REAL), 0.0)
+                    ELSE 0 END
+                ), 0) FROM entity_mentions em
+                JOIN stories s ON em.story_id = s.id
+                JOIN entities e ON em.entity_id = e.id
+                WHERE LOWER(e.name) = LOWER(?1) AND s.source_type = 'financial'
+                  AND em.mentioned_at >= date(?2, '-30 days')",
+                params![topic, today],
+                |row| row.get(0),
+            ).unwrap_or(0.0);
+
+            let contract_val: f64 = conn.query_row(
+                "SELECT COALESCE(SUM(
+                    CASE WHEN json_valid(s.financial_metadata)
+                         AND s.feed_id = 'usaspending'
+                    THEN COALESCE(json_extract(s.financial_metadata, '$.amount'), 0)
+                    ELSE 0 END
+                ), 0) FROM entity_mentions em
+                JOIN stories s ON em.story_id = s.id
+                JOIN entities e ON em.entity_id = e.id
+                WHERE LOWER(e.name) = LOWER(?1) AND s.source_type = 'financial'
+                  AND em.mentioned_at >= date(?2, '-90 days')",
+                params![topic, today],
+                |row| row.get(0),
+            ).unwrap_or(0.0);
+
+            // Lobbying spend (LDA)
+            let lobby_spend: f64 = conn.query_row(
+                "SELECT COALESCE(SUM(
+                    CASE WHEN json_valid(s.financial_metadata)
+                         AND (s.source_name LIKE '%LDA%' OR s.source_name LIKE '%Senate%')
+                    THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
+                    ELSE 0 END
+                ), 0) FROM entity_mentions em
+                JOIN stories s ON em.story_id = s.id
+                JOIN entities e ON em.entity_id = e.id
+                WHERE LOWER(e.name) = LOWER(?1) AND s.source_type = 'financial'
+                  AND em.mentioned_at >= date(?2, '-90 days')",
+                params![topic, today],
+                |row| row.get(0),
+            ).unwrap_or(0.0);
+
+            // Regulatory mentions (Federal Register)
+            let reg_count: f64 = conn.query_row(
+                "SELECT COUNT(*) FROM entity_mentions em
+                 JOIN stories s ON em.story_id = s.id
+                 JOIN entities e ON em.entity_id = e.id
+                 WHERE LOWER(e.name) = LOWER(?1) AND s.source_name LIKE '%Federal Register%'
+                   AND em.mentioned_at >= date(?2, '-30 days')",
+                params![topic, today],
+                |row| row.get::<_, i64>(0),
+            ).unwrap_or(0) as f64;
+
+            // Patent filings (USPTO)
+            let patent_count: f64 = conn.query_row(
+                "SELECT COUNT(*) FROM entity_mentions em
+                 JOIN stories s ON em.story_id = s.id
+                 JOIN entities e ON em.entity_id = e.id
+                 WHERE LOWER(e.name) = LOWER(?1) AND s.source_name = 'USPTO'
+                   AND em.mentioned_at >= date(?2, '-30 days')",
+                params![topic, today],
+                |row| row.get::<_, i64>(0),
+            ).unwrap_or(0) as f64;
+
+            conn.execute(
+                "UPDATE signals SET source_diversity = ?1, insider_buy_volume = ?2, contract_value = ?3,
+                     lobbying_spend_delta = ?4, regulatory_sentiment = ?5, patent_filing_rate = ?6
+                 WHERE topic = ?7 AND (sector = ?8 OR (?8 IS NULL AND sector IS NULL))",
+                params![diversity, insider_vol, contract_val, lobby_spend, reg_count, patent_count, topic, sector],
+            ).ok();
+        }
 
         count += 1;
     }
@@ -374,8 +471,10 @@ mod tests {
 
     #[test]
     fn test_classify_trajectory_fading() {
-        // Has mentions but decelerating
-        assert_eq!(classify_trajectory(2, 11, 0.78, 7), "fading");
+        // Has mentions but decelerating — must not satisfy hot (total>=7 && days>=5)
+        assert_eq!(classify_trajectory(1, 5, 0.5, 3), "fading");
+        // Also fading with more mentions but low acceleration
+        assert_eq!(classify_trajectory(2, 8, 0.7, 4), "fading");
     }
 
     // -----------------------------------------------------------------------
@@ -448,17 +547,17 @@ mod tests {
         // Directly insert signals with known accelerations
         conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
-             VALUES ('Fast', 'ai', 10, 5, 10, 5.0, 'emerging', datetime('now'))",
+             VALUES ('Fast', 'ai', 10, 5, 10, 5.0, 'rising', datetime('now'))",
             [],
         ).unwrap();
         conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
-             VALUES ('Medium', 'tech', 5, 5, 10, 2.0, 'growing', datetime('now'))",
+             VALUES ('Medium', 'tech', 5, 5, 10, 2.0, 'hot', datetime('now'))",
             [],
         ).unwrap();
         conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
-             VALUES ('Slow', 'ai', 3, 10, 20, 0.5, 'declining', datetime('now'))",
+             VALUES ('Slow', 'ai', 3, 10, 20, 0.5, 'fading', datetime('now'))",
             [],
         ).unwrap();
         conn.execute(
@@ -480,28 +579,28 @@ mod tests {
 
         conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
-             VALUES ('A', 'ai', 10, 5, 10, 5.0, 'emerging', datetime('now'))",
+             VALUES ('A', 'ai', 10, 5, 10, 5.0, 'rising', datetime('now'))",
             [],
         ).unwrap();
         conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
-             VALUES ('B', 'ai', 8, 4, 8, 3.0, 'emerging', datetime('now'))",
+             VALUES ('B', 'ai', 8, 4, 8, 3.0, 'rising', datetime('now'))",
             [],
         ).unwrap();
         conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
-             VALUES ('C', 'tech', 5, 5, 10, 1.0, 'peaking', datetime('now'))",
+             VALUES ('C', 'tech', 5, 5, 10, 1.0, 'dominant', datetime('now'))",
             [],
         ).unwrap();
 
-        let emerging = get_signals_by_trajectory(&conn, "emerging", 10).unwrap();
-        assert_eq!(emerging.len(), 2);
-        assert_eq!(emerging[0].topic, "A");
-        assert_eq!(emerging[1].topic, "B");
+        let rising = get_signals_by_trajectory(&conn, "rising", 10).unwrap();
+        assert_eq!(rising.len(), 2);
+        assert_eq!(rising[0].topic, "A");
+        assert_eq!(rising[1].topic, "B");
 
-        let peaking = get_signals_by_trajectory(&conn, "peaking", 10).unwrap();
-        assert_eq!(peaking.len(), 1);
-        assert_eq!(peaking[0].topic, "C");
+        let dominant = get_signals_by_trajectory(&conn, "dominant", 10).unwrap();
+        assert_eq!(dominant.len(), 1);
+        assert_eq!(dominant[0].topic, "C");
     }
 
     #[test]
@@ -510,7 +609,7 @@ mod tests {
 
         conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
-             VALUES ('OpenAI', 'ai', 10, 5, 10, 5.0, 'emerging', datetime('now'))",
+             VALUES ('OpenAI', 'ai', 10, 5, 10, 5.0, 'rising', datetime('now'))",
             [],
         ).unwrap();
 

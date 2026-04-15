@@ -15,6 +15,7 @@ pub struct Briefing {
     pub briefing_type: String,
     pub executive_summary: Option<String>,
     pub time_label: Option<String>,
+    pub hero_headline: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
