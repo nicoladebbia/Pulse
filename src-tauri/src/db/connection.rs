@@ -23,6 +23,7 @@ pub const MIGRATION_016: &str = include_str!("../../../migrations/016_feed_healt
 #[allow(dead_code)]
 pub const MIGRATION_017: &str = include_str!("../../../migrations/017_financial_data.sql");
 pub const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_resolution.sql");
+pub const MIGRATION_019: &str = include_str!("../../../migrations/019_position_management.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -521,6 +522,24 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_entities_canonical ON entities(canonical_id);")?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (18)", [])?;
+    }
+
+    // Migration 19: Position management
+    if !applied.contains(&19) {
+        conn.execute_batch(MIGRATION_019)?;
+        if !column_exists(&conn, "paper_trades", "high_water_mark") {
+            conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN high_water_mark REAL;")?;
+        }
+        if !column_exists(&conn, "paper_trades", "trailing_stop") {
+            conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN trailing_stop REAL;")?;
+        }
+        if !column_exists(&conn, "paper_trades", "original_compound_score") {
+            conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN original_compound_score REAL;")?;
+        }
+        if !column_exists(&conn, "paper_trades", "scale_in_count") {
+            conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN scale_in_count INTEGER DEFAULT 0;")?;
+        }
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (19)", [])?;
     }
 
     // Ensure composite indexes exist (idempotent, no migration version needed)

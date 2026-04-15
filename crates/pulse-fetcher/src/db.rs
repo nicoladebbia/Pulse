@@ -15,6 +15,7 @@ const MIGRATION_015: &str = include_str!("../../../migrations/015_entity_aliases
 const MIGRATION_016: &str = include_str!("../../../migrations/016_feed_health.sql");
 const MIGRATION_017: &str = include_str!("../../../migrations/017_financial_data.sql");
 const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_resolution.sql");
+const MIGRATION_019: &str = include_str!("../../../migrations/019_position_management.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -459,6 +460,28 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         }
 
         tx.execute("INSERT INTO schema_migrations (version) VALUES (18)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 19: Position management columns + portfolio snapshots
+    if !applied.contains(&19) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_019)?;
+
+        if !column_exists(&tx, "paper_trades", "high_water_mark") {
+            tx.execute_batch("ALTER TABLE paper_trades ADD COLUMN high_water_mark REAL;")?;
+        }
+        if !column_exists(&tx, "paper_trades", "trailing_stop") {
+            tx.execute_batch("ALTER TABLE paper_trades ADD COLUMN trailing_stop REAL;")?;
+        }
+        if !column_exists(&tx, "paper_trades", "original_compound_score") {
+            tx.execute_batch("ALTER TABLE paper_trades ADD COLUMN original_compound_score REAL;")?;
+        }
+        if !column_exists(&tx, "paper_trades", "scale_in_count") {
+            tx.execute_batch("ALTER TABLE paper_trades ADD COLUMN scale_in_count INTEGER DEFAULT 0;")?;
+        }
+
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (19)", [])?;
         tx.commit()?;
     }
 

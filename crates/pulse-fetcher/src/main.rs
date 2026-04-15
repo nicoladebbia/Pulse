@@ -7,6 +7,7 @@ mod dedup;
 mod embeddings;
 pub(crate) mod market_prices;
 pub(crate) mod calibration;
+pub(crate) mod position_management;
 
 use chrono::Timelike;
 use clap::Parser;

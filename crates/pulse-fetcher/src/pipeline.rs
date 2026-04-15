@@ -2954,10 +2954,10 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
                 "political": political,
             });
 
-            // Record in paper_trades — matching schema: direction, entry_price, entry_date, position_size, confidence, signal_profile
+            // Record in paper_trades with position management columns
             if let Err(e) = conn.execute(
-                "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status)
-                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open')",
+                "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status, high_water_mark, original_compound_score)
+                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6)",
                 rusqlite::params![entity_id, ticker, filled_price, today, notional, score, signal_profile.to_string(), order_id],
             ) {
                 tracing::warn!("Auto-trade: failed to record trade for {}: {}", ticker, e);
@@ -2972,6 +2972,61 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
         }
 
         // Rate limit
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Scale-in: check if existing positions have strengthening signals
+    let scale_in_candidates: Vec<(i64, String, f64, f64)> = conn.prepare(
+        "SELECT pt.id, pt.ticker, pt.original_compound_score, cs.compound_score
+         FROM paper_trades pt
+         JOIN cross_signals cs ON cs.ticker = pt.ticker
+         WHERE pt.status = 'open'
+           AND pt.pnl_pct > 0.0
+           AND COALESCE(pt.scale_in_count, 0) < 1
+           AND cs.compound_score > COALESCE(pt.original_compound_score, pt.confidence) * 1.2
+           AND cs.convergence_detected = 1
+         ORDER BY cs.compound_score DESC
+         LIMIT 3"
+    ).ok()
+    .map(|mut stmt| {
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+
+    for (trade_id, ticker, _old_score, new_score) in &scale_in_candidates {
+        let scale_notional = (buying_power * 0.01).min(5000.0).max(50.0); // Conservative scale-in
+
+        tracing::info!("Scale-in: {} — score increased to {:.2}, adding ${:.2}", ticker, new_score, scale_notional);
+
+        let order = serde_json::json!({
+            "symbol": ticker,
+            "notional": format!("{:.2}", scale_notional),
+            "side": "buy",
+            "type": "market",
+            "time_in_force": "day"
+        });
+
+        let resp = client
+            .post("https://paper-api.alpaca.markets/v2/orders")
+            .header("APCA-API-KEY-ID", &alpaca_key)
+            .header("APCA-API-SECRET-KEY", &alpaca_secret)
+            .json(&order)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            conn.execute(
+                "UPDATE paper_trades SET scale_in_count = COALESCE(scale_in_count, 0) + 1,
+                 position_size = position_size + ?1 WHERE id = ?2",
+                rusqlite::params![scale_notional, trade_id],
+            ).ok();
+            tracing::info!("Scale-in: added ${:.2} to {} position", scale_notional, ticker);
+            traded += 1;
+        }
+
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 

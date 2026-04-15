@@ -70,21 +70,23 @@ pub struct SignalAnalysis {
     pub dead_signals: Vec<String>, // dimensions with < 50% hit rate
 }
 
-/// Evaluate open paper trades: update P&L, check stop-loss and expiry.
+/// Evaluate open paper trades using ATR-based position management.
+/// Replaces the primitive -10% stop-loss + 90-day expiry with adaptive exits.
 fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Result<usize> {
-    let open_trades: Vec<(i64, String, f64, String)> = {
+    let open_trades: Vec<(i64, String, f64, String, f64)> = {
         let mut stmt = conn.prepare(
-            "SELECT id, ticker, entry_price, entry_date FROM paper_trades WHERE status = 'open'"
+            "SELECT id, ticker, entry_price, entry_date, COALESCE(original_compound_score, confidence)
+             FROM paper_trades WHERE status = 'open'"
         )?;
         stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, f64>(4).unwrap_or(0.5)))
         })?
         .filter_map(|r| r.ok())
         .collect()
     };
 
     let mut evaluated = 0;
-    for (trade_id, ticker, entry_price, entry_date) in &open_trades {
+    for (trade_id, ticker, entry_price, entry_date, original_score) in &open_trades {
         let current_price: f64 = conn
             .query_row(
                 "SELECT close FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
@@ -99,28 +101,52 @@ fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Result<usi
 
         let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
 
-        // Stop-loss at -10%
-        if pnl_pct <= -10.0 {
-            conn.execute(
-                "UPDATE paper_trades SET status = 'stopped_out', exit_price = ?1, exit_date = ?2, pnl = ?3, pnl_pct = ?4 WHERE id = ?5",
-                rusqlite::params![current_price, today, current_price - entry_price, pnl_pct, trade_id],
-            )?;
-            tracing::info!("Calibration: stop-loss {} at {:.1}%", ticker, pnl_pct);
-            evaluated += 1;
-            continue;
-        }
+        // Use ATR-based position management
+        use crate::position_management::{evaluate_position, check_signal_decay, PositionAction};
 
-        // Expire after 90 days
-        if let Ok(entry) = chrono::NaiveDate::parse_from_str(entry_date, "%Y-%m-%d") {
-            if let Ok(now) = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d") {
-                let days = (now - entry).num_days();
-                if days >= 90 {
+        let action = evaluate_position(conn, *trade_id, ticker, *entry_price, entry_date, current_price, today);
+
+        // Also check signal decay
+        let signal_decayed = check_signal_decay(conn, ticker, *original_score);
+
+        match action {
+            PositionAction::CloseAll { reason } => {
+                conn.execute(
+                    "UPDATE paper_trades SET status = 'stopped_out', exit_price = ?1, exit_date = ?2, pnl = ?3, pnl_pct = ?4 WHERE id = ?5",
+                    rusqlite::params![current_price, today, current_price - entry_price, pnl_pct, trade_id],
+                )?;
+                tracing::info!("Position closed: {} at {:.1}% — {}", ticker, pnl_pct, reason);
+                evaluated += 1;
+            }
+            PositionAction::CloseHalf { reason } => {
+                // For paper trading, we just log the half-close and reduce position_size
+                let half_size: f64 = conn.query_row(
+                    "SELECT position_size / 2.0 FROM paper_trades WHERE id = ?1",
+                    [trade_id], |row| row.get(0),
+                ).unwrap_or(0.0);
+
+                conn.execute(
+                    "UPDATE paper_trades SET position_size = ?1 WHERE id = ?2",
+                    rusqlite::params![half_size, trade_id],
+                )?;
+                tracing::info!("Position halved: {} at {:.1}% — {}", ticker, pnl_pct, reason);
+                evaluated += 1;
+            }
+            PositionAction::TightenStop { new_stop } => {
+                conn.execute(
+                    "UPDATE paper_trades SET trailing_stop = ?1 WHERE id = ?2",
+                    rusqlite::params![new_stop, trade_id],
+                )?;
+            }
+            PositionAction::Hold => {
+                // Check signal decay separately
+                if signal_decayed {
                     let status = if pnl_pct > 0.0 { "closed" } else { "expired" };
                     conn.execute(
                         "UPDATE paper_trades SET status = ?1, exit_price = ?2, exit_date = ?3, pnl = ?4, pnl_pct = ?5 WHERE id = ?6",
                         rusqlite::params![status, current_price, today, current_price - entry_price, pnl_pct, trade_id],
                     )?;
-                    tracing::info!("Calibration: {} {} after {}d at {:.1}%", status, ticker, days, pnl_pct);
+                    tracing::info!("Signal decay exit: {} at {:.1}% (score dropped below threshold)", ticker, pnl_pct);
                     evaluated += 1;
                 }
             }
