@@ -99,9 +99,13 @@ struct AnalysisTrend {
 
 #[derive(Deserialize)]
 struct CurationResult {
+    #[serde(default)]
     ai: Vec<usize>,
+    #[serde(default)]
     miami: Vec<usize>,
+    #[serde(default)]
     italy: Vec<usize>,
+    #[serde(default)]
     tech: Vec<usize>,
 }
 
@@ -321,6 +325,18 @@ impl GroqClient {
 
         let text = self.call(STRONG_MODEL, system, &user_msg, 4000).await?;
         let parsed: AnalysisResponse = serde_json::from_str(&extract_json(&text))?;
+
+        // Validate and log per-sector curation
+        tracing::info!("Curation response: ai={}, miami={}, italy={}, tech={}",
+            parsed.curation.ai.len(), parsed.curation.miami.len(),
+            parsed.curation.italy.len(), parsed.curation.tech.len());
+
+        if parsed.curation.miami.is_empty() {
+            tracing::warn!("Curation: 0 Miami stories — check Miami source feeds");
+        }
+        if parsed.curation.italy.is_empty() {
+            tracing::warn!("Curation: 0 Italy stories — check Italy source feeds");
+        }
 
         let mut curated_indices: Vec<usize> = Vec::new();
         curated_indices.extend(&parsed.curation.ai);

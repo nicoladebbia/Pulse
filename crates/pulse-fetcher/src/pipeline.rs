@@ -128,6 +128,19 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let raw_count = raw_articles.len();
     tracing::info!("Collected {} raw articles (excluding freedom sources)", raw_count);
 
+    // Log per-sector distribution at collection time
+    {
+        let sectors = ["ai", "miami", "italy", "tech"];
+        for sector in &sectors {
+            let count = raw_articles.iter().filter(|a| a.sector == *sector && a.source_type == "news").count();
+            if count < 10 {
+                tracing::warn!("Low source coverage: {} has only {} articles (expected 20+)", sector, count);
+            } else {
+                tracing::info!("Source coverage: {} = {} articles", sector, count);
+            }
+        }
+    }
+
     // Split financial articles OUT before dedup — they have their own dedup mechanism
     // and should NOT go through the O(n²) trigram comparison designed for news
     let (raw_news, raw_financial): (Vec<_>, Vec<_>) = raw_articles
