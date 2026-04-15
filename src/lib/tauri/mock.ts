@@ -431,7 +431,7 @@ export const mockUsageStats: UsageStats = {
 	total_output_tokens: 42000,
 	by_provider: [
 		{ provider: 'anthropic', model: 'claude-sonnet', total_input_tokens: 180000, total_output_tokens: 35000, total_cost_usd: 0.38, call_count: 23 },
-		{ provider: 'groq', model: 'llama-3.1-70b', total_input_tokens: 85000, total_output_tokens: 5000, total_cost_usd: 0.05, call_count: 80 },
+		{ provider: 'groq', model: 'llama-3.3-70b', total_input_tokens: 85000, total_output_tokens: 5000, total_cost_usd: 0.05, call_count: 80 },
 		{ provider: 'voyage', model: 'voyage-3-lite', total_input_tokens: 20000, total_output_tokens: 0, total_cost_usd: 0.0004, call_count: 80 },
 		{ provider: 'tavily', model: 'search', total_input_tokens: 0, total_output_tokens: 0, total_cost_usd: 0, call_count: 5 },
 	],

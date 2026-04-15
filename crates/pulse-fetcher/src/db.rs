@@ -504,7 +504,7 @@ pub fn log_api_usage(
 ) {
     let cost = match (provider, model) {
         ("groq", m) if m.contains("8b") => (input_tokens as f64 * 0.05 + output_tokens as f64 * 0.08) / 1_000_000.0,
-        ("groq", _) => (input_tokens as f64 * 0.88 + output_tokens as f64 * 0.88) / 1_000_000.0,
+        ("groq", _) => (input_tokens as f64 * 0.59 + output_tokens as f64 * 0.79) / 1_000_000.0,
         ("anthropic", m) if m.contains("haiku") => (input_tokens as f64 * 0.25 + output_tokens as f64 * 1.25) / 1_000_000.0,
         ("anthropic", m) if m.contains("sonnet") => (input_tokens as f64 * 3.0 + output_tokens as f64 * 15.0) / 1_000_000.0,
         ("voyage", _) => (input_tokens as f64 * 0.02) / 1_000_000.0,

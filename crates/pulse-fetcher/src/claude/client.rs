@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 // Groq models — fast inference, OpenAI-compatible API
 const FAST_MODEL: &str = "llama-3.1-8b-instant";
-const STRONG_MODEL: &str = "llama-3.1-70b-versatile";
+const STRONG_MODEL: &str = "llama-3.3-70b-versatile";
 const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 
 pub struct GroqClient {
@@ -414,7 +414,7 @@ Select ~90 total. No explanation, just the JSON array."#;
         }
         user_msg.push_str(&format!("\nSelect the best ~90 from these {} articles. Return JSON array of indices.", articles.len()));
 
-        let text = self.call(STRONG_MODEL, system, &user_msg, 1000).await?;
+        let text = self.call(STRONG_MODEL, system, &user_msg, 2000).await?;
 
         // Parse the JSON array
         let json_str = extract_json_array(&text);

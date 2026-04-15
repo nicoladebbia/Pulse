@@ -247,7 +247,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                 let curated: Vec<_> = indices.into_iter()
                     .filter_map(|i| news_articles.get(i).cloned())
                     .collect();
-                log_usage(db_path, "groq", "llama-3.1-70b-versatile", "pre_curate",
+                log_usage(db_path, "groq", "llama-3.3-70b-versatile", "pre_curate",
                     (news_articles.len() * 30) as i64, 500);
                 tracing::info!("Pre-curated to {} articles (saved {} summarization calls)",
                     curated.len(), news_articles.len() - curated.len());
@@ -315,7 +315,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     progress.start_stage(4);
     tracing::info!("Phase 4: Cross-sector analysis...");
     let mut analysis = crate::claude::analyze_cross_sector(&summaries).await?;
-    log_usage(db_path, "groq", "llama-3.1-70b-versatile", "analyze", 8000, 2000);
+    log_usage(db_path, "groq", "llama-3.3-70b-versatile", "analyze", 8000, 2000);
 
     // Log sector distribution in curated stories
     {
@@ -1653,7 +1653,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
     let curation_text = client
         .call(
-            "llama-3.1-70b-versatile",
+            "llama-3.3-70b-versatile",
             crate::claude::prompts::FREEDOMS_ANALYSIS_SYSTEM,
             &user_msg,
             2000,
