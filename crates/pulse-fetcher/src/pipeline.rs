@@ -2693,7 +2693,9 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
 /// Matches the weight order: [insider, institutional, news, government, search, patent, supply_chain, political]
 fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
     // [insider, institutional, news, government, search, patent, supply, political]
-    let defaults = [0.20, 0.10, 0.20, 0.15, 0.10, 0.05, 0.05, 0.15];
+    // Weights for active dimensions sum to ~1.0. New dimensions get small weights
+    // until calibration system has enough data to auto-adjust.
+    let defaults = [0.22, 0.05, 0.22, 0.18, 0.05, 0.05, 0.03, 0.20];
 
     let json: Option<String> = conn.query_row(
         "SELECT value FROM user_profile WHERE key = 'calibrated_weights'",
@@ -2939,6 +2941,24 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
                 if let Some(name) = meta.get("assignee").and_then(|v| v.as_str()) {
                     if !name.is_empty() {
                         ents.push((name, "patent_cluster", 0.3));
+                    }
+                }
+                ents
+            }
+            "Wikipedia Pageviews" => {
+                let mut ents = Vec::new();
+                if let Some(name) = meta.get("entity_name").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        ents.push((name, "search_trend", 0.0));
+                    }
+                }
+                ents
+            }
+            "EIA" => {
+                let mut ents = Vec::new();
+                if let Some(product) = meta.get("product").and_then(|v| v.as_str()) {
+                    if !product.is_empty() {
+                        ents.push((product, "commodity", 0.0));
                     }
                 }
                 ents

@@ -63,31 +63,46 @@ async fn fetch_pageviews(entities: &[(String, String)]) -> anyhow::Result<Vec<Ra
     let mut articles = Vec::new();
 
     for (entity_name, ticker) in entities {
-        // Convert entity name to Wikipedia article title (best effort)
-        let wiki_title = entity_name
+        // Convert entity name to Wikipedia article title
+        // Try exact name first, then with common suffixes for disambiguation
+        let base_title = entity_name
             .replace(' ', "_")
             .replace("&", "%26");
 
-        // Fetch last 37 days of page views (need 30d baseline + 7d recent)
-        let url = format!(
-            "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/all-agents/{}/daily/{}/{}",
-            wiki_title, start_37d, end
-        );
+        // Try multiple title variants for disambiguation
+        let title_variants = vec![
+            base_title.clone(),
+            format!("{}_(company)", base_title),
+            format!("{}_(corporation)", base_title),
+        ];
 
-        let resp = match client
-            .get(&url)
-            .header("User-Agent", "Pulse/1.0 (pulse-app@example.com)")
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let mut found_resp = None;
+        for wiki_title in &title_variants {
+            let url = format!(
+                "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/all-agents/{}/daily/{}/{}",
+                wiki_title, start_37d, end
+            );
 
-        if !resp.status().is_success() {
-            // Article might not exist on Wikipedia — skip silently
-            continue;
+            let resp = match client
+                .get(&url)
+                .header("User-Agent", "Pulse/1.0 (pulse-app@example.com)")
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => r,
+                _ => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+
+            found_resp = Some((resp, wiki_title.clone()));
+            break;
         }
+
+        let Some((resp, wiki_title)) = found_resp else {
+            continue;
+        };
 
         let body: serde_json::Value = match resp.json().await {
             Ok(b) => b,

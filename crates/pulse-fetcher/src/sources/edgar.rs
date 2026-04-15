@@ -78,6 +78,16 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         Err(e) => tracing::warn!("SEC EDGAR Form D failed: {}", e),
     }
 
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    match fetch_filing_type(&client, "13F-HR", "edgar_13f", 20).await {
+        Ok(a) => {
+            tracing::info!("SEC EDGAR 13F-HR: {} filings", a.len());
+            articles.extend(a);
+        }
+        Err(e) => tracing::warn!("SEC EDGAR 13F-HR failed: {}", e),
+    }
+
     tracing::info!("SEC EDGAR total: {} articles", articles.len());
     Ok(articles)
 }

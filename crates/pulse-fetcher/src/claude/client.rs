@@ -414,9 +414,9 @@ Select ~90 total. No explanation, just the JSON array."#;
         }
         user_msg.push_str(&format!("\nSelect the best ~90 from these {} articles. Return JSON array of indices.", articles.len()));
 
-        let text = self.call(STRONG_MODEL, system, &user_msg, 2000).await?;
+        let text = self.call_text(STRONG_MODEL, system, &user_msg, 2000).await?;
 
-        // Parse the JSON array
+        // Parse the JSON array from text response (no json_object mode overhead)
         let json_str = extract_json_array(&text);
         let indices: Vec<usize> = serde_json::from_str(&json_str)
             .unwrap_or_else(|_| {
