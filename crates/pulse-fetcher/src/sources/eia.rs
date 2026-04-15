@@ -90,7 +90,10 @@ async fn fetch_petroleum(client: &reqwest::Client, api_key: &str) -> anyhow::Res
 
     for entry in &entries {
         let product = entry.get("product-name").and_then(|v| v.as_str()).unwrap_or("Unknown");
-        let value = entry.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // EIA returns value as string, not number
+        let value = entry.get("value")
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0.0);
         let period = entry.get("period").and_then(|v| v.as_str()).unwrap_or("unknown");
         let product_id = entry.get("product").and_then(|v| v.as_str()).unwrap_or("UNK");
 
@@ -162,7 +165,10 @@ async fn fetch_natgas(client: &reqwest::Client, api_key: &str) -> anyhow::Result
     let mut articles = Vec::new();
 
     if let Some(entry) = entries.first() {
-        let value = entry.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // EIA returns value as string, not number
+        let value = entry.get("value")
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0.0);
         let period = entry.get("period").and_then(|v| v.as_str()).unwrap_or("unknown");
 
         if value > 0.0 {
