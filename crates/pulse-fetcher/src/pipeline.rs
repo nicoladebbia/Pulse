@@ -2514,19 +2514,17 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
             |row| row.get(0),
         ).unwrap_or(0.0);
 
-        // Supply chain — EIA energy trade data + any import/export indicators
+        // Supply chain — market-wide FRED indicators (PPI, Industrial Production, etc.)
+        // These are sector-level signals, not per-entity. Use absolute change_pct as signal strength.
         let import_delta: f64 = conn.query_row(
-            &format!("SELECT COALESCE(SUM(
-                CASE WHEN json_valid(s.financial_metadata)
-                     AND (s.source_name = 'EIA' OR s.source_name LIKE '%Trade%' OR s.source_name LIKE '%Census%')
-                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.value') AS REAL), 0)
-                ELSE 0 END
-            ), 0) FROM entity_mentions em
-            JOIN stories s ON em.story_id = s.id
-            JOIN entities e ON em.entity_id = e.id
-            WHERE {} AND s.source_type = 'financial'
-              AND em.mentioned_at >= date(?2, '-30 days')", entity_match_clause),
-            rusqlite::params![topic, today],
+            "SELECT COALESCE(AVG(ABS(
+                CAST(json_extract(s.financial_metadata, '$.change_pct') AS REAL)
+            )), 0) FROM stories s
+            WHERE s.source_name = 'FRED'
+              AND json_valid(s.financial_metadata)
+              AND json_extract(s.financial_metadata, '$.series_id') IN ('INDPRO', 'PPIACO', 'DCOILWTICO')
+              AND s.created_at >= datetime('now', '-7 days')",
+            [],
             |row| row.get(0),
         ).unwrap_or(0.0);
 
@@ -2687,9 +2685,9 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
 /// Matches the weight order: [insider, institutional, news, government, search, patent, supply_chain, political]
 fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
     // [insider, institutional, news, government, search, patent, supply, political]
-    // Weights for active dimensions sum to 1.0. supply_chain stays 0 until we have
-    // a source that links commodities to company entities.
-    let defaults = [0.23, 0.05, 0.22, 0.18, 0.05, 0.05, 0.0, 0.22];
+    // All 7 active dimensions (patent stays low — USPTO API in migration).
+    // supply_chain uses FRED macro indicators as market-wide signal.
+    let defaults = [0.22, 0.05, 0.22, 0.17, 0.05, 0.04, 0.03, 0.22];
 
     let json: Option<String> = conn.query_row(
         "SELECT value FROM user_profile WHERE key = 'calibrated_weights'",
