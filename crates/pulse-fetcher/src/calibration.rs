@@ -22,7 +22,7 @@ const DEFAULT_WEIGHTS: &[(&str, f64)] = &[
     ("government_signal", 0.18),
     ("search_trend", 0.05),         // Wikipedia Pageviews as proxy (new, low weight until calibrated)
     ("patent_signal", 0.05),
-    ("supply_chain", 0.03),         // EIA energy trade (new, low weight until calibrated)
+    ("supply_chain", 0.0),          // No source links commodities to companies yet
     ("political_signal", 0.20),
 ];
 

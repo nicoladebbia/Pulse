@@ -416,13 +416,23 @@ Select ~90 total. No explanation, just the JSON array."#;
 
         let text = self.call_text(STRONG_MODEL, system, &user_msg, 2000).await?;
 
-        // Parse the JSON array from text response (no json_object mode overhead)
+        // Parse the JSON array — try multiple extraction strategies
         let json_str = extract_json_array(&text);
-        let indices: Vec<usize> = serde_json::from_str(&json_str)
-            .unwrap_or_else(|_| {
-                tracing::warn!("Pre-curation JSON parse failed, falling back to all articles");
-                (0..articles.len()).collect()
-            });
+        let indices: Vec<usize> = serde_json::from_str::<Vec<usize>>(&json_str)
+            .or_else(|_| {
+                // Try extracting from a JSON object wrapper like {"indices": [...]}
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&extract_json(&text)) {
+                    // Find the first array value in the object
+                    if let Some(arr) = obj.as_object().and_then(|o| o.values().find(|v| v.is_array())) {
+                        return serde_json::from_value(arr.clone());
+                    }
+                }
+                Err(serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, "no array found")))
+            })
+            .map_err(|_| {
+                tracing::warn!("Pre-curation JSON parse failed (response: {}...)", &text[..text.len().min(200)]);
+                anyhow::anyhow!("Pre-curation response was not a valid JSON array")
+            })?;
 
         // Validate indices
         let valid: Vec<usize> = indices.into_iter()

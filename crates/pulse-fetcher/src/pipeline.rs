@@ -2693,9 +2693,9 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
 /// Matches the weight order: [insider, institutional, news, government, search, patent, supply_chain, political]
 fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
     // [insider, institutional, news, government, search, patent, supply, political]
-    // Weights for active dimensions sum to ~1.0. New dimensions get small weights
-    // until calibration system has enough data to auto-adjust.
-    let defaults = [0.22, 0.05, 0.22, 0.18, 0.05, 0.05, 0.03, 0.20];
+    // Weights for active dimensions sum to 1.0. supply_chain stays 0 until we have
+    // a source that links commodities to company entities.
+    let defaults = [0.23, 0.05, 0.22, 0.18, 0.05, 0.05, 0.0, 0.22];
 
     let json: Option<String> = conn.query_row(
         "SELECT value FROM user_profile WHERE key = 'calibrated_weights'",
