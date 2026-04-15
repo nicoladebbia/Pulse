@@ -95,6 +95,17 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let mut progress = ProgressWriter::new(db_path);
 
+    // Phase 0: Enrich Form 4 stories from previous runs (before EDGAR fetch burns SEC rate limit)
+    tracing::info!("Phase 0: Enriching prior Form 4 filings with transaction data...");
+    match enrich_form4_stories(db_path).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("Enriched {} Form 4 stories with transaction data", count);
+            }
+        }
+        Err(e) => tracing::warn!("Form 4 enrichment failed (non-fatal): {}", e),
+    }
+
     // Phase 1: Collect from all sources
     progress.start_stage(1);
     tracing::info!("Phase 1: Collecting from sources...");
@@ -2541,7 +2552,7 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
         };
 
         conn.execute(
-            "INSERT INTO cross_signals (entity_id, ticker, compound_score,
+            "INSERT OR REPLACE INTO cross_signals (entity_id, ticker, compound_score,
                 insider_signal, institutional_flow, news_momentum, government_signal,
                 search_trend, patent_signal, supply_chain, political_signal,
                 source_diversity, convergence_detected, computed_at)
@@ -3094,6 +3105,181 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     }
 
     Ok(traded)
+}
+
+/// Enrich stored Form 4 stories that are missing transaction data.
+/// Downloads the actual XML from EDGAR and parses buy/sell/shares/price.
+async fn enrich_form4_stories(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    // Find Form 4 stories missing transaction_code (not yet enriched)
+    let mut stmt = conn.prepare(
+        "SELECT id, financial_metadata FROM stories
+         WHERE source_type = 'financial'
+           AND source_name LIKE '%EDGAR 4%'
+           AND json_valid(financial_metadata)
+           AND json_extract(financial_metadata, '$.transaction_code') IS NULL
+           AND created_at >= datetime('now', '-7 days')
+         LIMIT 30"
+    )?;
+
+    let candidates: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if candidates.is_empty() { return Ok(0); }
+
+    let mut enriched = 0;
+
+    for (story_id, metadata_str) in &candidates {
+        let meta: serde_json::Value = serde_json::from_str(metadata_str)?;
+        let cik = meta.get("cik").and_then(|v| v.as_str()).unwrap_or("");
+        let accession = meta.get("accession_number").and_then(|v| v.as_str()).unwrap_or("");
+
+        if cik.is_empty() || accession.is_empty() { continue; }
+
+        let cik_clean = cik.trim_start_matches('0');
+        let accession_nd = accession.replace('-', "");
+
+        // Try to find the Form 4 XML via index page
+        let index_url = format!("https://www.sec.gov/Archives/edgar/data/{}/{}/", cik_clean, accession_nd);
+
+        let index_resp = client
+            .get(&index_url)
+            .header("User-Agent", "Pulse/1.0 (pulse-app@example.com)")
+            .send()
+            .await;
+
+        let xml = if let Ok(resp) = index_resp {
+            let status = resp.status();
+            if status.is_success() {
+                let html = resp.text().await.unwrap_or_default();
+                let mut found_xml = None;
+                for part in html.split("href=\"") {
+                    let href = part.split('"').next().unwrap_or("");
+                    if href.ends_with(".xml") && !href.contains("R1") && !href.contains("R2") && !href.contains("index") {
+                        let full_url = if href.starts_with("/") {
+                            format!("https://www.sec.gov{}", href)
+                        } else {
+                            format!("{}{}", index_url, href)
+                        };
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        if let Ok(xml_resp) = client.get(&full_url)
+                            .header("User-Agent", "Pulse/1.0 (pulse-app@example.com)")
+                            .send().await
+                        {
+                            if xml_resp.status().is_success() {
+                                let text = xml_resp.text().await.unwrap_or_default();
+                                if text.contains("<ownershipDocument") {
+                                    found_xml = Some(text);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                found_xml
+            } else {
+                if status.as_u16() == 429 {
+                    tracing::warn!("Form 4 enrichment: SEC rate limit (429), stopping early after {} enriched", enriched);
+                    break;
+                }
+                None
+            }
+        } else { None };
+
+        let Some(xml) = xml else {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            continue;
+        };
+
+        // Parse using the same logic as edgar.rs
+        let txn_code = extract_xml_value_simple(&xml, "transactionCode").unwrap_or_else(|| "?".to_string());
+        let shares = extract_nested_val(&xml, "transactionShares").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let price = extract_nested_val(&xml, "transactionPricePerShare").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let total_value = shares * price;
+        let owner_name = extract_xml_value_simple(&xml, "rptOwnerName").unwrap_or_default();
+        let is_officer = xml.contains("<isOfficer>1</isOfficer>") || xml.contains("<isOfficer>true</isOfficer>");
+        let is_director = xml.contains("<isDirector>1</isDirector>") || xml.contains("<isDirector>true</isDirector>");
+        let officer_title = extract_xml_value_simple(&xml, "officerTitle").unwrap_or_default();
+        let post_shares = extract_nested_val(&xml, "sharesOwnedFollowingTransaction").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+
+        // Classify
+        let (classification, signal_weight) = classify_form4_trade(&txn_code, is_officer, is_director, total_value, shares, post_shares);
+
+        // Update metadata
+        let mut updated: serde_json::Value = serde_json::from_str(metadata_str)?;
+        updated["transaction_code"] = serde_json::json!(txn_code);
+        updated["shares"] = serde_json::json!(shares);
+        updated["price_per_share"] = serde_json::json!(price);
+        updated["total_value"] = serde_json::json!(total_value);
+        updated["owner_name"] = serde_json::json!(owner_name);
+        updated["is_officer"] = serde_json::json!(is_officer);
+        updated["is_director"] = serde_json::json!(is_director);
+        updated["officer_title"] = serde_json::json!(officer_title);
+        updated["post_transaction_shares"] = serde_json::json!(post_shares);
+        updated["trade_classification"] = serde_json::json!(classification);
+        updated["signal_weight"] = serde_json::json!(signal_weight);
+
+        conn.execute(
+            "UPDATE stories SET financial_metadata = ?1 WHERE id = ?2",
+            rusqlite::params![serde_json::to_string(&updated)?, story_id],
+        ).ok();
+
+        enriched += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+
+    Ok(enriched)
+}
+
+fn extract_xml_value_simple(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].trim().to_string())
+}
+
+fn extract_nested_val(xml: &str, parent_tag: &str) -> Option<String> {
+    let open = format!("<{}>", parent_tag);
+    let close = format!("</{}>", parent_tag);
+    let start = xml.find(&open)?;
+    let end = xml.find(&close).unwrap_or(start + 200).min(start + 200);
+    let section = &xml[start..end];
+    let val_start = section.find("<value>")? + 7;
+    let val_end = section[val_start..].find("</value>")? + val_start;
+    Some(section[val_start..val_end].trim().to_string())
+}
+
+fn classify_form4_trade(code: &str, is_officer: bool, is_director: bool, total_value: f64, shares: f64, post_shares: f64) -> (&'static str, f64) {
+    match code {
+        "P" => {
+            if is_officer && total_value >= 100_000.0 { ("strong_buy", 1.0) }
+            else if is_officer && total_value >= 25_000.0 { ("moderate_buy", 0.7) }
+            else if is_director && total_value >= 50_000.0 { ("moderate_buy", 0.6) }
+            else if total_value >= 10_000.0 { ("small_buy", 0.3) }
+            else { ("minimal_buy", 0.1) }
+        }
+        "S" => {
+            if is_officer && post_shares > 0.0 && shares > 0.0 {
+                let pct = shares / (post_shares + shares);
+                if pct > 0.20 { return ("informative_sale", -0.3); }
+            }
+            ("routine_sale", 0.0)
+        }
+        "A" => ("award", 0.0),
+        "M" => ("option_exercise", 0.0),
+        "G" => ("gift", 0.0),
+        "F" => ("tax_withholding", 0.0),
+        _ => ("unknown", 0.0),
+    }
 }
 
 /// Classify ambiguous 8-K filings (Item 8.01 "other_event") using Claude Haiku.
