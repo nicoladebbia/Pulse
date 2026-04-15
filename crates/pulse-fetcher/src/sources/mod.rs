@@ -10,6 +10,7 @@ pub mod fec;
 pub mod eia;
 pub mod lobbying;
 pub mod patents;
+pub mod wikipedia;
 
 use serde::{Deserialize, Serialize};
 

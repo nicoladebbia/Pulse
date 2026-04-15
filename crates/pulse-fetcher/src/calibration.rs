@@ -16,14 +16,14 @@ use std::path::Path;
 /// Zeroed dimensions (no data source) excluded from compound score.
 /// Active weights sum to 1.0.
 const DEFAULT_WEIGHTS: &[(&str, f64)] = &[
-    ("insider_signal", 0.25),
-    ("institutional_flow", 0.0),    // No data source yet
-    ("news_momentum", 0.25),
-    ("government_signal", 0.20),
-    ("search_trend", 0.0),          // No data source yet
-    ("patent_signal", 0.10),
-    ("supply_chain", 0.0),          // No data source yet
-    ("political_signal", 0.20),
+    ("insider_signal", 0.20),
+    ("institutional_flow", 0.10),   // SEC 13F institutional holdings
+    ("news_momentum", 0.20),
+    ("government_signal", 0.15),
+    ("search_trend", 0.10),         // Wikipedia Pageviews as proxy
+    ("patent_signal", 0.05),
+    ("supply_chain", 0.05),         // EIA energy trade + Census data
+    ("political_signal", 0.15),
 ];
 
 /// Run the full calibration pipeline.

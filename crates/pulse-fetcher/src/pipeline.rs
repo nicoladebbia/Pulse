@@ -109,7 +109,19 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 1: Collect from all sources
     progress.start_stage(1);
     tracing::info!("Phase 1: Collecting from sources...");
-    let all_articles = sources::collect_all().await?;
+    let mut all_articles = sources::collect_all().await?;
+
+    // Wikipedia Pageviews — needs DB access for entity lookup (non-fatal)
+    match sources::wikipedia::fetch(db_path).await {
+        Ok(a) => {
+            if !a.is_empty() {
+                tracing::info!("Wikipedia Pageviews: {} search trend signals", a.len());
+                all_articles.extend(a);
+            }
+        }
+        Err(e) => tracing::warn!("Wikipedia Pageviews FAILED (non-fatal): {}", e),
+    }
+
     let raw_articles: Vec<_> = all_articles.into_iter()
         .filter(|a| !a.sector.starts_with("freedom_"))
         .collect();
@@ -2460,11 +2472,64 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
         // (regulatory_sentiment feeds into government_signal normalization)
         let reg_composite = reg_count + (event_severity_boost * 3.0); // 8-K severity scaled to same range
 
+        // Institutional flow — 13F holdings filings (SEC Form 13F-HR)
+        // Sum of reported market values from institutional investors
+        let inst_flow: f64 = conn.query_row(
+            &format!("SELECT COALESCE(SUM(
+                CASE WHEN json_valid(s.financial_metadata)
+                     AND json_extract(s.financial_metadata, '$.filing_type') IN ('13F-HR', '13F-HR/A')
+                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.total_value') AS REAL),
+                              CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
+                ELSE 0 END
+            ), 0) FROM entity_mentions em
+            JOIN stories s ON em.story_id = s.id
+            JOIN entities e ON em.entity_id = e.id
+            WHERE {} AND s.source_type = 'financial'
+              AND em.mentioned_at >= date(?2, '-90 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+
+        // Search trend — Wikipedia page views as proxy for search interest
+        // Count of Wikipedia-sourced mentions (populated by fetch_wikipedia_pageviews)
+        let search_delta: f64 = conn.query_row(
+            &format!("SELECT COALESCE(SUM(
+                CASE WHEN json_valid(s.financial_metadata)
+                     AND s.source_name = 'Wikipedia Pageviews'
+                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.views_delta_pct') AS REAL), 0)
+                ELSE 0 END
+            ), 0) FROM entity_mentions em
+            JOIN stories s ON em.story_id = s.id
+            JOIN entities e ON em.entity_id = e.id
+            WHERE {} AND s.source_type = 'financial'
+              AND em.mentioned_at >= date(?2, '-7 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+
+        // Supply chain — EIA energy trade data + any import/export indicators
+        let import_delta: f64 = conn.query_row(
+            &format!("SELECT COALESCE(SUM(
+                CASE WHEN json_valid(s.financial_metadata)
+                     AND (s.source_name = 'EIA' OR s.source_name LIKE '%Trade%' OR s.source_name LIKE '%Census%')
+                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.value') AS REAL), 0)
+                ELSE 0 END
+            ), 0) FROM entity_mentions em
+            JOIN stories s ON em.story_id = s.id
+            JOIN entities e ON em.entity_id = e.id
+            WHERE {} AND s.source_type = 'financial'
+              AND em.mentioned_at >= date(?2, '-30 days')", entity_match_clause),
+            rusqlite::params![topic, today],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+
         conn.execute(
             "UPDATE signals SET source_diversity = ?1, insider_buy_volume = ?2, contract_value = ?3,
-                 lobbying_spend_delta = ?4, regulatory_sentiment = ?5, patent_filing_rate = ?6
-             WHERE topic = ?7 AND (sector = ?8 OR (?8 IS NULL AND sector IS NULL))",
-            rusqlite::params![diversity, insider_vol, contract_val, lobby_spend, reg_composite, patent_count, topic, sector],
+                 lobbying_spend_delta = ?4, regulatory_sentiment = ?5, patent_filing_rate = ?6,
+                 institutional_flow = ?7, search_trend_delta = ?8, import_volume_delta = ?9
+             WHERE topic = ?10 AND (sector = ?11 OR (?11 IS NULL AND sector IS NULL))",
+            rusqlite::params![diversity, insider_vol, contract_val, lobby_spend, reg_composite, patent_count,
+                              inst_flow, search_delta, import_delta, topic, sector],
         ).ok();
 
         count += 1;
@@ -2614,8 +2679,8 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
 /// Load calibrated weights from DB, or return defaults.
 /// Matches the weight order: [insider, institutional, news, government, search, patent, supply_chain, political]
 fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
-    // [insider, institutional(0), news, government, search(0), patent, supply(0), political]
-    let defaults = [0.25, 0.0, 0.25, 0.20, 0.0, 0.10, 0.0, 0.20];
+    // [insider, institutional, news, government, search, patent, supply, political]
+    let defaults = [0.20, 0.10, 0.20, 0.15, 0.10, 0.05, 0.05, 0.15];
 
     let json: Option<String> = conn.query_row(
         "SELECT value FROM user_profile WHERE key = 'calibrated_weights'",
