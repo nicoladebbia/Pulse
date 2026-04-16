@@ -204,9 +204,10 @@ pub fn compute_all_cross_signals(conn: &Connection, today: &str) -> anyhow::Resu
         }
 
         // Look up entity_id and ticker
+        let topic_lower = topic.to_lowercase();
         let entity_id: Option<i64> = conn.query_row(
-            "SELECT id FROM entities WHERE LOWER(name) = LOWER(?1) LIMIT 1",
-            [topic],
+            "SELECT id FROM entities WHERE name_normalized = ?1 LIMIT 1",
+            [&topic_lower],
             |row| row.get(0),
         ).ok();
 

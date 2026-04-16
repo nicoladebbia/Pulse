@@ -9,12 +9,17 @@ pub fn get_cross_signals(db: State<'_, DbState>, limit: Option<usize>) -> Result
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let limit = limit.unwrap_or(20);
 
-    // Recompute signals first to ensure freshness
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    crate::services::signals::recompute_signals(&conn, &today).ok();
+    // Only recompute if stale (>1 hour) — these are expensive batch operations
+    let needs_recompute: bool = conn.query_row(
+        "SELECT COALESCE(MAX(computed_at) < datetime('now', '-1 hour'), 1) FROM cross_signals",
+        [], |row| row.get(0),
+    ).unwrap_or(true);
 
-    // Compute cross-signal scores
-    cross_signals::compute_all_cross_signals(&conn, &today).ok();
+    if needs_recompute {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        crate::services::signals::recompute_signals(&conn, &today).ok();
+        cross_signals::compute_all_cross_signals(&conn, &today).ok();
+    }
 
     cross_signals::get_top_signals(&conn, limit).map_err(|e| e.to_string())
 }

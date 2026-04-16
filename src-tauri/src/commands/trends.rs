@@ -1,7 +1,7 @@
 use serde::Serialize;
 use tauri::State;
 use crate::db::DbState;
-use crate::services::{causality, predictions, relationships, signals};
+use crate::services::{predictions, relationships, signals};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrendPoint {
