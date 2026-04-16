@@ -149,6 +149,15 @@ pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     }
 
+    // Log Finnhub API usage so Sources tab shows activity
+    if updated > 0 {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd) VALUES ('finnhub', 'quote', 'refresh_prices', ?1, 0, 0.0)",
+            [updated as i64],
+        ).ok();
+    }
+
     Ok(updated)
 }
 
@@ -369,27 +378,39 @@ pub struct SourceHealth {
 pub fn get_source_health(db: State<'_, DbState>) -> Result<Vec<SourceHealth>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
+    // (display_name, api_provider, source_name_match, description)
+    // source_name_match uses % for LIKE queries when the pipeline writes varied names
     let sources = vec![
-        ("SEC EDGAR", "sec_edgar", "edgar", "Form 4, 8-K, Form D insider/material filings"),
-        ("USASpending", "usaspending", "usaspending", "Government contracts > $1M"),
-        ("Federal Register", "federal_register", "federal_register", "Proposed and final rules"),
-        ("FRED", "fred", "fred", "20 key economic indicators"),
-        ("FEC", "fec", "fec", "Campaign contributions > $10K"),
-        ("EIA", "eia", "eia", "Oil, gas, energy market data"),
-        ("LDA Lobbying", "lda", "lda", "Senate lobbying disclosures"),
-        ("USPTO", "uspto", "patent", "Patent filings (API migrating)"),
-        ("Finnhub", "finnhub", "finnhub", "Real-time stock quotes"),
-        ("Alpaca", "alpaca", "alpaca", "Paper trading execution"),
+        ("SEC EDGAR", "sec_edgar", "SEC EDGAR%", "Form 4, 8-K, Form D insider/material filings"),
+        ("USASpending", "usaspending", "USASpending", "Government contracts > $1M"),
+        ("Federal Register", "federal_register", "Federal Register", "Proposed and final rules"),
+        ("FRED", "fred", "FRED", "20 key economic indicators"),
+        ("FEC", "fec", "FEC", "Campaign contributions > $10K"),
+        ("EIA", "eia", "EIA", "Oil, gas, energy market data"),
+        ("LDA Lobbying", "lda", "Senate LDA", "Senate lobbying disclosures"),
+        ("Google Patents", "uspto", "Google Patents", "Patent filings from major assignees"),
+        ("Finnhub", "finnhub", "", "Real-time stock quotes"),
+        ("Alpaca", "alpaca", "", "Paper trading execution"),
     ];
 
     let mut health = Vec::new();
-    for (name, api_provider, feed_prefix, desc) in sources {
-        // Count stories with matching feed_id prefix
-        let story_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM stories WHERE source_type = 'financial' AND feed_id LIKE ?1 AND created_at >= datetime('now', '-7 days')",
-            [format!("{}%", feed_prefix)],
-            |row| row.get(0),
-        ).unwrap_or(0);
+    for (name, api_provider, source_match, desc) in sources {
+        // Count stories by source_name (Finnhub/Alpaca don't produce stories)
+        let story_count: i64 = if source_match.is_empty() {
+            0
+        } else if source_match.contains('%') {
+            conn.query_row(
+                "SELECT COUNT(*) FROM stories WHERE source_type = 'financial' AND source_name LIKE ?1 AND created_at >= datetime('now', '-7 days')",
+                [source_match],
+                |row| row.get(0),
+            ).unwrap_or(0)
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM stories WHERE source_type = 'financial' AND source_name = ?1 AND created_at >= datetime('now', '-7 days')",
+                [source_match],
+                |row| row.get(0),
+            ).unwrap_or(0)
+        };
 
         // Also check api_usage
         let api_count: i64 = conn.query_row(
@@ -402,7 +423,7 @@ pub fn get_source_health(db: State<'_, DbState>) -> Result<Vec<SourceHealth>, St
 
         let last_fetch: Option<String> = conn.query_row(
             "SELECT MAX(created_at) FROM api_usage WHERE provider = ?1",
-            [feed_prefix],
+            [api_provider],
             |row| row.get(0),
         ).unwrap_or(None);
 

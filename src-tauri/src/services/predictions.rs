@@ -1,6 +1,102 @@
 use anyhow::{Context, Result};
+use chrono::{Local, NaiveDate};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Date parsing
+// ---------------------------------------------------------------------------
+
+/// Convert a natural-language timeframe (e.g. "2 weeks", "Q3 2026", "soon")
+/// into an ISO date string, using `base_date` as the reference point.
+pub fn parse_timeframe_to_date(timeframe: &str, base_date: NaiveDate) -> String {
+    let t = timeframe.trim();
+
+    // Already an ISO date
+    if NaiveDate::parse_from_str(t, "%Y-%m-%d").is_ok() {
+        return t.to_string();
+    }
+
+    // "N days/weeks/months/years"
+    let lower = t.to_lowercase();
+    if let Some(n) = parse_leading_number(&lower) {
+        if lower.contains("day") {
+            return (base_date + chrono::Duration::days(n)).format("%Y-%m-%d").to_string();
+        } else if lower.contains("week") {
+            return (base_date + chrono::Duration::weeks(n)).format("%Y-%m-%d").to_string();
+        } else if lower.contains("month") {
+            return (base_date + chrono::Months::new(n as u32)).format("%Y-%m-%d").to_string();
+        } else if lower.contains("year") {
+            return (base_date + chrono::Months::new(n as u32 * 12)).format("%Y-%m-%d").to_string();
+        }
+    }
+
+    // "QN YYYY" or "QN"
+    if lower.starts_with('q') {
+        let parts: Vec<&str> = t.split_whitespace().collect();
+        let quarter: Option<u32> = parts[0][1..].parse().ok();
+        let year: i32 = if parts.len() > 1 {
+            parts[1].parse().unwrap_or(base_date.year())
+        } else {
+            base_date.year()
+        };
+        if let Some(q) = quarter {
+            let (m, d) = match q {
+                1 => (3, 31), 2 => (6, 30), 3 => (9, 30), _ => (12, 31),
+            };
+            if let Some(date) = NaiveDate::from_ymd_opt(year, m, d) {
+                return date.format("%Y-%m-%d").to_string();
+            }
+        }
+    }
+
+    // Keywords
+    if lower.contains("soon") || lower.contains("near") || lower.contains("imminent") {
+        return (base_date + chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+    }
+    if lower.contains("long") {
+        return (base_date + chrono::Duration::days(180)).format("%Y-%m-%d").to_string();
+    }
+
+    // Default: 90 days
+    (base_date + chrono::Duration::days(90)).format("%Y-%m-%d").to_string()
+}
+
+fn parse_leading_number(s: &str) -> Option<i64> {
+    s.split_whitespace().next()?.parse().ok()
+}
+
+use chrono::Datelike;
+
+/// Migrate existing predictions with non-ISO predicted_date values.
+/// Uses each prediction's created_at as the base date for parsing.
+pub fn migrate_prediction_dates(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT id, predicted_date, created_at FROM insights
+         WHERE insight_type = 'prediction'
+         AND predicted_date IS NOT NULL
+         AND predicted_date NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'"
+    )?;
+
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut migrated = 0;
+    for (id, timeframe, created_at) in &rows {
+        let base = NaiveDate::parse_from_str(&created_at[..10], "%Y-%m-%d")
+            .unwrap_or_else(|_| Local::now().date_naive());
+        let iso_date = parse_timeframe_to_date(timeframe, base);
+        conn.execute(
+            "UPDATE insights SET predicted_date = ?1 WHERE id = ?2",
+            params![iso_date, id],
+        )?;
+        migrated += 1;
+    }
+
+    Ok(migrated)
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -63,6 +159,11 @@ pub fn store_prediction(conn: &Connection, prediction: &Prediction) -> Result<i6
         prediction.evidence_types.join(", "),
     );
 
+    let iso_date = parse_timeframe_to_date(
+        &prediction.predicted_timeframe,
+        Local::now().date_naive(),
+    );
+
     conn.execute(
         "INSERT INTO insights (
             insight_type, title, content, confidence, evidence,
@@ -75,7 +176,7 @@ pub fn store_prediction(conn: &Connection, prediction: &Prediction) -> Result<i6
             evidence_json,
             prediction.sector,
             prediction.status,
-            prediction.predicted_timeframe,
+            iso_date,
         ],
     )
     .context("failed to insert prediction insight")?;

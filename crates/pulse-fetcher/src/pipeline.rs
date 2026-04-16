@@ -742,17 +742,25 @@ async fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::R
                 "reason": format!("Semantic match ({:.0}% similarity)", similarity * 100.0)
             }));
 
-            conn.execute(
-                "UPDATE insights SET probability_history = ?1, confidence = ?2 WHERE id = ?3",
-                rusqlite::params![serde_json::to_string(&entries).unwrap_or_default(), new_prob, pred_id],
-            ).ok();
+            // Strong match → auto-validate; weaker match → just nudge confidence
+            if similarity > 0.80 {
+                conn.execute(
+                    "UPDATE insights SET probability_history = ?1, confidence = ?2, status = 'validated', actual_outcome = ?3, updated_at = datetime('now') WHERE id = ?4",
+                    rusqlite::params![serde_json::to_string(&entries).unwrap_or_default(), new_prob, story_headline, pred_id],
+                ).ok();
+            } else {
+                conn.execute(
+                    "UPDATE insights SET probability_history = ?1, confidence = ?2 WHERE id = ?3",
+                    rusqlite::params![serde_json::to_string(&entries).unwrap_or_default(), new_prob, pred_id],
+                ).ok();
+            }
             validated += 1;
         }
     }
 
     // 5. Expire stale predictions (past their predicted_date with no resolution)
     let expired: usize = conn.execute(
-        "UPDATE insights SET status = 'expired' WHERE insight_type = 'prediction' AND status = 'active' AND predicted_date IS NOT NULL AND predicted_date < date('now', '-7 days')",
+        "UPDATE insights SET status = 'expired' WHERE insight_type = 'prediction' AND status = 'active' AND predicted_date IS NOT NULL AND predicted_date < date('now')",
         [],
     ).unwrap_or(0);
 
@@ -844,7 +852,7 @@ fn validate_predictions_keyword_fallback(
     }
 
     let expired: usize = conn.execute(
-        "UPDATE insights SET status = 'expired' WHERE insight_type = 'prediction' AND status = 'active' AND predicted_date IS NOT NULL AND predicted_date < date('now', '-7 days')",
+        "UPDATE insights SET status = 'expired' WHERE insight_type = 'prediction' AND status = 'active' AND predicted_date IS NOT NULL AND predicted_date < date('now')",
         [],
     ).unwrap_or(0);
 

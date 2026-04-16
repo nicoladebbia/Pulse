@@ -80,16 +80,11 @@ pub fn get_today_freedoms(db: State<'_, DbState>) -> Result<Option<FreedomsBrief
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    // Try today first, fall back to most recent (same as daily briefing)
+    // Strict date match — no fallback to stale data
     let row: Option<(i64, String, Option<String>)> = conn.query_row(
         "SELECT id, date, executive_summary FROM briefings WHERE date = ?1 AND briefing_type = 'freedoms'",
         [&today], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    ).ok().or_else(|| {
-        conn.query_row(
-            "SELECT id, date, executive_summary FROM briefings WHERE briefing_type = 'freedoms' AND status = 'complete' ORDER BY date DESC, created_at DESC LIMIT 1",
-            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        ).ok()
-    });
+    ).ok();
 
     let Some((bid, date, summary)) = row else { return Ok(None) };
 

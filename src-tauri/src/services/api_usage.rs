@@ -34,6 +34,8 @@ pub const FINANCIAL_RATE_LIMITS: &[(&str, i64, i64, &str)] = &[
     ("usaspending",        -1,   -1,     "USASpending (no limit)"),
     ("federal_register",   -1,   -1,     "Federal Register (no limit)"),
     ("alpaca",            200,   -1,     "Alpaca (200/min)"),
+    ("lda",                -1,   -1,     "Senate LDA (no limit)"),
+    ("uspto",              -1,   -1,     "Google Patents (no limit)"),
 ];
 
 pub fn estimate_cost(provider: &str, model: &str, input_tokens: i64, output_tokens: i64) -> f64 {

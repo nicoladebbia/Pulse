@@ -43,6 +43,19 @@ pub fn run() {
 
             let conn = db::connection::initialize(&db_path)
                 .map_err(|e| format!("failed to initialize database: {e}"))?;
+
+            // Startup maintenance: migrate prediction dates and expire stale predictions
+            if let Ok(migrated) = services::predictions::migrate_prediction_dates(&conn) {
+                if migrated > 0 {
+                    eprintln!("Migrated {} prediction dates to ISO format", migrated);
+                }
+            }
+            if let Ok(expired) = services::predictions::expire_stale_predictions(&conn) {
+                if expired > 0 {
+                    eprintln!("Expired {} stale predictions", expired);
+                }
+            }
+
             app.manage(db::DbState(std::sync::Mutex::new(conn)));
             app.manage(ChatAbortFlag(Arc::new(AtomicBool::new(false))));
 
@@ -82,6 +95,7 @@ pub fn run() {
             commands::predictions::get_all_predictions,
             commands::predictions::get_prediction_stats,
             commands::predictions::manually_validate_prediction,
+            commands::predictions::expire_stale_predictions,
             commands::usage::get_api_usage,
             commands::usage::get_tavily_quota,
             commands::usage::get_financial_quotas,
