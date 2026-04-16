@@ -68,7 +68,7 @@ pub fn get_story_trend_badges(db: State<'_, DbState>, story_ids: Vec<i64>) -> Re
         "SELECT em.story_id, sig.topic, sig.trajectory, sig.window_30d
          FROM entity_mentions em
          JOIN entities e ON e.id = em.entity_id
-         JOIN signals sig ON LOWER(sig.topic) = LOWER(e.name)
+         JOIN signals sig ON LOWER(sig.topic) = e.name_normalized
          WHERE em.story_id IN ({})
            AND sig.trajectory IN ('dominant', 'hot', 'rising', 'fading')
          ORDER BY sig.window_30d DESC",
@@ -135,7 +135,7 @@ pub fn get_story_entities(db: State<'_, DbState>, story_id: i64) -> Result<Vec<S
         "SELECT e.name, e.entity_type, COALESCE(sig.trajectory, 'unknown'), COALESCE(sig.acceleration, 0.0), em.sentiment
          FROM entity_mentions em
          JOIN entities e ON e.id = em.entity_id
-         LEFT JOIN signals sig ON LOWER(sig.topic) = LOWER(e.name)
+         LEFT JOIN signals sig ON LOWER(sig.topic) = e.name_normalized
          WHERE em.story_id = ?1
          ORDER BY sig.window_30d DESC NULLS LAST
          LIMIT 10",
@@ -208,7 +208,7 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
                     COUNT(DISTINCT em.mentioned_at) AS days_active,
                     COUNT(em.id) AS mention_count
              FROM signals sig
-             JOIN entities e ON LOWER(e.name) = LOWER(sig.topic)
+             JOIN entities e ON e.name_normalized = LOWER(sig.topic)
              JOIN entity_mentions em ON em.entity_id = e.id
              WHERE sig.trajectory != 'dormant'
                AND em.mentioned_at >= date('now', '-14 days')
@@ -257,7 +257,7 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
                  FROM entities e
                  JOIN entity_mentions em ON em.entity_id = e.id
                  JOIN stories s ON s.id = em.story_id
-                 WHERE LOWER(e.name) = LOWER(?1)
+                 WHERE e.name_normalized = LOWER(?1)
                    AND em.mentioned_at >= date('now', '-14 days')
                  ORDER BY em.mentioned_at DESC
                  LIMIT 10",
@@ -291,7 +291,7 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
                 "SELECT em.mentioned_at, COUNT(*)
                  FROM entities e
                  JOIN entity_mentions em ON em.entity_id = e.id
-                 WHERE LOWER(e.name) = LOWER(?1)
+                 WHERE e.name_normalized = LOWER(?1)
                    AND em.mentioned_at >= date('now', '-13 days')
                  GROUP BY em.mentioned_at
                  ORDER BY em.mentioned_at ASC",
@@ -324,7 +324,7 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
                 "SELECT COALESCE(AVG(em.sentiment), 0.0)
                  FROM entity_mentions em
                  JOIN entities e ON e.id = em.entity_id
-                 WHERE LOWER(e.name) = LOWER(?1)
+                 WHERE e.name_normalized = LOWER(?1)
                    AND em.mentioned_at >= date('now', '-14 days')",
                 [&topic],
                 |row| row.get(0),
@@ -345,7 +345,7 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
                  FROM entity_mentions em
                  JOIN entities e ON e.id = em.entity_id
                  JOIN stories s ON s.id = em.story_id
-                 WHERE LOWER(e.name) = LOWER(?1)
+                 WHERE e.name_normalized = LOWER(?1)
                    AND em.mentioned_at >= date('now', '-14 days')",
             )
             .map_err(|e| e.to_string())?;
