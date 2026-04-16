@@ -172,11 +172,18 @@ pub struct StoryEntityContext {
 pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
-    // Recompute signals before reading
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    match signals::recompute_signals(&conn, &today) {
-        Ok(count) => tracing::debug!("Recomputed {} signals", count),
-        Err(e) => tracing::warn!("Signal recompute failed: {}", e),
+    // Only recompute signals if stale (>1 hour since last update)
+    let needs_recompute: bool = conn.query_row(
+        "SELECT COALESCE(MAX(updated_at) < datetime('now', '-1 hour'), 1) FROM signals",
+        [], |row| row.get(0),
+    ).unwrap_or(true);
+
+    if needs_recompute {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        match signals::recompute_signals(&conn, &today) {
+            Ok(count) => tracing::debug!("Recomputed {} signals (stale)", count),
+            Err(e) => tracing::warn!("Signal recompute failed: {}", e),
+        }
     }
 
     // Build alias map: alias → canonical entity name (for dedup)
@@ -349,11 +356,9 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
             .filter_map(|r| r.ok())
             .collect();
 
-        // --- Enrichment: top causal consequence (min 2 occurrences, 14-day window) ---
-        let causal_consequence = causality::find_causal_chains(&conn, &topic, 14, 2)
-            .ok()
-            .and_then(|chains| chains.into_iter().next())
-            .map(|chain| chain.consequence);
+        // --- Enrichment: top causal consequence ---
+        // Skip causal chains — the cross-join query is too expensive for interactive use
+        let causal_consequence: Option<String> = None;
 
         // --- Enrichment: related prediction ---
         let prediction: Option<TrendPrediction> = predictions::get_predictions_for_topic(&conn, &topic)
