@@ -80,7 +80,13 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    match fetch_filing_type(&client, "13F-HR", "edgar_13f", 20).await {
+    // Pre-fetch 13F infotable filenames in ONE batch EFTS query (avoids per-filing lookups)
+    let infotable_map = fetch_13f_infotable_map(&client).await.unwrap_or_default();
+    if !infotable_map.is_empty() {
+        tracing::info!("SEC EDGAR: pre-fetched {} 13F infotable filenames", infotable_map.len());
+    }
+
+    match fetch_filing_type_13f(&client, "edgar_13f", 20, &infotable_map).await {
         Ok(a) => {
             tracing::info!("SEC EDGAR 13F-HR: {} filings", a.len());
             articles.extend(a);
@@ -130,7 +136,6 @@ async fn fetch_filing_type(
     let mut articles = Vec::new();
     let mut form4_xml_count = 0;
     let mut eight_k_parsed = 0;
-    let mut thirteenf_parsed = 0;
 
     for hit in data.hits.hits {
         let src = hit._source;
@@ -187,23 +192,10 @@ async fn fetch_filing_type(
             })
         } else { None };
 
-        // For 13F-HR: download and parse informationTable.xml for holdings
-        let holdings_data = if (form == "13F-HR" || form == "13F") && thirteenf_parsed < 15 {
-            match download_13f_holdings(client, &accession, cik.as_deref().unwrap_or("0")).await {
-                Ok(holdings) => { thirteenf_parsed += 1; Some(holdings) }
-                Err(e) => {
-                    tracing::warn!("13F holdings failed for {}: {}", entity, e);
-                    None
-                }
-            }
-        } else { None };
-
         let (title, content_snippet) = if let Some(ref f4) = form4_data {
             build_form4_text(&entity, f4)
         } else if let Some(ref ek) = eight_k_data {
             build_8k_text(&entity, ek)
-        } else if let Some(ref holdings) = holdings_data {
-            build_13f_text(&entity, holdings)
         } else {
             build_filing_text(&form, &entity, &src)
         };
@@ -242,23 +234,6 @@ async fn fetch_filing_type(
             metadata["content_preview"] = serde_json::json!(ek.content_preview);
         }
 
-        // Merge 13F holdings data
-        if let Some(ref holdings) = holdings_data {
-            let holdings_json: Vec<serde_json::Value> = holdings.iter().map(|h| {
-                serde_json::json!({
-                    "issuer": h.issuer_name,
-                    "class": h.title_of_class,
-                    "cusip": h.cusip,
-                    "value_thousands": h.value_thousands,
-                    "shares": h.shares,
-                })
-            }).collect();
-            metadata["holdings"] = serde_json::json!(holdings_json);
-            metadata["total_holdings_count"] = serde_json::json!(holdings.len());
-            let total_value: f64 = holdings.iter().map(|h| h.value_thousands).sum();
-            metadata["total_portfolio_value_thousands"] = serde_json::json!(total_value);
-        }
-
         articles.push(RawArticle {
             title,
             url: base_url,
@@ -280,10 +255,6 @@ async fn fetch_filing_type(
     if eight_k_parsed > 0 {
         tracing::info!("SEC EDGAR: parsed {} 8-K filings with event classification", eight_k_parsed);
     }
-    if thirteenf_parsed > 0 {
-        tracing::info!("SEC EDGAR: parsed {} 13F filings with holdings data", thirteenf_parsed);
-    }
-
     Ok(articles)
 }
 
@@ -796,84 +767,222 @@ struct Holding {
     shares: f64,
 }
 
-/// Download and parse 13F informationTable.xml for top holdings.
-/// Uses EFTS search to find the infotable filename, then downloads from data.sec.gov.
-async fn download_13f_holdings(
+/// Pre-fetch all 13F infotable filenames in one EFTS batch query.
+/// Returns a map of accession_number → infotable_filename.
+async fn fetch_13f_infotable_map(
     client: &reqwest::Client,
-    accession: &str,
-    cik: &str,
-) -> anyhow::Result<Vec<Holding>> {
-    // Search EFTS for infotable documents matching this accession
-    let efts_url = format!(
-        "https://efts.sec.gov/LATEST/search-index?q=%22{}%22&forms=13F-HR&from=0&size=5",
-        accession
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let week_ago = (chrono::Local::now() - chrono::Duration::days(7))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    // Single EFTS query: get all 13F-HR documents from past week (returns both primary_doc and infotable entries)
+    let url = format!(
+        "https://efts.sec.gov/LATEST/search-index?q=%22%22&dateRange=custom&startdt={}&enddt={}&forms=13F-HR&from=0&size=200",
+        week_ago, today
     );
 
     let resp = client
-        .get(&efts_url)
+        .get(&url)
         .header("User-Agent", SEC_USER_AGENT)
         .header("Accept", "application/json")
         .send()
         .await?;
 
     if !resp.status().is_success() {
-        anyhow::bail!("EFTS search failed for 13F accession {}", accession);
+        anyhow::bail!("EFTS 13F batch search failed: {}", resp.status());
     }
 
     let body: serde_json::Value = resp.json().await?;
     let hits = body.get("hits")
         .and_then(|h| h.get("hits"))
         .and_then(|h| h.as_array())
-        .ok_or_else(|| anyhow::anyhow!("No EFTS hits for accession {}", accession))?;
+        .ok_or_else(|| anyhow::anyhow!("No EFTS hits for 13F batch"))?;
 
-    // Find the infotable document from the _id fields
-    // Format: "accession:filename.xml"
-    let infotable_filename = hits.iter()
-        .filter_map(|hit| hit.get("_id").and_then(|id| id.as_str()))
-        .find(|id| {
+    let mut map = std::collections::HashMap::new();
+
+    for hit in hits {
+        if let Some(id) = hit.get("_id").and_then(|v| v.as_str()) {
             let lower = id.to_lowercase();
-            lower.contains("infotable") || lower.contains("information_table")
+            // Only keep infotable entries (not primary_doc)
+            let is_infotable = lower.contains("infotable") || lower.contains("information_table")
                 || lower.contains("informationtable")
-                || (lower.ends_with(".xml") && !lower.contains("primary_doc"))
-        })
-        .and_then(|id| id.split(':').nth(1))
-        .ok_or_else(|| anyhow::anyhow!("No infotable found in EFTS for accession {}", accession))?
+                || (lower.ends_with(".xml") && !lower.contains("primary_doc"));
+
+            if is_infotable {
+                if let Some((accession, filename)) = id.split_once(':') {
+                    map.insert(accession.to_string(), filename.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(map)
+}
+
+/// Fetch 13F-HR filings with holdings data using pre-built infotable map.
+async fn fetch_filing_type_13f(
+    client: &reqwest::Client,
+    feed_id: &str,
+    limit: usize,
+    infotable_map: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<Vec<RawArticle>> {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let week_ago = (chrono::Local::now() - chrono::Duration::days(7))
+        .format("%Y-%m-%d")
         .to_string();
 
-    // Build the download URL from www.sec.gov (archives only served here)
-    let cik_trimmed = cik.trim_start_matches('0');
-    let acc_nodash = accession.replace('-', "");
-    let download_url = format!(
-        "https://www.sec.gov/Archives/edgar/data/{}/{}/{}",
-        cik_trimmed, acc_nodash, infotable_filename
+    let url = format!(
+        "https://efts.sec.gov/LATEST/search-index?q=%22%22&dateRange=custom&startdt={}&enddt={}&forms=13F-HR&from=0&size={}",
+        week_ago, today, limit
     );
 
-    // Rate limit: SEC allows 10 req/sec, stay well under (budget shared with Form 4 + 8-K)
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let resp = client
+        .get(&url)
+        .header("User-Agent", SEC_USER_AGENT)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
 
-    let doc_resp = client
-        .get(&download_url)
+    if !resp.status().is_success() {
+        return fetch_via_rss(client, "13F-HR", feed_id).await;
+    }
+
+    let data: EdgarSearchResponse = match resp.json().await {
+        Ok(d) => d,
+        Err(_) => return fetch_via_rss(client, "13F-HR", feed_id).await,
+    };
+
+    let mut articles = Vec::new();
+    let mut thirteenf_parsed = 0;
+
+    for hit in data.hits.hits {
+        let src = hit._source;
+        let display_names = src.display_names.as_deref().unwrap_or(&[]);
+        let entity = display_names
+            .iter()
+            .find(|n| !n.contains("CIK"))
+            .or(display_names.first())
+            .map(|n| n.split("  (CIK").next().unwrap_or(n).trim().to_string())
+            .unwrap_or_else(|| "Unknown Entity".to_string());
+
+        let form = src.form.as_deref().unwrap_or("13F-HR").to_string();
+        let file_date = src.file_date.clone();
+        let accession = src.adsh.clone().unwrap_or_else(|| hit._id.clone());
+        let cik = src.ciks.as_ref().and_then(|c| c.last().cloned());
+
+        let cik_str = cik.as_deref().unwrap_or("0");
+        let cik_trimmed = cik_str.trim_start_matches('0');
+        let acc_nodash = accession.replace('-', "");
+        let base_url = format!(
+            "https://www.sec.gov/Archives/edgar/data/{}/{}",
+            cik_str, acc_nodash
+        );
+
+        // Download holdings using pre-fetched infotable filename (no per-filing EFTS lookup)
+        let holdings_data = if thirteenf_parsed < 15 {
+            if let Some(filename) = infotable_map.get(&accession) {
+                let download_url = format!(
+                    "https://www.sec.gov/Archives/edgar/data/{}/{}/{}",
+                    cik_trimmed, acc_nodash, filename
+                );
+                // 500ms delay to stay well under SEC rate limit
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                match download_and_parse_13f(client, &download_url).await {
+                    Ok(holdings) => {
+                        thirteenf_parsed += 1;
+                        Some(holdings)
+                    }
+                    Err(e) => {
+                        tracing::warn!("13F holdings failed for {}: {}", entity, e);
+                        None
+                    }
+                }
+            } else {
+                None // No infotable filename found in batch
+            }
+        } else {
+            None
+        };
+
+        let (title, content_snippet) = if let Some(ref holdings) = holdings_data {
+            build_13f_text(&entity, holdings)
+        } else {
+            build_filing_text(&form, &entity, &src)
+        };
+
+        let mut metadata = serde_json::json!({
+            "filing_type": form,
+            "accession_number": accession,
+            "entity_name": entity,
+            "file_date": file_date,
+            "cik": cik,
+            "display_names": display_names,
+        });
+
+        if let Some(ref holdings) = holdings_data {
+            let holdings_json: Vec<serde_json::Value> = holdings.iter().map(|h| {
+                serde_json::json!({
+                    "issuer": h.issuer_name,
+                    "class": h.title_of_class,
+                    "cusip": h.cusip,
+                    "value_thousands": h.value_thousands,
+                    "shares": h.shares,
+                })
+            }).collect();
+            metadata["holdings"] = serde_json::json!(holdings_json);
+            metadata["total_holdings_count"] = serde_json::json!(holdings.len());
+            let total_value: f64 = holdings.iter().map(|h| h.value_thousands).sum();
+            metadata["total_portfolio_value_thousands"] = serde_json::json!(total_value);
+        }
+
+        articles.push(RawArticle {
+            title,
+            url: base_url,
+            source_name: format!("SEC EDGAR {}", form),
+            source_url: "https://www.sec.gov".to_string(),
+            published_at: file_date,
+            content_snippet,
+            sector: "finance".to_string(),
+            feed_id: feed_id.to_string(),
+            language: "en".to_string(),
+            source_type: "financial".to_string(),
+            financial_metadata: Some(serde_json::to_string(&metadata).unwrap_or_default()),
+        });
+    }
+
+    if thirteenf_parsed > 0 {
+        tracing::info!("SEC EDGAR: parsed {} 13F filings with holdings data", thirteenf_parsed);
+    }
+
+    Ok(articles)
+}
+
+/// Download and parse a 13F infotable XML from a known URL.
+async fn download_and_parse_13f(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<Vec<Holding>> {
+    let resp = client
+        .get(url)
         .header("User-Agent", SEC_USER_AGENT)
         .send()
         .await?;
 
-    if !doc_resp.status().is_success() {
-        anyhow::bail!("13F infotable download failed: HTTP {}", doc_resp.status());
+    if !resp.status().is_success() {
+        anyhow::bail!("13F infotable download failed: HTTP {}", resp.status());
     }
 
-    let xml = doc_resp.text().await?;
+    let xml = resp.text().await?;
 
-    // Check for rate-limit HTML response (SEC returns HTML when rate-limited)
     if xml.contains("Request Rate Threshold Exceeded") || xml.contains("SEC.gov | Request Rate") {
         anyhow::bail!("SEC rate limit hit during 13F infotable download");
     }
-    // Check for non-XML response (e.g., error page)
     if !xml.trim_start().starts_with("<?xml") && !xml.trim_start().starts_with("<informationTable")
         && !xml.trim_start().starts_with("<ns1:informationTable") {
         anyhow::bail!("13F infotable response is not XML");
     }
-
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     parse_13f_xml(&xml)
 }
