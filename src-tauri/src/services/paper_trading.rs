@@ -315,26 +315,40 @@ pub fn get_trades_from_db(conn: &Connection, status: &str) -> Result<Vec<PaperTr
 }
 
 /// Build portfolio from pre-fetched trades + async Alpaca API calls.
+/// Merges live Alpaca P&L data into DB open_trades for accurate display.
 pub async fn get_portfolio_with_trades(
-    open_trades: Vec<PaperTrade>,
+    mut open_trades: Vec<PaperTrade>,
     closed_trades: Vec<PaperTrade>,
 ) -> Result<Portfolio> {
     let account = get_account().await?;
 
     let alpaca_positions = get_positions().await.unwrap_or_default();
     let positions: Vec<Position> = alpaca_positions
-        .into_iter()
+        .iter()
         .map(|p| Position {
-            symbol: p.symbol,
+            symbol: p.symbol.clone(),
             qty: p.qty.parse().unwrap_or(0.0),
             avg_entry_price: p.avg_entry_price.parse().unwrap_or(0.0),
             current_price: p.current_price.parse().unwrap_or(0.0),
             market_value: p.market_value.parse().unwrap_or(0.0),
             unrealized_pl: p.unrealized_pl.parse().unwrap_or(0.0),
             unrealized_pl_pct: p.unrealized_plpc.parse().unwrap_or(0.0),
-            side: p.side,
+            side: p.side.clone(),
         })
         .collect();
+
+    // Merge Alpaca live P&L into DB open_trades
+    for trade in &mut open_trades {
+        if let Some(pos) = alpaca_positions.iter().find(|p| p.symbol == trade.ticker) {
+            let current_price = pos.current_price.parse::<f64>().unwrap_or(0.0);
+            let unrealized_pl = pos.unrealized_pl.parse::<f64>().unwrap_or(0.0);
+            let unrealized_pct = pos.unrealized_plpc.parse::<f64>().unwrap_or(0.0);
+            if current_price > 0.0 {
+                trade.pnl = Some(unrealized_pl);
+                trade.pnl_pct = Some(unrealized_pct * 100.0); // Convert from decimal to %
+            }
+        }
+    }
 
     Ok(Portfolio {
         equity: account.equity.parse().unwrap_or(0.0),

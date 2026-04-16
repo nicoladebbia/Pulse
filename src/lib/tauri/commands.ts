@@ -141,6 +141,10 @@ export async function getEntityPrices(limit?: number): Promise<EntityPrice[]> {
 	return invoke('get_entity_prices', { limit: limit ?? 50 });
 }
 
+export async function refreshPrices(): Promise<number> {
+	return invoke('refresh_prices');
+}
+
 export async function getFinancialEvents(limit?: number): Promise<FinancialEvent[]> {
 	return invoke('get_financial_events', { limit: limit ?? 30 });
 }

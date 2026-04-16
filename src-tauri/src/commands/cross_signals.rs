@@ -4,23 +4,11 @@ use crate::db::DbState;
 use crate::services::cross_signals::{self, CrossSignal};
 
 /// Get entities with the strongest cross-signal scores.
+/// Cross-signals are computed during the daily pipeline run — never recompute from the UI.
 #[tauri::command]
 pub fn get_cross_signals(db: State<'_, DbState>, limit: Option<usize>) -> Result<Vec<CrossSignal>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let limit = limit.unwrap_or(20);
-
-    // Only recompute if stale (>1 hour) — these are expensive batch operations
-    let needs_recompute: bool = conn.query_row(
-        "SELECT COALESCE(MAX(computed_at) < datetime('now', '-1 hour'), 1) FROM cross_signals",
-        [], |row| row.get(0),
-    ).unwrap_or(true);
-
-    if needs_recompute {
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        crate::services::signals::recompute_signals(&conn, &today).ok();
-        cross_signals::compute_all_cross_signals(&conn, &today).ok();
-    }
-
     cross_signals::get_top_signals(&conn, limit).map_err(|e| e.to_string())
 }
 
@@ -52,11 +40,14 @@ pub fn get_entity_prices(db: State<'_, DbState>, limit: Option<usize>) -> Result
 
     let mut stmt = conn
         .prepare(
-            "SELECT ep.ticker, ep.date, ep.close, ep.change_1d, ep.change_7d, ep.change_30d, e.name
+            "SELECT ep.ticker, ep.date, ep.close, ep.change_1d, ep.change_7d, ep.change_30d,
+                    (SELECT e.name FROM entity_tickers et
+                     JOIN entities e ON e.id = et.entity_id
+                     WHERE et.ticker = ep.ticker
+                     ORDER BY et.confidence DESC LIMIT 1) AS entity_name
              FROM entity_prices ep
-             LEFT JOIN entity_tickers et ON et.ticker = ep.ticker
-             LEFT JOIN entities e ON e.id = et.entity_id
              WHERE ep.date = (SELECT MAX(date) FROM entity_prices)
+             GROUP BY ep.ticker
              ORDER BY ep.close DESC
              LIMIT ?1"
         )
@@ -79,6 +70,86 @@ pub fn get_entity_prices(db: State<'_, DbState>, limit: Option<usize>) -> Result
         .collect();
 
     Ok(prices)
+}
+
+/// Refresh prices for top tickers from Finnhub. Called on signals page load.
+#[tauri::command]
+pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
+    let api_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        return Ok(0);
+    }
+
+    // Get tickers to refresh (from DB, drop lock before async)
+    let tickers: Vec<(i64, String)> = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT et.entity_id, et.ticker FROM entity_tickers et
+             WHERE et.is_public = 1 AND et.confidence >= 0.8
+             ORDER BY et.confidence DESC LIMIT 25"
+        ).map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+    // Lock dropped
+
+    if tickers.is_empty() { return Ok(0); }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build().map_err(|e| e.to_string())?;
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut updated = 0;
+
+    for (entity_id, ticker) in &tickers {
+        let url = format!("https://finnhub.io/api/v1/quote?symbol={}&token={}", ticker, api_key);
+        let resp = match client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+
+        #[derive(serde::Deserialize)]
+        struct Q { c: f64, pc: f64 }
+        let quote: Q = match resp.json().await {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+        if quote.c == 0.0 { continue; }
+
+        let change_1d = if quote.pc > 0.0 {
+            Some(((quote.c - quote.pc) / quote.pc) * 100.0)
+        } else { None };
+
+        // Re-acquire lock briefly to write
+        {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+            // Compute 7d/30d from historical data
+            let change_7d: Option<f64> = conn.query_row(
+                "SELECT close FROM entity_prices WHERE ticker = ?1 AND date <= date('now', '-7 days') ORDER BY date DESC LIMIT 1",
+                [&ticker], |row| row.get(0),
+            ).ok().and_then(|past: f64| if past > 0.0 { Some(((quote.c - past) / past) * 100.0) } else { None });
+
+            let change_30d: Option<f64> = conn.query_row(
+                "SELECT close FROM entity_prices WHERE ticker = ?1 AND date <= date('now', '-30 days') ORDER BY date DESC LIMIT 1",
+                [&ticker], |row| row.get(0),
+            ).ok().and_then(|past: f64| if past > 0.0 { Some(((quote.c - past) / past) * 100.0) } else { None });
+
+            conn.execute(
+                "INSERT OR REPLACE INTO entity_prices (entity_id, ticker, date, close, change_1d, change_7d, change_30d)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![entity_id, ticker, today, quote.c, change_1d, change_7d, change_30d],
+            ).ok();
+            updated += 1;
+        }
+        // Drop lock, rate limit
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    }
+
+    Ok(updated)
 }
 
 /// A recent financial event from any source.

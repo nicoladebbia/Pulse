@@ -108,6 +108,52 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
     }
 
     tracing::info!("Finnhub: stored {} prices ({} errors)", stored, errors);
+
+    // Backfill 30-day candle history for tickers missing 7d/30d changes
+    let needs_backfill: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT ep.ticker FROM entity_prices ep
+             WHERE ep.date = ?1 AND (ep.change_7d IS NULL OR ep.change_30d IS NULL)
+             LIMIT 30"
+        )?;
+        stmt.query_map([&today], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    if !needs_backfill.is_empty() {
+        tracing::info!("Finnhub: backfilling 30-day candles for {} tickers", needs_backfill.len());
+        let mut backfilled = 0;
+        for ticker in &needs_backfill {
+            match backfill_candles(&client, &api_key, &conn, ticker, 35).await {
+                Ok(n) if n > 0 => backfilled += 1,
+                Ok(_) => {}
+                Err(e) => tracing::debug!("Candle backfill failed for {}: {}", ticker, e),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+
+        // Now recompute 7d/30d changes for today's prices using the backfilled history
+        if backfilled > 0 {
+            for ticker in &needs_backfill {
+                let current: Option<f64> = conn.query_row(
+                    "SELECT close FROM entity_prices WHERE ticker = ?1 AND date = ?2",
+                    rusqlite::params![ticker, today], |row| row.get(0),
+                ).ok();
+                if let Some(price) = current {
+                    let c7 = compute_change(&conn, ticker, price, 7);
+                    let c30 = compute_change(&conn, ticker, price, 30);
+                    conn.execute(
+                        "UPDATE entity_prices SET change_7d = ?1, change_30d = ?2
+                         WHERE ticker = ?3 AND date = ?4",
+                        rusqlite::params![c7, c30, ticker, today],
+                    ).ok();
+                }
+            }
+            tracing::info!("Finnhub: backfilled candles for {} tickers, recomputed 7d/30d changes", backfilled);
+        }
+    }
+
     Ok(stored)
 }
 
@@ -163,6 +209,67 @@ fn compute_change(conn: &Connection, ticker: &str, current_price: f64, days: i64
             None
         }
     })
+}
+
+/// Backfill candle history for a ticker (used during daily pipeline).
+async fn backfill_candles(
+    client: &reqwest::Client,
+    api_key: &str,
+    conn: &Connection,
+    ticker: &str,
+    days_back: i64,
+) -> anyhow::Result<usize> {
+    let now = chrono::Utc::now().timestamp();
+    let from = now - (days_back * 86400);
+
+    let url = format!(
+        "https://finnhub.io/api/v1/stock/candle?symbol={}&resolution=D&from={}&to={}&token={}",
+        ticker, from, now, api_key
+    );
+
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Finnhub candle API returned {}", resp.status());
+    }
+
+    let data: serde_json::Value = resp.json().await?;
+    let status = data.get("s").and_then(|s| s.as_str()).unwrap_or("no_data");
+    if status != "ok" {
+        return Ok(0);
+    }
+
+    let closes = data.get("c").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let opens = data.get("o").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let highs = data.get("h").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let lows = data.get("l").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let timestamps = data.get("t").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    let entity_id: Option<i64> = conn
+        .query_row("SELECT entity_id FROM entity_tickers WHERE ticker = ?1", [ticker], |row| row.get(0))
+        .ok();
+
+    let mut stored = 0;
+    for i in 0..closes.len() {
+        let ts = timestamps.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
+        let date = chrono::DateTime::from_timestamp(ts, 0)
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        if date.is_empty() { continue; }
+
+        let close = closes.get(i).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let open = opens.get(i).and_then(|v| v.as_f64());
+        let high = highs.get(i).and_then(|v| v.as_f64());
+        let low = lows.get(i).and_then(|v| v.as_f64());
+
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_prices (entity_id, ticker, date, open, close, high, low)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![entity_id, ticker, date, open, close, high, low],
+        )?;
+        stored += 1;
+    }
+
+    Ok(stored)
 }
 
 /// Fetch historical daily candles for backtesting.

@@ -3,7 +3,7 @@
 	import {
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
 		executeTrade, getFinancialEvents, getSignalEvidence, getSourceHealth,
-		getFinancialQuotas
+		getFinancialQuotas, refreshPrices
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
@@ -26,6 +26,7 @@
 	let tradingTicker = $state('');
 	let tradingConfidence = $state(0.6);
 	let tradeStatus = $state<string | null>(null);
+	let pricesRefreshing = $state(false);
 
 	$effect(() => {
 		if (loaded) return;
@@ -50,10 +51,17 @@
 			evidence = ev;
 			events = e;
 			prices = p;
-			// Load async data separately (Alpaca API call)
+			// Load async data separately (Alpaca API call + price refresh)
 			getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
 			getSourceHealth().then(sh => { sources = sh; }).catch(() => {});
 			getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
+			// Refresh prices in background, then reload price list
+			pricesRefreshing = true;
+			refreshPrices()
+				.then(() => getEntityPrices(50))
+				.then(p => { prices = p; })
+				.catch(() => {})
+				.finally(() => { pricesRefreshing = false; });
 		} catch (e: any) {
 			error = String(e?.message ?? e);
 		} finally {
@@ -76,13 +84,6 @@
 		}
 	}
 
-	function dimColor(value: number): string {
-		if (value > 0.6) return 'bg-emerald-400';
-		if (value > 0.3) return 'bg-amber-400';
-		if (value > 0.1) return 'bg-zinc-500';
-		return 'bg-zinc-800';
-	}
-
 	function changeColor(val: number | null): string {
 		if (val === null) return 'text-text-muted';
 		return val >= 0 ? 'text-emerald-400' : 'text-rose-400';
@@ -97,15 +98,8 @@
 		return val.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 	}
 
-	function sourceIcon(name: string): string {
-		if (name.includes('SEC') || name.includes('EDGAR')) return '●';
-		if (name.includes('USASpending')) return '●';
-		if (name.includes('Federal')) return '●';
-		if (name.includes('FRED')) return '●';
-		if (name.includes('FEC')) return '●';
-		if (name.includes('EIA')) return '●';
-		if (name.includes('LDA') || name.includes('Lobby')) return '●';
-		return '●';
+	function fmtPnl(val: number): string {
+		return `${val >= 0 ? '+' : ''}${fmtPrice(val)}`;
 	}
 
 	function sourceColor(name: string): string {
@@ -135,24 +129,32 @@
 		return 'text-zinc-500 bg-zinc-500/5 border-zinc-700/30';
 	}
 
-	const dimensions = [
-		{ key: 'insider_signal', label: 'INS', color: 'bg-blue-400', full: 'Insider Trading' },
-		{ key: 'news_momentum', label: 'NWS', color: 'bg-cyan-400', full: 'News Momentum' },
-		{ key: 'government_signal', label: 'GOV', color: 'bg-amber-400', full: 'Government' },
-		{ key: 'institutional_flow', label: 'IST', color: 'bg-violet-400', full: 'Institutional' },
-		{ key: 'search_trend', label: 'SRC', color: 'bg-emerald-400', full: 'Search Trends' },
-		{ key: 'patent_signal', label: 'PAT', color: 'bg-rose-400', full: 'Patents' },
-		{ key: 'supply_chain', label: 'SUP', color: 'bg-orange-400', full: 'Supply Chain' },
-		{ key: 'political_signal', label: 'POL', color: 'bg-fuchsia-400', full: 'Political' },
-	] as const;
-
-	function getDimValue(sig: CrossSignal, key: string): number {
-		return (sig as any)[key] ?? 0;
+	function recIcon(rec: string): string {
+		if (rec.startsWith('Strong Buy')) return '▲▲';
+		if (rec.startsWith('Buy')) return '▲';
+		if (rec.startsWith('Watch')) return '◉';
+		if (rec.startsWith('Monitor')) return '○';
+		return '·';
 	}
 
 	const activeSources = $derived(sources.filter(s => s.status === 'active').length);
 	const totalEvents = $derived(events.length);
 	const openTrades = $derived(portfolio?.open_trades.length ?? 0);
+
+	// Portfolio P&L
+	const totalPnl = $derived(
+		portfolio?.positions.reduce((sum, p) => sum + p.unrealized_pl, 0) ?? 0
+	);
+	const totalPnlPct = $derived(
+		portfolio && portfolio.portfolio_value > 0
+			? (totalPnl / (portfolio.portfolio_value - totalPnl)) * 100
+			: 0
+	);
+
+	// Actionable signals (Buy or Strong Buy only)
+	const actionable = $derived(evidence.filter(e =>
+		e.recommendation.startsWith('Strong Buy') || e.recommendation.startsWith('Buy')
+	));
 
 	// Keyboard shortcuts
 	function handleKeydown(e: KeyboardEvent) {
@@ -174,12 +176,15 @@
 			<h1 class="text-xl font-bold text-text">Signals</h1>
 			<p class="text-xs text-text-muted mt-0.5">
 				{activeSources} sources active · {totalEvents} events · {signals.length} entities scored
+				{#if pricesRefreshing}
+					<span class="text-ai ml-1">· refreshing prices...</span>
+				{/if}
 			</p>
 		</div>
 		{#if convergence.length > 0}
-			<div class="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg animate-pulse">
-				<div class="w-2 h-2 rounded-full bg-emerald-400"></div>
-				<span class="text-emerald-400 text-sm font-medium">{convergence.length} convergence alert{convergence.length > 1 ? 's' : ''}</span>
+			<div class="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
+				<div class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
+				<span class="text-emerald-400 text-sm font-medium">{convergence.length} convergence</span>
 			</div>
 		{/if}
 	</div>
@@ -191,15 +196,17 @@
 			<div class="text-xl font-mono font-bold text-text">{signals.length > 0 ? `${(signals[0]?.compound_score * 100).toFixed(0)}%` : '--'}</div>
 		</div>
 		<div class="bg-bg-card border border-border rounded-xl p-3">
-			<div class="text-[10px] text-text-muted uppercase tracking-wider">Convergence</div>
-			<div class="text-xl font-mono font-bold {convergence.length > 0 ? 'text-emerald-400' : 'text-text'}">{convergence.length}</div>
+			<div class="text-[10px] text-text-muted uppercase tracking-wider">Actionable</div>
+			<div class="text-xl font-mono font-bold {actionable.length > 0 ? 'text-emerald-400' : 'text-text'}">{actionable.length} signals</div>
 		</div>
 		<div class="bg-bg-card border border-border rounded-xl p-3">
-			<div class="text-[10px] text-text-muted uppercase tracking-wider">Sources</div>
-			<div class="text-xl font-mono font-bold text-text">{activeSources}/{sources.length || '?'}</div>
+			<div class="text-[10px] text-text-muted uppercase tracking-wider">Portfolio P&L</div>
+			<div class="text-xl font-mono font-bold {totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
+				{portfolio ? fmtPnl(totalPnl) : '--'}
+			</div>
 		</div>
 		<div class="bg-bg-card border border-border rounded-xl p-3">
-			<div class="text-[10px] text-text-muted uppercase tracking-wider">Paper Trades</div>
+			<div class="text-[10px] text-text-muted uppercase tracking-wider">Positions</div>
 			<div class="text-xl font-mono font-bold text-text">{openTrades} open</div>
 		</div>
 	</div>
@@ -232,74 +239,100 @@
 	<!-- ==================== OVERVIEW TAB ==================== -->
 	{:else if activeTab === 'overview'}
 
-		<!-- Buy Suggestions / Signal Evidence -->
-		{#if evidence.length > 0}
-			<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Signal Intelligence</h2>
-			<div class="space-y-3 mb-6">
-				{#each evidence as ev, idx}
-					{@const isExpanded = expandedSignal === idx}
-					<div class="bg-bg-card border {ev.recommendation.startsWith('Strong Buy') ? 'border-emerald-500/25' : ev.recommendation.startsWith('Buy') ? 'border-blue-500/20' : 'border-border'} rounded-xl overflow-hidden transition-colors">
-						<!-- Main row -->
-						<button
-							class="w-full px-5 py-4 text-left"
-							onclick={() => { expandedSignal = isExpanded ? null : idx; }}
-						>
-							<div class="flex items-center justify-between mb-2">
-								<div class="flex items-center gap-2.5">
-									<span class="text-base font-semibold text-text">{ev.entity_name}</span>
+		{#if tradeStatus}
+			<div class="mb-4 px-4 py-2.5 rounded-lg text-sm {tradeStatus.startsWith('Error') ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20' : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'}">
+				{tradeStatus}
+			</div>
+		{/if}
+
+		<!-- Actionable Signals (Buy/Strong Buy) -->
+		{#if actionable.length > 0}
+			<h2 class="text-xs font-semibold text-emerald-400 uppercase tracking-wider mb-3">Action Required</h2>
+			<div class="space-y-2 mb-6">
+				{#each actionable as ev}
+					<div class="bg-bg-card border border-emerald-500/20 rounded-xl px-5 py-4 flex items-center justify-between">
+						<div class="flex items-center gap-3">
+							<span class="text-emerald-400 text-lg font-bold">{recIcon(ev.recommendation)}</span>
+							<div>
+								<div class="flex items-center gap-2">
+									<span class="font-semibold text-text">{ev.entity_name}</span>
 									{#if ev.ticker}
 										<span class="text-[10px] font-mono text-text-muted bg-bg px-1.5 py-0.5 rounded">{ev.ticker}</span>
 									{/if}
 									{#if ev.price}
 										<span class="text-sm font-mono text-text-secondary">{fmtPrice(ev.price)}</span>
+									{/if}
+								</div>
+								<p class="text-xs text-text-muted mt-0.5">{ev.reasons[0] ?? ''}</p>
+							</div>
+						</div>
+						<div class="flex items-center gap-3">
+							<span class="text-sm font-mono font-bold text-emerald-400">{(ev.compound_score * 100).toFixed(0)}%</span>
+							{#if ev.ticker}
+								<button
+									class="px-4 py-1.5 bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 rounded-lg text-xs font-semibold hover:bg-emerald-500/25 transition-colors"
+									onclick={() => handleTrade(ev.ticker!, ev.compound_score)}
+								>
+									Buy {ev.ticker}
+								</button>
+							{/if}
+						</div>
+					</div>
+				{/each}
+			</div>
+		{/if}
+
+		<!-- All Signal Evidence -->
+		{#if evidence.length > 0}
+			<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">All Signals</h2>
+			<div class="space-y-2 mb-6">
+				{#each evidence as ev, idx}
+					{@const isExpanded = expandedSignal === idx}
+					<div class="bg-bg-card border {ev.recommendation.startsWith('Strong Buy') ? 'border-emerald-500/25' : ev.recommendation.startsWith('Buy') ? 'border-blue-500/20' : 'border-border'} rounded-xl overflow-hidden">
+						<button class="w-full px-5 py-3 text-left" onclick={() => { expandedSignal = isExpanded ? null : idx; }}>
+							<div class="flex items-center justify-between">
+								<div class="flex items-center gap-2.5">
+									<span class="text-xs w-5 text-center {ev.recommendation.startsWith('Strong') ? 'text-emerald-400' : ev.recommendation.startsWith('Buy') ? 'text-blue-400' : ev.recommendation.startsWith('Watch') ? 'text-amber-400' : 'text-zinc-500'}">{recIcon(ev.recommendation)}</span>
+									<span class="text-sm font-semibold text-text">{ev.entity_name}</span>
+									{#if ev.ticker}
+										<span class="text-[10px] font-mono text-text-muted bg-bg px-1.5 py-0.5 rounded">{ev.ticker}</span>
+									{/if}
+									{#if ev.price}
+										<span class="text-xs font-mono text-text-secondary">{fmtPrice(ev.price)}</span>
 										{#if ev.price_change_1d !== null}
-											<span class="text-xs font-mono {changeColor(ev.price_change_1d)}">{fmtChange(ev.price_change_1d)}</span>
+											<span class="text-[10px] font-mono {changeColor(ev.price_change_1d)}">{fmtChange(ev.price_change_1d)}</span>
 										{/if}
 									{/if}
 								</div>
 								<div class="flex items-center gap-3">
-									<span class="text-lg font-mono font-bold {ev.compound_score > 0.5 ? 'text-emerald-400' : 'text-text-secondary'}">{(ev.compound_score * 100).toFixed(0)}%</span>
-									<span class="text-text-muted text-sm">{isExpanded ? '−' : '+'}</span>
+									<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium border {recColor(ev.recommendation)}">
+										{ev.recommendation.split(' — ')[0]}
+									</span>
+									<span class="text-sm font-mono font-bold {ev.compound_score > 0.4 ? 'text-emerald-400' : 'text-text-secondary'}">{(ev.compound_score * 100).toFixed(0)}%</span>
+									<span class="text-text-muted text-xs">{isExpanded ? '−' : '+'}</span>
 								</div>
 							</div>
-
-							<!-- Recommendation badge -->
-							<div class="inline-flex items-center px-2.5 py-1 rounded-lg border text-xs font-medium {recColor(ev.recommendation)} mb-2">
-								{ev.recommendation}
-							</div>
-
-							<!-- Top reasons (always visible) -->
-							{#if ev.reasons.length > 0}
-								<p class="text-sm text-text-secondary mt-1">
-									{ev.reasons.slice(0, 2).join(' · ')}
-								</p>
-							{/if}
 						</button>
 
-						<!-- Expanded detail -->
 						{#if isExpanded}
 							<div class="px-5 pb-4 border-t border-border pt-3 space-y-3">
-								<!-- All reasons -->
 								<div>
-									<h4 class="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-1.5">Why This Signal</h4>
+									<h4 class="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-1.5">Why</h4>
 									<ul class="space-y-1">
 										{#each ev.reasons as reason}
 											<li class="text-sm text-text-secondary flex items-start gap-2">
-												<span class="text-ai mt-0.5">▪</span>
-												{reason}
+												<span class="text-ai mt-0.5">+</span> {reason}
 											</li>
 										{/each}
 									</ul>
 								</div>
-
-								<!-- Evidence stories -->
 								{#if ev.source_stories.length > 0}
 									<div>
 										<h4 class="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-1.5">Evidence</h4>
 										<div class="space-y-1">
 											{#each ev.source_stories as story}
 												<div class="flex items-start gap-2 text-xs">
-													<span class="{sourceColor(story.source_name)}">●</span>
+													<span class="{sourceColor(story.source_name)}">+</span>
 													<span class="text-text-secondary flex-1">{story.headline}</span>
 													<span class="text-text-muted shrink-0">{story.source_name}</span>
 												</div>
@@ -307,22 +340,18 @@
 										</div>
 									</div>
 								{/if}
-
-								<!-- Position sizing + trade button -->
 								<div class="flex items-center justify-between bg-bg rounded-lg px-4 py-3">
 									<div class="text-xs text-text-muted">
-										Suggested position: <span class="text-text font-mono">{ev.position_size_pct}%</span> of portfolio
+										Position: <span class="text-text font-mono">{ev.position_size_pct}%</span>
 										{#if portfolio}
-											<span class="text-text-muted"> ≈ {fmtPrice(portfolio.portfolio_value * ev.position_size_pct / 100)}</span>
+											<span class="text-text-muted"> = {fmtPrice(portfolio.portfolio_value * ev.position_size_pct / 100)}</span>
 										{/if}
 									</div>
 									{#if ev.ticker}
 										<button
 											class="px-4 py-1.5 bg-ai/10 text-ai border border-ai/25 rounded-lg text-xs font-medium hover:bg-ai/20 transition-colors"
 											onclick={() => handleTrade(ev.ticker!, ev.compound_score)}
-										>
-											Paper Trade {ev.ticker} →
-										</button>
+										>Buy {ev.ticker}</button>
 									{/if}
 								</div>
 							</div>
@@ -333,23 +362,17 @@
 		{:else}
 			<div class="bg-bg-card border border-border rounded-xl p-8 text-center mb-6">
 				<p class="text-base text-text-secondary mb-2">No signal intelligence yet</p>
-				<p class="text-sm text-text-muted">Run the pipeline daily to accumulate financial data from SEC, government contracts, lobbying, and more. Signals appear when entities are mentioned across multiple source types.</p>
-			</div>
-		{/if}
-
-		{#if tradeStatus}
-			<div class="mb-4 px-4 py-2.5 rounded-lg text-sm {tradeStatus.startsWith('Error') ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20' : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'}">
-				{tradeStatus}
+				<p class="text-sm text-text-muted">Run the pipeline daily to accumulate financial data. Signals appear when entities are mentioned across multiple source types.</p>
 			</div>
 		{/if}
 
 		<!-- Recent Financial Events -->
 		{#if events.length > 0}
 			<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Recent Financial Events</h2>
-			<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50 mb-6">
+			<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50">
 				{#each events.slice(0, 12) as event}
 					<div class="px-4 py-2.5 flex items-center gap-3">
-						<span class="text-sm {sourceColor(event.source_name)}">{sourceIcon(event.source_name)}</span>
+						<span class="text-sm {sourceColor(event.source_name)}">+</span>
 						<span class="text-[10px] font-semibold uppercase w-10 shrink-0 {sourceColor(event.source_name)}">
 							{event.source_name.split(' ')[0].slice(0, 5)}
 						</span>
@@ -368,7 +391,7 @@
 		{#if prices.length === 0}
 			<div class="bg-bg-card border border-border rounded-xl p-8 text-center">
 				<p class="text-base text-text-secondary mb-2">No price data yet</p>
-				<p class="text-sm text-text-muted">Prices are fetched daily for entities with ticker mappings. Run the pipeline to start mapping entities to tickers.</p>
+				<p class="text-sm text-text-muted">Prices are fetched daily for entities with ticker mappings.</p>
 			</div>
 		{:else}
 			<div class="bg-bg-card border border-border rounded-xl overflow-hidden">
@@ -380,7 +403,7 @@
 					<span class="text-right">30D</span>
 				</div>
 				{#each prices as p}
-					<div class="grid grid-cols-6 px-4 py-3 items-center hover:bg-bg-card-hover transition-colors border-b border-border/50 last:border-0">
+					<div class="grid grid-cols-6 px-4 py-2.5 items-center hover:bg-bg-card-hover transition-colors border-b border-border/50 last:border-0">
 						<div class="col-span-2 flex items-center gap-2">
 							<span class="text-sm font-mono font-semibold text-text">{p.ticker}</span>
 							{#if p.entity_name}
@@ -400,72 +423,104 @@
 	{:else if activeTab === 'portfolio'}
 
 		{#if portfolio}
-			<!-- Summary cards -->
-			<div class="grid grid-cols-4 gap-3 mb-5">
-				<div class="bg-bg-card border border-border rounded-xl p-4">
-					<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Equity</div>
-					<div class="text-xl font-mono font-bold text-text">{fmtPrice(portfolio.equity)}</div>
+			<!-- P&L Hero -->
+			<div class="bg-bg-card border {totalPnl >= 0 ? 'border-emerald-500/20' : 'border-rose-500/20'} rounded-xl p-6 mb-5 text-center">
+				<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Total Unrealized P&L</div>
+				<div class="text-3xl font-mono font-bold {totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
+					{fmtPnl(totalPnl)}
 				</div>
-				<div class="bg-bg-card border border-border rounded-xl p-4">
-					<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Cash</div>
-					<div class="text-xl font-mono font-bold text-text">{fmtPrice(portfolio.cash)}</div>
-				</div>
-				<div class="bg-bg-card border border-border rounded-xl p-4">
-					<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Buying Power</div>
-					<div class="text-xl font-mono font-bold text-text">{fmtPrice(portfolio.buying_power)}</div>
-				</div>
-				<div class="bg-bg-card border border-border rounded-xl p-4">
-					<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Positions</div>
-					<div class="text-xl font-mono font-bold text-text">{portfolio.positions.length}</div>
+				<div class="text-sm font-mono {totalPnlPct >= 0 ? 'text-emerald-400/70' : 'text-rose-400/70'}">
+					{totalPnlPct >= 0 ? '+' : ''}{totalPnlPct.toFixed(2)}%
 				</div>
 			</div>
 
-			<!-- Positions -->
+			<!-- Summary row -->
+			<div class="grid grid-cols-3 gap-3 mb-5">
+				<div class="bg-bg-card border border-border rounded-xl p-3">
+					<div class="text-[10px] text-text-muted uppercase tracking-wider">Equity</div>
+					<div class="text-lg font-mono font-bold text-text">{fmtPrice(portfolio.equity)}</div>
+				</div>
+				<div class="bg-bg-card border border-border rounded-xl p-3">
+					<div class="text-[10px] text-text-muted uppercase tracking-wider">Cash</div>
+					<div class="text-lg font-mono font-bold text-text">{fmtPrice(portfolio.cash)}</div>
+				</div>
+				<div class="bg-bg-card border border-border rounded-xl p-3">
+					<div class="text-[10px] text-text-muted uppercase tracking-wider">Buying Power</div>
+					<div class="text-lg font-mono font-bold text-text">{fmtPrice(portfolio.buying_power)}</div>
+				</div>
+			</div>
+
+			<!-- Open Positions -->
 			{#if portfolio.positions.length > 0}
 				<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Open Positions</h2>
 				<div class="space-y-2 mb-6">
 					{#each portfolio.positions as pos}
-						<div class="bg-bg-card border border-border rounded-xl px-5 py-4 flex items-center justify-between">
-							<div>
-								<span class="text-sm font-mono font-semibold text-text">{pos.symbol}</span>
-								<span class="text-xs text-text-muted ml-2">{pos.qty} shares @ ${pos.avg_entry_price.toFixed(2)}</span>
-							</div>
-							<div class="text-right">
-								<div class="text-sm font-mono font-semibold {pos.unrealized_pl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
-									{pos.unrealized_pl >= 0 ? '+' : ''}{fmtPrice(pos.unrealized_pl)}
-									<span class="text-xs ml-1">({pos.unrealized_pl_pct >= 0 ? '+' : ''}{(pos.unrealized_pl_pct * 100).toFixed(1)}%)</span>
+						{@const pnlPct = pos.unrealized_pl_pct * 100}
+						{@const isWinning = pos.unrealized_pl >= 0}
+						<div class="bg-bg-card border {isWinning ? 'border-emerald-500/15' : 'border-rose-500/15'} rounded-xl px-5 py-4">
+							<div class="flex items-center justify-between mb-2">
+								<div class="flex items-center gap-3">
+									<span class="text-sm font-mono font-bold text-text">{pos.symbol}</span>
+									<span class="text-xs text-text-muted">{pos.qty.toFixed(2)} shares</span>
 								</div>
-								<div class="text-[10px] text-text-muted">{fmtPrice(pos.market_value)} market value</div>
+								<div class="text-right">
+									<span class="text-lg font-mono font-bold {isWinning ? 'text-emerald-400' : 'text-rose-400'}">
+										{fmtPnl(pos.unrealized_pl)}
+									</span>
+									<span class="text-xs font-mono ml-1.5 {isWinning ? 'text-emerald-400/70' : 'text-rose-400/70'}">
+										{pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(1)}%
+									</span>
+								</div>
+							</div>
+							<div class="flex items-center justify-between text-xs text-text-muted">
+								<span>Entry: ${pos.avg_entry_price.toFixed(2)} &rarr; Now: ${pos.current_price.toFixed(2)}</span>
+								<span>{fmtPrice(pos.market_value)} value</span>
+							</div>
+							<!-- P&L bar -->
+							<div class="mt-2 h-1 bg-border rounded-full overflow-hidden">
+								{@const barWidth = Math.min(Math.abs(pnlPct) * 5, 100)}
+								<div class="h-full rounded-full {isWinning ? 'bg-emerald-400' : 'bg-rose-400'}" style="width: {barWidth}%"></div>
 							</div>
 						</div>
 					{/each}
 				</div>
 			{/if}
 
-			<!-- Trade History -->
+			<!-- Trade History from DB (with live P&L for open trades) -->
 			{#if portfolio.open_trades.length > 0 || portfolio.closed_trades.length > 0}
-				<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Trade History</h2>
+				<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Trade Log</h2>
 				<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50 mb-6">
 					{#each [...portfolio.open_trades, ...portfolio.closed_trades] as trade}
+						{@const hasPnl = trade.pnl_pct !== null && trade.pnl_pct !== undefined}
+						{@const pnl = trade.pnl_pct ?? 0}
+						{@const isGreen = pnl >= 0}
 						<div class="px-4 py-3 flex items-center justify-between">
 							<div class="flex items-center gap-2.5">
+								<span class="w-2 h-2 rounded-full {trade.status === 'open' ? (isGreen ? 'bg-emerald-400' : 'bg-rose-400') : 'bg-zinc-500'}"></span>
+								<span class="text-sm font-mono font-semibold text-text">{trade.ticker}</span>
+								<span class="text-xs text-text-muted">@ ${trade.entry_price.toFixed(2)}</span>
+								<span class="text-[10px] text-text-muted">{trade.entry_date.slice(0, 10)}</span>
+							</div>
+							<div class="flex items-center gap-2">
+								{#if hasPnl}
+									<span class="text-sm font-mono font-bold {isGreen ? 'text-emerald-400' : 'text-rose-400'}">
+										{isGreen ? '+' : ''}{pnl.toFixed(1)}%
+									</span>
+									{#if trade.pnl !== null && trade.pnl !== undefined}
+										<span class="text-xs font-mono {isGreen ? 'text-emerald-400/60' : 'text-rose-400/60'}">
+											({fmtPnl(trade.pnl)})
+										</span>
+									{/if}
+								{:else}
+									<span class="text-xs text-text-muted">pending</span>
+								{/if}
 								<span class="text-[10px] px-1.5 py-0.5 rounded font-medium {
 									trade.status === 'open' ? 'bg-blue-500/15 text-blue-400' :
-									trade.status === 'closed' && (trade.pnl_pct ?? 0) > 0 ? 'bg-emerald-500/15 text-emerald-400' :
+									trade.status === 'closed' && pnl > 0 ? 'bg-emerald-500/15 text-emerald-400' :
 									trade.status === 'stopped_out' ? 'bg-rose-500/15 text-rose-400' :
 									'bg-zinc-500/15 text-zinc-400'
 								}">{trade.status}</span>
-								<span class="text-sm font-mono font-medium text-text">{trade.ticker}</span>
-								<span class="text-xs text-text-muted">@ ${trade.entry_price.toFixed(2)}</span>
-								<span class="text-[10px] text-text-muted">{trade.entry_date}</span>
 							</div>
-							{#if trade.pnl_pct !== null}
-								<span class="text-sm font-mono font-semibold {(trade.pnl_pct ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
-									{(trade.pnl_pct ?? 0) >= 0 ? '+' : ''}{trade.pnl_pct?.toFixed(1)}%
-								</span>
-							{:else}
-								<span class="text-xs text-text-muted">open</span>
-							{/if}
 						</div>
 					{/each}
 				</div>
@@ -497,7 +552,7 @@
 		{:else}
 			<div class="bg-bg-card border border-border rounded-xl p-8 text-center">
 				<div class="w-6 h-6 border-2 border-ai border-t-transparent rounded-full animate-spin mx-auto mb-3"></div>
-				<p class="text-sm text-text-muted">Connecting to Alpaca paper trading...</p>
+				<p class="text-sm text-text-muted">Connecting to Alpaca...</p>
 			</div>
 		{/if}
 
@@ -516,14 +571,13 @@
 					<div class="flex items-center justify-between text-[10px]">
 						<span class="text-text-secondary font-mono">{src.last_count} items/week</span>
 						<span class="{src.status === 'active' ? 'text-emerald-400' : src.status === 'migrating' ? 'text-amber-400' : 'text-zinc-500'}">
-							{src.status === 'active' ? '✓ Active' : src.status === 'migrating' ? '⏳ Migrating' : '○ Inactive'}
+							{src.status === 'active' ? 'Active' : src.status === 'migrating' ? 'Migrating' : 'Inactive'}
 						</span>
 					</div>
 				</div>
 			{/each}
 		</div>
 
-		<!-- Rate limits -->
 		{#if quotas.length > 0}
 			<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">API Rate Limits</h2>
 			<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50">
@@ -541,7 +595,7 @@
 							{/if}
 						</div>
 						<span class="text-xs font-mono text-text-muted w-24 text-right">
-							{q.calls_this_hour}/{hourlyLimit > 0 ? hourlyLimit.toLocaleString() : '∞'}
+							{q.calls_this_hour}/{hourlyLimit > 0 ? hourlyLimit.toLocaleString() : '--'}
 						</span>
 						<span class="text-[10px] text-text-muted w-16 text-right">{q.calls_today} today</span>
 					</div>

@@ -88,6 +88,7 @@ pub fn run() {
             commands::cross_signals::get_cross_signals,
             commands::cross_signals::get_convergence_alerts,
             commands::cross_signals::get_entity_prices,
+            commands::cross_signals::refresh_prices,
             commands::cross_signals::get_financial_events,
             commands::cross_signals::get_signal_evidence,
             commands::cross_signals::get_source_health,
