@@ -478,8 +478,7 @@
 							</div>
 							<!-- P&L bar -->
 							<div class="mt-2 h-1 bg-border rounded-full overflow-hidden">
-								{@const barWidth = Math.min(Math.abs(pnlPct) * 5, 100)}
-								<div class="h-full rounded-full {isWinning ? 'bg-emerald-400' : 'bg-rose-400'}" style="width: {barWidth}%"></div>
+								<div class="h-full rounded-full {isWinning ? 'bg-emerald-400' : 'bg-rose-400'}" style="width: {Math.min(Math.abs(pnlPct) * 5, 100)}%"></div>
 							</div>
 						</div>
 					{/each}

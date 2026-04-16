@@ -182,6 +182,9 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
         )
         .map_err(|e| e.to_string())?;
 
+    // Garbage entity patterns to exclude from trends
+    const GARBAGE: &[&str] = &["n/a", "tbd", "unknown", "none", "other", "null", "test"];
+
     let ranked: Vec<(i64, String, Option<String>, String, f64, i32, i32, f64)> = stmt
         .query_map([], |row| {
             Ok((
@@ -191,6 +194,10 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
+        .filter(|r: &(i64, String, Option<String>, String, f64, i32, i32, f64)| {
+            let t = r.1.to_lowercase();
+            t.len() >= 2 && !GARBAGE.contains(&t.as_str()) && !t.contains("n/a")
+        })
         .collect();
 
     // Batch: get ALL story points for all trending topics in one query
