@@ -2176,11 +2176,36 @@ fn populate_tickers(db_path: &Path) -> anyhow::Result<usize> {
         }
     }
 
-    // Step 2: Download SEC company_tickers.json and match remaining
+    // Step 2: Download SEC company_tickers.json and match remaining (by name + CIK)
     if !still_unmapped.is_empty() {
         match download_sec_tickers() {
             Ok(sec_map) => {
+                // Build reverse CIK→ticker map for CIK-bearing entity names
+                let cik_map: std::collections::HashMap<String, (String, String)> = sec_map.values()
+                    .filter(|(_, cik)| !cik.is_empty())
+                    .map(|(ticker, cik)| (cik.clone(), (ticker.clone(), cik.clone())))
+                    .collect();
+
                 for (entity_id, name) in &still_unmapped {
+                    // Try CIK extraction from entity name first (e.g. "UL Solutions Inc.  (CIK 0001901440)")
+                    let mut found = false;
+                    if let Some(cik_start) = name.to_lowercase().find("(cik") {
+                        let cik_part = &name[cik_start..];
+                        let cik_digits: String = cik_part.chars().filter(|c| c.is_ascii_digit()).collect();
+                        if !cik_digits.is_empty() {
+                            if let Some((ticker, cik)) = cik_map.get(&cik_digits) {
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO entity_tickers (entity_id, ticker, cik, confidence)
+                                     VALUES (?1, ?2, ?3, 0.95)",
+                                    rusqlite::params![entity_id, ticker, cik],
+                                )?;
+                                mapped += 1;
+                                found = true;
+                            }
+                        }
+                    }
+                    if found { continue; }
+
                     if let Some((ticker, cik, confidence)) = resolve_ticker_sec(name, &sec_map) {
                         conn.execute(
                             "INSERT OR IGNORE INTO entity_tickers (entity_id, ticker, cik, confidence)
@@ -2274,7 +2299,19 @@ fn resolve_ticker_sec(
     name: &str,
     sec_map: &std::collections::HashMap<String, (String, String)>,
 ) -> Option<(String, String, f64)> {
-    let name_lower = name.to_lowercase().trim().to_string();
+    // Strip CIK patterns like "(CIK 0001901440)" and clean up
+    let cleaned = name
+        .trim()
+        .to_lowercase();
+    let name_lower = if let Some(idx) = cleaned.find("(cik") {
+        cleaned[..idx].trim().to_string()
+    } else {
+        cleaned
+    };
+
+    if name_lower.is_empty() || name_lower.len() < 2 {
+        return None;
+    }
 
     // 1. Exact match
     if let Some((ticker, cik)) = sec_map.get(&name_lower) {
@@ -2288,10 +2325,10 @@ fn resolve_ticker_sec(
         " holdings", " group", " technologies", " technology",
         " international", " solutions", " systems", " enterprises",
     ];
-    let stripped = suffixes.iter().fold(name_lower.as_str(), |s, sfx| s.trim_end_matches(sfx));
-    if stripped != name_lower {
+    let stripped = suffixes.iter().fold(name_lower.as_str(), |s, sfx| s.trim_end_matches(sfx)).trim();
+    if stripped != name_lower && stripped.len() >= 3 {
         for (key, (ticker, cik)) in sec_map.iter() {
-            let key_stripped = suffixes.iter().fold(key.as_str(), |s, sfx| s.trim_end_matches(sfx));
+            let key_stripped = suffixes.iter().fold(key.as_str(), |s, sfx| s.trim_end_matches(sfx)).trim();
             if key_stripped == stripped {
                 return Some((ticker.clone(), cik.clone(), 0.8));
             }
