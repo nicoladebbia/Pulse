@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+	import { listen } from '@tauri-apps/api/event';
 	import { isTauri } from '$lib/tauri/mock';
 	import {
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
@@ -45,6 +46,7 @@
 	let streamError = $state<string | null>(null);
 	let livePrices = $state<Record<string, number>>({});
 	let unlistenFns: Array<() => void> = [];
+	let destroyed = false;
 	let btMinScore = $state(0.4);
 	let btStopLoss = $state(-10);
 	let btTakeProfit = $state(15);
@@ -62,47 +64,39 @@
 		error = null;
 		if (!isTauri()) return;
 
+		let remaining = 5;
 		loadProgress = ['signals', 'alerts', 'evidence', 'events', 'prices'];
 
-		// Fire all requests in parallel — each updates its own state independently
-		getCrossSignals(30)
-			.then(s => { signals = s; })
-			.catch(() => {})
-			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'signals'); });
+		function done(name: string) {
+			if (destroyed) return;
+			remaining--;
+			loadProgress = remaining > 0 ? loadProgress.filter(x => x !== name) : [];
+		}
 
-		getConvergenceAlerts(10)
-			.then(c => { convergence = c; })
-			.catch(() => {})
-			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'alerts'); });
+		try {
+			// Fire all in parallel, each updates independently
+			getCrossSignals(30).then(s => { if (!destroyed) signals = s; }).catch(() => {}).finally(() => done('signals'));
+			getConvergenceAlerts(10).then(c => { if (!destroyed) convergence = c; }).catch(() => {}).finally(() => done('alerts'));
+			getSignalEvidence(15).then(ev => { if (!destroyed) evidence = ev; }).catch(() => {}).finally(() => done('evidence'));
+			getFinancialEvents(20).then(e => { if (!destroyed) events = e; }).catch(() => {}).finally(() => done('events'));
+			getEntityPrices(50).then(p => { if (!destroyed) prices = p; }).catch(() => {}).finally(() => done('prices'));
 
-		getSignalEvidence(15)
-			.then(ev => { evidence = ev; })
-			.catch(() => {})
-			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'evidence'); });
+			// Slower API calls
+			getPortfolio().then(pf => { if (!destroyed) portfolio = pf; }).catch(() => {});
+			getPortfolioAnalytics().then(a => { if (!destroyed) analytics = a; }).catch(() => {});
+			getSourceHealth().then(sh => { if (!destroyed) sources = sh; }).catch(() => {});
+			getFinancialQuotas().then(q => { if (!destroyed) quotas = q; }).catch(() => {});
 
-		getFinancialEvents(20)
-			.then(e => { events = e; })
-			.catch(() => {})
-			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'events'); });
-
-		getEntityPrices(50)
-			.then(p => { prices = p; })
-			.catch(() => {})
-			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'prices'); });
-
-		// Slower API calls — fire and forget
-		getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
-		getPortfolioAnalytics().then(a => { analytics = a; }).catch(() => {});
-		getSourceHealth().then(sh => { sources = sh; }).catch(() => {});
-		getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
-
-		// Background price refresh
-		pricesRefreshing = true;
-		refreshPrices()
-			.then(() => getEntityPrices(50))
-			.then(p => { prices = p; })
-			.catch(() => {})
-			.finally(() => { pricesRefreshing = false; });
+			// Background price refresh
+			pricesRefreshing = true;
+			refreshPrices()
+				.then(() => getEntityPrices(50))
+				.then(p => { if (!destroyed) prices = p; })
+				.catch(() => {})
+				.finally(() => { if (!destroyed) pricesRefreshing = false; });
+		} catch (e: any) {
+			error = String(e?.message ?? e);
+		}
 	}
 
 	async function handleTrade(ticker: string, confidence: number) {
@@ -135,9 +129,6 @@
 			return;
 		}
 		try {
-			// Dynamically import listen to avoid SSR issues
-			const { listen } = await import('@tauri-apps/api/event');
-
 			const unlisten1 = await listen<PriceUpdate[]>('price-updates', (event) => {
 				const updates = event.payload;
 				const newPrices = { ...livePrices };
@@ -182,8 +173,8 @@
 	}
 
 	onDestroy(() => {
+		destroyed = true;
 		for (const fn of unlistenFns) fn();
-		if (streaming) stopPriceStream().catch(() => {});
 	});
 
 	async function handleBacktest() {
