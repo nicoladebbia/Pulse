@@ -29,3 +29,4 @@ pub mod cross_signals;
 pub mod paper_trading;
 pub mod analytics;
 pub mod backtester;
+pub mod live_prices;

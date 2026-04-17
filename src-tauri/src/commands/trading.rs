@@ -1,8 +1,10 @@
-use tauri::State;
+use tauri::{AppHandle, State};
 use crate::db::DbState;
 use crate::services::paper_trading::{self, Portfolio, PaperTrade};
 use crate::services::analytics::{self, PortfolioAnalytics, TradeJournal};
 use crate::services::backtester::{self, BacktestConfig, BacktestResult};
+use crate::services::live_prices::{self, LivePriceState, StreamStatus};
+use std::sync::Arc;
 
 /// Get full portfolio: account info + positions + trade history.
 #[tauri::command]
@@ -158,4 +160,46 @@ pub fn run_backtest(db: State<'_, DbState>, config: BacktestConfig) -> Result<Ba
 pub fn get_backtest_history(db: State<'_, DbState>) -> Result<Vec<BacktestResult>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     backtester::get_backtest_history(&conn, 10)
+}
+
+/// Start live price streaming for open positions.
+#[tauri::command]
+pub async fn start_price_stream(
+    app: AppHandle,
+    db: State<'_, DbState>,
+    state: State<'_, Arc<LivePriceState>>,
+) -> Result<(), String> {
+    // Get tickers of open positions
+    let symbols: Vec<String> = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT ticker FROM paper_trades WHERE status = 'open'"
+        ).map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    if symbols.is_empty() {
+        return Err("No open positions to stream".into());
+    }
+
+    live_prices::start_stream(app, state.inner().clone(), symbols).await
+}
+
+/// Stop live price streaming.
+#[tauri::command]
+pub async fn stop_price_stream(
+    state: State<'_, Arc<LivePriceState>>,
+) -> Result<(), String> {
+    live_prices::stop_stream(state.inner().clone()).await
+}
+
+/// Get current stream status.
+#[tauri::command]
+pub async fn get_stream_status(
+    state: State<'_, Arc<LivePriceState>>,
+) -> Result<StreamStatus, String> {
+    Ok(live_prices::get_status(state.inner().clone()).await)
 }

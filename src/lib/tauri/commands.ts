@@ -1,5 +1,5 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, BacktestConfig, BacktestResult } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, BacktestConfig, BacktestResult, StreamStatus } from './types';
 
 export async function getTodayBriefing(): Promise<BriefingWithStories | null> {
 	return invoke('get_today_briefing');
@@ -185,4 +185,16 @@ export async function runBacktest(config: BacktestConfig): Promise<BacktestResul
 
 export async function getBacktestHistory(): Promise<BacktestResult[]> {
 	return invoke('get_backtest_history');
+}
+
+export async function startPriceStream(): Promise<void> {
+	return invoke('start_price_stream');
+}
+
+export async function stopPriceStream(): Promise<void> {
+	return invoke('stop_price_stream');
+}
+
+export async function getStreamStatus(): Promise<StreamStatus> {
+	return invoke('get_stream_status');
 }

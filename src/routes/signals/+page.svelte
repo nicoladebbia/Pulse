@@ -1,15 +1,16 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { isTauri } from '$lib/tauri/mock';
 	import {
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
 		executeTrade, getFinancialEvents, getSignalEvidence, getSourceHealth,
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getTradeJournal,
-		runBacktest, getBacktestHistory
+		runBacktest, getBacktestHistory, startPriceStream, stopPriceStream
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics, TradeJournal,
-		BacktestConfig, BacktestResult
+		BacktestConfig, BacktestResult, PriceUpdate
 	} from '$lib/tauri/types';
 
 	let signals = $state<CrossSignal[]>([]);
@@ -39,6 +40,10 @@
 	let backtestError = $state<string | null>(null);
 	let expandedBtTrade = $state<number | null>(null);
 	// Backtest config defaults
+	let streaming = $state(false);
+	let streamError = $state<string | null>(null);
+	let livePrices = $state<Record<string, number>>({});
+	let unlistenFns: Array<() => void> = [];
 	let btMinScore = $state(0.4);
 	let btStopLoss = $state(-10);
 	let btTakeProfit = $state(15);
@@ -102,6 +107,72 @@
 			tradeStatus = `Error: ${e?.message ?? e}`;
 		}
 	}
+
+	async function toggleStream() {
+		streamError = null;
+		if (streaming) {
+			try {
+				await stopPriceStream();
+				streaming = false;
+				// Clean up listeners
+				for (const fn of unlistenFns) fn();
+				unlistenFns = [];
+			} catch (e: any) {
+				streamError = String(e?.message ?? e);
+			}
+			return;
+		}
+		try {
+			// Dynamically import listen to avoid SSR issues
+			const { listen } = await import('@tauri-apps/api/event');
+
+			const unlisten1 = await listen<PriceUpdate[]>('price-updates', (event) => {
+				const updates = event.payload;
+				const newPrices = { ...livePrices };
+				for (const u of updates) {
+					newPrices[u.symbol] = u.price;
+				}
+				livePrices = newPrices;
+
+				// Update portfolio positions with live prices
+				if (portfolio) {
+					portfolio = {
+						...portfolio,
+						positions: portfolio.positions.map(pos => {
+							const livePrice = newPrices[pos.symbol];
+							if (livePrice && livePrice > 0) {
+								const unrealized_pl = (livePrice - pos.avg_entry_price) * pos.qty;
+								const unrealized_pl_pct = (livePrice - pos.avg_entry_price) / pos.avg_entry_price;
+								return {
+									...pos,
+									current_price: livePrice,
+									market_value: livePrice * pos.qty,
+									unrealized_pl,
+									unrealized_pl_pct,
+								};
+							}
+							return pos;
+						}),
+					};
+				}
+			});
+
+			const unlisten2 = await listen<boolean>('stream-status', (event) => {
+				streaming = event.payload;
+			});
+
+			unlistenFns = [unlisten1, unlisten2];
+			await startPriceStream();
+			streaming = true;
+		} catch (e: any) {
+			streamError = String(e?.message ?? e);
+		}
+	}
+
+	onDestroy(() => {
+		for (const fn of unlistenFns) fn();
+		if (streaming) stopPriceStream().catch(() => {});
+	});
 
 	async function handleBacktest() {
 		backtestRunning = true;
@@ -486,7 +557,7 @@
 
 		{#if portfolio}
 			<!-- P&L Hero -->
-			<div class="bg-bg-card border {totalPnl >= 0 ? 'border-emerald-500/20' : 'border-rose-500/20'} rounded-xl p-6 mb-5 text-center">
+			<div class="bg-bg-card border {totalPnl >= 0 ? 'border-emerald-500/20' : 'border-rose-500/20'} rounded-xl p-6 mb-5 text-center relative">
 				<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Total Unrealized P&L</div>
 				<div class="text-3xl font-mono font-bold {totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
 					{fmtPnl(totalPnl)}
@@ -494,6 +565,17 @@
 				<div class="text-sm font-mono {totalPnlPct >= 0 ? 'text-emerald-400/70' : 'text-rose-400/70'}">
 					{totalPnlPct >= 0 ? '+' : ''}{totalPnlPct.toFixed(2)}%
 				</div>
+				<!-- Live streaming toggle -->
+				<button
+					onclick={toggleStream}
+					class="absolute top-3 right-3 flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] transition-colors {streaming ? 'bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25' : 'bg-zinc-500/10 text-text-muted hover:bg-zinc-500/20'}"
+				>
+					<span class="w-1.5 h-1.5 rounded-full {streaming ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-500'}"></span>
+					{streaming ? 'LIVE' : 'Stream'}
+				</button>
+				{#if streamError}
+					<p class="text-[10px] text-rose-400 mt-1">{streamError}</p>
+				{/if}
 			</div>
 
 			<!-- Summary row -->

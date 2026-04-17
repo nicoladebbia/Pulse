@@ -58,6 +58,7 @@ pub fn run() {
 
             app.manage(db::DbState(std::sync::Mutex::new(conn)));
             app.manage(ChatAbortFlag(Arc::new(AtomicBool::new(false))));
+            app.manage(Arc::new(services::live_prices::LivePriceState::new()));
 
             Ok(())
         })
@@ -111,6 +112,9 @@ pub fn run() {
             commands::trading::get_trade_journal,
             commands::trading::run_backtest,
             commands::trading::get_backtest_history,
+            commands::trading::start_price_stream,
+            commands::trading::stop_price_stream,
+            commands::trading::get_stream_status,
         ])
         .build(tauri::generate_context!())
         .expect("error building Pulse")

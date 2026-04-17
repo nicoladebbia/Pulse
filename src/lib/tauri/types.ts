@@ -463,6 +463,21 @@ export interface EquityPoint {
 	value: number;
 }
 
+// === Live Price Streaming ===
+
+export interface PriceUpdate {
+	symbol: string;
+	price: number;
+	volume: number;
+	timestamp: number;
+}
+
+export interface StreamStatus {
+	connected: boolean;
+	symbols: string[];
+	last_update: string | null;
+}
+
 // === Backtester ===
 
 export interface BacktestConfig {

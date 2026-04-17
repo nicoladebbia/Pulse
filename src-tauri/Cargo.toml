@@ -33,6 +33,7 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
