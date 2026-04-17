@@ -1,5 +1,5 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, BacktestConfig, BacktestResult } from './types';
 
 export async function getTodayBriefing(): Promise<BriefingWithStories | null> {
 	return invoke('get_today_briefing');
@@ -169,4 +169,20 @@ export async function getPaperTrades(status?: string): Promise<PaperTrade[]> {
 
 export async function executeTrade(ticker: string, confidence: number): Promise<PaperTrade | null> {
 	return invoke('execute_trade', { ticker, confidence });
+}
+
+export async function getPortfolioAnalytics(): Promise<PortfolioAnalytics> {
+	return invoke('get_portfolio_analytics');
+}
+
+export async function getTradeJournal(tradeId: number): Promise<TradeJournal> {
+	return invoke('get_trade_journal', { tradeId });
+}
+
+export async function runBacktest(config: BacktestConfig): Promise<BacktestResult> {
+	return invoke('run_backtest', { config });
+}
+
+export async function getBacktestHistory(): Promise<BacktestResult[]> {
+	return invoke('get_backtest_history');
 }

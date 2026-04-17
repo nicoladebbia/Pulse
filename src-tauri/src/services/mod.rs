@@ -27,3 +27,5 @@ pub mod ticker_mapping;
 pub mod cross_signals;
 #[allow(dead_code)]
 pub mod paper_trading;
+pub mod analytics;
+pub mod backtester;

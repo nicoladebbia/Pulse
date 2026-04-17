@@ -16,6 +16,7 @@ const MIGRATION_016: &str = include_str!("../../../migrations/016_feed_health.sq
 const MIGRATION_017: &str = include_str!("../../../migrations/017_financial_data.sql");
 const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_resolution.sql");
 const MIGRATION_019: &str = include_str!("../../../migrations/019_position_management.sql");
+const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -483,6 +484,13 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
 
         tx.execute("INSERT INTO schema_migrations (version) VALUES (19)", [])?;
         tx.commit()?;
+    }
+
+    if !applied.contains(&21) {
+        if !column_exists(conn, "paper_trades", "trade_journal") {
+            conn.execute_batch(MIGRATION_021)?;
+        }
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (21)", [])?;
     }
 
     // Ensure composite indexes exist (idempotent)

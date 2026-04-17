@@ -404,6 +404,123 @@ export interface PaperTrade {
 	pnl_pct: number | null;
 }
 
+// === Portfolio Analytics ===
+
+export interface PortfolioAnalytics {
+	total_trades: number;
+	open_count: number;
+	win_rate: number;
+	loss_rate: number;
+	avg_win_pct: number;
+	avg_loss_pct: number;
+	profit_factor: number;
+	total_return_pct: number;
+	total_return_dollars: number;
+	sharpe_ratio: number;
+	sortino_ratio: number;
+	max_drawdown_pct: number;
+	avg_holding_days: number;
+	best_trade: TradeSummary | null;
+	worst_trade: TradeSummary | null;
+	signal_attribution: SignalAttribution[];
+	sector_exposure: SectorExposure[];
+	monthly_returns: MonthlyReturn[];
+	equity_curve: EquityPoint[];
+}
+
+export interface TradeSummary {
+	ticker: string;
+	pnl_pct: number;
+	pnl_dollars: number;
+	entry_date: string;
+	exit_date: string;
+}
+
+export interface SignalAttribution {
+	dimension: string;
+	avg_on_wins: number;
+	avg_on_losses: number;
+	predictive_edge: number;
+	sample_count: number;
+}
+
+export interface SectorExposure {
+	sector: string;
+	trade_count: number;
+	total_pnl: number;
+	win_rate: number;
+}
+
+export interface MonthlyReturn {
+	month: string;
+	pnl_dollars: number;
+	pnl_pct: number;
+	trade_count: number;
+}
+
+export interface EquityPoint {
+	date: string;
+	value: number;
+}
+
+// === Backtester ===
+
+export interface BacktestConfig {
+	start_date: string;
+	end_date: string;
+	min_score: number;
+	stop_loss_pct: number;
+	take_profit_pct: number;
+	max_hold_days: number;
+	max_positions: number;
+	position_size_pct: number;
+}
+
+export interface BacktestResult {
+	config_summary: string;
+	total_signals: number;
+	trades_taken: number;
+	trades_won: number;
+	trades_lost: number;
+	hit_rate: number;
+	avg_return_pct: number;
+	total_return_pct: number;
+	max_drawdown_pct: number;
+	sharpe_ratio: number;
+	avg_holding_days: number;
+	starting_equity: number;
+	ending_equity: number;
+	trades: BacktestTrade[];
+}
+
+export interface BacktestTrade {
+	ticker: string;
+	entity_name: string;
+	entry_date: string;
+	entry_price: number;
+	exit_date: string;
+	exit_price: number;
+	pnl_pct: number;
+	pnl_dollars: number;
+	holding_days: number;
+	exit_reason: string;
+	compound_score: number;
+	signal_profile: string;
+}
+
+// === Trade Journal ===
+
+export interface TradeJournal {
+	trade_id: number;
+	journal: string;
+	signal_breakdown: SignalEntry[];
+}
+
+export interface SignalEntry {
+	dimension: string;
+	entry_value: number;
+}
+
 // === Financial Events ===
 
 export interface FinancialEvent {

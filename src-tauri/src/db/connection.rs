@@ -25,6 +25,7 @@ pub const MIGRATION_017: &str = include_str!("../../../migrations/017_financial_
 pub const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_resolution.sql");
 pub const MIGRATION_019: &str = include_str!("../../../migrations/019_position_management.sql");
 pub const MIGRATION_020: &str = include_str!("../../../migrations/020_performance_indexes.sql");
+pub const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -547,6 +548,13 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     if !applied.contains(&20) {
         conn.execute_batch(MIGRATION_020)?;
         conn.execute("INSERT INTO schema_migrations (version) VALUES (20)", [])?;
+    }
+
+    if !applied.contains(&21) {
+        if !column_exists(&conn, "paper_trades", "trade_journal") {
+            conn.execute_batch(MIGRATION_021)?;
+        }
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (21)", [])?;
     }
 
     // Ensure critical indexes exist (idempotent — some were lost by table rebuilds in earlier migrations)

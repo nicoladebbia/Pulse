@@ -1,6 +1,8 @@
 use tauri::State;
 use crate::db::DbState;
 use crate::services::paper_trading::{self, Portfolio, PaperTrade};
+use crate::services::analytics::{self, PortfolioAnalytics, TradeJournal};
+use crate::services::backtester::{self, BacktestConfig, BacktestResult};
 
 /// Get full portfolio: account info + positions + trade history.
 #[tauri::command]
@@ -128,4 +130,32 @@ pub async fn execute_trade(
         signal_profile, status: "open".to_string(),
         pnl: None, pnl_pct: None,
     }))
+}
+
+/// Get portfolio analytics: win rate, Sharpe, attribution, etc.
+#[tauri::command]
+pub fn get_portfolio_analytics(db: State<'_, DbState>) -> Result<PortfolioAnalytics, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    analytics::compute_analytics(&conn)
+}
+
+/// Get or generate a trade journal for a specific trade.
+#[tauri::command]
+pub fn get_trade_journal(db: State<'_, DbState>, trade_id: i64) -> Result<TradeJournal, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    analytics::get_or_generate_journal(&conn, trade_id)
+}
+
+/// Run a backtest against historical cross-signals.
+#[tauri::command]
+pub fn run_backtest(db: State<'_, DbState>, config: BacktestConfig) -> Result<BacktestResult, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    backtester::run_backtest(&conn, config)
+}
+
+/// Get past backtest results.
+#[tauri::command]
+pub fn get_backtest_history(db: State<'_, DbState>) -> Result<Vec<BacktestResult>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    backtester::get_backtest_history(&conn, 10)
 }

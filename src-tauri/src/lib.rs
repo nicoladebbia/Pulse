@@ -107,6 +107,10 @@ pub fn run() {
             commands::trading::get_portfolio,
             commands::trading::get_paper_trades,
             commands::trading::execute_trade,
+            commands::trading::get_portfolio_analytics,
+            commands::trading::get_trade_journal,
+            commands::trading::run_backtest,
+            commands::trading::get_backtest_history,
         ])
         .build(tauri::generate_context!())
         .expect("error building Pulse")
