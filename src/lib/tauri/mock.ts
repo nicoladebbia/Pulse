@@ -109,6 +109,8 @@ const mockBriefing: Briefing = {
 	created_at: today,
 	briefing_type: 'daily',
 	executive_summary: 'AI dominates today\'s briefing with OpenAI\'s GPT-5 launch and Anthropic\'s massive fundraise signaling an acceleration in the frontier model race. Meanwhile, Miami continues to cement its tech hub status with a $500M district expansion, and Italy takes a leadership role in EU AI governance.',
+	time_label: null,
+	hero_headline: 'OpenAI Launches GPT-5 with Real-Time Reasoning',
 };
 
 const mockConnections: BriefingConnection[] = [
@@ -427,13 +429,20 @@ export const mockPredictionStats: PredictionStats = {
 export const mockUsageStats: UsageStats = {
 	period: 'last 7 days',
 	total_cost_usd: 0.47,
+	today_cost_usd: 0.08,
 	total_input_tokens: 285000,
 	total_output_tokens: 42000,
+	total_calls: 188,
 	by_provider: [
 		{ provider: 'anthropic', model: 'claude-sonnet', total_input_tokens: 180000, total_output_tokens: 35000, total_cost_usd: 0.38, call_count: 23 },
 		{ provider: 'groq', model: 'llama-3.3-70b', total_input_tokens: 85000, total_output_tokens: 5000, total_cost_usd: 0.05, call_count: 80 },
 		{ provider: 'voyage', model: 'voyage-3-lite', total_input_tokens: 20000, total_output_tokens: 0, total_cost_usd: 0.0004, call_count: 80 },
 		{ provider: 'tavily', model: 'search', total_input_tokens: 0, total_output_tokens: 0, total_cost_usd: 0, call_count: 5 },
+	],
+	daily: [
+		{ date: '2026-04-17', cost_usd: 0.08, call_count: 28 },
+		{ date: '2026-04-16', cost_usd: 0.12, call_count: 45 },
+		{ date: '2026-04-15', cost_usd: 0.09, call_count: 32 },
 	],
 };
 

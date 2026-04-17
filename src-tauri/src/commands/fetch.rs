@@ -15,11 +15,6 @@ pub struct FetchStatus {
 }
 
 #[tauri::command]
-pub fn ping() -> String {
-    "pong".to_string()
-}
-
-#[tauri::command]
 pub async fn trigger_manual_fetch() -> Result<String, String> {
     if FETCHING.swap(true, Ordering::SeqCst) {
         return Err("Fetch already in progress".to_string());

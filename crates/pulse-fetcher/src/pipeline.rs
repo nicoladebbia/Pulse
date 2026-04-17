@@ -200,14 +200,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         })
         .collect();
 
-    if !financial_stories.is_empty() {
-        tracing::info!("Writing {} financial stories to database (instant, no LLM needed)...", financial_stories.len());
-        match write_financial_stories(db_path, &financial_stories) {
-            Ok(count) => tracing::info!("Stored {} financial stories successfully", count),
-            Err(e) => tracing::warn!("Financial story write failed: {}", e),
-        }
-        record_financial_dedup(db_path, &financial_stories);
-    }
+    // Financial stories will be written after the main briefing (Phase 8) to avoid creating a stub briefing
 
     // NEWS PATH: dedup (slow O(n²) trigram comparison)
     progress.start_stage(2);
@@ -423,6 +416,16 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     progress.start_stage(8);
     tracing::info!("Phase 8: Writing {} news stories to database...", analysis.curated_stories.len());
     write_to_db(db_path, &analysis, embeddings.as_deref(), prefixes.as_deref(), executive_summary.as_deref())?;
+
+    // Phase 8.1: Write financial stories (after main briefing exists so they share the same briefing_id)
+    if !financial_stories.is_empty() {
+        tracing::info!("Writing {} financial stories to database...", financial_stories.len());
+        match write_financial_stories(db_path, &financial_stories) {
+            Ok(count) => tracing::info!("Stored {} financial stories successfully", count),
+            Err(e) => tracing::warn!("Financial story write failed: {}", e),
+        }
+        record_financial_dedup(db_path, &financial_stories);
+    }
 
     // Phase 8.5: Auto-backfill missing embeddings from previous failed runs (non-fatal)
     {
@@ -2027,21 +2030,14 @@ fn write_financial_stories(
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    // Get or create today's briefing
+    // Find today's briefing (must exist — write_to_db creates it first)
     let briefing_id: i64 = conn
         .query_row(
-            "SELECT id FROM briefings WHERE date = ?1 ORDER BY created_at DESC LIMIT 1",
+            "SELECT id FROM briefings WHERE date = ?1 AND briefing_type = 'daily' ORDER BY created_at DESC LIMIT 1",
             [&today],
             |row| row.get(0),
         )
-        .unwrap_or_else(|_| {
-            conn.execute(
-                "INSERT INTO briefings (date, story_count, ai_count, miami_count, italy_count, tech_count, status)
-                 VALUES (?1, 0, 0, 0, 0, 0, 'complete')",
-                [&today],
-            ).ok();
-            conn.last_insert_rowid()
-        });
+        .map_err(|_| anyhow::anyhow!("No daily briefing found for {} — write_to_db must run first", today))?;
 
     let mut stored = 0;
     for story in stories {

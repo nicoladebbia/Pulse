@@ -72,8 +72,6 @@ pub fn run() {
             commands::search::full_text_search,
             commands::fetch::trigger_manual_fetch,
             commands::fetch::get_fetch_status,
-            commands::fetch::ping,
-            commands::chat::ask_pulse,
             commands::chat::chat_send,
             commands::chat::chat_send_stream,
             commands::chat::chat_list_threads,

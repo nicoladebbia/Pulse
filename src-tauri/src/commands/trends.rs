@@ -42,37 +42,48 @@ pub struct TrendPrediction {
     pub confidence: f32,
 }
 
-/// Get story badges (entity tags) for a specific story.
+/// Get story badges (entity tags) for a batch of stories.
 #[derive(Debug, Clone, Serialize)]
 pub struct StoryTrendBadge {
-    pub entity_name: String,
+    pub story_id: i64,
+    pub entity: String,
     pub trajectory: String,
-    pub acceleration: f64,
+    pub mention_count: i64,
 }
 
 #[tauri::command]
-pub fn get_story_trend_badges(db: State<'_, DbState>, story_id: i64) -> Result<Vec<StoryTrendBadge>, String> {
+pub fn get_story_trend_badges(db: State<'_, DbState>, story_ids: Vec<i64>) -> Result<Vec<StoryTrendBadge>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
-    let mut stmt = conn.prepare(
-        "SELECT e.name, COALESCE(sig.trajectory, 'unknown'), COALESCE(sig.acceleration, 0.0)
-         FROM entity_mentions em
-         JOIN entities e ON e.id = em.entity_id
-         LEFT JOIN signals sig ON sig.topic = e.name_normalized
-         WHERE em.story_id = ?1
-         ORDER BY sig.window_30d DESC NULLS LAST
-         LIMIT 5",
-    ).map_err(|e| e.to_string())?;
+    let mut badges = Vec::new();
+    for sid in &story_ids {
+        let mut stmt = conn.prepare(
+            "SELECT e.name, COALESCE(sig.trajectory, 'unknown'),
+                    (SELECT COUNT(*) FROM entity_mentions em2 WHERE em2.entity_id = e.id)
+             FROM entity_mentions em
+             JOIN entities e ON e.id = em.entity_id
+             LEFT JOIN signals sig ON sig.topic = e.name_normalized
+             WHERE em.story_id = ?1
+             ORDER BY sig.window_30d DESC NULLS LAST
+             LIMIT 3",
+        ).map_err(|e| e.to_string())?;
 
-    let badges = stmt.query_map([story_id], |row| {
-        Ok(StoryTrendBadge {
-            entity_name: row.get(0)?,
-            trajectory: row.get(1)?,
-            acceleration: row.get(2)?,
-        })
-    }).map_err(|e| e.to_string())?
-    .filter_map(|r| r.ok())
-    .collect();
+        let rows: Vec<StoryTrendBadge> = stmt.query_map([sid], |row| {
+            Ok(StoryTrendBadge {
+                story_id: *sid,
+                entity: row.get(0)?,
+                trajectory: row.get(1)?,
+                mention_count: row.get(2)?,
+            })
+        }).map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        // Return the top badge per story (most mentioned entity)
+        if let Some(best) = rows.into_iter().max_by_key(|b| b.mention_count) {
+            badges.push(best);
+        }
+    }
 
     Ok(badges)
 }

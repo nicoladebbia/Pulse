@@ -1,5 +1,5 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus } from './types';
 
 export async function getTodayBriefing(): Promise<BriefingWithStories | null> {
 	return invoke('get_today_briefing');
@@ -29,7 +29,7 @@ export async function triggerManualFetch(): Promise<string> {
 	return invoke('trigger_manual_fetch');
 }
 
-export async function getFetchStatus(): Promise<boolean> {
+export async function getFetchStatus(): Promise<FetchStatus> {
 	return invoke('get_fetch_status');
 }
 

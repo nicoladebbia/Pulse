@@ -147,6 +147,7 @@ export interface StoryTrendBadge {
 	mention_count: number;
 }
 
+
 // === Story Headline Types ===
 
 export interface StoryHeadline {
@@ -240,7 +241,7 @@ export type IdeaStreamEvent =
 // === Prediction Types ===
 
 export interface Prediction {
-	id: number;
+	id: number | null;
 	title: string;
 	prediction: string;
 	confidence: number;
