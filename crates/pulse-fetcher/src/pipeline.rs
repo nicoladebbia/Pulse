@@ -1856,6 +1856,7 @@ fn write_freedoms_to_db(
     if let Some(old_id) = existing_id {
         tracing::info!("Replacing existing freedoms briefing {} for {}", old_id, today);
         tx.execute("DELETE FROM freedom_stories WHERE briefing_id = ?1", [old_id])?;
+        tx.execute("DELETE FROM stories WHERE briefing_id = ?1", [old_id])?;
         tx.execute("DELETE FROM briefings WHERE id = ?1", [old_id])?;
     }
 

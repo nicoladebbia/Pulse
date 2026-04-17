@@ -223,7 +223,13 @@ pub fn list_briefings(db: State<DbState>) -> Result<Vec<Briefing>, String> {
         .prepare(
             "SELECT b.id, b.date, b.story_count, b.ai_count, b.miami_count, b.italy_count, b.tech_count, b.status, b.created_at, b.briefing_type, b.executive_summary, b.time_label,
                     (SELECT s.headline FROM stories s WHERE s.briefing_id = b.id AND s.is_hero = 1 LIMIT 1)
-             FROM briefings b ORDER BY b.date DESC, b.created_at DESC LIMIT 100",
+             FROM briefings b
+             WHERE b.id = (
+                 SELECT b2.id FROM briefings b2
+                 WHERE b2.date = b.date AND b2.briefing_type = b.briefing_type
+                 ORDER BY b2.created_at DESC LIMIT 1
+             )
+             ORDER BY b.date DESC, b.created_at DESC LIMIT 100",
         )
         .map_err(|e| e.to_string())?;
 

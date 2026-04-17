@@ -474,7 +474,7 @@
 							</div>
 							<div class="flex items-center justify-between text-xs text-text-muted">
 								<span>Entry: ${pos.avg_entry_price.toFixed(2)} &rarr; Now: ${pos.current_price.toFixed(2)}</span>
-								<span>{fmtPrice(pos.market_value)} value</span>
+								<span>Cost: {fmtPrice(pos.avg_entry_price * pos.qty)} &rarr; {fmtPrice(pos.market_value)}</span>
 							</div>
 							<!-- P&L bar -->
 							<div class="mt-2 h-1 bg-border rounded-full overflow-hidden">
@@ -493,32 +493,38 @@
 						{@const hasPnl = trade.pnl_pct !== null && trade.pnl_pct !== undefined}
 						{@const pnl = trade.pnl_pct ?? 0}
 						{@const isGreen = pnl >= 0}
-						<div class="px-4 py-3 flex items-center justify-between">
-							<div class="flex items-center gap-2.5">
-								<span class="w-2 h-2 rounded-full {trade.status === 'open' ? (isGreen ? 'bg-emerald-400' : 'bg-rose-400') : 'bg-zinc-500'}"></span>
-								<span class="text-sm font-mono font-semibold text-text">{trade.ticker}</span>
-								<span class="text-xs text-text-muted">@ ${trade.entry_price.toFixed(2)}</span>
-								<span class="text-[10px] text-text-muted">{trade.entry_date.slice(0, 10)}</span>
-							</div>
-							<div class="flex items-center gap-2">
-								{#if hasPnl}
-									<span class="text-sm font-mono font-bold {isGreen ? 'text-emerald-400' : 'text-rose-400'}">
-										{isGreen ? '+' : ''}{pnl.toFixed(1)}%
-									</span>
-									{#if trade.pnl !== null && trade.pnl !== undefined}
-										<span class="text-xs font-mono {isGreen ? 'text-emerald-400/60' : 'text-rose-400/60'}">
-											({fmtPnl(trade.pnl)})
+						<div class="px-4 py-3">
+							<div class="flex items-center justify-between">
+								<div class="flex items-center gap-2.5">
+									<span class="w-2 h-2 rounded-full {trade.status === 'open' ? (isGreen ? 'bg-emerald-400' : 'bg-rose-400') : 'bg-zinc-500'}"></span>
+									<span class="text-sm font-mono font-semibold text-text">{trade.ticker}</span>
+									<span class="text-[10px] px-1.5 py-0.5 rounded font-medium {
+										trade.status === 'open' ? 'bg-blue-500/15 text-blue-400' :
+										trade.status === 'closed' && pnl > 0 ? 'bg-emerald-500/15 text-emerald-400' :
+										trade.status === 'stopped_out' ? 'bg-rose-500/15 text-rose-400' :
+										'bg-zinc-500/15 text-zinc-400'
+									}">{trade.status}</span>
+								</div>
+								<div class="flex items-center gap-2">
+									{#if hasPnl}
+										<span class="text-sm font-mono font-bold {isGreen ? 'text-emerald-400' : 'text-rose-400'}">
+											{isGreen ? '+' : ''}{pnl.toFixed(1)}%
 										</span>
+										{#if trade.pnl !== null && trade.pnl !== undefined}
+											<span class="text-xs font-mono {isGreen ? 'text-emerald-400/60' : 'text-rose-400/60'}">
+												({fmtPnl(trade.pnl)})
+											</span>
+										{/if}
+									{:else}
+										<span class="text-xs text-text-muted">pending</span>
 									{/if}
-								{:else}
-									<span class="text-xs text-text-muted">pending</span>
+								</div>
+							</div>
+							<div class="flex items-center justify-between mt-1.5 text-[11px] text-text-muted">
+								<span>Bought @ ${trade.entry_price.toFixed(2)} &middot; {fmtPrice(trade.position_size)} invested &middot; {trade.entry_date.slice(0, 10)}</span>
+								{#if trade.exit_price}
+									<span>Sold @ ${trade.exit_price.toFixed(2)} &middot; {trade.exit_date?.slice(0, 10)}</span>
 								{/if}
-								<span class="text-[10px] px-1.5 py-0.5 rounded font-medium {
-									trade.status === 'open' ? 'bg-blue-500/15 text-blue-400' :
-									trade.status === 'closed' && pnl > 0 ? 'bg-emerald-500/15 text-emerald-400' :
-									trade.status === 'stopped_out' ? 'bg-rose-500/15 text-rose-400' :
-									'bg-zinc-500/15 text-zinc-400'
-								}">{trade.status}</span>
 							</div>
 						</div>
 					{/each}
