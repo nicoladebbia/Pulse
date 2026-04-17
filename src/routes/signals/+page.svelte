@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
-	import { listen } from '@tauri-apps/api/event';
 	import { isTauri } from '$lib/tauri/mock';
 	import {
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
@@ -129,6 +128,7 @@
 			return;
 		}
 		try {
+			const { listen } = await import('@tauri-apps/api/event');
 			const unlisten1 = await listen<PriceUpdate[]>('price-updates', (event) => {
 				const updates = event.payload;
 				const newPrices = { ...livePrices };
