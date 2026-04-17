@@ -25,5 +25,12 @@ cargo build -p pulse-fetcher    # Build fetcher only
 - All news sources are free APIs (Google News RSS, HN, direct RSS, Currents)
 - Magazine layout, dark mode only, vim-style keyboard shortcuts
 
+## Crash Prevention Rules
+- **NEVER use `.unwrap()` on `partial_cmp()`** — f64 NaN values return None. Always use `.unwrap_or(std::cmp::Ordering::Equal)`.
+- **NEVER use bare `.unwrap()` in Tauri commands** — a panic kills the app. Use `.map_err()`, `.unwrap_or()`, or `.ok()`.
+- **All Tauri command errors must be `Result<T, String>`** — never panic, always return Err.
+- **Frontend must `.catch()` every Tauri invoke** — an unhandled rejection crashes the webview.
+- **Test nullable DB columns** — use `Option<T>` for any column that can be NULL, even if a WHERE clause filters NULLs.
+
 ## Environment Variables
 Required in `.env`: ANTHROPIC_API_KEY, VOYAGE_API_KEY, CURRENTS_API_KEY
