@@ -166,11 +166,12 @@ export async function sendMessage(message: string) {
 					return updated;
 				});
 			} else if (event.event === 'Complete') {
-				// Replace raw streamed text with cleaned version + update sources
+				// Replace raw streamed text with cleaned version + update sources + real message ID
 				messages.update(m => {
 					const updated = [...m];
 					const last = updated.find(msg => msg.id === assistantMsgId);
 					if (last) {
+						last.id = event.data.message_id; // Replace frontend UUID with backend ID for feedback
 						last.content = event.data.message;
 						last.sources = event.data.source_story_ids;
 						last.metadata = {

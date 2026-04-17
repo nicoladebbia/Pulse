@@ -126,6 +126,7 @@ export type ChatStreamEvent =
 			event: 'Complete';
 			data: {
 				message: string;
+				message_id: string;
 				source_story_ids: number[];
 				suggested_followups: string[];
 				thread_topic: string;

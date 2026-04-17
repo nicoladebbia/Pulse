@@ -14,6 +14,7 @@ pub enum ChatStreamEvent {
     Delta { text: String },
     Complete {
         message: String,
+        message_id: String,
         source_story_ids: Vec<i64>,
         suggested_followups: Vec<String>,
         thread_topic: String,
@@ -958,11 +959,11 @@ pub async fn chat_send_stream(
         .filter(|id| *id > 0) // Filter out encoded freedom story IDs (negative)
         .collect::<std::collections::HashSet<_>>()
         .into_iter().collect();
-    {
+    let assistant_msg_id = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         conversation::store_message(&conn, &thread.id, "assistant", &clean_message, Some(&all_source_ids), None)
-            .map_err(|e| e.to_string())?;
-    }
+            .map_err(|e| e.to_string())?
+    };
 
     // Store predictions
     if !extracted_predictions.is_empty() {
@@ -1003,6 +1004,7 @@ pub async fn chat_send_stream(
     // Send Complete event with cleaned message text
     if let Err(e) = on_event.send(ChatStreamEvent::Complete {
         message: clean_message,
+        message_id: assistant_msg_id,
         source_story_ids: all_source_ids,
         suggested_followups: followups,
         thread_topic: topic.to_string(),

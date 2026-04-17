@@ -24,6 +24,7 @@ pub const MIGRATION_016: &str = include_str!("../../../migrations/016_feed_healt
 pub const MIGRATION_017: &str = include_str!("../../../migrations/017_financial_data.sql");
 pub const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_resolution.sql");
 pub const MIGRATION_019: &str = include_str!("../../../migrations/019_position_management.sql");
+pub const MIGRATION_020: &str = include_str!("../../../migrations/020_performance_indexes.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -311,10 +312,11 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             CREATE VIRTUAL TABLE stories_fts USING fts5(
                 headline, summary, key_facts, why_it_matters, context_prefix,
                 content='stories',
-                content_rowid='id'
+                content_rowid='id',
+                tokenize='porter unicode61'
             );
             INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                SELECT id, headline, summary, key_facts, why_it_matters, context_prefix FROM stories;
+                SELECT id, headline, summary, key_facts, why_it_matters, COALESCE(context_prefix, '') FROM stories;
 
             DROP TRIGGER IF EXISTS stories_fts_insert;
             DROP TRIGGER IF EXISTS stories_fts_delete;
@@ -322,19 +324,19 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
             CREATE TRIGGER stories_fts_insert AFTER INSERT ON stories BEGIN
                 INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, COALESCE(NEW.context_prefix, ''));
             END;
 
             CREATE TRIGGER stories_fts_delete AFTER DELETE ON stories BEGIN
                 INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, COALESCE(OLD.context_prefix, ''));
             END;
 
             CREATE TRIGGER stories_fts_update AFTER UPDATE ON stories BEGIN
                 INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, COALESCE(OLD.context_prefix, ''));
                 INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, COALESCE(NEW.context_prefix, ''));
             END;"
         )?;
 
@@ -542,9 +544,16 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (19)", [])?;
     }
 
-    // Ensure composite indexes exist (idempotent, no migration version needed)
+    if !applied.contains(&20) {
+        conn.execute_batch(MIGRATION_020)?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (20)", [])?;
+    }
+
+    // Ensure critical indexes exist (idempotent — some were lost by table rebuilds in earlier migrations)
     conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_freedom_stories_bf ON freedom_stories(briefing_id, freedom, display_order);"
+        "CREATE INDEX IF NOT EXISTS idx_freedom_stories_bf ON freedom_stories(briefing_id, freedom, display_order);
+         CREATE INDEX IF NOT EXISTS idx_signals_trajectory ON signals(trajectory, acceleration);
+         CREATE INDEX IF NOT EXISTS idx_entity_mentions_date ON entity_mentions(mentioned_at);"
     )?;
 
     Ok(())
