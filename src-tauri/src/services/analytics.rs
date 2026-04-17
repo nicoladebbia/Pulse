@@ -147,8 +147,8 @@ pub fn compute_analytics(conn: &Connection) -> Result<PortfolioAnalytics, String
     let max_drawdown_pct = compute_max_drawdown(&closed);
 
     // Best / worst
-    let best = closed.iter().max_by(|a, b| a.pnl_pct.partial_cmp(&b.pnl_pct).unwrap());
-    let worst = closed.iter().min_by(|a, b| a.pnl_pct.partial_cmp(&b.pnl_pct).unwrap());
+    let best = closed.iter().max_by(|a, b| a.pnl_pct.partial_cmp(&b.pnl_pct).unwrap_or(std::cmp::Ordering::Equal));
+    let worst = closed.iter().min_by(|a, b| a.pnl_pct.partial_cmp(&b.pnl_pct).unwrap_or(std::cmp::Ordering::Equal));
 
     let best_trade = best.map(|t| TradeSummary {
         ticker: t.ticker.clone(), pnl_pct: t.pnl_pct, pnl_dollars: t.pnl_dollars,
@@ -508,7 +508,7 @@ fn generate_journal_text(
     // Entry narrative
     let top_signals: Vec<&SignalEntry> = {
         let mut sorted: Vec<&SignalEntry> = signals.iter().collect();
-        sorted.sort_by(|a, b| b.entry_value.partial_cmp(&a.entry_value).unwrap());
+        sorted.sort_by(|a, b| b.entry_value.partial_cmp(&a.entry_value).unwrap_or(std::cmp::Ordering::Equal));
         sorted.into_iter().take(3).collect()
     };
 

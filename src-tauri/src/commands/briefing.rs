@@ -227,6 +227,7 @@ pub fn list_briefings(db: State<DbState>) -> Result<Vec<Briefing>, String> {
              WHERE b.id = (
                  SELECT b2.id FROM briefings b2
                  WHERE b2.date = b.date AND b2.briefing_type = b.briefing_type
+                   AND COALESCE(b2.time_label, '') = COALESCE(b.time_label, '')
                  ORDER BY b2.created_at DESC LIMIT 1
              )
              ORDER BY b.date DESC, b.created_at DESC LIMIT 100",

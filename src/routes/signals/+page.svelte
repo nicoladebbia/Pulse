@@ -777,33 +777,33 @@
 				<div class="bg-bg-card border border-border rounded-xl p-4 mb-5">
 					<div class="grid grid-cols-3 gap-3 mb-3">
 						<div>
-							<label class="text-[10px] text-text-muted block mb-1">Min Score</label>
-							<input type="number" bind:value={btMinScore} min="0.1" max="1.0" step="0.05"
+							<label for="bt-min-score" class="text-[10px] text-text-muted block mb-1">Min Score</label>
+							<input id="bt-min-score" type="number" bind:value={btMinScore} min="0.1" max="1.0" step="0.05"
 								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
 						</div>
 						<div>
-							<label class="text-[10px] text-text-muted block mb-1">Stop Loss %</label>
-							<input type="number" bind:value={btStopLoss} max="0" step="1"
+							<label for="bt-stop-loss" class="text-[10px] text-text-muted block mb-1">Stop Loss %</label>
+							<input id="bt-stop-loss" type="number" bind:value={btStopLoss} max="0" step="1"
 								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
 						</div>
 						<div>
-							<label class="text-[10px] text-text-muted block mb-1">Take Profit %</label>
-							<input type="number" bind:value={btTakeProfit} min="1" step="1"
+							<label for="bt-take-profit" class="text-[10px] text-text-muted block mb-1">Take Profit %</label>
+							<input id="bt-take-profit" type="number" bind:value={btTakeProfit} min="1" step="1"
 								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
 						</div>
 						<div>
-							<label class="text-[10px] text-text-muted block mb-1">Max Hold (days)</label>
-							<input type="number" bind:value={btMaxHold} min="1" max="365" step="1"
+							<label for="bt-max-hold" class="text-[10px] text-text-muted block mb-1">Max Hold (days)</label>
+							<input id="bt-max-hold" type="number" bind:value={btMaxHold} min="1" max="365" step="1"
 								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
 						</div>
 						<div>
-							<label class="text-[10px] text-text-muted block mb-1">Max Positions</label>
-							<input type="number" bind:value={btMaxPositions} min="1" max="50" step="1"
+							<label for="bt-max-pos" class="text-[10px] text-text-muted block mb-1">Max Positions</label>
+							<input id="bt-max-pos" type="number" bind:value={btMaxPositions} min="1" max="50" step="1"
 								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
 						</div>
 						<div>
-							<label class="text-[10px] text-text-muted block mb-1">Position Size %</label>
-							<input type="number" bind:value={btPositionSize} min="1" max="25" step="1"
+							<label for="bt-pos-size" class="text-[10px] text-text-muted block mb-1">Position Size %</label>
+							<input id="bt-pos-size" type="number" bind:value={btPositionSize} min="1" max="25" step="1"
 								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
 						</div>
 					</div>
