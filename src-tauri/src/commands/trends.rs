@@ -182,7 +182,7 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
                     COUNT(em.id) AS mention_count,
                     COALESCE(AVG(em.sentiment), 0.0) AS sentiment_avg
              FROM signals sig
-             JOIN entities e ON e.name_normalized = sig.topic
+             JOIN entities e ON e.name_normalized = LOWER(sig.topic)
              JOIN entity_mentions em ON em.entity_id = e.id
              WHERE sig.trajectory != 'dormant'
                AND em.mentioned_at >= date('now', '-14 days')

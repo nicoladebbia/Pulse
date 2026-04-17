@@ -21,8 +21,9 @@
 	let portfolio = $state<Portfolio | null>(null);
 	let sources = $state<SourceHealth[]>([]);
 	let quotas = $state<FinancialApiQuota[]>([]);
-	let isLoading = $state(true);
+	let isLoading = $state(false);
 	let error = $state<string | null>(null);
+	let loadProgress = $state<string[]>([]);
 	let activeTab = $state<'overview' | 'market' | 'portfolio' | 'sources'>('overview');
 	let loaded = $state(false);
 	let expandedSignal = $state<number | null>(null);
@@ -59,38 +60,49 @@
 
 	async function loadData() {
 		error = null;
-		isLoading = true;
-		try {
-			if (!isTauri()) { isLoading = false; return; }
-			const [s, c, ev, e, p] = await Promise.all([
-				getCrossSignals(30).catch(() => []),
-				getConvergenceAlerts(10).catch(() => []),
-				getSignalEvidence(15).catch(() => []),
-				getFinancialEvents(20).catch(() => []),
-				getEntityPrices(50).catch(() => []),
-			]);
-			signals = s;
-			convergence = c;
-			evidence = ev;
-			events = e;
-			prices = p;
-			// Load async data separately (Alpaca API call + price refresh)
-			getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
-			getPortfolioAnalytics().then(a => { analytics = a; }).catch(() => {});
-			getSourceHealth().then(sh => { sources = sh; }).catch(() => {});
-			getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
-			// Refresh prices in background, then reload price list
-			pricesRefreshing = true;
-			refreshPrices()
-				.then(() => getEntityPrices(50))
-				.then(p => { prices = p; })
-				.catch(() => {})
-				.finally(() => { pricesRefreshing = false; });
-		} catch (e: any) {
-			error = String(e?.message ?? e);
-		} finally {
-			isLoading = false;
-		}
+		if (!isTauri()) return;
+
+		loadProgress = ['signals', 'alerts', 'evidence', 'events', 'prices'];
+
+		// Fire all requests in parallel — each updates its own state independently
+		getCrossSignals(30)
+			.then(s => { signals = s; })
+			.catch(() => {})
+			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'signals'); });
+
+		getConvergenceAlerts(10)
+			.then(c => { convergence = c; })
+			.catch(() => {})
+			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'alerts'); });
+
+		getSignalEvidence(15)
+			.then(ev => { evidence = ev; })
+			.catch(() => {})
+			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'evidence'); });
+
+		getFinancialEvents(20)
+			.then(e => { events = e; })
+			.catch(() => {})
+			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'events'); });
+
+		getEntityPrices(50)
+			.then(p => { prices = p; })
+			.catch(() => {})
+			.finally(() => { loadProgress = loadProgress.filter(x => x !== 'prices'); });
+
+		// Slower API calls — fire and forget
+		getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
+		getPortfolioAnalytics().then(a => { analytics = a; }).catch(() => {});
+		getSourceHealth().then(sh => { sources = sh; }).catch(() => {});
+		getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
+
+		// Background price refresh
+		pricesRefreshing = true;
+		refreshPrices()
+			.then(() => getEntityPrices(50))
+			.then(p => { prices = p; })
+			.catch(() => {})
+			.finally(() => { pricesRefreshing = false; });
 	}
 
 	async function handleTrade(ticker: string, confidence: number) {
@@ -361,12 +373,17 @@
 		{/each}
 	</div>
 
-	{#if isLoading}
-		<div class="flex items-center justify-center py-20">
-			<div class="w-6 h-6 border-2 border-ai border-t-transparent rounded-full animate-spin"></div>
+	<!-- Loading progress bar -->
+	{#if loadProgress.length > 0}
+		<div class="mb-4 flex items-center gap-2 px-1">
+			<div class="flex-1 h-1 bg-border rounded-full overflow-hidden">
+				<div class="h-full bg-ai/60 rounded-full transition-all duration-300" style="width: {((5 - loadProgress.length) / 5) * 100}%"></div>
+			</div>
+			<span class="text-[10px] text-text-muted font-mono shrink-0">Loading {loadProgress[0]}...</span>
 		</div>
+	{/if}
 
-	{:else if error}
+	{#if error}
 		<div class="text-center py-20 text-rose-400">{error}</div>
 
 	<!-- ==================== OVERVIEW TAB ==================== -->
