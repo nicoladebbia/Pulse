@@ -427,7 +427,7 @@ pub fn get_source_health(db: State<'_, DbState>) -> Result<Vec<SourceHealth>, St
             |row| row.get(0),
         ).unwrap_or(None);
 
-        let status = if total > 0 { "active" } else if name.contains("USPTO") { "migrating" } else { "inactive" };
+        let status = if total > 0 { "active" } else if name.contains("Patents") { "migrating" } else { "inactive" };
 
         health.push(SourceHealth {
             name: name.to_string(),

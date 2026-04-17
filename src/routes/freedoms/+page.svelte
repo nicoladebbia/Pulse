@@ -118,7 +118,7 @@
 			<p class="text-[10px] uppercase tracking-[0.3em] text-gold-muted mb-3">Daily Intelligence</p>
 			<h1 class="text-2xl font-light text-text tracking-wide mb-2">The Four Freedoms</h1>
 			<p class="text-sm text-text-muted font-light">
-				{totalStories} stories across wealth and health
+				{totalStories} stories across time, wealth, location & health
 			</p>
 
 			<!-- Date navigation -->

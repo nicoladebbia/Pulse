@@ -150,13 +150,13 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
         )
         .context("failed to upsert signal")?;
 
-        // Compute source diversity: count distinct feed_ids mentioning this entity in last 7 days
+        // Compute source diversity: count distinct source_names mentioning this entity in last 7 days
         if has_source_diversity {
             let diversity: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT s.feed_id) FROM entity_mentions em
+                "SELECT COUNT(DISTINCT s.source_name) FROM entity_mentions em
                  JOIN stories s ON em.story_id = s.id
                  JOIN entities e ON em.entity_id = e.id
-                 WHERE LOWER(e.name) = LOWER(?1) AND em.mentioned_at >= date(?2, '-7 days')",
+                 WHERE e.name_normalized = LOWER(?1) AND em.mentioned_at >= date(?2, '-7 days')",
                 params![topic, today],
                 |row| row.get(0),
             ).unwrap_or(0);
@@ -172,7 +172,7 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
                 ), 0) FROM entity_mentions em
                 JOIN stories s ON em.story_id = s.id
                 JOIN entities e ON em.entity_id = e.id
-                WHERE LOWER(e.name) = LOWER(?1) AND s.source_type = 'financial'
+                WHERE e.name_normalized = LOWER(?1) AND s.source_type = 'financial'
                   AND em.mentioned_at >= date(?2, '-30 days')",
                 params![topic, today],
                 |row| row.get(0),
@@ -181,13 +181,13 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
             let contract_val: f64 = conn.query_row(
                 "SELECT COALESCE(SUM(
                     CASE WHEN json_valid(s.financial_metadata)
-                         AND s.feed_id = 'usaspending'
+                         AND s.source_name = 'USASpending'
                     THEN COALESCE(json_extract(s.financial_metadata, '$.amount'), 0)
                     ELSE 0 END
                 ), 0) FROM entity_mentions em
                 JOIN stories s ON em.story_id = s.id
                 JOIN entities e ON em.entity_id = e.id
-                WHERE LOWER(e.name) = LOWER(?1) AND s.source_type = 'financial'
+                WHERE e.name_normalized = LOWER(?1) AND s.source_type = 'financial'
                   AND em.mentioned_at >= date(?2, '-90 days')",
                 params![topic, today],
                 |row| row.get(0),
@@ -197,13 +197,13 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
             let lobby_spend: f64 = conn.query_row(
                 "SELECT COALESCE(SUM(
                     CASE WHEN json_valid(s.financial_metadata)
-                         AND (s.source_name LIKE '%LDA%' OR s.source_name LIKE '%Senate%')
+                         AND s.source_name = 'Senate LDA'
                     THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
                     ELSE 0 END
                 ), 0) FROM entity_mentions em
                 JOIN stories s ON em.story_id = s.id
                 JOIN entities e ON em.entity_id = e.id
-                WHERE LOWER(e.name) = LOWER(?1) AND s.source_type = 'financial'
+                WHERE e.name_normalized = LOWER(?1) AND s.source_type = 'financial'
                   AND em.mentioned_at >= date(?2, '-90 days')",
                 params![topic, today],
                 |row| row.get(0),
@@ -214,18 +214,19 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
                 "SELECT COUNT(*) FROM entity_mentions em
                  JOIN stories s ON em.story_id = s.id
                  JOIN entities e ON em.entity_id = e.id
-                 WHERE LOWER(e.name) = LOWER(?1) AND s.source_name LIKE '%Federal Register%'
+                 WHERE e.name_normalized = LOWER(?1) AND s.source_name = 'Federal Register'
                    AND em.mentioned_at >= date(?2, '-30 days')",
                 params![topic, today],
                 |row| row.get::<_, i64>(0),
             ).unwrap_or(0) as f64;
 
-            // Patent filings (USPTO)
+            // Patent filings (Google Patents)
             let patent_count: f64 = conn.query_row(
                 "SELECT COUNT(*) FROM entity_mentions em
                  JOIN stories s ON em.story_id = s.id
                  JOIN entities e ON em.entity_id = e.id
-                 WHERE LOWER(e.name) = LOWER(?1) AND s.source_name = 'USPTO'
+                 WHERE e.name_normalized = LOWER(?1)
+                   AND (s.source_name = 'Google Patents' OR s.source_name = 'USPTO')
                    AND em.mentioned_at >= date(?2, '-30 days')",
                 params![topic, today],
                 |row| row.get::<_, i64>(0),
@@ -252,7 +253,7 @@ pub fn get_signal(conn: &Connection, topic: &str) -> Result<Option<Signal>> {
     let mut stmt = conn.prepare(
         "SELECT id, topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at
          FROM signals
-         WHERE lower(topic) = ?1",
+         WHERE LOWER(topic) = ?1",
     )?;
 
     let mut rows = stmt.query_map(params![normalized], |row| {

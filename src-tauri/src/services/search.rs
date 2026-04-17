@@ -717,7 +717,7 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
         // Look up entities matching this word by name
         let pattern = format!("%{}%", clean);
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT DISTINCT name FROM entities WHERE LOWER(name) LIKE LOWER(?1) LIMIT 3"
+            "SELECT DISTINCT name FROM entities WHERE name_normalized LIKE ?1 LIMIT 3"
         ) {
             if let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
                 for name in rows.flatten() {
@@ -735,7 +735,7 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT e.name FROM entity_aliases ea
              JOIN entities e ON e.id = ea.entity_id
-             WHERE LOWER(ea.alias) = LOWER(?1) LIMIT 3"
+             WHERE LOWER(ea.alias) = ?1 LIMIT 3"
         ) {
             if let Ok(rows) = stmt.query_map(params![clean], |row| row.get::<_, String>(0)) {
                 for name in rows.flatten() {
@@ -753,7 +753,7 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT ea.alias FROM entity_aliases ea
              JOIN entities e ON e.id = ea.entity_id
-             WHERE LOWER(e.name) LIKE LOWER(?1) LIMIT 3"
+             WHERE e.name_normalized LIKE ?1 LIMIT 3"
         ) {
             if let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
                 for alias in rows.flatten() {
