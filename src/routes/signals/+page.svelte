@@ -1,16 +1,15 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
 	import { isTauri } from '$lib/tauri/mock';
 	import {
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
 		executeTrade, getFinancialEvents, getSignalEvidence, getSourceHealth,
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getTradeJournal,
-		runBacktest, getBacktestHistory, startPriceStream, stopPriceStream
+		runBacktest, startPriceStream, stopPriceStream
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
-		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics, TradeJournal,
-		BacktestConfig, BacktestResult, PriceUpdate
+		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics,
+		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate
 	} from '$lib/tauri/types';
 
 	let signals = $state<CrossSignal[]>([]);
@@ -21,9 +20,8 @@
 	let portfolio = $state<Portfolio | null>(null);
 	let sources = $state<SourceHealth[]>([]);
 	let quotas = $state<FinancialApiQuota[]>([]);
-	let isLoading = $state(false);
+	let isLoading = $state(true);
 	let error = $state<string | null>(null);
-	let loadProgress = $state<string[]>([]);
 	let activeTab = $state<'overview' | 'market' | 'portfolio' | 'sources'>('overview');
 	let loaded = $state(false);
 	let expandedSignal = $state<number | null>(null);
@@ -40,12 +38,8 @@
 	let backtestResult = $state<BacktestResult | null>(null);
 	let backtestError = $state<string | null>(null);
 	let expandedBtTrade = $state<number | null>(null);
-	// Backtest config defaults
 	let streaming = $state(false);
 	let streamError = $state<string | null>(null);
-	let livePrices = $state<Record<string, number>>({});
-	let unlistenFns: Array<() => void> = [];
-	let destroyed = false;
 	let btMinScore = $state(0.4);
 	let btStopLoss = $state(-10);
 	let btTakeProfit = $state(15);
@@ -61,40 +55,37 @@
 
 	async function loadData() {
 		error = null;
-		if (!isTauri()) return;
-
-		let remaining = 5;
-		loadProgress = ['signals', 'alerts', 'evidence', 'events', 'prices'];
-
-		function done(name: string) {
-			if (destroyed) return;
-			remaining--;
-			loadProgress = remaining > 0 ? loadProgress.filter(x => x !== name) : [];
-		}
-
+		isLoading = true;
 		try {
-			// Fire all in parallel, each updates independently
-			getCrossSignals(30).then(s => { if (!destroyed) signals = s; }).catch(() => {}).finally(() => done('signals'));
-			getConvergenceAlerts(10).then(c => { if (!destroyed) convergence = c; }).catch(() => {}).finally(() => done('alerts'));
-			getSignalEvidence(15).then(ev => { if (!destroyed) evidence = ev; }).catch(() => {}).finally(() => done('evidence'));
-			getFinancialEvents(20).then(e => { if (!destroyed) events = e; }).catch(() => {}).finally(() => done('events'));
-			getEntityPrices(50).then(p => { if (!destroyed) prices = p; }).catch(() => {}).finally(() => done('prices'));
-
-			// Slower API calls
-			getPortfolio().then(pf => { if (!destroyed) portfolio = pf; }).catch(() => {});
-			getPortfolioAnalytics().then(a => { if (!destroyed) analytics = a; }).catch(() => {});
-			getSourceHealth().then(sh => { if (!destroyed) sources = sh; }).catch(() => {});
-			getFinancialQuotas().then(q => { if (!destroyed) quotas = q; }).catch(() => {});
-
-			// Background price refresh
+			if (!isTauri()) { isLoading = false; return; }
+			const [s, c, ev, e, p] = await Promise.all([
+				getCrossSignals(30).catch(() => []),
+				getConvergenceAlerts(10).catch(() => []),
+				getSignalEvidence(15).catch(() => []),
+				getFinancialEvents(20).catch(() => []),
+				getEntityPrices(50).catch(() => []),
+			]);
+			signals = s;
+			convergence = c;
+			evidence = ev;
+			events = e;
+			prices = p;
+			// Load async data separately (Alpaca API call + price refresh)
+			getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
+			getPortfolioAnalytics().then(a => { analytics = a; }).catch(() => {});
+			getSourceHealth().then(sh => { sources = sh; }).catch(() => {});
+			getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
+			// Refresh prices in background, then reload price list
 			pricesRefreshing = true;
 			refreshPrices()
 				.then(() => getEntityPrices(50))
-				.then(p => { if (!destroyed) prices = p; })
+				.then(p => { prices = p; })
 				.catch(() => {})
-				.finally(() => { if (!destroyed) pricesRefreshing = false; });
+				.finally(() => { pricesRefreshing = false; });
 		} catch (e: any) {
 			error = String(e?.message ?? e);
+		} finally {
+			isLoading = false;
 		}
 	}
 
@@ -116,55 +107,11 @@
 	async function toggleStream() {
 		streamError = null;
 		if (streaming) {
-			try {
-				await stopPriceStream();
-				streaming = false;
-				// Clean up listeners
-				for (const fn of unlistenFns) fn();
-				unlistenFns = [];
-			} catch (e: any) {
-				streamError = String(e?.message ?? e);
-			}
+			await stopPriceStream().catch(() => {});
+			streaming = false;
 			return;
 		}
 		try {
-			const { listen } = await import('@tauri-apps/api/event');
-			const unlisten1 = await listen<PriceUpdate[]>('price-updates', (event) => {
-				const updates = event.payload;
-				const newPrices = { ...livePrices };
-				for (const u of updates) {
-					newPrices[u.symbol] = u.price;
-				}
-				livePrices = newPrices;
-
-				// Update portfolio positions with live prices
-				if (portfolio) {
-					portfolio = {
-						...portfolio,
-						positions: portfolio.positions.map(pos => {
-							const livePrice = newPrices[pos.symbol];
-							if (livePrice && livePrice > 0) {
-								const unrealized_pl = (livePrice - pos.avg_entry_price) * pos.qty;
-								const unrealized_pl_pct = (livePrice - pos.avg_entry_price) / pos.avg_entry_price;
-								return {
-									...pos,
-									current_price: livePrice,
-									market_value: livePrice * pos.qty,
-									unrealized_pl,
-									unrealized_pl_pct,
-								};
-							}
-							return pos;
-						}),
-					};
-				}
-			});
-
-			const unlisten2 = await listen<boolean>('stream-status', (event) => {
-				streaming = event.payload;
-			});
-
-			unlistenFns = [unlisten1, unlisten2];
 			await startPriceStream();
 			streaming = true;
 		} catch (e: any) {
@@ -172,26 +119,16 @@
 		}
 	}
 
-	onDestroy(() => {
-		destroyed = true;
-		for (const fn of unlistenFns) fn();
-	});
-
 	async function handleBacktest() {
 		backtestRunning = true;
 		backtestError = null;
 		try {
-			// Default date range: last 30 days
 			const end = new Date().toISOString().slice(0, 10);
 			const start = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
 			const config: BacktestConfig = {
-				start_date: start,
-				end_date: end,
-				min_score: btMinScore,
-				stop_loss_pct: btStopLoss,
-				take_profit_pct: btTakeProfit,
-				max_hold_days: btMaxHold,
-				max_positions: btMaxPositions,
+				start_date: start, end_date: end, min_score: btMinScore,
+				stop_loss_pct: btStopLoss, take_profit_pct: btTakeProfit,
+				max_hold_days: btMaxHold, max_positions: btMaxPositions,
 				position_size_pct: btPositionSize,
 			};
 			backtestResult = await runBacktest(config);
@@ -203,18 +140,13 @@
 	}
 
 	async function toggleTradeJournal(tradeId: number) {
-		if (expandedTradeId === tradeId) {
-			expandedTradeId = null;
-			return;
-		}
+		if (expandedTradeId === tradeId) { expandedTradeId = null; return; }
 		expandedTradeId = tradeId;
 		if (!tradeJournals[tradeId]) {
 			try {
 				const j = await getTradeJournal(tradeId);
 				tradeJournals = { ...tradeJournals, [tradeId]: j };
-			} catch (e) {
-				// Silently fail — will show "No journal" state
-			}
+			} catch { /* will show loading state */ }
 		}
 	}
 
@@ -364,17 +296,12 @@
 		{/each}
 	</div>
 
-	<!-- Loading progress bar -->
-	{#if loadProgress.length > 0}
-		<div class="mb-4 flex items-center gap-2 px-1">
-			<div class="flex-1 h-1 bg-border rounded-full overflow-hidden">
-				<div class="h-full bg-ai/60 rounded-full transition-all duration-300" style="width: {((5 - loadProgress.length) / 5) * 100}%"></div>
-			</div>
-			<span class="text-[10px] text-text-muted font-mono shrink-0">Loading {loadProgress[0]}...</span>
+	{#if isLoading}
+		<div class="flex items-center justify-center py-20">
+			<div class="w-6 h-6 border-2 border-ai border-t-transparent rounded-full animate-spin"></div>
 		</div>
-	{/if}
 
-	{#if error}
+	{:else if error}
 		<div class="text-center py-20 text-rose-400">{error}</div>
 
 	<!-- ==================== OVERVIEW TAB ==================== -->
@@ -573,17 +500,12 @@
 				<div class="text-sm font-mono {totalPnlPct >= 0 ? 'text-emerald-400/70' : 'text-rose-400/70'}">
 					{totalPnlPct >= 0 ? '+' : ''}{totalPnlPct.toFixed(2)}%
 				</div>
-				<!-- Live streaming toggle -->
-				<button
-					onclick={toggleStream}
-					class="absolute top-3 right-3 flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] transition-colors {streaming ? 'bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25' : 'bg-zinc-500/10 text-text-muted hover:bg-zinc-500/20'}"
-				>
+				<button onclick={toggleStream}
+					class="absolute top-3 right-3 flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] transition-colors {streaming ? 'bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25' : 'bg-zinc-500/10 text-text-muted hover:bg-zinc-500/20'}">
 					<span class="w-1.5 h-1.5 rounded-full {streaming ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-500'}"></span>
 					{streaming ? 'LIVE' : 'Stream'}
 				</button>
-				{#if streamError}
-					<p class="text-[10px] text-rose-400 mt-1">{streamError}</p>
-				{/if}
+				{#if streamError}<p class="text-[10px] text-rose-400 mt-1">{streamError}</p>{/if}
 			</div>
 
 			<!-- Summary row -->
@@ -602,181 +524,71 @@
 				</div>
 			</div>
 
-			<!-- Analytics Dashboard (toggle with 'a' key) -->
-			<button
-				onclick={() => showAnalytics = !showAnalytics}
-				class="w-full text-left mb-5 flex items-center justify-between px-4 py-2.5 bg-bg-card border border-border rounded-xl hover:border-ai/30 transition-colors"
-			>
+			<!-- Analytics Toggle -->
+			<button onclick={() => showAnalytics = !showAnalytics}
+				class="w-full text-left mb-5 flex items-center justify-between px-4 py-2.5 bg-bg-card border border-border rounded-xl hover:border-ai/30 transition-colors">
 				<span class="text-xs font-semibold text-text-muted uppercase tracking-wider">Analytics {analytics?.total_trades ? `(${analytics.total_trades} trades)` : ''}</span>
 				<span class="text-xs text-text-muted">{showAnalytics ? '▾' : '▸'} <kbd class="text-[10px] px-1 py-0.5 bg-bg rounded border border-border ml-1">a</kbd></span>
 			</button>
 
-			{#if showAnalytics && analytics}
-				<!-- Analytics Hero -->
+			{#if showAnalytics && analytics && analytics.total_trades > 0}
 				<div class="grid grid-cols-3 gap-3 mb-4">
 					<div class="bg-bg-card border border-border rounded-xl p-4 text-center">
 						<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Win Rate</div>
-						<div class="text-2xl font-mono font-bold {analytics.win_rate >= 50 ? 'text-emerald-400' : 'text-rose-400'}">
-							{analytics.win_rate.toFixed(0)}%
-						</div>
-						<div class="text-[10px] text-text-muted mt-0.5">{analytics.total_trades} closed</div>
+						<div class="text-2xl font-mono font-bold {analytics.win_rate >= 50 ? 'text-emerald-400' : 'text-rose-400'}">{analytics.win_rate.toFixed(0)}%</div>
 					</div>
 					<div class="bg-bg-card border border-border rounded-xl p-4 text-center">
 						<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Profit Factor</div>
-						<div class="text-2xl font-mono font-bold {analytics.profit_factor >= 1 ? 'text-emerald-400' : 'text-rose-400'}">
-							{analytics.profit_factor === Infinity ? '∞' : analytics.profit_factor.toFixed(2)}
-						</div>
-						<div class="text-[10px] text-text-muted mt-0.5">
-							{analytics.profit_factor >= 1.5 ? 'strong' : analytics.profit_factor >= 1 ? 'positive' : 'losing'}
-						</div>
+						<div class="text-2xl font-mono font-bold {analytics.profit_factor >= 1 ? 'text-emerald-400' : 'text-rose-400'}">{analytics.profit_factor === Infinity ? '∞' : analytics.profit_factor.toFixed(2)}</div>
 					</div>
 					<div class="bg-bg-card border border-border rounded-xl p-4 text-center">
 						<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Sharpe Ratio</div>
-						<div class="text-2xl font-mono font-bold {analytics.sharpe_ratio >= 1 ? 'text-emerald-400' : analytics.sharpe_ratio >= 0 ? 'text-amber-400' : 'text-rose-400'}">
-							{analytics.sharpe_ratio.toFixed(2)}
-						</div>
-						<div class="text-[10px] text-text-muted mt-0.5">annualized</div>
+						<div class="text-2xl font-mono font-bold {analytics.sharpe_ratio >= 1 ? 'text-emerald-400' : analytics.sharpe_ratio >= 0 ? 'text-amber-400' : 'text-rose-400'}">{analytics.sharpe_ratio.toFixed(2)}</div>
 					</div>
 				</div>
-
-				<!-- Detailed Stats -->
 				<div class="grid grid-cols-2 gap-3 mb-4">
 					<div class="bg-bg-card border border-border rounded-xl p-4">
 						<div class="text-[10px] text-text-muted uppercase tracking-wider mb-2">Returns</div>
 						<div class="space-y-1.5">
-							<div class="flex justify-between text-xs">
-								<span class="text-text-muted">Total Return</span>
-								<span class="font-mono font-semibold {analytics.total_return_dollars >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
-									{analytics.total_return_dollars >= 0 ? '+' : ''}{fmtPrice(analytics.total_return_dollars)} ({analytics.total_return_pct >= 0 ? '+' : ''}{analytics.total_return_pct.toFixed(1)}%)
-								</span>
-							</div>
-							<div class="flex justify-between text-xs">
-								<span class="text-text-muted">Avg Win</span>
-								<span class="font-mono text-emerald-400">+{analytics.avg_win_pct.toFixed(1)}%</span>
-							</div>
-							<div class="flex justify-between text-xs">
-								<span class="text-text-muted">Avg Loss</span>
-								<span class="font-mono text-rose-400">{analytics.avg_loss_pct.toFixed(1)}%</span>
-							</div>
-							<div class="flex justify-between text-xs">
-								<span class="text-text-muted">Sortino</span>
-								<span class="font-mono text-text">{analytics.sortino_ratio === Infinity ? '∞' : analytics.sortino_ratio.toFixed(2)}</span>
-							</div>
+							<div class="flex justify-between text-xs"><span class="text-text-muted">Total Return</span><span class="font-mono font-semibold {analytics.total_return_dollars >= 0 ? 'text-emerald-400' : 'text-rose-400'}">{analytics.total_return_dollars >= 0 ? '+' : ''}{fmtPrice(analytics.total_return_dollars)}</span></div>
+							<div class="flex justify-between text-xs"><span class="text-text-muted">Avg Win</span><span class="font-mono text-emerald-400">+{analytics.avg_win_pct.toFixed(1)}%</span></div>
+							<div class="flex justify-between text-xs"><span class="text-text-muted">Avg Loss</span><span class="font-mono text-rose-400">{analytics.avg_loss_pct.toFixed(1)}%</span></div>
 						</div>
 					</div>
 					<div class="bg-bg-card border border-border rounded-xl p-4">
 						<div class="text-[10px] text-text-muted uppercase tracking-wider mb-2">Risk</div>
 						<div class="space-y-1.5">
-							<div class="flex justify-between text-xs">
-								<span class="text-text-muted">Max Drawdown</span>
-								<span class="font-mono text-rose-400">-{analytics.max_drawdown_pct.toFixed(1)}%</span>
-							</div>
-							<div class="flex justify-between text-xs">
-								<span class="text-text-muted">Avg Hold</span>
-								<span class="font-mono text-text">{analytics.avg_holding_days.toFixed(0)} days</span>
-							</div>
-							<div class="flex justify-between text-xs">
-								<span class="text-text-muted">Open Now</span>
-								<span class="font-mono text-text">{analytics.open_count}</span>
-							</div>
-							{#if analytics.best_trade}
-								<div class="flex justify-between text-xs">
-									<span class="text-text-muted">Best</span>
-									<span class="font-mono text-emerald-400">{analytics.best_trade.ticker} +{analytics.best_trade.pnl_pct.toFixed(1)}%</span>
-								</div>
-							{/if}
-							{#if analytics.worst_trade}
-								<div class="flex justify-between text-xs">
-									<span class="text-text-muted">Worst</span>
-									<span class="font-mono text-rose-400">{analytics.worst_trade.ticker} {analytics.worst_trade.pnl_pct.toFixed(1)}%</span>
-								</div>
-							{/if}
+							<div class="flex justify-between text-xs"><span class="text-text-muted">Max Drawdown</span><span class="font-mono text-rose-400">-{analytics.max_drawdown_pct.toFixed(1)}%</span></div>
+							<div class="flex justify-between text-xs"><span class="text-text-muted">Avg Hold</span><span class="font-mono text-text">{analytics.avg_holding_days.toFixed(0)} days</span></div>
+							{#if analytics.best_trade}<div class="flex justify-between text-xs"><span class="text-text-muted">Best</span><span class="font-mono text-emerald-400">{analytics.best_trade.ticker} +{analytics.best_trade.pnl_pct.toFixed(1)}%</span></div>{/if}
+							{#if analytics.worst_trade}<div class="flex justify-between text-xs"><span class="text-text-muted">Worst</span><span class="font-mono text-rose-400">{analytics.worst_trade.ticker} {analytics.worst_trade.pnl_pct.toFixed(1)}%</span></div>{/if}
 						</div>
 					</div>
 				</div>
-
-				<!-- Signal Attribution -->
-				{#if analytics.signal_attribution.length > 0}
-					<div class="bg-bg-card border border-border rounded-xl p-4 mb-4">
+				{#if analytics.signal_attribution.some(s => s.sample_count > 0)}
+					<div class="bg-bg-card border border-border rounded-xl p-4 mb-5">
 						<div class="text-[10px] text-text-muted uppercase tracking-wider mb-3">Signal Attribution</div>
 						<div class="space-y-2">
 							{#each analytics.signal_attribution.filter(s => s.sample_count > 0) as sig}
-								{@const edge = sig.predictive_edge}
 								<div class="flex items-center gap-3">
 									<span class="text-xs text-text w-24 capitalize">{sig.dimension}</span>
-									<div class="flex-1 flex items-center gap-2">
-										<div class="flex-1 h-1.5 bg-border rounded-full overflow-hidden relative">
-											{#if edge > 0}
-												<div class="absolute left-1/2 h-full rounded-full bg-emerald-400/60" style="width: {Math.min(edge * 250, 50)}%"></div>
-											{:else}
-												<div class="absolute h-full rounded-full bg-rose-400/60" style="right: 50%; width: {Math.min(Math.abs(edge) * 250, 50)}%"></div>
-											{/if}
-										</div>
-									</div>
-									<span class="text-[10px] font-mono w-12 text-right {edge > 0 ? 'text-emerald-400' : edge < 0 ? 'text-rose-400' : 'text-text-muted'}">
-										{edge >= 0 ? '+' : ''}{edge.toFixed(2)}
-									</span>
+									<div class="flex-1 h-1.5 bg-border rounded-full overflow-hidden"><div class="h-full rounded-full {sig.predictive_edge > 0 ? 'bg-emerald-400/60' : 'bg-rose-400/60'}" style="width: {Math.min(Math.abs(sig.predictive_edge) * 250, 50) + 50}%"></div></div>
+									<span class="text-[10px] font-mono w-12 text-right {sig.predictive_edge > 0 ? 'text-emerald-400' : sig.predictive_edge < 0 ? 'text-rose-400' : 'text-text-muted'}">{sig.predictive_edge >= 0 ? '+' : ''}{sig.predictive_edge.toFixed(2)}</span>
 									<span class="text-[10px] text-text-muted w-8 text-right">n={sig.sample_count}</span>
 								</div>
 							{/each}
 						</div>
-						<p class="text-[10px] text-text-muted mt-2">Edge = avg signal value on wins minus losses. Positive = predictive.</p>
 					</div>
 				{/if}
-
-				<!-- Sector Exposure + Monthly Returns side by side -->
-				<div class="grid grid-cols-2 gap-3 mb-5">
-					{#if analytics.sector_exposure.length > 0}
-						<div class="bg-bg-card border border-border rounded-xl p-4">
-							<div class="text-[10px] text-text-muted uppercase tracking-wider mb-3">Sector Exposure</div>
-							<div class="space-y-2">
-								{#each analytics.sector_exposure as sec}
-									{@const maxCount = Math.max(...analytics.sector_exposure.map(s => s.trade_count))}
-									<div class="flex items-center gap-2">
-										<span class="text-xs text-text w-20 capitalize truncate">{sec.sector}</span>
-										<div class="flex-1 h-2 bg-border rounded-full overflow-hidden">
-											<div class="h-full rounded-full bg-ai/40" style="width: {(sec.trade_count / maxCount) * 100}%"></div>
-										</div>
-										<span class="text-[10px] font-mono text-text-muted w-6 text-right">{sec.trade_count}</span>
-										<span class="text-[10px] font-mono w-10 text-right {sec.win_rate >= 50 ? 'text-emerald-400' : 'text-rose-400'}">
-											{sec.win_rate.toFixed(0)}%
-										</span>
-									</div>
-								{/each}
-							</div>
-						</div>
-					{/if}
-
-					{#if analytics.monthly_returns.length > 0}
-						<div class="bg-bg-card border border-border rounded-xl p-4">
-							<div class="text-[10px] text-text-muted uppercase tracking-wider mb-3">Monthly Returns</div>
-							<div class="space-y-1.5">
-								{#each analytics.monthly_returns as m}
-									<div class="flex items-center justify-between text-xs">
-										<span class="text-text-muted font-mono">{m.month}</span>
-										<div class="flex items-center gap-2">
-											<span class="font-mono font-semibold {m.pnl_dollars >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
-												{m.pnl_dollars >= 0 ? '+' : ''}{fmtPrice(m.pnl_dollars)}
-											</span>
-											<span class="text-[10px] text-text-muted">{m.trade_count}t</span>
-										</div>
-									</div>
-								{/each}
-							</div>
-						</div>
-					{/if}
-				</div>
-			{:else if showAnalytics && !analytics}
+			{:else if showAnalytics}
 				<div class="bg-bg-card border border-border rounded-xl p-6 mb-5 text-center">
-					<p class="text-sm text-text-muted">No closed trades yet — analytics will appear after your first trade closes.</p>
+					<p class="text-sm text-text-muted">No closed trades yet — analytics appear after your first trade closes.</p>
 				</div>
 			{/if}
 
-			<!-- Backtester -->
-			<button
-				onclick={() => showBacktest = !showBacktest}
-				class="w-full text-left mb-5 flex items-center justify-between px-4 py-2.5 bg-bg-card border border-border rounded-xl hover:border-ai/30 transition-colors"
-			>
+			<!-- Backtester Toggle -->
+			<button onclick={() => showBacktest = !showBacktest}
+				class="w-full text-left mb-5 flex items-center justify-between px-4 py-2.5 bg-bg-card border border-border rounded-xl hover:border-ai/30 transition-colors">
 				<span class="text-xs font-semibold text-text-muted uppercase tracking-wider">Backtester</span>
 				<span class="text-xs text-text-muted">{showBacktest ? '▾' : '▸'} <kbd class="text-[10px] px-1 py-0.5 bg-bg rounded border border-border ml-1">b</kbd></span>
 			</button>
@@ -784,137 +596,50 @@
 			{#if showBacktest}
 				<div class="bg-bg-card border border-border rounded-xl p-4 mb-5">
 					<div class="grid grid-cols-3 gap-3 mb-3">
-						<div>
-							<label for="bt-min-score" class="text-[10px] text-text-muted block mb-1">Min Score</label>
-							<input id="bt-min-score" type="number" bind:value={btMinScore} min="0.1" max="1.0" step="0.05"
-								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
-						</div>
-						<div>
-							<label for="bt-stop-loss" class="text-[10px] text-text-muted block mb-1">Stop Loss %</label>
-							<input id="bt-stop-loss" type="number" bind:value={btStopLoss} max="0" step="1"
-								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
-						</div>
-						<div>
-							<label for="bt-take-profit" class="text-[10px] text-text-muted block mb-1">Take Profit %</label>
-							<input id="bt-take-profit" type="number" bind:value={btTakeProfit} min="1" step="1"
-								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
-						</div>
-						<div>
-							<label for="bt-max-hold" class="text-[10px] text-text-muted block mb-1">Max Hold (days)</label>
-							<input id="bt-max-hold" type="number" bind:value={btMaxHold} min="1" max="365" step="1"
-								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
-						</div>
-						<div>
-							<label for="bt-max-pos" class="text-[10px] text-text-muted block mb-1">Max Positions</label>
-							<input id="bt-max-pos" type="number" bind:value={btMaxPositions} min="1" max="50" step="1"
-								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
-						</div>
-						<div>
-							<label for="bt-pos-size" class="text-[10px] text-text-muted block mb-1">Position Size %</label>
-							<input id="bt-pos-size" type="number" bind:value={btPositionSize} min="1" max="25" step="1"
-								class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" />
-						</div>
+						<div><label for="bt-min-score" class="text-[10px] text-text-muted block mb-1">Min Score</label><input id="bt-min-score" type="number" bind:value={btMinScore} min="0.1" max="1.0" step="0.05" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
+						<div><label for="bt-stop-loss" class="text-[10px] text-text-muted block mb-1">Stop Loss %</label><input id="bt-stop-loss" type="number" bind:value={btStopLoss} max="0" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
+						<div><label for="bt-take-profit" class="text-[10px] text-text-muted block mb-1">Take Profit %</label><input id="bt-take-profit" type="number" bind:value={btTakeProfit} min="1" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
+						<div><label for="bt-max-hold" class="text-[10px] text-text-muted block mb-1">Max Hold (days)</label><input id="bt-max-hold" type="number" bind:value={btMaxHold} min="1" max="365" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
+						<div><label for="bt-max-pos" class="text-[10px] text-text-muted block mb-1">Max Positions</label><input id="bt-max-pos" type="number" bind:value={btMaxPositions} min="1" max="50" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
+						<div><label for="bt-pos-size" class="text-[10px] text-text-muted block mb-1">Position Size %</label><input id="bt-pos-size" type="number" bind:value={btPositionSize} min="1" max="25" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
 					</div>
-					<div class="flex items-center gap-3">
-						<button
-							onclick={handleBacktest}
-							disabled={backtestRunning}
-							class="px-4 py-2 bg-ai/10 text-ai border border-ai/25 rounded-lg text-xs font-medium hover:bg-ai/20 transition-colors disabled:opacity-50"
-						>{backtestRunning ? 'Running...' : 'Run Backtest (30 days)'}</button>
-						<p class="text-[10px] text-text-muted">Replays convergence signals against actual prices</p>
-					</div>
+					<button onclick={handleBacktest} disabled={backtestRunning}
+						class="px-4 py-2 bg-ai/10 text-ai border border-ai/25 rounded-lg text-xs font-medium hover:bg-ai/20 transition-colors disabled:opacity-50">{backtestRunning ? 'Running...' : 'Run Backtest (30 days)'}</button>
 				</div>
-
-				{#if backtestError}
-					<div class="bg-rose-500/10 border border-rose-500/20 rounded-xl p-3 mb-5">
-						<p class="text-xs text-rose-400">{backtestError}</p>
-					</div>
-				{/if}
-
+				{#if backtestError}<div class="bg-rose-500/10 border border-rose-500/20 rounded-xl p-3 mb-5"><p class="text-xs text-rose-400">{backtestError}</p></div>{/if}
 				{#if backtestResult}
-					<!-- Backtest Results -->
 					<div class="mb-5">
-						<div class="text-[10px] text-text-muted mb-2 font-mono">{backtestResult.config_summary}</div>
-
-						<!-- Summary stats -->
 						<div class="grid grid-cols-4 gap-2 mb-3">
-							<div class="bg-bg border border-border rounded-lg p-2.5 text-center">
-								<div class="text-[10px] text-text-muted">Hit Rate</div>
-								<div class="text-lg font-mono font-bold {backtestResult.hit_rate >= 50 ? 'text-emerald-400' : 'text-rose-400'}">
-									{backtestResult.hit_rate.toFixed(0)}%
-								</div>
-								<div class="text-[10px] text-text-muted">{backtestResult.trades_won}W / {backtestResult.trades_lost}L</div>
-							</div>
-							<div class="bg-bg border border-border rounded-lg p-2.5 text-center">
-								<div class="text-[10px] text-text-muted">Total Return</div>
-								<div class="text-lg font-mono font-bold {backtestResult.total_return_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
-									{backtestResult.total_return_pct >= 0 ? '+' : ''}{backtestResult.total_return_pct.toFixed(1)}%
-								</div>
-								<div class="text-[10px] text-text-muted">{fmtPrice(backtestResult.ending_equity - backtestResult.starting_equity)}</div>
-							</div>
-							<div class="bg-bg border border-border rounded-lg p-2.5 text-center">
-								<div class="text-[10px] text-text-muted">Sharpe</div>
-								<div class="text-lg font-mono font-bold {backtestResult.sharpe_ratio >= 1 ? 'text-emerald-400' : backtestResult.sharpe_ratio >= 0 ? 'text-amber-400' : 'text-rose-400'}">
-									{backtestResult.sharpe_ratio.toFixed(2)}
-								</div>
-							</div>
-							<div class="bg-bg border border-border rounded-lg p-2.5 text-center">
-								<div class="text-[10px] text-text-muted">Max DD</div>
-								<div class="text-lg font-mono font-bold text-rose-400">
-									-{backtestResult.max_drawdown_pct.toFixed(1)}%
-								</div>
-								<div class="text-[10px] text-text-muted">{backtestResult.avg_holding_days.toFixed(0)}d avg hold</div>
-							</div>
+							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Hit Rate</div><div class="text-lg font-mono font-bold {backtestResult.hit_rate >= 50 ? 'text-emerald-400' : 'text-rose-400'}">{backtestResult.hit_rate.toFixed(0)}%</div><div class="text-[10px] text-text-muted">{backtestResult.trades_won}W / {backtestResult.trades_lost}L</div></div>
+							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Total Return</div><div class="text-lg font-mono font-bold {backtestResult.total_return_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}">{backtestResult.total_return_pct >= 0 ? '+' : ''}{backtestResult.total_return_pct.toFixed(1)}%</div></div>
+							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Sharpe</div><div class="text-lg font-mono font-bold {backtestResult.sharpe_ratio >= 1 ? 'text-emerald-400' : 'text-amber-400'}">{backtestResult.sharpe_ratio.toFixed(2)}</div></div>
+							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Max DD</div><div class="text-lg font-mono font-bold text-rose-400">-{backtestResult.max_drawdown_pct.toFixed(1)}%</div></div>
 						</div>
-
-						<!-- Trade list -->
 						{#if backtestResult.trades.length > 0}
 							<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50">
 								{#each backtestResult.trades as bt, i}
 									{@const isWin = bt.pnl_pct > 0}
-									<div>
-										<button
-											class="w-full text-left px-4 py-2.5 hover:bg-white/[0.02] transition-colors"
-											onclick={() => expandedBtTrade = expandedBtTrade === i ? null : i}
-										>
-											<div class="flex items-center justify-between">
-												<div class="flex items-center gap-2">
-													<span class="w-1.5 h-1.5 rounded-full {isWin ? 'bg-emerald-400' : 'bg-rose-400'}"></span>
-													<span class="text-xs font-mono font-semibold text-text">{bt.ticker}</span>
-													<span class="text-[10px] text-text-muted">{bt.entity_name}</span>
-													<span class="text-[10px] px-1.5 py-0.5 rounded font-medium {
-														bt.exit_reason === 'take_profit' ? 'bg-emerald-500/15 text-emerald-400' :
-														bt.exit_reason === 'stop_loss' ? 'bg-rose-500/15 text-rose-400' :
-														bt.exit_reason === 'max_hold' ? 'bg-amber-500/15 text-amber-400' :
-														'bg-zinc-500/15 text-zinc-400'
-													}">{bt.exit_reason.replace('_', ' ')}</span>
-												</div>
-												<div class="flex items-center gap-2">
-													<span class="text-xs font-mono font-bold {isWin ? 'text-emerald-400' : 'text-rose-400'}">
-														{isWin ? '+' : ''}{bt.pnl_pct.toFixed(1)}%
-													</span>
-													<span class="text-[10px] font-mono {isWin ? 'text-emerald-400/60' : 'text-rose-400/60'}">
-														({isWin ? '+' : ''}{fmtPrice(bt.pnl_dollars)})
-													</span>
-													<span class="text-[10px] text-text-muted">{expandedBtTrade === i ? '▾' : '▸'}</span>
-												</div>
+									<button class="w-full text-left px-4 py-2.5 hover:bg-white/[0.02] transition-colors" onclick={() => expandedBtTrade = expandedBtTrade === i ? null : i}>
+										<div class="flex items-center justify-between">
+											<div class="flex items-center gap-2">
+												<span class="w-1.5 h-1.5 rounded-full {isWin ? 'bg-emerald-400' : 'bg-rose-400'}"></span>
+												<span class="text-xs font-mono font-semibold text-text">{bt.ticker}</span>
+												<span class="text-[10px] px-1.5 py-0.5 rounded font-medium {bt.exit_reason === 'take_profit' ? 'bg-emerald-500/15 text-emerald-400' : bt.exit_reason === 'stop_loss' ? 'bg-rose-500/15 text-rose-400' : 'bg-zinc-500/15 text-zinc-400'}">{bt.exit_reason.replace('_', ' ')}</span>
 											</div>
-										</button>
+											<span class="text-xs font-mono font-bold {isWin ? 'text-emerald-400' : 'text-rose-400'}">{isWin ? '+' : ''}{bt.pnl_pct.toFixed(1)}%</span>
+										</div>
 										{#if expandedBtTrade === i}
-											<div class="px-4 pb-3 pt-0.5 text-[11px] text-text-muted space-y-1">
-												<div class="flex gap-4">
-													<span>Entry: {bt.entry_date} @ ${bt.entry_price.toFixed(2)}</span>
-													<span>Exit: {bt.exit_date} @ ${bt.exit_price.toFixed(2)}</span>
-													<span>{bt.holding_days}d held</span>
-													<span>Score: {(bt.compound_score * 100).toFixed(0)}%</span>
-												</div>
+											<div class="mt-1 text-[11px] text-text-muted flex gap-4">
+												<span>Entry: {bt.entry_date} @ ${bt.entry_price.toFixed(2)}</span>
+												<span>Exit: {bt.exit_date} @ ${bt.exit_price.toFixed(2)}</span>
+												<span>{bt.holding_days}d</span>
 											</div>
 										{/if}
-									</div>
+									</button>
 								{/each}
 							</div>
 						{:else}
-							<p class="text-xs text-text-muted text-center py-3">No signals matched criteria in this period. Try lowering the min score.</p>
+							<p class="text-xs text-text-muted text-center py-3">No signals matched criteria.</p>
 						{/if}
 					</div>
 				{/if}
@@ -964,13 +689,9 @@
 						{@const pnl = trade.pnl_pct ?? 0}
 						{@const isGreen = pnl >= 0}
 						{@const isClosed = trade.status !== 'open'}
-						{@const isExpanded = expandedTradeId === trade.id}
 						<div>
-							<button
-								class="w-full text-left px-4 py-3 {isClosed ? 'cursor-pointer hover:bg-white/[0.02]' : ''} transition-colors"
-								onclick={() => isClosed && toggleTradeJournal(trade.id)}
-								disabled={!isClosed}
-							>
+							<button class="w-full text-left px-4 py-3 {isClosed ? 'hover:bg-white/[0.02]' : ''} transition-colors"
+								onclick={() => isClosed && toggleTradeJournal(trade.id)} disabled={!isClosed}>
 								<div class="flex items-center justify-between">
 									<div class="flex items-center gap-2.5">
 										<span class="w-2 h-2 rounded-full {trade.status === 'open' ? (isGreen ? 'bg-emerald-400' : 'bg-rose-400') : 'bg-zinc-500'}"></span>
@@ -995,9 +716,7 @@
 										{:else}
 											<span class="text-xs text-text-muted">pending</span>
 										{/if}
-										{#if isClosed}
-											<span class="text-[10px] text-text-muted ml-1">{isExpanded ? '▾' : '▸'}</span>
-										{/if}
+										{#if isClosed}<span class="text-[10px] text-text-muted ml-1">{expandedTradeId === trade.id ? '▾' : '▸'}</span>{/if}
 									</div>
 								</div>
 								<div class="flex items-center justify-between mt-1.5 text-[11px] text-text-muted">
@@ -1007,31 +726,11 @@
 									{/if}
 								</div>
 							</button>
-							{#if isExpanded}
+							{#if expandedTradeId === trade.id && tradeJournals[trade.id]}
 								<div class="px-4 pb-3 pt-1">
-									{#if tradeJournals[trade.id]}
-										<div class="bg-bg border border-border rounded-lg p-3 mb-2">
-											<p class="text-xs text-text-secondary leading-relaxed">{tradeJournals[trade.id].journal}</p>
-										</div>
-										{#if tradeJournals[trade.id].signal_breakdown.length > 0}
-											<div class="flex flex-wrap gap-2">
-												{#each tradeJournals[trade.id].signal_breakdown as sig}
-													<div class="flex items-center gap-1.5 px-2 py-1 bg-bg border border-border rounded-md">
-														<span class="text-[10px] text-text-muted capitalize">{sig.dimension}</span>
-														<div class="w-12 h-1 bg-border rounded-full overflow-hidden">
-															<div class="h-full rounded-full bg-ai/50" style="width: {sig.entry_value * 100}%"></div>
-														</div>
-														<span class="text-[10px] font-mono text-text">{(sig.entry_value * 100).toFixed(0)}%</span>
-													</div>
-												{/each}
-											</div>
-										{/if}
-									{:else}
-										<div class="flex items-center justify-center py-2">
-											<div class="w-3 h-3 border border-ai border-t-transparent rounded-full animate-spin"></div>
-											<span class="text-[10px] text-text-muted ml-2">Loading journal...</span>
-										</div>
-									{/if}
+									<div class="bg-bg border border-border rounded-lg p-3">
+										<p class="text-xs text-text-secondary leading-relaxed">{tradeJournals[trade.id].journal}</p>
+									</div>
 								</div>
 							{/if}
 						</div>
