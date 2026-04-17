@@ -10,12 +10,10 @@ use super::RawArticle;
 
 /// Top assignees to search — covers major tech companies that file frequently.
 /// We search these explicitly, then match any results to our entity database.
-/// Grouped into 2 batches to minimize requests to Google.
+/// Kept small (1 per request) to avoid Google's bot detection on large queries.
 const PATENT_ASSIGNEES: &[&str] = &[
     "Apple", "Google", "Microsoft", "Amazon", "Meta",
-    "NVIDIA", "Intel", "AMD", "Qualcomm", "Tesla",
-    "Samsung", "IBM", "Oracle", "Cisco", "Adobe",
-    "Salesforce", "Boeing", "Lockheed Martin",
+    "NVIDIA", "Intel", "Tesla", "Qualcomm", "Samsung",
 ];
 
 pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
@@ -26,14 +24,18 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
 
     let mut articles = Vec::new();
 
-    // Search in 2 large batches to minimize requests to Google
-    for chunk in PATENT_ASSIGNEES.chunks(9) {
-        match fetch_patents_batch(&client, chunk).await {
-            Ok(batch) => articles.extend(batch),
-            Err(e) => tracing::debug!("Google Patents batch failed: {}", e),
+    // Search 1 assignee per request with 5s delay to avoid Google's bot detection
+    for assignee in PATENT_ASSIGNEES {
+        match fetch_patents_batch(&client, &[assignee]).await {
+            Ok(batch) => {
+                if !batch.is_empty() {
+                    tracing::debug!("Google Patents: {} results for {}", batch.len(), assignee);
+                }
+                articles.extend(batch);
+            }
+            Err(e) => tracing::debug!("Google Patents failed for {}: {}", assignee, e),
         }
-        // Rate limit: 2 seconds between requests to avoid Google blocking
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 
     if articles.is_empty() {
@@ -87,7 +89,7 @@ async fn fetch_patents_batch(
 
     let resp = client
         .get(&url)
-        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .header("Accept", "application/json")
         .send()
         .await?;
