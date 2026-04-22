@@ -9,7 +9,7 @@ use tauri::{AppHandle, Emitter};
 /// Free tier: 1 connection, real-time US stock trades, ~50 symbols max.
 /// Does NOT count against the 60 calls/min REST limit.
 
-const WS_URL: &str = "wss://ws.finnhub.io";
+const WS_URL: &str = "wss://ws.finnhub.io/";
 
 // ---------------------------------------------------------------------------
 // Types

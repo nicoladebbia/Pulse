@@ -52,6 +52,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         api_key, two_year_period
     );
 
+    super::API_CALLS.fec.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&url)
         .header("User-Agent", "Pulse/1.0")

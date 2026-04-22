@@ -83,6 +83,7 @@ async fn fetch_pageviews(entities: &[(String, String)]) -> anyhow::Result<Vec<Ra
                 wiki_title, start_37d, end
             );
 
+            super::API_CALLS.wikipedia.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let resp = match client
                 .get(&url)
                 .header("User-Agent", "Pulse/1.0 (pulse-app@example.com)")

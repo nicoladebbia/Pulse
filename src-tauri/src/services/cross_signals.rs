@@ -21,6 +21,7 @@ pub struct CrossSignal {
     pub political_signal: f64,
     pub source_diversity: i64,
     pub convergence_detected: bool,
+    pub computed_at: Option<String>,
 }
 
 /// Signal weights — active dimensions only. Dimensions without data sources
@@ -247,14 +248,18 @@ pub fn compute_all_cross_signals(conn: &Connection, today: &str) -> anyhow::Resu
 /// Get entities with convergence detected, ordered by compound score.
 pub fn get_convergence_signals(conn: &Connection, limit: usize) -> anyhow::Result<Vec<CrossSignal>> {
     let mut stmt = conn.prepare(
-        "SELECT cs.entity_id, e.name, cs.ticker, cs.compound_score,
+        "WITH latest AS (
+           SELECT cs.*, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY computed_at DESC) AS rn
+           FROM cross_signals cs
+         )
+         SELECT cs.entity_id, e.name, cs.ticker, cs.compound_score,
                 cs.insider_signal, cs.institutional_flow, cs.news_momentum,
                 cs.government_signal, cs.search_trend, cs.patent_signal,
                 cs.supply_chain, cs.political_signal, cs.source_diversity,
-                cs.convergence_detected
-         FROM cross_signals cs
+                cs.convergence_detected, cs.computed_at
+         FROM latest cs
          LEFT JOIN entities e ON e.id = cs.entity_id
-         WHERE cs.convergence_detected = 1
+         WHERE cs.rn = 1 AND cs.convergence_detected = 1
          ORDER BY cs.compound_score DESC
          LIMIT ?1"
     )?;
@@ -276,6 +281,7 @@ pub fn get_convergence_signals(conn: &Connection, limit: usize) -> anyhow::Resul
                 political_signal: row.get(11)?,
                 source_diversity: row.get(12)?,
                 convergence_detected: row.get::<_, i32>(13)? != 0,
+                computed_at: row.get(14).ok(),
             })
         })?
         .filter_map(|r| r.ok())
@@ -287,14 +293,19 @@ pub fn get_convergence_signals(conn: &Connection, limit: usize) -> anyhow::Resul
 /// Get top cross-signal scores (regardless of convergence).
 pub fn get_top_signals(conn: &Connection, limit: usize) -> anyhow::Result<Vec<CrossSignal>> {
     let mut stmt = conn.prepare(
-        "SELECT cs.entity_id, e.name, cs.ticker, cs.compound_score,
+        "WITH latest AS (
+           SELECT cs.*, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY computed_at DESC) AS rn
+           FROM cross_signals cs
+           WHERE computed_at >= date('now', '-7 days')
+         )
+         SELECT cs.entity_id, e.name, cs.ticker, cs.compound_score,
                 cs.insider_signal, cs.institutional_flow, cs.news_momentum,
                 cs.government_signal, cs.search_trend, cs.patent_signal,
                 cs.supply_chain, cs.political_signal, cs.source_diversity,
-                cs.convergence_detected
-         FROM cross_signals cs
+                cs.convergence_detected, cs.computed_at
+         FROM latest cs
          LEFT JOIN entities e ON e.id = cs.entity_id
-         WHERE cs.computed_at >= date('now', '-7 days')
+         WHERE cs.rn = 1
          ORDER BY cs.compound_score DESC
          LIMIT ?1"
     )?;
@@ -316,6 +327,7 @@ pub fn get_top_signals(conn: &Connection, limit: usize) -> anyhow::Result<Vec<Cr
                 political_signal: row.get(11)?,
                 source_diversity: row.get(12)?,
                 convergence_detected: row.get::<_, i32>(13)? != 0,
+                computed_at: row.get(14).ok(),
             })
         })?
         .filter_map(|r| r.ok())

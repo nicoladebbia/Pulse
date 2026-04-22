@@ -110,6 +110,50 @@
 			currentBriefing.set(result);
 		} catch (_) {}
 	}
+
+	// Clock ticker to keep "Xh ago" and next-fetch countdown fresh without reload
+	let now = $state(Date.now());
+	$effect(() => {
+		const h = setInterval(() => { now = Date.now(); }, 60_000);
+		return () => clearInterval(h);
+	});
+
+	function formatTimeAgo(ts: number, nowMs: number): string {
+		const diffMin = Math.floor((nowMs - ts) / 60_000);
+		if (diffMin < 1) return 'just now';
+		if (diffMin < 60) return `${diffMin}m ago`;
+		const diffHr = Math.floor(diffMin / 60);
+		if (diffHr < 24) return `${diffHr}h ago`;
+		const diffDay = Math.floor(diffHr / 24);
+		return `${diffDay}d ago`;
+	}
+
+	// Launchd schedules daily fetches at 8:00 AM and 9:00 PM local
+	function nextFetchLabel(nowMs: number): string {
+		const d = new Date(nowMs);
+		const hour = d.getHours();
+		const minute = d.getMinutes();
+		const currentMin = hour * 60 + minute;
+		const schedules = [8 * 60, 21 * 60];
+		for (const s of schedules) {
+			if (s > currentMin) {
+				const h = Math.floor(s / 60);
+				const m = s % 60;
+				return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+			}
+		}
+		return '08:00'; // tomorrow
+	}
+
+	let lastFetchedMs = $derived(
+		$currentBriefing?.briefing.created_at
+			? new Date($currentBriefing.briefing.created_at + 'Z').getTime()
+			: null
+	);
+	let lastFetchedLabel = $derived(
+		lastFetchedMs ? formatTimeAgo(lastFetchedMs, now) : null
+	);
+	let nextFetchAt = $derived(nextFetchLabel(now));
 </script>
 
 <aside class="w-56 bg-bg-sidebar border-r border-border flex flex-col shrink-0 h-full overflow-y-auto overflow-x-hidden">
@@ -136,6 +180,45 @@
 			</a>
 		{/each}
 	</nav>
+
+	<!-- Refresh Briefing + fetch times -->
+	<div class="px-3 py-3 border-t border-border">
+		{#if $isFetching}
+			<FetchTaskList compact />
+			{#if $fetchDone}
+				<button class="w-full text-[10px] text-center mt-2 text-ai hover:underline cursor-pointer" onclick={reloadBriefing}>
+					Reload briefing
+				</button>
+			{/if}
+		{:else}
+			<button
+				class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm
+					transition-colors border border-border
+					text-text-secondary hover:bg-bg-card hover:text-text hover:border-ai/30"
+				onclick={handleFetch}
+			>
+				<span>↻</span>
+				<span>Refresh Briefing</span>
+			</button>
+			{#if $fetchDone}
+				<button class="w-full text-[10px] text-center mt-1.5 text-ai hover:underline cursor-pointer" onclick={reloadBriefing}>
+					Done — reload briefing
+				</button>
+			{/if}
+			{#if $fetchError}
+				<p class="text-[10px] text-center mt-1.5 text-red-400">{$fetchError}</p>
+			{/if}
+		{/if}
+
+		<!-- Last fetched / next fetch -->
+		<div class="mt-2 px-1 flex items-center justify-center gap-1.5 text-[10px] text-text-muted">
+			{#if lastFetchedLabel}
+				<span>Last {lastFetchedLabel}</span>
+				<span class="opacity-40">•</span>
+			{/if}
+			<span>Next {nextFetchAt}</span>
+		</div>
+	</div>
 
 	<!-- Sector filters -->
 	<div class="px-3 py-4 border-t border-border">
@@ -190,36 +273,8 @@
 	<!-- Spacer to push footer down when sidebar is short -->
 	<div class="flex-1"></div>
 
-	<!-- Refetch + keyboard hints -->
+	<!-- Bottom section: Spend + keyboard hints -->
 	<div class="border-t border-border shrink-0">
-		<div class="px-3 py-3">
-			{#if $isFetching}
-				<FetchTaskList compact />
-				{#if $fetchDone}
-					<button class="w-full text-[10px] text-center mt-2 text-ai hover:underline cursor-pointer" onclick={reloadBriefing}>
-						Reload briefing
-					</button>
-				{/if}
-			{:else}
-				<button
-					class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm
-						transition-colors border border-border
-						text-text-secondary hover:bg-bg-card hover:text-text hover:border-ai/30"
-					onclick={handleFetch}
-				>
-					<span>↻</span>
-					<span>Refresh Briefing</span>
-				</button>
-				{#if $fetchDone}
-					<button class="w-full text-[10px] text-center mt-1.5 text-ai hover:underline cursor-pointer" onclick={reloadBriefing}>
-						Done — reload briefing
-					</button>
-				{/if}
-				{#if $fetchError}
-					<p class="text-[10px] text-center mt-1.5 text-red-400">{$fetchError}</p>
-				{/if}
-			{/if}
-		</div>
 		<!-- API Usage section -->
 		<div class="px-3 py-4 border-t border-border">
 			<p class="px-3 text-xs font-medium text-text-muted uppercase tracking-wider mb-3">Spend</p>
@@ -283,7 +338,7 @@
 						class="w-full px-3 py-1.5 text-[10px] text-text-muted hover:text-text transition-colors text-left"
 						onclick={() => { showFinancialApis = !showFinancialApis; }}
 					>
-						{showFinancialApis ? '▾ Hide data APIs' : '▸ Data APIs'} <span class="font-mono text-text-secondary">{financialQuotas.reduce((s, q) => s + q.calls_today, 0)} calls today</span>
+						{showFinancialApis ? '▾ Hide external APIs' : '▸ External APIs'} <span class="font-mono text-text-secondary">{financialQuotas.reduce((s, q) => s + q.calls_today, 0)} calls today</span>
 					</button>
 
 					{#if showFinancialApis}

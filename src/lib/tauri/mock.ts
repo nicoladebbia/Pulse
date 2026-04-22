@@ -1,4 +1,4 @@
-import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread } from './types';
+import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread } from './types';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -217,7 +217,7 @@ const makeFreedomStory = (id: number, freedom: string, headline: string, summary
 
 export const mockFreedomsBriefing: FreedomsBriefing = {
 	date: today,
-	summary: 'Today\'s freedoms briefing highlights breakthroughs in AI-powered delegation, a shift in remote work policies, and new longevity research findings.',
+	summary: 'AI agents colonize the productivity stack while Europe standardizes the 4-day week, reshaping time and location freedom simultaneously.',
 	time_stories: [
 		makeFreedomStory(100, 'time', 'AI Agents Now Handle 60% of Routine Dev Tasks', 'New study shows AI coding assistants are dramatically reducing time spent on boilerplate and debugging.'),
 		makeFreedomStory(101, 'time', 'The 4-Day Work Week Goes Mainstream in Europe', 'Following successful trials, three more EU countries announce nationwide 4-day week pilots.'),
@@ -414,14 +414,42 @@ export const mockPredictions: Prediction[] = [
 ];
 
 export const mockPredictionStats: PredictionStats = {
-	total: 9,
+	total: 10,
 	active: 5,
 	validated: 1,
 	partially_validated: 1,
 	invalidated: 1,
 	expired: 1,
+	needs_review: 1,
 	accuracy_rate: 0.667,
 	avg_brier_score: null,
+};
+
+export const mockCalibrationStats: CalibrationStats = {
+	computed_at: '2026-04-21T12:00:00Z',
+	total_resolved: 62,
+	accuracy_overall: 0.58,
+	avg_brier: 0.21,
+	accuracy_by_confidence: {
+		'50-60': { accuracy: 0.42, n: 12 },
+		'60-70': { accuracy: 0.55, n: 18 },
+		'70-80': { accuracy: 0.71, n: 14 },
+		'80-90': { accuracy: 0.78, n: 9 },
+	},
+	accuracy_by_topic: {
+		ai: { accuracy: 0.65, n: 22 },
+		tech: { accuracy: 0.55, n: 15 },
+		miami: { accuracy: 0.48, n: 8 },
+	},
+	accuracy_by_timeframe: {
+		'7d': { accuracy: 0.72, n: 11 },
+		'30d': { accuracy: 0.58, n: 27 },
+		'90d': { accuracy: 0.44, n: 14 },
+	},
+	accuracy_by_source: {
+		'Hacker News': { accuracy: 0.68, n: 19 },
+		'Google News': { accuracy: 0.52, n: 23 },
+	},
 };
 
 // === Mock Usage Stats ===

@@ -64,6 +64,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         thirty_days_ago
     );
 
+    super::API_CALLS.lda.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&url)
         .header("User-Agent", "Pulse/1.0 (news aggregator)")

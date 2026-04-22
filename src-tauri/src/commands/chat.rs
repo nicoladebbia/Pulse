@@ -449,6 +449,16 @@ pub async fn chat_send(
                 sector: Some(topic.to_string()),
                 status: "active".to_string(),
                 probability_history: Vec::new(),
+                target_metric: None,
+                target_date: None,
+                source_story_ids: Vec::new(),
+                source_signal_ids: Vec::new(),
+                model_used: None,
+                resolution_method: None,
+                resolution_attempts: 0,
+                brier_score: None,
+                actual_outcome: None,
+                created_at: None,
             };
             predictions::store_prediction(&conn, &pred).ok();
         }
@@ -981,6 +991,16 @@ pub async fn chat_send_stream(
                 sector: Some(topic.to_string()),
                 status: "active".to_string(),
                 probability_history: Vec::new(),
+                target_metric: None,
+                target_date: None,
+                source_story_ids: Vec::new(),
+                source_signal_ids: Vec::new(),
+                model_used: None,
+                resolution_method: None,
+                resolution_attempts: 0,
+                brier_score: None,
+                actual_outcome: None,
+                created_at: None,
             };
             predictions::store_prediction(&conn, &pred).ok();
         }

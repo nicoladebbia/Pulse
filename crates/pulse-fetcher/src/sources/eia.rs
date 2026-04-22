@@ -63,6 +63,7 @@ async fn fetch_petroleum(client: &reqwest::Client, api_key: &str) -> anyhow::Res
         api_key
     );
 
+    super::API_CALLS.eia.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("EIA petroleum API returned {}", resp.status());
@@ -144,6 +145,7 @@ async fn fetch_natgas(client: &reqwest::Client, api_key: &str) -> anyhow::Result
         api_key
     );
 
+    super::API_CALLS.eia.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("EIA natural gas API returned {}", resp.status());

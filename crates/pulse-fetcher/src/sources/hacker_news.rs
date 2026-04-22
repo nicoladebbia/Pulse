@@ -35,7 +35,33 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         }
     }
 
+    // Exclusive route: productivity-adjacent HN stories move from tech/ai
+    // to freedom_time (not duplicated). Keeps the freedom feed fresh
+    // with real tech productivity signal without polluting tech sector.
+    let mut retagged = 0;
+    for article in &mut articles {
+        if is_productivity_story(&article.title) {
+            article.sector = "freedom_time".to_string();
+            retagged += 1;
+        }
+    }
+    if retagged > 0 {
+        tracing::info!("HN: retagged {} productivity stories to freedom_time", retagged);
+    }
+
     Ok(articles)
+}
+
+fn is_productivity_story(title: &str) -> bool {
+    let t = title.to_lowercase();
+    const KEYWORDS: &[&str] = &[
+        "productiv", "automat", "async work", "async communication",
+        "deep work", "solopren", "indie hacker", "notion", "obsidian",
+        "todo app", "calendar", "pomodoro", "time management",
+        "focus app", "distraction", "workflow automat", "zapier",
+        "n8n", "second brain", "pkm", "task management",
+    ];
+    KEYWORDS.iter().any(|k| t.contains(k))
 }
 
 async fn fetch_endpoint(
@@ -43,6 +69,7 @@ async fn fetch_endpoint(
     sector: &str,
     url: &str,
 ) -> anyhow::Result<Vec<RawArticle>> {
+    super::API_CALLS.hacker_news.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp: HNResponse = client
         .get(url)
         .send()

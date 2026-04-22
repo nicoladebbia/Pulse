@@ -45,6 +45,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         .to_string();
 
     // Fetch proposed rules + final rules (skip notices — too noisy)
+    super::API_CALLS.federal_register.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get("https://www.federalregister.gov/api/v1/documents.json")
         .query(&[

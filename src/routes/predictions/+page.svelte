@@ -1,10 +1,12 @@
 <script lang="ts">
-	import { isTauri, mockPredictions, mockPredictionStats } from '$lib/tauri/mock';
-	import { getAllPredictions, getPredictionStats, manuallyValidatePrediction } from '$lib/tauri/commands';
-	import type { Prediction, PredictionStats } from '$lib/tauri/types';
+	import { isTauri, mockPredictions, mockPredictionStats, mockCalibrationStats } from '$lib/tauri/mock';
+	import { getAllPredictions, getPredictionStats, getCalibrationStats, manuallyValidatePrediction } from '$lib/tauri/commands';
+	import type { Prediction, PredictionStats, CalibrationStats, TargetMetric, CalibrationBucket } from '$lib/tauri/types';
+	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
 
 	let predictions = $state<Prediction[]>([]);
 	let stats = $state<PredictionStats | null>(null);
+	let calibration = $state<CalibrationStats | null>(null);
 	let isLoading = $state(true);
 	let error = $state<string | null>(null);
 	let expandedId = $state<number | null>(null);
@@ -24,11 +26,17 @@
 			if (!isTauri()) {
 				predictions = mockPredictions;
 				stats = mockPredictionStats;
+				calibration = mockCalibrationStats;
 				return;
 			}
-			const [p, s] = await Promise.all([getAllPredictions(), getPredictionStats()]);
+			const [p, s, c] = await Promise.all([
+				getAllPredictions(),
+				getPredictionStats(),
+				getCalibrationStats().catch(() => null),
+			]);
 			predictions = p;
 			stats = s;
+			calibration = c;
 		} catch (e: any) {
 			error = String(e?.message ?? e);
 		} finally {
@@ -87,15 +95,71 @@
 		partially_validated: { icon: '~', label: 'Partial', class: 'bg-amber-500/15 text-amber-400' },
 		invalidated: { icon: '✗', label: 'Wrong', class: 'bg-rose-500/15 text-rose-400' },
 		expired: { icon: '○', label: 'Expired', class: 'bg-zinc-500/15 text-zinc-400' },
+		needs_review: { icon: '✋', label: 'Review', class: 'bg-purple-500/15 text-purple-400' },
 	};
 
 	const filterOptions = [
 		{ value: 'all', label: 'All' },
 		{ value: 'active', label: 'Active' },
 		{ value: 'validated', label: 'Validated' },
+		{ value: 'partially_validated', label: 'Partial' },
 		{ value: 'invalidated', label: 'Wrong' },
 		{ value: 'expired', label: 'Expired' },
+		{ value: 'needs_review', label: 'Review' },
 	];
+
+	const resolutionMeta: Record<string, { icon: string; label: string }> = {
+		market: { icon: '🎯', label: 'Market' },
+		llm: { icon: '🤖', label: 'LLM' },
+		manual: { icon: '✋', label: 'Manual' },
+	};
+
+	// Format target_metric + target_date into a human-readable target line.
+	// Accepts permissive shapes; falls back to nothing when fields are missing.
+	function formatTarget(tm: TargetMetric | null | undefined, targetDate: string | null | undefined): string | null {
+		if (!tm) return null;
+		const ticker = typeof tm.ticker === 'string' ? tm.ticker : null;
+		const operator = typeof tm.operator === 'string' ? tm.operator : null;
+		const value = typeof tm.value === 'number' ? tm.value : null;
+		const unit = typeof tm.unit === 'string' ? tm.unit : null;
+
+		let valueStr: string | null = null;
+		if (value != null) {
+			if (unit === 'usd' || unit === 'USD' || unit === '$') {
+				valueStr = `$${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+			} else if (unit === 'pct' || unit === '%') {
+				valueStr = `${value}%`;
+			} else {
+				valueStr = value.toLocaleString();
+			}
+		}
+
+		const parts: string[] = [];
+		if (ticker) parts.push(ticker);
+		if (operator) parts.push(operator);
+		if (valueStr) parts.push(valueStr);
+		if (targetDate) parts.push(`by ${formatDate(targetDate)}`);
+		return parts.length > 0 ? parts.join(' ') : null;
+	}
+
+	function bucketEntries(map: Record<string, CalibrationBucket> | undefined): Array<[string, CalibrationBucket]> {
+		if (!map) return [];
+		return Object.entries(map).sort(([a], [b]) => a.localeCompare(b));
+	}
+
+	function accuracyColor(acc: number): string {
+		if (acc >= 0.7) return 'text-emerald-400';
+		if (acc >= 0.5) return 'text-amber-400';
+		return 'text-rose-400';
+	}
+
+	// Brier scale is inverted and compressed: 0 perfect, 0.25 random, 1 always-wrong.
+	// Keep the thresholds tight so "random" shows amber, not green.
+	function brierColor(b: number): string {
+		if (b <= 0.15) return 'text-emerald-400';
+		if (b <= 0.30) return 'text-amber-400';
+		return 'text-rose-400';
+	}
 </script>
 
 <div class="space-y-4 pt-2">
@@ -103,12 +167,21 @@
 	<div>
 		<h2 class="text-xl font-semibold text-text">Predictions</h2>
 		<p class="text-xs text-text-muted mt-0.5">AI-generated forecasts tracked against reality</p>
+		{#if predictions.length > 0}
+			{@const mostRecent = predictions.reduce((max, p) => (p.created_at && (!max || p.created_at > max)) ? p.created_at : max, '' as string | null)}
+			<div class="mt-1 flex items-center gap-2">
+				<span class="text-[10px] text-text-muted/70 font-mono">{predictions.length} tracked</span>
+				{#if mostRecent}
+					<FreshnessPill timestamp={mostRecent} label="generated" />
+				{/if}
+			</div>
+		{/if}
 	</div>
 
 	<!-- Stats Card -->
 	{#if stats && stats.total > 0}
 		<div class="bg-bg-card border border-border rounded-xl p-4">
-			<div class="grid grid-cols-5 gap-4">
+			<div class="grid grid-cols-6 gap-3">
 				<div class="text-center">
 					<div class="text-lg font-semibold text-text">{stats.active}</div>
 					<div class="text-[10px] text-text-muted uppercase tracking-wider">Active</div>
@@ -129,13 +202,22 @@
 					<div class="text-lg font-semibold text-zinc-400">{stats.expired}</div>
 					<div class="text-[10px] text-text-muted uppercase tracking-wider">Expired</div>
 				</div>
+				<button
+					type="button"
+					class="text-center rounded-lg transition-colors {stats.needs_review > 0 ? 'hover:bg-purple-500/5 cursor-pointer' : 'cursor-default opacity-60'}"
+					onclick={() => { if (stats && stats.needs_review > 0) statusFilter = 'needs_review'; }}
+					title={stats.needs_review > 0 ? 'Filter to predictions that need manual review' : 'No predictions awaiting review'}
+				>
+					<div class="text-lg font-semibold text-purple-400">{stats.needs_review}</div>
+					<div class="text-[10px] text-text-muted uppercase tracking-wider">Review</div>
+				</button>
 			</div>
 
-			<!-- Accuracy bar -->
-			{#if stats.validated + stats.partially_validated + stats.invalidated + stats.expired > 0}
+			<!-- Accuracy bar — denominator excludes expired + needs_review (backend-side). -->
+			{#if stats.validated + stats.partially_validated + stats.invalidated > 0}
 				<div class="mt-4 pt-3 border-t border-border">
 					<div class="flex items-center justify-between mb-1.5">
-						<span class="text-xs text-text-muted">Accuracy</span>
+						<span class="text-xs text-text-muted" title="Right ÷ (Right + Partial + Wrong). Excludes Expired and Review.">Accuracy</span>
 						<span class="text-xs font-semibold font-mono text-text">{Math.round(stats.accuracy_rate * 100)}%</span>
 					</div>
 					<div class="w-full h-1.5 bg-border rounded-full overflow-hidden">
@@ -154,6 +236,51 @@
 					{/if}
 				</div>
 			{/if}
+		</div>
+	{/if}
+
+	<!-- Calibration: 2×2 grid across confidence/topic/timeframe/source. Only shown when a snapshot exists. -->
+	{#if calibration && calibration.total_resolved >= 50 && calibration.accuracy_overall != null}
+		{@const groups = [
+			{ title: 'By Confidence', data: bucketEntries(calibration.accuracy_by_confidence) },
+			{ title: 'By Topic', data: bucketEntries(calibration.accuracy_by_topic) },
+			{ title: 'By Timeframe', data: bucketEntries(calibration.accuracy_by_timeframe) },
+			{ title: 'By Source', data: bucketEntries(calibration.accuracy_by_source) },
+		]}
+		<div class="bg-bg-card border border-border rounded-xl p-4">
+			<div class="flex items-center justify-between mb-3">
+				<div>
+					<h3 class="text-xs font-semibold text-text uppercase tracking-wider">Calibration</h3>
+					<p class="text-[10px] text-text-muted mt-0.5">
+						{calibration.total_resolved} resolved · overall {Math.round(calibration.accuracy_overall * 100)}%{calibration.avg_brier != null ? ` · brier ${calibration.avg_brier.toFixed(3)}` : ''}
+					</p>
+				</div>
+				{#if calibration.computed_at}
+					<span class="text-[10px] font-mono text-text-muted">{formatDate(calibration.computed_at.slice(0, 10))}</span>
+				{/if}
+			</div>
+			<div class="grid grid-cols-2 gap-3">
+				{#each groups as group}
+					<div class="rounded-lg border border-border bg-bg-page p-3">
+						<div class="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-2">{group.title}</div>
+						{#if group.data.length === 0}
+							<div class="text-[11px] text-text-muted">Not enough samples yet.</div>
+						{:else}
+							<div class="space-y-1.5">
+								{#each group.data as [bucket, info]}
+									<div class="flex items-center justify-between gap-2">
+										<span class="text-[11px] text-text-secondary truncate" title={bucket}>{bucket}</span>
+										<div class="flex items-center gap-1.5 shrink-0">
+											<span class="text-[10px] font-mono text-text-muted">n={info.n}</span>
+											<span class="text-[11px] font-mono font-semibold {accuracyColor(info.accuracy)}">{Math.round(info.accuracy * 100)}%</span>
+										</div>
+									</div>
+								{/each}
+							</div>
+						{/if}
+					</div>
+				{/each}
+			</div>
 		</div>
 	{/if}
 
@@ -283,7 +410,33 @@
 
 					<!-- Expanded content -->
 					{#if expandedId === pred.id}
+						{@const targetLine = formatTarget(pred.target_metric, pred.target_date ?? pred.predicted_timeframe)}
+						{@const resMeta = pred.resolution_method ? resolutionMeta[pred.resolution_method] : null}
+						{@const sourceIds = pred.source_story_ids ?? []}
 						<div class="px-4 pb-4 border-t border-border pt-3 space-y-3">
+							<div class="flex flex-wrap items-center gap-2">
+								{#if resMeta}
+									<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-bg-page border border-border text-text-secondary" title="Resolution method">
+										{resMeta.icon} {resMeta.label}
+									</span>
+								{/if}
+								{#if pred.brier_score != null}
+									<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono bg-bg-page border border-border {brierColor(pred.brier_score)}" title="Brier score — 0 is perfect, 0.25 is random, 1 is always wrong">
+										Brier {pred.brier_score.toFixed(3)}
+									</span>
+								{/if}
+								{#if pred.model_used}
+									<span class="text-[10px] text-text-muted font-mono" title="Model used to generate this prediction">{pred.model_used}</span>
+								{/if}
+							</div>
+
+							{#if targetLine}
+								<div>
+									<h4 class="text-[11px] font-semibold text-text-muted uppercase tracking-wider mb-1">Target</h4>
+									<p class="text-[13px] text-text leading-relaxed font-mono">{targetLine}</p>
+								</div>
+							{/if}
+
 							<div>
 								<h4 class="text-[11px] font-semibold text-text-muted uppercase tracking-wider mb-1">Prediction</h4>
 								<p class="text-[13px] text-text-secondary leading-relaxed">{pred.prediction}</p>
@@ -296,9 +449,27 @@
 								</div>
 							{/if}
 
+							{#if pred.actual_outcome}
+								<div>
+									<h4 class="text-[11px] font-semibold text-text-muted uppercase tracking-wider mb-1">Actual Outcome</h4>
+									<p class="text-[13px] text-text-secondary leading-relaxed">{pred.actual_outcome}</p>
+								</div>
+							{/if}
+
+							{#if sourceIds.length > 0}
+								<div>
+									<h4 class="text-[11px] font-semibold text-text-muted uppercase tracking-wider mb-1">Grounded in</h4>
+									<div class="flex flex-wrap gap-1.5">
+										{#each sourceIds as sid}
+											<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono bg-bg-page border border-border text-text-muted" title="Story #{sid}">#{sid}</span>
+										{/each}
+									</div>
+								</div>
+							{/if}
+
 							<div class="flex items-center gap-4 text-[11px] text-text-muted">
 								{#if pred.predicted_timeframe}
-									<span>Target: {formatDate(pred.predicted_timeframe)}</span>
+									<span>Due: {formatDate(pred.predicted_timeframe)}</span>
 								{/if}
 								{#if pred.evidence_types.length > 0}
 									<span>Evidence: {pred.evidence_types.join(', ')}</span>
@@ -307,27 +478,29 @@
 
 							<!-- Manual validation buttons (only for active predictions) -->
 							{#if pred.status === 'active'}
-								<div class="flex items-center gap-2 pt-2 border-t border-border">
-									<span class="text-[10px] text-text-muted mr-1">Resolve:</span>
-									<button
-										class="text-xs px-3 py-1.5 rounded-lg bg-emerald-400/10 text-emerald-400 border border-emerald-400/20 hover:bg-emerald-400/20 transition-colors"
-										onclick={() => handleValidate(pred.id, 'validated')}
-									>
-										Correct
-									</button>
-									<button
-										class="text-xs px-3 py-1.5 rounded-lg bg-amber-400/10 text-amber-400 border border-amber-400/20 hover:bg-amber-400/20 transition-colors"
-										onclick={() => handleValidate(pred.id, 'partially_validated')}
-									>
-										Partially
-									</button>
-									<button
-										class="text-xs px-3 py-1.5 rounded-lg bg-rose-400/10 text-rose-400 border border-rose-400/20 hover:bg-rose-400/20 transition-colors"
-										onclick={() => handleValidate(pred.id, 'invalidated')}
-									>
-										Wrong
-									</button>
-								</div>
+								{#if pred.id != null}
+									<div class="flex items-center gap-2 pt-2 border-t border-border">
+										<span class="text-[10px] text-text-muted mr-1">Resolve:</span>
+										<button
+											class="text-xs px-3 py-1.5 rounded-lg bg-emerald-400/10 text-emerald-400 border border-emerald-400/20 hover:bg-emerald-400/20 transition-colors"
+											onclick={() => handleValidate(pred.id!, 'validated')}
+										>
+											Correct
+										</button>
+										<button
+											class="text-xs px-3 py-1.5 rounded-lg bg-amber-400/10 text-amber-400 border border-amber-400/20 hover:bg-amber-400/20 transition-colors"
+											onclick={() => handleValidate(pred.id!, 'partially_validated')}
+										>
+											Partially
+										</button>
+										<button
+											class="text-xs px-3 py-1.5 rounded-lg bg-rose-400/10 text-rose-400 border border-rose-400/20 hover:bg-rose-400/20 transition-colors"
+											onclick={() => handleValidate(pred.id!, 'invalidated')}
+										>
+											Wrong
+										</button>
+									</div>
+								{/if}
 							{/if}
 						</div>
 					{/if}

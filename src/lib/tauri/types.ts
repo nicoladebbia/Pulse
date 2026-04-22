@@ -241,6 +241,26 @@ export type IdeaStreamEvent =
 
 // === Prediction Types ===
 
+export type PredictionStatus =
+	| 'active'
+	| 'validated'
+	| 'partially_validated'
+	| 'invalidated'
+	| 'expired'
+	| 'needs_review';
+
+export type ResolutionMethod = 'market' | 'llm' | 'manual';
+
+export interface TargetMetric {
+	ticker?: string | null;
+	operator?: string | null; // e.g. ">=", "<=", "=="
+	value?: number | null;
+	unit?: string | null;      // "usd", "pct", "count", ...
+	baseline_date?: string | null;
+	// LLM may produce extra descriptive fields — keep permissive.
+	[key: string]: unknown;
+}
+
 export interface Prediction {
 	id: number | null;
 	title: string;
@@ -251,8 +271,19 @@ export interface Prediction {
 	evidence_story_ids: number[];
 	predicted_timeframe: string;
 	sector: string | null;
-	status: 'active' | 'validated' | 'partially_validated' | 'invalidated' | 'expired';
+	status: PredictionStatus;
 	probability_history: number[];
+	// --- v2 fields (nullable on legacy rows) ---
+	target_metric?: TargetMetric | null;
+	target_date?: string | null;
+	source_story_ids?: number[];
+	source_signal_ids?: number[];
+	model_used?: string | null;
+	resolution_method?: ResolutionMethod | null;
+	resolution_attempts?: number;
+	brier_score?: number | null;
+	actual_outcome?: string | null;
+	created_at?: string | null;
 }
 
 export interface PredictionStats {
@@ -262,8 +293,25 @@ export interface PredictionStats {
 	partially_validated: number;
 	invalidated: number;
 	expired: number;
+	needs_review: number;
 	accuracy_rate: number;
 	avg_brier_score: number | null;
+}
+
+export interface CalibrationBucket {
+	accuracy: number;
+	n: number;
+}
+
+export interface CalibrationStats {
+	computed_at: string | null;
+	total_resolved: number;
+	accuracy_overall: number | null;
+	avg_brier: number | null;
+	accuracy_by_confidence: Record<string, CalibrationBucket>;
+	accuracy_by_topic: Record<string, CalibrationBucket>;
+	accuracy_by_timeframe: Record<string, CalibrationBucket>;
+	accuracy_by_source: Record<string, CalibrationBucket>;
 }
 
 // === Story Entity Context ===
@@ -360,6 +408,7 @@ export interface FinancialApiQuota {
 	calls_today: number;
 	calls_this_hour: number;
 	limit_per_minute: number;  // -1 = no limit
+	limit_per_hour: number;    // -1 = no limit (carries hourly cap for FEC etc.)
 	limit_per_day: number;     // -1 = no limit
 	last_call_at: string | null;
 }
@@ -491,6 +540,18 @@ export interface BacktestConfig {
 	position_size_pct: number;
 }
 
+export interface BacktestEquityPoint {
+	date: string;
+	value: number;
+}
+
+export interface BacktestMonthlyReturn {
+	month: string;          // "YYYY-MM"
+	pnl_dollars: number;
+	pnl_pct: number;
+	trade_count: number;
+}
+
 export interface BacktestResult {
 	config_summary: string;
 	total_signals: number;
@@ -506,6 +567,8 @@ export interface BacktestResult {
 	starting_equity: number;
 	ending_equity: number;
 	trades: BacktestTrade[];
+	equity_curve?: BacktestEquityPoint[];
+	monthly_returns?: BacktestMonthlyReturn[];
 }
 
 export interface BacktestTrade {
@@ -559,6 +622,8 @@ export interface SignalEvidence {
 	source_stories: EvidenceStory[];
 	price: number | null;
 	price_change_1d: number | null;
+	price_date: string | null;      // staleness indicator for price
+	computed_at: string | null;     // staleness indicator for signal
 	recommendation: string;
 	position_size_pct: number;
 }
@@ -608,4 +673,5 @@ export interface CrossSignal {
 	political_signal: number;
 	source_diversity: number;
 	convergence_detected: boolean;
+	computed_at: string | null;
 }

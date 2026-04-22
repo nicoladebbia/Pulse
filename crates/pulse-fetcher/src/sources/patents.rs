@@ -87,6 +87,7 @@ async fn fetch_patents_batch(
         encoded_query
     );
 
+    super::API_CALLS.uspto.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")

@@ -81,6 +81,7 @@ async fn fetch_series(
         series_id, api_key
     );
 
+    super::API_CALLS.fred.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("FRED API returned {} for {}", resp.status(), series_id);

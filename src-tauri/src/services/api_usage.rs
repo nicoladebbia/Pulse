@@ -23,19 +23,30 @@ const PRICING: &[(&str, &str, f64, f64)] = &[
     ("alpaca", "trading", 0.0, 0.0),
 ];
 
-/// Rate limits for financial APIs (calls per minute unless noted)
-/// (provider, calls_per_minute, calls_per_day, description)
-pub const FINANCIAL_RATE_LIMITS: &[(&str, i64, i64, &str)] = &[
-    ("fred",              120,   -1,     "FRED (120/min)"),
-    ("finnhub",            60,   -1,     "Finnhub (60/min)"),
-    ("fec",                60, 1000,     "FEC (1000/hr)"),
-    ("eia",                -1,   -1,     "EIA (no limit)"),
-    ("sec_edgar",         600,   -1,     "SEC EDGAR (10/sec)"),
-    ("usaspending",        -1,   -1,     "USASpending (no limit)"),
-    ("federal_register",   -1,   -1,     "Federal Register (no limit)"),
-    ("alpaca",            200,   -1,     "Alpaca (200/min)"),
-    ("lda",                -1,   -1,     "Senate LDA (no limit)"),
-    ("uspto",              -1,   -1,     "Google Patents (no limit)"),
+/// Rate limits for all tracked external APIs.
+/// (provider, calls_per_minute, calls_per_hour, calls_per_day, description)
+/// Use -1 for "no limit" on any dimension.
+pub const FINANCIAL_RATE_LIMITS: &[(&str, i64, i64, i64, &str)] = &[
+    // Financial / government data APIs
+    ("fred",              120,   -1,   -1,     "FRED (120/min)"),
+    ("finnhub",            60,   -1,   -1,     "Finnhub (60/min)"),
+    ("fec",                60, 1000,   -1,     "FEC (1000/hr)"),
+    ("eia",                -1,   -1,   -1,     "EIA (no limit)"),
+    ("sec_edgar",         600,   -1,   -1,     "SEC EDGAR (10/sec)"),
+    ("usaspending",        -1,   -1,   -1,     "USASpending (no limit)"),
+    ("federal_register",   -1,   -1,   -1,     "Federal Register (no limit)"),
+    ("alpaca",            200,   -1,   -1,     "Alpaca (200/min)"),
+    ("lda",                -1,   -1,   -1,     "Senate LDA (no limit)"),
+    ("uspto",              -1,   -1,   -1,     "Google Patents (no limit)"),
+    ("sbir",               -1,   -1,   -1,     "SBIR (no limit)"),
+    // News / content APIs
+    ("google_news",        -1,   -1,   -1,     "Google News RSS"),
+    ("hacker_news",        -1,   -1,   -1,     "Hacker News (Algolia)"),
+    ("reddit",             -1,  600,   -1,     "Reddit (600/hr)"),
+    ("arxiv",              -1,   -1,   -1,     "ArXiv"),
+    ("biorxiv",            -1,   -1,   -1,     "bioRxiv"),
+    ("rss_feeds",          -1,   -1,   -1,     "RSS Feeds"),
+    ("wikipedia",          -1,   -1,   -1,     "Wikipedia"),
 ];
 
 pub fn estimate_cost(provider: &str, model: &str, input_tokens: i64, output_tokens: i64) -> f64 {
@@ -174,6 +185,7 @@ pub struct FinancialApiQuota {
     pub calls_today: i64,
     pub calls_this_hour: i64,
     pub limit_per_minute: i64,   // -1 = no limit
+    pub limit_per_hour: i64,     // -1 = no limit
     pub limit_per_day: i64,      // -1 = no limit
     pub last_call_at: Option<String>,
 }
@@ -182,7 +194,7 @@ pub struct FinancialApiQuota {
 pub fn get_financial_quotas(conn: &Connection) -> Result<Vec<FinancialApiQuota>> {
     let mut quotas = Vec::new();
 
-    for &(provider, rpm, daily_limit, desc) in FINANCIAL_RATE_LIMITS {
+    for &(provider, rpm, rph, daily_limit, desc) in FINANCIAL_RATE_LIMITS {
         let calls_today: i64 = conn.query_row(
             "SELECT COUNT(*) FROM api_usage WHERE provider = ?1 AND DATE(created_at) = DATE('now')",
             params![provider],
@@ -207,6 +219,7 @@ pub fn get_financial_quotas(conn: &Connection) -> Result<Vec<FinancialApiQuota>>
             calls_today,
             calls_this_hour,
             limit_per_minute: rpm,
+            limit_per_hour: rph,
             limit_per_day: daily_limit,
             last_call_at: last_call,
         });

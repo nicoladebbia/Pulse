@@ -43,6 +43,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         current_year
     );
 
+    super::API_CALLS.sbir.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&url)
         .header("User-Agent", "Pulse/1.0 (news aggregator)")

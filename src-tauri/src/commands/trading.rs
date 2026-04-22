@@ -17,9 +17,16 @@ pub async fn get_portfolio(db: State<'_, DbState>) -> Result<Portfolio, String> 
         (open, closed)
     };
     // Lock dropped — now safe to await
-    paper_trading::get_portfolio_with_trades(open_trades, closed_trades)
+    let result = paper_trading::get_portfolio_with_trades(open_trades, closed_trades)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    // Log Alpaca reads (1 for account + 1 for positions, regardless of ticker count)
+    if result.is_ok() {
+        if let Ok(conn) = db.0.lock() {
+            crate::services::api_usage::log_usage(&conn, "alpaca", "paper_api", "portfolio", 2, 0).ok();
+        }
+    }
+    result
 }
 
 /// Get paper trades by status.

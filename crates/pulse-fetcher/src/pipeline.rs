@@ -109,6 +109,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 1: Collect from all sources
     progress.start_stage(1);
     tracing::info!("Phase 1: Collecting from sources...");
+    sources::API_CALLS.reset();
     let mut all_articles = sources::collect_all().await?;
 
     // Wikipedia Pageviews — needs DB access for entity lookup (non-fatal)
@@ -147,26 +148,15 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         .into_iter()
         .partition(|a| a.source_type != "financial");
 
-    // Log financial API calls for quota tracking
+    // Log API calls for quota tracking — 1 row per actual HTTP request,
+    // not per batch. Each source module bumps its atomic counter inside
+    // every fetch() call; we write that many rows here.
     {
-        let mut feed_counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
-        for a in &raw_financial {
-            let provider = match a.feed_id.as_str() {
-                id if id.starts_with("edgar") => "sec_edgar",
-                "usaspending" => "usaspending",
-                "federal_register" => "federal_register",
-                id if id.starts_with("fred") => "fred",
-                id if id.starts_with("sbir") => "sbir",
-                id if id.starts_with("fec") => "fec",
-                id if id.starts_with("eia") => "eia",
-                id if id.starts_with("lda") => "lda",
-                id if id.starts_with("patent") => "uspto",
-                _ => "financial_other",
-            };
-            *feed_counts.entry(provider).or_insert(0) += 1;
-        }
-        for (provider, count) in &feed_counts {
-            log_usage(db_path, provider, "fetch", "collect", *count, 0);
+        let snapshot = sources::API_CALLS.snapshot();
+        for (provider, calls) in snapshot {
+            for _ in 0..calls {
+                log_usage(db_path, provider, "fetch", "collect", 0, 0);
+            }
         }
     }
 
@@ -493,15 +483,21 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Deep summary generation failed (non-fatal): {}", e),
     }
 
-    // Phase 11: Validate predictions against new stories (non-fatal)
-    tracing::info!("Phase 11: Validating predictions...");
+    // Phase 11: Resolve predictions (hybrid router: market/LLM/manual) (non-fatal)
+    tracing::info!("Phase 11: Resolving predictions...");
     match validate_and_expire_predictions(db_path).await {
-        Ok((validated, expired)) => {
-            if validated > 0 || expired > 0 {
-                tracing::info!("Predictions: {} validated/updated, {} expired", validated, expired);
+        Ok((resolved, expired)) => {
+            if resolved > 0 || expired > 0 {
+                tracing::info!("Predictions: {} resolved, {} expired", resolved, expired);
             }
         }
-        Err(e) => tracing::warn!("Prediction validation failed (non-fatal): {}", e),
+        Err(e) => tracing::warn!("Prediction resolution failed (non-fatal): {}", e),
+    }
+
+    // Phase 11.1: Compute calibration stats (daily aggregation) (non-fatal)
+    tracing::info!("Phase 11.1: Computing prediction calibration...");
+    if let Err(e) = compute_calibration_stats(db_path).await {
+        tracing::warn!("Calibration computation failed (non-fatal): {}", e);
     }
 
     // Phase 11.5: Entity resolution — merge duplicate entities into canonical records
@@ -603,6 +599,59 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Calibration failed (non-fatal): {}", e),
     }
 
+    // Phase 14.5: Generate predictions (Sonnet daily, Opus Sunday) (non-fatal)
+    // Runs AFTER Phase 13 cross-signals are computed so predictions can
+    // reference them. See plan .plans/signals-predictions-rework-plan.md Push 2.
+    tracing::info!("Phase 14.5: Generating predictions...");
+    {
+        // Gather top stories
+        let top_stories: Vec<(i64, String, String, String)> = {
+            let conn = rusqlite::Connection::open(db_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, headline, summary, sector
+                 FROM stories
+                 WHERE DATE(created_at) = DATE('now')
+                 ORDER BY importance_score DESC, created_at DESC
+                 LIMIT 40"
+            )?;
+            stmt.query_map([], |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            )))?.filter_map(|r| r.ok()).collect()
+        };
+
+        // Gather top cross-signals
+        let top_signals: Vec<(i64, String, Option<String>, f64)> = {
+            let conn = rusqlite::Connection::open(db_path)?;
+            let mut stmt = conn.prepare(
+                "WITH latest AS (
+                   SELECT cs.*, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY computed_at DESC) AS rn
+                   FROM cross_signals cs
+                   WHERE cs.computed_at >= date('now', '-7 days')
+                 )
+                 SELECT cs.entity_id, e.name, cs.ticker, cs.compound_score
+                 FROM latest cs
+                 LEFT JOIN entities e ON e.id = cs.entity_id
+                 WHERE cs.rn = 1 AND cs.compound_score > 0.3
+                 ORDER BY cs.compound_score DESC
+                 LIMIT 20"
+            )?;
+            stmt.query_map([], |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, f64>(3)?,
+            )))?.filter_map(|r| r.ok()).collect()
+        };
+
+        match generate_predictions(db_path, &top_stories, &top_signals).await {
+            Ok(count) => tracing::info!("Generated {} predictions", count),
+            Err(e) => tracing::warn!("Prediction generation failed (non-fatal): {}", e),
+        }
+    }
+
     // Done
     progress.finish();
     send_notification(analysis.curated_stories.len())?;
@@ -640,149 +689,522 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validate active predictions against recent stories using embedding similarity.
-/// Embeds prediction texts via Voyage (1 API call for all predictions), then
-/// compares against today's story embeddings using cosine similarity.
+/// Validate active predictions via hybrid router (Push 2 rebuild).
+///
+/// Routing:
+///   - target_metric has ticker → market-based resolution from entity_prices
+///   - else → Sonnet LLM outcome check (capped at 15/day)
+///   - LLM "unclear" → increments resolution_attempts; after 3 → needs_review
+///
+/// Returns (resolved, expired).
 async fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::Result<(usize, usize)> {
     let conn = rusqlite::Connection::open(db_path)?;
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    // 1. Load today's story embeddings
-    let story_embeddings: Vec<(i64, Vec<f32>)> = {
-        let mut stmt = conn.prepare(
-            "SELECT se.story_id, se.embedding FROM story_embeddings se
-             JOIN stories s ON s.id = se.story_id
-             JOIN briefings b ON b.id = s.briefing_id
-             WHERE b.date = ?1 AND se.story_id > 0"
-        )?;
-        stmt.query_map([&today], |row| {
-            let id: i64 = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            let emb: Vec<f32> = blob.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            Ok((id, emb))
-        })?.filter_map(|r| r.ok()).collect()
-    };
-
-    // 2. Load active predictions
+    // 1. Load active predictions whose target_date is today or past
+    //    (future-dated predictions wait until their deadline).
     let mut pred_stmt = conn.prepare(
-        "SELECT id, title, content, confidence FROM insights WHERE insight_type = 'prediction' AND status = 'active'"
+        "SELECT id, title, content, confidence, target_metric, target_date, resolution_attempts
+         FROM insights
+         WHERE insight_type = 'prediction'
+           AND status = 'active'
+           AND (target_date IS NULL OR target_date <= date('now'))
+         ORDER BY target_date ASC NULLS LAST"
     )?;
-    let predictions: Vec<(i64, String, String, f64)> = pred_stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+    let predictions: Vec<PredToResolve> = pred_stmt
+        .query_map([], |row| Ok(PredToResolve {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            content: row.get(2)?,
+            confidence: row.get(3)?,
+            target_metric: row.get::<_, Option<String>>(4)?,
+            target_date: row.get::<_, Option<String>>(5)?,
+            resolution_attempts: row.get::<_, i64>(6).unwrap_or(0),
+        }))?
         .filter_map(|r| r.ok())
         .collect();
 
-    if predictions.is_empty() || story_embeddings.is_empty() {
-        return Ok((0, 0));
+    if predictions.is_empty() {
+        // Still run expiry pass below — some legacy predictions without target_date
+        // may have predicted_date in the past.
     }
 
-    // 3. Embed prediction texts via Voyage (1 API call for all predictions)
-    let pred_texts: Vec<String> = predictions.iter()
-        .map(|(_, title, content, _)| format!("{}. {}", title, content))
-        .collect();
+    let mut resolved = 0usize;
+    let mut llm_checks_used = 0usize;
+    const LLM_DAILY_CAP: usize = 15;
 
-    let pred_embeddings = match crate::embeddings::generate_from_texts(&pred_texts).await {
-        Ok(embs) => {
-            tracing::info!("Embedded {} prediction texts for validation", embs.len());
-            log_usage(db_path, "voyage", "voyage-3-lite", "prediction_validation", (embs.len() as i64) * 100, 0);
-            embs
-        }
-        Err(e) => {
-            tracing::warn!("Failed to embed predictions (falling back to keyword matching): {}", e);
-            return validate_predictions_keyword_fallback(&conn, &predictions, &story_embeddings, &today);
-        }
-    };
-
-    // 4. For each prediction, find best semantic match against today's stories
-    let mut validated = 0usize;
-    for (i, (pred_id, title, _content, confidence)) in predictions.iter().enumerate() {
-        let pred_emb = match pred_embeddings.get(i) {
-            Some(e) => e,
-            None => continue,
+    for p in &predictions {
+        // Route: market-based if ticker, LLM check otherwise
+        let outcome = if let Some(tm_str) = &p.target_metric {
+            match serde_json::from_str::<serde_json::Value>(tm_str) {
+                Ok(tm) if tm.get("ticker").and_then(|v| v.as_str()).is_some() => {
+                    resolve_market_prediction(&conn, &tm, p.target_date.as_deref())
+                }
+                _ => ResolutionOutcome::Unclear,
+            }
+        } else {
+            // Qualitative → LLM check, respecting daily cap
+            if llm_checks_used >= LLM_DAILY_CAP {
+                tracing::info!("Prediction #{}: LLM cap reached ({}), try tomorrow", p.id, LLM_DAILY_CAP);
+                continue;
+            }
+            llm_checks_used += 1;
+            resolve_llm_prediction(db_path, &conn, p, &today).await
+                .unwrap_or(ResolutionOutcome::Unclear)
         };
 
-        // Cosine similarity against each of today's story embeddings
-        let mut best_match: Option<(i64, f32)> = None;
-        for (sid, story_emb) in &story_embeddings {
-            let sim = cosine_similarity(pred_emb, story_emb);
-            if sim > 0.5 { // Threshold: meaningful semantic similarity
-                if best_match.is_none() || sim > best_match.unwrap().1 {
-                    best_match = Some((*sid, sim));
+        match outcome {
+            ResolutionOutcome::Validated { summary, method } => {
+                apply_resolution(&conn, p, "validated", 1.0, &summary, &method, &today)?;
+                resolved += 1;
+            }
+            ResolutionOutcome::Invalidated { summary, method } => {
+                apply_resolution(&conn, p, "invalidated", 0.0, &summary, &method, &today)?;
+                resolved += 1;
+            }
+            ResolutionOutcome::Partial { summary, method } => {
+                apply_resolution(&conn, p, "partially_validated", 0.5, &summary, &method, &today)?;
+                resolved += 1;
+            }
+            ResolutionOutcome::Unclear => {
+                let attempts = p.resolution_attempts + 1;
+                if attempts >= 3 {
+                    conn.execute(
+                        "UPDATE insights SET status = 'needs_review', resolution_attempts = ?1, updated_at = datetime('now') WHERE id = ?2",
+                        rusqlite::params![attempts, p.id],
+                    ).ok();
+                    tracing::info!("Prediction #{} → needs_review (3 unclear attempts)", p.id);
+                } else {
+                    conn.execute(
+                        "UPDATE insights SET resolution_attempts = ?1, updated_at = datetime('now') WHERE id = ?2",
+                        rusqlite::params![attempts, p.id],
+                    ).ok();
                 }
             }
         }
-
-        if let Some((sid, similarity)) = best_match {
-            // Nudge confidence based on similarity strength
-            // 0.5-0.65: weak evidence → +0.02
-            // 0.65-0.8: moderate evidence → +0.05
-            // 0.8+: strong evidence → +0.08
-            let nudge = if similarity > 0.8 { 0.08 } else if similarity > 0.65 { 0.05 } else { 0.02 };
-            let new_prob = (confidence + nudge).min(0.95);
-
-            let story_headline: String = conn.query_row(
-                "SELECT headline FROM stories WHERE id = ?1", [sid], |row| row.get(0),
-            ).unwrap_or_default();
-
-            tracing::info!("Prediction #{} matched story (sim={:.3}): \"{}\" ↔ \"{}\"",
-                pred_id, similarity, truncate_str(title, 50), truncate_str(&story_headline, 50));
-
-            let history: String = conn.query_row(
-                "SELECT COALESCE(probability_history, '[]') FROM insights WHERE id = ?1",
-                [pred_id], |row| row.get(0),
-            ).unwrap_or_else(|_| "[]".to_string());
-
-            let mut entries: Vec<serde_json::Value> = serde_json::from_str(&history).unwrap_or_default();
-            entries.push(serde_json::json!({
-                "date": today,
-                "probability": new_prob,
-                "similarity": similarity,
-                "story_id": sid,
-                "story_headline": story_headline,
-                "reason": format!("Semantic match ({:.0}% similarity)", similarity * 100.0)
-            }));
-
-            // Strong match → auto-validate; weaker match → just nudge confidence
-            if similarity > 0.80 {
-                conn.execute(
-                    "UPDATE insights SET probability_history = ?1, confidence = ?2, status = 'validated', actual_outcome = ?3, updated_at = datetime('now') WHERE id = ?4",
-                    rusqlite::params![serde_json::to_string(&entries).unwrap_or_default(), new_prob, story_headline, pred_id],
-                ).ok();
-            } else {
-                conn.execute(
-                    "UPDATE insights SET probability_history = ?1, confidence = ?2 WHERE id = ?3",
-                    rusqlite::params![serde_json::to_string(&entries).unwrap_or_default(), new_prob, pred_id],
-                ).ok();
-            }
-            validated += 1;
-        }
     }
 
-    // 5. Expire stale predictions (past their predicted_date with no resolution)
+    // 2. Expire legacy predictions that have predicted_date in the past but
+    //    no target_date AND no target_metric (can't be resolved by us).
     let expired: usize = conn.execute(
-        "UPDATE insights SET status = 'expired' WHERE insight_type = 'prediction' AND status = 'active' AND predicted_date IS NOT NULL AND predicted_date < date('now')",
+        "UPDATE insights SET status = 'expired'
+         WHERE insight_type = 'prediction' AND status = 'active'
+           AND target_date IS NULL AND target_metric IS NULL
+           AND predicted_date IS NOT NULL AND predicted_date < date('now')",
         [],
     ).unwrap_or(0);
 
-    // 6. Compute Brier scores for resolved predictions
-    let mut brier_stmt = conn.prepare(
-        "SELECT id, confidence, status FROM insights WHERE insight_type = 'prediction' AND status IN ('validated', 'invalidated') AND brier_score IS NULL"
-    )?;
-    let to_score: Vec<(i64, f64, String)> = brier_stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+    tracing::info!("Predictions v2: {} resolved, {} expired, {} LLM checks used",
+        resolved, expired, llm_checks_used);
+
+    Ok((resolved, expired))
+}
+
+// ----------------------------------------------------------------------------
+// Hybrid resolver types + helpers (Push 2, Task 2.7)
+// ----------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct PredToResolve {
+    id: i64,
+    title: String,
+    content: String,
+    confidence: f64,
+    target_metric: Option<String>,
+    target_date: Option<String>,
+    resolution_attempts: i64,
+}
+
+#[derive(Debug)]
+enum ResolutionOutcome {
+    Validated { summary: String, method: String },
+    Invalidated { summary: String, method: String },
+    Partial { summary: String, method: String },
+    Unclear,
+}
+
+/// Resolve a ticker-grounded prediction using entity_prices.
+/// target_metric is JSON {ticker, operator, value, unit, baseline_date?}
+fn resolve_market_prediction(
+    conn: &rusqlite::Connection,
+    tm: &serde_json::Value,
+    target_date: Option<&str>,
+) -> ResolutionOutcome {
+    let ticker = match tm.get("ticker").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return ResolutionOutcome::Unclear,
+    };
+    let operator = tm.get("operator").and_then(|v| v.as_str()).unwrap_or(">=");
+    let value = match tm.get("value").and_then(|v| v.as_f64()) {
+        Some(v) => v,
+        None => return ResolutionOutcome::Unclear,
+    };
+    let unit = tm.get("unit").and_then(|v| v.as_str()).unwrap_or("price_usd");
+
+    // Look up price on or after the target_date (closest)
+    let t_date = target_date.unwrap_or("");
+    let row: Option<(f64, String)> = conn.query_row(
+        "SELECT close, date FROM entity_prices
+         WHERE ticker = ?1 AND date >= ?2
+         ORDER BY date ASC LIMIT 1",
+        rusqlite::params![ticker, t_date],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).ok();
+
+    let (close, matched_date) = match row {
+        Some(r) => r,
+        None => return ResolutionOutcome::Unclear, // no price data available yet
+    };
+
+    // Compute comparison value
+    let observed = match unit {
+        "price_usd" => close,
+        "pct_change" => {
+            let baseline_date = tm.get("baseline_date").and_then(|v| v.as_str()).unwrap_or("");
+            let baseline: Option<f64> = conn.query_row(
+                "SELECT close FROM entity_prices WHERE ticker = ?1 AND date <= ?2 ORDER BY date DESC LIMIT 1",
+                rusqlite::params![ticker, baseline_date],
+                |row| row.get(0),
+            ).ok();
+            match baseline {
+                Some(b) if b > 0.0 => ((close - b) / b) * 100.0,
+                _ => return ResolutionOutcome::Unclear,
+            }
+        }
+        _ => return ResolutionOutcome::Unclear,
+    };
+
+    let hit = match operator {
+        ">=" => observed >= value,
+        "<=" => observed <= value,
+        _ => return ResolutionOutcome::Unclear,
+    };
+
+    let summary = format!("{} close on {} was {:.2} {} — target {} {:.2} ({})",
+        ticker, matched_date, observed, unit, operator, value,
+        if hit { "MET" } else { "MISSED" });
+
+    if hit {
+        ResolutionOutcome::Validated { summary, method: "market".to_string() }
+    } else {
+        ResolutionOutcome::Invalidated { summary, method: "market".to_string() }
+    }
+}
+
+/// Resolve a qualitative prediction using Sonnet LLM outcome check.
+async fn resolve_llm_prediction(
+    db_path: &std::path::Path,
+    conn: &rusqlite::Connection,
+    p: &PredToResolve,
+    today: &str,
+) -> anyhow::Result<ResolutionOutcome> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
+
+    // Gather stories near the target_date (+/- 7 days) that mention keywords
+    // from the prediction. Simple keyword approach: split title by whitespace,
+    // take tokens > 4 chars as candidates.
+    let keywords: Vec<String> = p.title
+        .split_whitespace()
+        .filter(|w| w.len() >= 5)
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty())
+        .take(4)
+        .collect();
+
+    let like_clause = keywords.iter()
+        .map(|k| format!("LOWER(headline) LIKE '%{}%'", k.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let query = if like_clause.is_empty() {
+        "SELECT headline, summary FROM stories WHERE DATE(created_at) >= date('now', '-7 days') ORDER BY created_at DESC LIMIT 10".to_string()
+    } else {
+        format!("SELECT headline, summary FROM stories WHERE DATE(created_at) >= date('now', '-7 days') AND ({}) ORDER BY created_at DESC LIMIT 10", like_clause)
+    };
+
+    let mut stmt = conn.prepare(&query)?;
+    let stories: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .filter_map(|r| r.ok())
         .collect();
 
-    for (id, confidence, status) in &to_score {
-        let outcome: f64 = if status == "validated" { 1.0 } else { 0.0 };
-        let brier = (confidence - outcome).powi(2);
-        conn.execute("UPDATE insights SET brier_score = ?1 WHERE id = ?2", rusqlite::params![brier, id]).ok();
+    if stories.is_empty() {
+        return Ok(ResolutionOutcome::Unclear);
     }
 
-    Ok((validated, expired))
+    let mut input = format!("PREDICTION (made earlier): {}\n\nTARGET DATE: {}\n\nRECENT STORIES:\n",
+        p.title, p.target_date.as_deref().unwrap_or("unknown"));
+    for (i, (h, s)) in stories.iter().enumerate() {
+        input.push_str(&format!("[{}] {} — {}\n", i, h, s.chars().take(200).collect::<String>()));
+    }
+    input.push_str("\nReturn your verdict as strict JSON only.");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 500,
+        "system": crate::claude::prompts::PREDICTION_OUTCOME_CHECK_SYSTEM,
+        "messages": [{"role": "user", "content": input}]
+    });
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        tracing::warn!("LLM outcome check returned {}: prediction {}", status, p.id);
+        return Ok(ResolutionOutcome::Unclear);
+    }
+
+    let parsed: serde_json::Value = resp.json().await?;
+    let text = parsed["content"][0]["text"].as_str().unwrap_or("").to_string();
+
+    // Log token usage (rough estimate: 1k in, 200 out per outcome check)
+    log_usage(db_path, "anthropic", "claude-sonnet-4-6", "predictions_outcome_check", 1000, 200);
+
+    let _ = today;  // reserved for future use
+    let json_str = extract_json_str(&text);
+    let verdict: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return Ok(ResolutionOutcome::Unclear),
+    };
+
+    let verdict_str = verdict.get("verdict").and_then(|v| v.as_str()).unwrap_or("unclear");
+    let summary = verdict.get("outcome_summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    Ok(match verdict_str {
+        "validated" => ResolutionOutcome::Validated { summary, method: "llm".to_string() },
+        "invalidated" => ResolutionOutcome::Invalidated { summary, method: "llm".to_string() },
+        "partial" => ResolutionOutcome::Partial { summary, method: "llm".to_string() },
+        _ => ResolutionOutcome::Unclear,
+    })
+}
+
+/// Compute calibration stats over all resolved predictions.
+/// Bucketed by confidence (0.1 buckets), topic (sector), timeframe (7/14/30/60/90d),
+/// and source (aggregated from source_story_ids → stories.source_name).
+/// Writes one row to prediction_calibration.
+async fn compute_calibration_stats(db_path: &std::path::Path) -> anyhow::Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    // Load resolved predictions only
+    let mut stmt = conn.prepare(
+        "SELECT id, confidence, status, sector, target_date, created_at, source_story_ids, brier_score
+         FROM insights
+         WHERE insight_type = 'prediction'
+           AND status IN ('validated', 'partially_validated', 'invalidated')"
+    )?;
+
+    struct ResolvedPred {
+        _id: i64,
+        confidence: f64,
+        outcome: f64,
+        sector: Option<String>,
+        days_horizon: Option<i64>,
+        source_ids: Vec<i64>,
+        brier: Option<f64>,
+    }
+
+    let resolved: Vec<ResolvedPred> = stmt.query_map([], |row| {
+        let status: String = row.get(2)?;
+        let outcome = match status.as_str() {
+            "validated" => 1.0,
+            "partially_validated" => 0.5,
+            _ => 0.0,
+        };
+        let target_date: Option<String> = row.get(4)?;
+        let created_at: Option<String> = row.get(5)?;
+        let days_horizon = match (target_date.as_deref(), created_at.as_deref()) {
+            (Some(td), Some(ca)) => {
+                let t = chrono::NaiveDate::parse_from_str(td, "%Y-%m-%d").ok();
+                let c = chrono::NaiveDateTime::parse_from_str(ca, "%Y-%m-%d %H:%M:%S").ok()
+                    .map(|dt| dt.date());
+                match (t, c) {
+                    (Some(t), Some(c)) => Some((t - c).num_days()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let source_ids_json: Option<String> = row.get(6)?;
+        let source_ids: Vec<i64> = source_ids_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        Ok(ResolvedPred {
+            _id: row.get(0)?,
+            confidence: row.get(1)?,
+            outcome,
+            sector: row.get(3)?,
+            days_horizon,
+            source_ids,
+            brier: row.get(7)?,
+        })
+    })?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    let total_resolved = resolved.len();
+    if total_resolved == 0 {
+        tracing::info!("Calibration: no resolved predictions yet, skipping");
+        return Ok(());
+    }
+
+    let accuracy_overall = resolved.iter().map(|r| r.outcome).sum::<f64>() / total_resolved as f64;
+    let avg_brier = {
+        let briers: Vec<f64> = resolved.iter().filter_map(|r| r.brier).collect();
+        if briers.is_empty() { None } else { Some(briers.iter().sum::<f64>() / briers.len() as f64) }
+    };
+
+    // Bucket by confidence (0.5-0.6, 0.6-0.7, ..., 0.9-1.0)
+    let mut confidence_buckets: std::collections::BTreeMap<String, (f64, usize)> = std::collections::BTreeMap::new();
+    for r in &resolved {
+        let bucket = if r.confidence < 0.6 { "0.5-0.6" }
+            else if r.confidence < 0.7 { "0.6-0.7" }
+            else if r.confidence < 0.8 { "0.7-0.8" }
+            else if r.confidence < 0.9 { "0.8-0.9" }
+            else { "0.9-1.0" };
+        let entry = confidence_buckets.entry(bucket.to_string()).or_insert((0.0, 0));
+        entry.0 += r.outcome;
+        entry.1 += 1;
+    }
+    let confidence_map: serde_json::Map<String, serde_json::Value> = confidence_buckets.iter()
+        .filter(|(_, (_, n))| *n >= 5)  // min sample size
+        .map(|(k, (sum, n))| (k.clone(), serde_json::json!({"accuracy": sum / *n as f64, "n": n})))
+        .collect();
+
+    // Bucket by topic (sector)
+    let mut topic_buckets: std::collections::BTreeMap<String, (f64, usize)> = std::collections::BTreeMap::new();
+    for r in &resolved {
+        if let Some(s) = &r.sector {
+            let entry = topic_buckets.entry(s.clone()).or_insert((0.0, 0));
+            entry.0 += r.outcome;
+            entry.1 += 1;
+        }
+    }
+    let topic_map: serde_json::Map<String, serde_json::Value> = topic_buckets.iter()
+        .filter(|(_, (_, n))| *n >= 5)
+        .map(|(k, (sum, n))| (k.clone(), serde_json::json!({"accuracy": sum / *n as f64, "n": n})))
+        .collect();
+
+    // Bucket by timeframe (7/14/30/60/90 days)
+    let mut time_buckets: std::collections::BTreeMap<i64, (f64, usize)> = std::collections::BTreeMap::new();
+    for r in &resolved {
+        if let Some(d) = r.days_horizon {
+            let bucket = if d <= 7 { 7 }
+                else if d <= 14 { 14 }
+                else if d <= 30 { 30 }
+                else if d <= 60 { 60 }
+                else { 90 };
+            let entry = time_buckets.entry(bucket).or_insert((0.0, 0));
+            entry.0 += r.outcome;
+            entry.1 += 1;
+        }
+    }
+    let time_map: serde_json::Map<String, serde_json::Value> = time_buckets.iter()
+        .filter(|(_, (_, n))| *n >= 5)
+        .map(|(k, (sum, n))| (k.to_string(), serde_json::json!({"accuracy": sum / *n as f64, "n": n})))
+        .collect();
+
+    // Bucket by source — aggregate by source_name from stories
+    let mut source_accuracies: std::collections::BTreeMap<String, (f64, usize)> = std::collections::BTreeMap::new();
+    for r in &resolved {
+        if r.source_ids.is_empty() { continue; }
+        // For each source_id, look up source_name
+        let placeholders = r.source_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!("SELECT DISTINCT source_name FROM stories WHERE id IN ({})", placeholders);
+        let params: Vec<&dyn rusqlite::ToSql> = r.source_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let mut stmt = match conn.prepare(&query) { Ok(s) => s, Err(_) => continue };
+        let names: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| row.get::<_, String>(0))
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        for name in names {
+            let entry = source_accuracies.entry(name).or_insert((0.0, 0));
+            entry.0 += r.outcome;
+            entry.1 += 1;
+        }
+    }
+    let source_map: serde_json::Map<String, serde_json::Value> = source_accuracies.iter()
+        .filter(|(_, (_, n))| *n >= 5)
+        .map(|(k, (sum, n))| (k.clone(), serde_json::json!({"accuracy": sum / *n as f64, "n": n})))
+        .collect();
+
+    conn.execute(
+        "INSERT INTO prediction_calibration
+            (total_resolved, accuracy_overall, accuracy_by_confidence,
+             accuracy_by_topic, accuracy_by_timeframe, accuracy_by_source, avg_brier)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            total_resolved as i64,
+            accuracy_overall,
+            serde_json::Value::Object(confidence_map).to_string(),
+            serde_json::Value::Object(topic_map).to_string(),
+            serde_json::Value::Object(time_map).to_string(),
+            serde_json::Value::Object(source_map).to_string(),
+            avg_brier,
+        ],
+    )?;
+
+    tracing::info!("Calibration: {} resolved, overall accuracy {:.1}%",
+        total_resolved, accuracy_overall * 100.0);
+
+    Ok(())
+}
+
+/// Persist a resolution: set status, actual_outcome, resolution_method, compute Brier.
+fn apply_resolution(
+    conn: &rusqlite::Connection,
+    p: &PredToResolve,
+    status: &str,
+    outcome_value: f64,
+    summary: &str,
+    method: &str,
+    today: &str,
+) -> anyhow::Result<()> {
+    let brier = (p.confidence - outcome_value).powi(2);
+
+    // Append to confidence_history (Vec<f64>)
+    let history: String = conn.query_row(
+        "SELECT COALESCE(confidence_history, '[]') FROM insights WHERE id = ?1",
+        [p.id], |row| row.get(0),
+    ).unwrap_or_else(|_| "[]".to_string());
+    let mut entries: Vec<f64> = serde_json::from_str(&history).unwrap_or_default();
+    entries.push(p.confidence);  // record confidence at resolution
+
+    conn.execute(
+        "UPDATE insights
+            SET status = ?1,
+                actual_outcome = ?2,
+                resolution_method = ?3,
+                brier_score = ?4,
+                confidence_history = ?5,
+                updated_at = datetime('now')
+          WHERE id = ?6",
+        rusqlite::params![
+            status,
+            summary,
+            method,
+            brier,
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string()),
+            p.id,
+        ],
+    )?;
+
+    tracing::info!("Prediction #{} → {} ({}), Brier={:.3}", p.id, status, method, brier);
+    let _ = today;
+    Ok(())
 }
 
 /// Keyword-based fallback when Voyage API is unavailable.
@@ -887,12 +1309,329 @@ async fn generate_freedoms_summary(curated: &[(&str, &crate::claude::SummarizedS
 
     let mut input = String::new();
     for (freedom, story) in curated {
-        input.push_str(&format!("[{}] {} — {}\n", freedom, story.headline, story.summary.chars().take(80).collect::<String>()));
+        input.push_str(&format!("[{}] {} — {}\n", freedom, story.headline, story.summary.chars().take(100).collect::<String>()));
     }
 
-    let system = "You write a brief executive summary of a Four Freedoms daily briefing covering Time, Financial, Location, and Health freedom stories. The reader is a tech founder optimizing for personal freedom.\n\nWrite exactly 2-4 sentences covering the most actionable highlights across all four freedoms. Be specific — name tools, companies, trends. No preamble.";
+    let system = r#"You write executive summaries for a daily Four Freedoms briefing covering Time, Wealth, Location, and Health.
 
-    client.call_text("llama-3.1-8b-instant", system, &input, 250).await
+Write exactly 3-5 sentences of flowing prose describing what is happening across the four freedoms today. Name specific companies, people, dollar amounts, and trends. Cover at least three of the four freedoms. Connect stories when genuinely related.
+
+=== VOICE: DESCRIPTIVE, NOT ADVISORY ===
+
+Report on events. Do NOT give the reader advice or recommendations.
+
+FORBIDDEN phrasings — these address the reader directly and must NEVER appear:
+- "To optimize for X, consider..."
+- "Explore..."  "Leverage..."  "Consider investing in..."
+- "Keep an eye on..."  "Watch for..."
+- "Your wealth..."  "Your productivity..."
+- "Build a presence..."
+- Second-person "you" or "your" anywhere
+- Imperative verbs directed at the reader
+
+The summary is a news briefing, not a coaching session. Describe what's happening in the world, not what the reader should do about it.
+
+=== FORMAT ===
+
+Start the FIRST sentence with a concrete subject — a company name, person, or trend. Do NOT start with "Here's...", "Today's...", "This summary...", "The following...", or any meta-description of the summary itself.
+
+No preamble, no greeting, no meta-framing, no bullet points, no markdown, no labels, no headers. Just flowing prose.
+
+=== EXAMPLE ===
+
+Good (descriptive, third-person, no advice):
+Microsoft's AI integration push is reshaping productivity tools while SpaceX's Starlink revenue hit $4.4B, shifting location freedom economics. A $292M Kelp DAO exploit underscores DeFi fragility even as Strategy overtakes BlackRock in Bitcoin holdings. A new Trump executive order accelerates FDA review of psychedelic therapies, potentially opening a major mental-health treatment pipeline.
+
+Bad — advisory tone (NEVER produce this):
+To optimize for time freedom, consider leveraging AI tools like Nova Launcher. Explore the creator economy by building a presence on YouTube Gaming. Keep an eye on American Express's acquisition of Hyper.
+
+Bad — meta preamble (NEVER produce this):
+Here's a summary of today's four freedoms: ..."#;
+
+    let raw = client.call_text("llama-3.3-70b-versatile", system, &input, 350).await?;
+    Ok(clean_theme_output(&raw))
+}
+
+/// Strip common preamble/formatting noise from LLM executive-summary outputs.
+fn clean_theme_output(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+
+    // Remove surrounding quotes (straight, smart, single)
+    let quote_chars: &[char] = &['"', '\u{201C}', '\u{201D}', '\'', '\u{2018}', '\u{2019}'];
+    if let (Some(first), Some(last)) = (s.chars().next(), s.chars().last()) {
+        if quote_chars.contains(&first) && quote_chars.contains(&last) && s.len() > 1 {
+            s = s.trim_matches(quote_chars).to_string();
+        }
+    }
+
+    // Strip markdown bold/italic
+    s = s.replace("**", "").replace("__", "");
+
+    // Smart preamble strip: if the text opens with a meta-framing clause
+    // followed by a colon (e.g. "Here's a 2-4 sentence summary of today's
+    // briefing:", "Following is a summary:", "Below are the highlights:"),
+    // strip everything up to and including that first colon.
+    //
+    // Only triggers if the pre-colon chunk contains a meta signal word AND
+    // is short enough to be a preamble (≤200 chars) — prevents chopping
+    // real prose that happens to have an early colon.
+    const META_SIGNALS: &[&str] = &[
+        "here's", "here is", "heres",
+        "summary", "briefing", "overview", "highlights",
+        "following", "below",
+        "most important story",
+    ];
+    if let Some(colon_pos) = s.find(':') {
+        if colon_pos <= 200 {
+            let pre = &s[..colon_pos].to_lowercase();
+            if META_SIGNALS.iter().any(|sig| pre.contains(sig)) {
+                s = s[colon_pos + 1..].trim_start_matches([' ', '-', '—', '\n']).to_string();
+            }
+        }
+    }
+
+    // Fallback: static prefix match for preambles that don't end in a colon
+    let preambles = [
+        "today's thread",
+        "today's theme",
+        "the most important story today is",
+        "the most important story is",
+        "today's most important story is",
+    ];
+    let lower = s.to_lowercase();
+    for p in &preambles {
+        if lower.starts_with(p) {
+            s = s[p.len()..].trim_start_matches([':', ' ', '-', '—']).trim().to_string();
+            break;
+        }
+    }
+
+    s.trim().to_string()
+}
+
+// ============================================================================
+// Prediction generator (Task 2.4 + 2.4b) — Sonnet daily, Opus Sunday
+// ============================================================================
+
+#[derive(serde::Deserialize)]
+struct GeneratedPrediction {
+    text: String,
+    #[serde(default)]
+    target_metric: Option<serde_json::Value>,
+    target_date: String,
+    confidence: f64,
+    #[serde(default)]
+    source_story_ids: Vec<i64>,
+    #[serde(default)]
+    source_signal_ids: Vec<i64>,
+    #[serde(default)]
+    reasoning: String,
+    #[serde(default)]
+    sector: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PredictionGenResponse {
+    predictions: Vec<GeneratedPrediction>,
+}
+
+/// Generate fresh predictions from today's top stories + cross-signals.
+/// Runs once per daily pipeline. Uses Sonnet by default; on Sunday, uses Opus
+/// with a bigger input for a "weekly deep-dive" run (see plan Q2).
+async fn generate_predictions(
+    db_path: &Path,
+    top_stories: &[(i64, String, String, String)],  // (id, headline, summary, sector)
+    top_signals: &[(i64, String, Option<String>, f64)],  // (entity_id, name, ticker, score)
+) -> anyhow::Result<usize> {
+    use chrono::{Datelike, Local, Weekday};
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
+
+    // Sunday = weekly Opus deep-dive. Other days = Sonnet.
+    let is_sunday = Local::now().weekday() == Weekday::Sun;
+    let (model, max_stories, max_signals) = if is_sunday {
+        ("claude-opus-4-7", 40usize, 20usize)
+    } else {
+        ("claude-sonnet-4-6", 20usize, 10usize)
+    };
+
+    if top_stories.is_empty() {
+        tracing::info!("Predictions: no top stories, skipping generation");
+        return Ok(0);
+    }
+
+    // Build input block
+    let mut input = String::from("Today's top stories:\n");
+    for (i, (id, headline, summary, sector)) in top_stories.iter().take(max_stories).enumerate() {
+        input.push_str(&format!(
+            "[{}] story_id={} sector={} | {} — {}\n",
+            i, id, sector, headline,
+            summary.chars().take(150).collect::<String>()
+        ));
+    }
+    input.push_str("\nTop cross-signals today:\n");
+    for (i, (eid, name, ticker, score)) in top_signals.iter().take(max_signals).enumerate() {
+        input.push_str(&format!(
+            "[{}] signal_id={} entity=\"{}\" ticker={} score={:.2}\n",
+            i, eid, name, ticker.as_deref().unwrap_or("-"), score
+        ));
+    }
+    input.push_str(&format!(
+        "\nToday's date: {}. Return 5-10 predictions as strict JSON.",
+        Local::now().format("%Y-%m-%d")
+    ));
+
+    // Feedback loop (Task 2.11): inject calibration stats when ≥50 resolved.
+    // Give the model its own track record to calibrate new predictions against.
+    let calibration_injection = {
+        let conn = rusqlite::Connection::open(db_path)?;
+        let total_resolved: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM insights
+             WHERE insight_type = 'prediction'
+               AND status IN ('validated', 'partially_validated', 'invalidated')",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        if total_resolved >= 50 {
+            // Fetch latest calibration row
+            let row: Option<(f64, Option<f64>, String, String, String)> = conn.query_row(
+                "SELECT accuracy_overall, avg_brier, accuracy_by_confidence,
+                        accuracy_by_topic, accuracy_by_timeframe
+                 FROM prediction_calibration
+                 ORDER BY computed_at DESC LIMIT 1",
+                [],
+                |row| Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2).unwrap_or_else(|_| "{}".to_string()),
+                    row.get(3).unwrap_or_else(|_| "{}".to_string()),
+                    row.get(4).unwrap_or_else(|_| "{}".to_string()),
+                )),
+            ).ok();
+            if let Some((acc, brier, by_conf, by_topic, by_time)) = row {
+                Some(format!(
+                    "\n\n=== YOUR TRACK RECORD (last {} resolved predictions) ===\nOverall accuracy: {:.0}%\nAvg Brier score: {}\nBy confidence bucket: {}\nBy topic: {}\nBy timeframe (days): {}\n\nCalibrate your confidence accordingly — if 80% confidence = 63% actual, be less certain.",
+                    total_resolved,
+                    acc * 100.0,
+                    brier.map(|b| format!("{:.3}", b)).unwrap_or_else(|| "n/a".to_string()),
+                    by_conf, by_topic, by_time,
+                ))
+            } else { None }
+        } else {
+            tracing::info!("Predictions: calibration injection OFF ({}/50 resolved)", total_resolved);
+            None
+        }
+    };
+
+    // Build full system prompt with optional calibration suffix
+    let system_prompt = match calibration_injection {
+        Some(s) => format!("{}{}", crate::claude::prompts::PREDICTION_GENERATOR_SYSTEM, s),
+        None => crate::claude::prompts::PREDICTION_GENERATOR_SYSTEM.to_string(),
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 4000,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": input}]
+    });
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Prediction generator API {}: {}", status, text.chars().take(500).collect::<String>());
+    }
+
+    let parsed: serde_json::Value = resp.json().await?;
+    let raw_text = parsed["content"][0]["text"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("No content in prediction generator response"))?
+        .to_string();
+
+    // Parse JSON — extract from potential markdown fences.
+    let json_str = extract_json_str(&raw_text);
+    let parsed: PredictionGenResponse = serde_json::from_str(json_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse predictions: {} — raw: {}", e, json_str.chars().take(300).collect::<String>()))?;
+
+    tracing::info!("Predictions: generated {} predictions via {}", parsed.predictions.len(), model);
+
+    // Log cost. Sonnet: ~2k in + 1k out. Opus: ~4k in + 2k out.
+    let (in_tokens, out_tokens) = if is_sunday { (4000, 2000) } else { (2000, 1000) };
+    log_usage(db_path, "anthropic", model, "predictions_generate", in_tokens, out_tokens);
+
+    // Insert into insights table
+    let conn = rusqlite::Connection::open(db_path)?;
+    let mut inserted = 0;
+    for p in &parsed.predictions {
+        // Confidence validation
+        let confidence = p.confidence.clamp(0.5, 0.95);
+
+        // Build "evidence" JSON in the legacy shape for back-compat
+        let evidence = serde_json::json!(
+            p.source_story_ids.iter().map(|sid| serde_json::json!({
+                "story_id": sid,
+                "reasoning": "Evidence type: source"
+            })).collect::<Vec<_>>()
+        );
+
+        // Seed confidence_history with the initial confidence
+        let confidence_history = serde_json::json!([confidence]);
+
+        let target_metric_str = p.target_metric.as_ref().map(|v| v.to_string());
+        let source_story_ids_str = serde_json::to_string(&p.source_story_ids).unwrap_or_else(|_| "[]".to_string());
+        let source_signal_ids_str = serde_json::to_string(&p.source_signal_ids).unwrap_or_else(|_| "[]".to_string());
+
+        let title = p.text.chars().take(100).collect::<String>();
+        let content = if p.reasoning.is_empty() {
+            p.text.clone()
+        } else {
+            format!("{}\n\nReasoning: {}", p.text, p.reasoning)
+        };
+
+        let result = conn.execute(
+            "INSERT INTO insights (
+                insight_type, title, content, confidence, evidence, sector, status,
+                predicted_date, target_metric, target_date, source_story_ids,
+                source_signal_ids, model_used, confidence_history
+             ) VALUES ('prediction', ?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                title,
+                content,
+                confidence,
+                evidence.to_string(),
+                p.sector.as_deref(),
+                p.target_date,       // predicted_date (back-compat)
+                target_metric_str,
+                p.target_date,
+                source_story_ids_str,
+                source_signal_ids_str,
+                model,
+                confidence_history.to_string(),
+            ],
+        );
+
+        match result {
+            Ok(_) => inserted += 1,
+            Err(e) => tracing::warn!("Prediction insert failed: {}", e),
+        }
+    }
+
+    tracing::info!("Predictions: inserted {} of {} generated predictions", inserted, parsed.predictions.len());
+    Ok(inserted)
 }
 
 async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult) -> anyhow::Result<String> {
@@ -1581,12 +2320,51 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 1: Collect from all sources, filter to freedom_* only
     tracing::info!("Freedoms: Collecting articles...");
+    sources::API_CALLS.reset();
     let all_articles = sources::collect_all().await?;
+    // Log per-call API usage for this fetch run
+    {
+        let snapshot = sources::API_CALLS.snapshot();
+        for (provider, calls) in snapshot {
+            for _ in 0..calls {
+                log_usage(db_path, provider, "fetch", "collect", 0, 0);
+            }
+        }
+    }
     let freedom_articles: Vec<_> = all_articles
         .into_iter()
         .filter(|a| a.sector.starts_with("freedom_"))
         .collect();
     tracing::info!("Freedoms: {} raw articles", freedom_articles.len());
+
+    // Phase 1.5: Freshness filter — drop articles older than 72h.
+    // Exempt academic sources (ArXiv, bioRxiv) which publish on weekly cycles
+    // and would be gutted by a news-oriented cutoff.
+    // Keep articles with missing published_at (Google News often lacks it;
+    // Google News URLs themselves already filter with when:1d).
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(72);
+    let pre_fresh = freedom_articles.len();
+    let freedom_articles: Vec<_> = freedom_articles
+        .into_iter()
+        .filter(|a| {
+            // Academic sources use a 14-day window instead of 72h
+            let is_academic = a.source_name.starts_with("ArXiv:") || a.source_name.starts_with("bioRxiv:");
+            let effective_cutoff = if is_academic {
+                chrono::Utc::now() - chrono::Duration::days(14)
+            } else {
+                cutoff
+            };
+            match a.published_at.as_deref() {
+                None => true,
+                Some(s) => match chrono::DateTime::parse_from_rfc3339(s) {
+                    Ok(dt) => dt.with_timezone(&chrono::Utc) >= effective_cutoff,
+                    Err(_) => true, // unparseable date → keep, don't over-prune
+                },
+            }
+        })
+        .collect();
+    let dropped = pre_fresh.saturating_sub(freedom_articles.len());
+    tracing::info!("Freedoms: freshness filter dropped {} stale articles (news >72h, academic >14d); {} remain", dropped, freedom_articles.len());
 
     if freedom_articles.is_empty() {
         tracing::warn!("Freedoms: No freedom articles found, skipping");

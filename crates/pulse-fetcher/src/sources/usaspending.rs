@@ -56,6 +56,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         "order": "desc"
     });
 
+    super::API_CALLS.usaspending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .post("https://api.usaspending.gov/api/v2/search/spending_by_award/")
         .header("Content-Type", "application/json")

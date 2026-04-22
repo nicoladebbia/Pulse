@@ -95,6 +95,7 @@ pub fn run() {
             commands::predictions::get_prediction_stats,
             commands::predictions::manually_validate_prediction,
             commands::predictions::expire_stale_predictions,
+            commands::predictions::get_calibration_stats,
             commands::usage::get_api_usage,
             commands::usage::get_tavily_quota,
             commands::usage::get_financial_quotas,

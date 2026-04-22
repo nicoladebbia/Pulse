@@ -114,7 +114,62 @@ pub struct Prediction {
     pub predicted_timeframe: String,
     pub sector: Option<String>,
     pub status: String,
-    pub probability_history: Vec<f64>,
+    pub probability_history: Vec<f64>,  // frontend sparkline — v2 backfills from confidence_history
+    // --- v2 fields (nullable for legacy rows) ---
+    pub target_metric: Option<serde_json::Value>,  // JSON: {ticker, operator, value, unit, baseline_date?}
+    pub target_date: Option<String>,               // ISO date
+    pub source_story_ids: Vec<i64>,                // grounding evidence
+    pub source_signal_ids: Vec<i64>,               // grounding signals
+    pub model_used: Option<String>,
+    pub resolution_method: Option<String>,         // 'market' | 'llm' | 'manual'
+    pub resolution_attempts: i64,
+    pub brier_score: Option<f64>,
+    pub actual_outcome: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// Calibration snapshot — most recent row from `prediction_calibration`.
+/// Each `accuracy_by_*` is a JSON map {bucket → {accuracy: float, n: int}}.
+/// Buckets with <5 samples are omitted upstream.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CalibrationStats {
+    pub computed_at: Option<String>,
+    pub total_resolved: i64,
+    pub accuracy_overall: Option<f64>,
+    pub avg_brier: Option<f64>,
+    pub accuracy_by_confidence: serde_json::Value,
+    pub accuracy_by_topic: serde_json::Value,
+    pub accuracy_by_timeframe: serde_json::Value,
+    pub accuracy_by_source: serde_json::Value,
+}
+
+/// Load the latest calibration snapshot. Returns default (zeros) if no rows yet.
+pub fn get_calibration_stats(conn: &Connection) -> Result<CalibrationStats> {
+    let row = conn.query_row(
+        "SELECT computed_at, total_resolved, accuracy_overall, avg_brier,
+                accuracy_by_confidence, accuracy_by_topic, accuracy_by_timeframe, accuracy_by_source
+         FROM prediction_calibration
+         ORDER BY computed_at DESC LIMIT 1",
+        [],
+        |row| {
+            let conf_json: String = row.get(4).unwrap_or_else(|_| "{}".to_string());
+            let topic_json: String = row.get(5).unwrap_or_else(|_| "{}".to_string());
+            let time_json: String = row.get(6).unwrap_or_else(|_| "{}".to_string());
+            let source_json: String = row.get(7).unwrap_or_else(|_| "{}".to_string());
+            Ok(CalibrationStats {
+                computed_at: row.get(0)?,
+                total_resolved: row.get(1)?,
+                accuracy_overall: row.get(2)?,
+                avg_brier: row.get(3)?,
+                accuracy_by_confidence: serde_json::from_str(&conf_json).unwrap_or(serde_json::json!({})),
+                accuracy_by_topic: serde_json::from_str(&topic_json).unwrap_or(serde_json::json!({})),
+                accuracy_by_timeframe: serde_json::from_str(&time_json).unwrap_or(serde_json::json!({})),
+                accuracy_by_source: serde_json::from_str(&source_json).unwrap_or(serde_json::json!({})),
+            })
+        },
+    ).ok();
+
+    Ok(row.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -125,7 +180,9 @@ pub struct PredictionStats {
     pub partially_validated: usize,
     pub invalidated: usize,
     pub expired: usize,
-    /// (validated + partially_validated) / (validated + partially_validated + invalidated + expired)
+    pub needs_review: usize,
+    /// (validated + partially_validated) / (validated + partially_validated + invalidated)
+    /// Note: excludes `expired` (never checked) and `needs_review` (no real outcome).
     pub accuracy_rate: f64,
     /// Average Brier score (0=perfect, 0.25=random, 1=always wrong). None if no scored predictions.
     pub avg_brier_score: Option<f64>,
@@ -201,7 +258,9 @@ pub fn store_prediction(conn: &Connection, prediction: &Prediction) -> Result<i6
 /// Get all predictions regardless of status.
 pub fn get_all_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date, probability_history
+        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date, probability_history,
+                target_metric, target_date, source_story_ids, source_signal_ids, model_used,
+                resolution_method, confidence_history, resolution_attempts, brier_score, actual_outcome, created_at
          FROM insights
          WHERE insight_type = 'prediction'
          ORDER BY
@@ -227,6 +286,17 @@ pub fn get_all_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
                 status: row.get(6)?,
                 predicted_date: row.get(7)?,
                 probability_history: row.get(8)?,
+                target_metric: row.get(9).ok(),
+                target_date: row.get(10).ok(),
+                source_story_ids: row.get(11).ok(),
+                source_signal_ids: row.get(12).ok(),
+                model_used: row.get(13).ok(),
+                resolution_method: row.get(14).ok(),
+                confidence_history: row.get(15).ok(),
+                resolution_attempts: row.get(16).unwrap_or(0),
+                brier_score: row.get(17).ok(),
+                actual_outcome: row.get(18).ok(),
+                created_at: row.get(19).ok(),
             })
         })?
         .filter_map(|r| r.ok())
@@ -239,7 +309,9 @@ pub fn get_all_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
 /// Get all active predictions.
 pub fn get_active_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date, probability_history
+        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date, probability_history,
+                target_metric, target_date, source_story_ids, source_signal_ids, model_used,
+                resolution_method, confidence_history, resolution_attempts, brier_score, actual_outcome, created_at
          FROM insights
          WHERE insight_type = 'prediction' AND status = 'active'
          ORDER BY confidence DESC",
@@ -257,6 +329,17 @@ pub fn get_active_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
                 status: row.get(6)?,
                 predicted_date: row.get(7)?,
                 probability_history: row.get(8)?,
+                target_metric: row.get(9).ok(),
+                target_date: row.get(10).ok(),
+                source_story_ids: row.get(11).ok(),
+                source_signal_ids: row.get(12).ok(),
+                model_used: row.get(13).ok(),
+                resolution_method: row.get(14).ok(),
+                confidence_history: row.get(15).ok(),
+                resolution_attempts: row.get(16).unwrap_or(0),
+                brier_score: row.get(17).ok(),
+                actual_outcome: row.get(18).ok(),
+                created_at: row.get(19).ok(),
             })
         })?
         .filter_map(|r| r.ok())
@@ -271,7 +354,9 @@ pub fn get_predictions_for_topic(conn: &Connection, topic: &str) -> Result<Vec<P
     let pattern = format!("%{}%", topic.to_lowercase());
 
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date, probability_history
+        "SELECT id, title, content, confidence, evidence, sector, status, predicted_date, probability_history,
+                target_metric, target_date, source_story_ids, source_signal_ids, model_used,
+                resolution_method, confidence_history, resolution_attempts, brier_score, actual_outcome, created_at
          FROM insights
          WHERE insight_type = 'prediction'
            AND (LOWER(title) LIKE ?1 OR LOWER(content) LIKE ?1)
@@ -290,6 +375,17 @@ pub fn get_predictions_for_topic(conn: &Connection, topic: &str) -> Result<Vec<P
                 status: row.get(6)?,
                 predicted_date: row.get(7)?,
                 probability_history: row.get(8)?,
+                target_metric: row.get(9).ok(),
+                target_date: row.get(10).ok(),
+                source_story_ids: row.get(11).ok(),
+                source_signal_ids: row.get(12).ok(),
+                model_used: row.get(13).ok(),
+                resolution_method: row.get(14).ok(),
+                confidence_history: row.get(15).ok(),
+                resolution_attempts: row.get(16).unwrap_or(0),
+                brier_score: row.get(17).ok(),
+                actual_outcome: row.get(18).ok(),
+                created_at: row.get(19).ok(),
             })
         })?
         .filter_map(|r| r.ok())
@@ -450,15 +546,18 @@ pub fn get_prediction_stats(conn: &Connection) -> Result<PredictionStats> {
             "partially_validated" => stats.partially_validated = count,
             "invalidated" => stats.invalidated = count,
             "expired" => stats.expired = count,
+            "needs_review" => stats.needs_review = count,
             _ => {}
         }
     }
 
     stats.total = stats.active + stats.validated + stats.partially_validated
-        + stats.invalidated + stats.expired;
+        + stats.invalidated + stats.expired + stats.needs_review;
 
+    // Accuracy explicitly EXCLUDES expired (we never checked) and
+    // needs_review (legacy wipes + LLM-unclear — not real outcomes).
     let resolved = (stats.validated + stats.partially_validated
-        + stats.invalidated + stats.expired) as f64;
+        + stats.invalidated) as f64;
     if resolved > 0.0 {
         stats.accuracy_rate =
             (stats.validated + stats.partially_validated) as f64 / resolved;
@@ -487,6 +586,18 @@ struct RawInsightRow {
     status: String,
     predicted_date: Option<String>,
     probability_history: Option<String>,
+    // v2 columns
+    target_metric: Option<String>,
+    target_date: Option<String>,
+    source_story_ids: Option<String>,
+    source_signal_ids: Option<String>,
+    model_used: Option<String>,
+    resolution_method: Option<String>,
+    confidence_history: Option<String>,
+    resolution_attempts: i64,
+    brier_score: Option<f64>,
+    actual_outcome: Option<String>,
+    created_at: Option<String>,
 }
 
 fn row_to_prediction(row: RawInsightRow) -> Prediction {
@@ -525,6 +636,30 @@ fn row_to_prediction(row: RawInsightRow) -> Prediction {
         })
         .unwrap_or((row.content.clone(), String::new()));
 
+    // v2 sparkline comes from confidence_history (Vec<f64>).
+    // Legacy rows only have probability_history, which may contain objects —
+    // try to extract {probability} values, else fall back to empty vec.
+    let confidence_history_vec = row
+        .confidence_history
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<f64>>(json).ok())
+        .unwrap_or_else(|| {
+            // Legacy fallback: try to extract probability floats from object array
+            row.probability_history
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Vec<f64>>(json).ok())
+                .unwrap_or_else(|| {
+                    row.probability_history
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+                        .map(|arr| arr.iter().filter_map(|v| {
+                            v.get("probability").and_then(|p| p.as_f64())
+                                .or_else(|| v.as_f64())
+                        }).collect())
+                        .unwrap_or_default()
+                })
+        });
+
     Prediction {
         id: Some(row.id),
         title: row.title,
@@ -536,11 +671,25 @@ fn row_to_prediction(row: RawInsightRow) -> Prediction {
         predicted_timeframe: row.predicted_date.unwrap_or_default(),
         sector: row.sector,
         status: row.status,
-        probability_history: row
-            .probability_history
+        probability_history: confidence_history_vec,
+        target_metric: row.target_metric
             .as_deref()
-            .and_then(|json| serde_json::from_str::<Vec<f64>>(json).ok())
+            .and_then(|s| serde_json::from_str(s).ok()),
+        target_date: row.target_date,
+        source_story_ids: row.source_story_ids
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default(),
+        source_signal_ids: row.source_signal_ids
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default(),
+        model_used: row.model_used,
+        resolution_method: row.resolution_method,
+        resolution_attempts: row.resolution_attempts,
+        brier_score: row.brier_score,
+        actual_outcome: row.actual_outcome,
+        created_at: row.created_at,
     }
 }
 
@@ -566,6 +715,16 @@ mod tests {
             sector: Some(sector.to_string()),
             status: status.to_string(),
             probability_history: Vec::new(),
+            target_metric: None,
+            target_date: None,
+            source_story_ids: Vec::new(),
+            source_signal_ids: Vec::new(),
+            model_used: None,
+            resolution_method: None,
+            resolution_attempts: 0,
+            brier_score: None,
+            actual_outcome: None,
+            created_at: None,
         }
     }
 

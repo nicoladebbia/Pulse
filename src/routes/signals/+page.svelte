@@ -11,6 +11,7 @@
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics,
 		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate
 	} from '$lib/tauri/types';
+	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
 
 	let signals = $state<CrossSignal[]>([]);
 	let convergence = $state<CrossSignal[]>([]);
@@ -51,6 +52,48 @@
 		if (loaded) return;
 		loaded = true;
 		loadData();
+	});
+
+	// Live price stream: subscribe to 'price-updates' emitted from live_prices.rs
+	// and merge into portfolio.positions[] so the P&L strip ticks without a reload.
+	// Dynamic import per feedback_tauri_imports — never static-import @tauri-apps/api
+	// at module scope in Svelte (kills the page).
+	$effect(() => {
+		if (!isTauri()) return;
+		let unlisten: (() => void) | null = null;
+		let cancelled = false;
+		(async () => {
+			try {
+				const { listen } = await import('@tauri-apps/api/event');
+				if (cancelled) return;
+				const un = await listen<PriceUpdate[]>('price-updates', (ev) => {
+					const updates = ev.payload;
+					if (!updates || updates.length === 0 || !portfolio) return;
+					const priceBySymbol = new Map<string, number>();
+					for (const u of updates) priceBySymbol.set(u.symbol, u.price);
+					// Rebuild positions with updated marks. Leaves untouched any
+					// symbol not in this batch (partial updates are normal).
+					portfolio = {
+						...portfolio,
+						positions: portfolio.positions.map(pos => {
+							const live = priceBySymbol.get(pos.symbol);
+							if (live == null || live <= 0) return pos;
+							const market_value = live * pos.qty;
+							const cost_basis = pos.avg_entry_price * pos.qty;
+							const unrealized_pl = market_value - cost_basis;
+							const unrealized_pl_pct = cost_basis > 0 ? unrealized_pl / cost_basis : 0;
+							return { ...pos, current_price: live, market_value, unrealized_pl, unrealized_pl_pct };
+						}),
+					};
+				});
+				if (cancelled) { un(); return; }
+				unlisten = un;
+			} catch {
+				// If event API isn't available for any reason, silently skip —
+				// stale positions beat a crashed page.
+			}
+		})();
+		return () => { cancelled = true; if (unlisten) unlisten(); };
 	});
 
 	async function loadData() {
@@ -168,6 +211,27 @@
 		return `${val >= 0 ? '+' : ''}${fmtPrice(val)}`;
 	}
 
+	/**
+	 * Determine if a Buy button should be disabled due to stale data.
+	 * Signal >24h old OR price >48h old OR price missing → stale.
+	 * Returns { stale, reason } for UI.
+	 */
+	function signalStale(ev: { computed_at: string | null; price_date: string | null; price: number | null }): { stale: boolean; reason: string } {
+		if (ev.price == null) return { stale: true, reason: 'no price data' };
+		const now = Date.now();
+		if (ev.computed_at) {
+			const age_h = (now - Date.parse(ev.computed_at + 'Z')) / 3_600_000;
+			if (age_h > 24) return { stale: true, reason: `signal ${Math.floor(age_h)}h old` };
+		}
+		if (ev.price_date) {
+			const age_h = (now - Date.parse(ev.price_date + 'T00:00:00Z')) / 3_600_000;
+			if (age_h > 48) return { stale: true, reason: `price ${Math.floor(age_h / 24)}d old` };
+		} else {
+			return { stale: true, reason: 'price missing' };
+		}
+		return { stale: false, reason: '' };
+	}
+
 	function sourceColor(name: string): string {
 		if (name.includes('SEC') || name.includes('EDGAR')) return 'text-blue-400';
 		if (name.includes('USASpending')) return 'text-amber-400';
@@ -248,6 +312,11 @@
 					<span class="text-ai ml-1">· refreshing prices...</span>
 				{/if}
 			</p>
+			{#if signals.length > 0 && signals[0].computed_at}
+				<div class="mt-1">
+					<FreshnessPill timestamp={signals[0].computed_at} label="Signals" />
+				</div>
+			{/if}
 		</div>
 		{#if convergence.length > 0}
 			<div class="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
@@ -267,8 +336,8 @@
 			<div class="text-[10px] text-text-muted uppercase tracking-wider">Actionable</div>
 			<div class="text-xl font-mono font-bold {actionable.length > 0 ? 'text-emerald-400' : 'text-text'}">{actionable.length} signals</div>
 		</div>
-		<div class="bg-bg-card border border-border rounded-xl p-3">
-			<div class="text-[10px] text-text-muted uppercase tracking-wider">Portfolio P&L</div>
+		<div class="bg-bg-card border border-border rounded-xl p-3" title="Sum of unrealized P&L across open Alpaca positions. Does not include realized P&L from closed trades.">
+			<div class="text-[10px] text-text-muted uppercase tracking-wider">Unrealized P&L</div>
 			<div class="text-xl font-mono font-bold {totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
 				{portfolio ? fmtPnl(totalPnl) : '--'}
 			</div>
@@ -337,11 +406,17 @@
 						<div class="flex items-center gap-3">
 							<span class="text-sm font-mono font-bold text-emerald-400">{(ev.compound_score * 100).toFixed(0)}%</span>
 							{#if ev.ticker}
+								{@const stale = signalStale(ev)}
 								<button
-									class="px-4 py-1.5 bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 rounded-lg text-xs font-semibold hover:bg-emerald-500/25 transition-colors"
-									onclick={() => handleTrade(ev.ticker!, ev.compound_score)}
+									class="px-4 py-1.5 rounded-lg text-xs font-semibold transition-colors
+										{stale.stale
+											? 'bg-amber-500/10 text-amber-400 border border-amber-500/25 cursor-not-allowed'
+											: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 hover:bg-emerald-500/25'}"
+									onclick={() => !stale.stale && handleTrade(ev.ticker!, ev.compound_score)}
+									disabled={stale.stale}
+									title={stale.stale ? `Stale — ${stale.reason}` : `Buy ${ev.ticker}`}
 								>
-									Buy {ev.ticker}
+									{stale.stale ? `Stale · ${stale.reason}` : `Buy ${ev.ticker}`}
 								</button>
 							{/if}
 						</div>
@@ -416,10 +491,16 @@
 										{/if}
 									</div>
 									{#if ev.ticker}
+										{@const stale2 = signalStale(ev)}
 										<button
-											class="px-4 py-1.5 bg-ai/10 text-ai border border-ai/25 rounded-lg text-xs font-medium hover:bg-ai/20 transition-colors"
-											onclick={() => handleTrade(ev.ticker!, ev.compound_score)}
-										>Buy {ev.ticker}</button>
+											class="px-4 py-1.5 rounded-lg text-xs font-medium transition-colors
+												{stale2.stale
+													? 'bg-amber-500/10 text-amber-400 border border-amber-500/25 cursor-not-allowed'
+													: 'bg-ai/10 text-ai border border-ai/25 hover:bg-ai/20'}"
+											onclick={() => !stale2.stale && handleTrade(ev.ticker!, ev.compound_score)}
+											disabled={stale2.stale}
+											title={stale2.stale ? `Stale — ${stale2.reason}` : `Buy ${ev.ticker}`}
+										>{stale2.stale ? `Stale · ${stale2.reason}` : `Buy ${ev.ticker}`}</button>
 									{/if}
 								</div>
 							</div>
@@ -501,6 +582,7 @@
 					{totalPnlPct >= 0 ? '+' : ''}{totalPnlPct.toFixed(2)}%
 				</div>
 				<button onclick={toggleStream}
+					title={streaming ? 'Live Finnhub stream active — positions tick as trades print' : 'Start a Finnhub WebSocket stream to see positions tick live'}
 					class="absolute top-3 right-3 flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] transition-colors {streaming ? 'bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25' : 'bg-zinc-500/10 text-text-muted hover:bg-zinc-500/20'}">
 					<span class="w-1.5 h-1.5 rounded-full {streaming ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-500'}"></span>
 					{streaming ? 'LIVE' : 'Stream'}
@@ -550,7 +632,7 @@
 					<div class="bg-bg-card border border-border rounded-xl p-4">
 						<div class="text-[10px] text-text-muted uppercase tracking-wider mb-2">Returns</div>
 						<div class="space-y-1.5">
-							<div class="flex justify-between text-xs"><span class="text-text-muted">Total Return</span><span class="font-mono font-semibold {analytics.total_return_dollars >= 0 ? 'text-emerald-400' : 'text-rose-400'}">{analytics.total_return_dollars >= 0 ? '+' : ''}{fmtPrice(analytics.total_return_dollars)}</span></div>
+							<div class="flex justify-between text-xs" title="Realized P&L from closed trades only. Open positions' unrealized P&L shown separately in the hero."><span class="text-text-muted">Realized P&L (closed)</span><span class="font-mono font-semibold {analytics.total_return_dollars >= 0 ? 'text-emerald-400' : 'text-rose-400'}">{analytics.total_return_dollars >= 0 ? '+' : ''}{fmtPrice(analytics.total_return_dollars)}</span></div>
 							<div class="flex justify-between text-xs"><span class="text-text-muted">Avg Win</span><span class="font-mono text-emerald-400">+{analytics.avg_win_pct.toFixed(1)}%</span></div>
 							<div class="flex justify-between text-xs"><span class="text-text-muted">Avg Loss</span><span class="font-mono text-rose-400">{analytics.avg_loss_pct.toFixed(1)}%</span></div>
 						</div>
@@ -615,6 +697,46 @@
 							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Sharpe</div><div class="text-lg font-mono font-bold {backtestResult.sharpe_ratio >= 1 ? 'text-emerald-400' : 'text-amber-400'}">{backtestResult.sharpe_ratio.toFixed(2)}</div></div>
 							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Max DD</div><div class="text-lg font-mono font-bold text-rose-400">-{backtestResult.max_drawdown_pct.toFixed(1)}%</div></div>
 						</div>
+						{#if backtestResult.equity_curve && backtestResult.equity_curve.length >= 2}
+							{@const curve = backtestResult.equity_curve}
+							{@const minV = Math.min(...curve.map(p => p.value))}
+							{@const maxV = Math.max(...curve.map(p => p.value))}
+							{@const range = (maxV - minV) || 1}
+							{@const start = backtestResult.starting_equity}
+							<div class="bg-bg border border-border rounded-xl p-3 mb-3">
+								<div class="flex items-center justify-between mb-2">
+									<span class="text-[10px] text-text-muted uppercase tracking-wider">Equity Curve</span>
+									<span class="text-[10px] font-mono text-text-muted">${Math.round(curve[0].value).toLocaleString()} → ${Math.round(curve[curve.length - 1].value).toLocaleString()}</span>
+								</div>
+								<svg viewBox="0 0 200 40" preserveAspectRatio="none" class="w-full h-10">
+									<polyline
+										fill="none"
+										stroke-width="1.2"
+										class="{backtestResult.total_return_pct >= 0 ? 'stroke-emerald-400' : 'stroke-rose-400'}"
+										points={curve.map((p, i) => `${(i / (curve.length - 1)) * 200},${40 - ((p.value - minV) / range) * 38 - 1}`).join(' ')}
+									/>
+									<line x1="0" x2="200" y1={40 - ((start - minV) / range) * 38 - 1} y2={40 - ((start - minV) / range) * 38 - 1} stroke="currentColor" stroke-dasharray="2,2" class="text-text-muted/40" stroke-width="0.5" />
+								</svg>
+							</div>
+						{/if}
+						{#if backtestResult.monthly_returns && backtestResult.monthly_returns.length > 0}
+							{@const months = backtestResult.monthly_returns}
+							{@const maxAbs = Math.max(...months.map(m => Math.abs(m.pnl_pct)), 0.01)}
+							<div class="bg-bg border border-border rounded-xl p-3 mb-3">
+								<div class="text-[10px] text-text-muted uppercase tracking-wider mb-2">Monthly Returns</div>
+								<div class="flex items-end gap-1 h-14">
+									{#each months as m}
+										{@const heightPct = (Math.abs(m.pnl_pct) / maxAbs) * 100}
+										<div class="flex-1 flex flex-col items-center gap-0.5" title="{m.month}: {m.pnl_pct >= 0 ? '+' : ''}{m.pnl_pct.toFixed(1)}% · {m.trade_count} trade{m.trade_count === 1 ? '' : 's'} closed">
+											<div class="w-full flex items-end justify-center" style="height: {heightPct}%">
+												<div class="w-full rounded-t {m.pnl_pct >= 0 ? 'bg-emerald-400/70' : 'bg-rose-400/70'}" style="height: 100%"></div>
+											</div>
+											<span class="text-[8px] font-mono text-text-muted">{m.month.slice(5)}</span>
+										</div>
+									{/each}
+								</div>
+							</div>
+						{/if}
 						{#if backtestResult.trades.length > 0}
 							<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50">
 								{#each backtestResult.trades as bt, i}
@@ -680,11 +802,11 @@
 				</div>
 			{/if}
 
-			<!-- Trade History from DB (with live P&L for open trades) -->
-			{#if portfolio.open_trades.length > 0 || portfolio.closed_trades.length > 0}
-				<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Trade Log</h2>
+			<!-- Closed Trades (historical ledger — open positions shown above) -->
+			{#if portfolio.closed_trades.length > 0}
+				<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Closed Trades</h2>
 				<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50 mb-6">
-					{#each [...portfolio.open_trades, ...portfolio.closed_trades] as trade}
+					{#each portfolio.closed_trades as trade}
 						{@const hasPnl = trade.pnl_pct !== null && trade.pnl_pct !== undefined}
 						{@const pnl = trade.pnl_pct ?? 0}
 						{@const isGreen = pnl >= 0}
@@ -793,8 +915,10 @@
 		{#if quotas.length > 0}
 			<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">API Rate Limits</h2>
 			<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50">
-				{#each quotas.filter(q => q.limit_per_minute > 0 || q.calls_today > 0) as q}
-					{@const hourlyLimit = q.limit_per_minute > 0 ? q.limit_per_minute * 60 : 0}
+				{#each quotas.filter(q => q.limit_per_minute > 0 || q.limit_per_hour > 0 || q.calls_today > 0) as q}
+					{@const hourlyLimit = q.limit_per_hour > 0
+						? q.limit_per_hour
+						: (q.limit_per_minute > 0 ? q.limit_per_minute * 60 : 0)}
 					{@const pct = hourlyLimit > 0 ? Math.round((q.calls_this_hour / hourlyLimit) * 100) : 0}
 					<div class="px-4 py-3 flex items-center gap-4">
 						<span class="text-sm text-text w-32">{q.description}</span>

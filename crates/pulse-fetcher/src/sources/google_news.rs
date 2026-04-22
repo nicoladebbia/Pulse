@@ -152,6 +152,7 @@ async fn fetch_feed(
     name: &str,
     url: &str,
 ) -> anyhow::Result<Vec<RawArticle>> {
+    super::API_CALLS.google_news.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let response = client
         .get(url)
         .header("User-Agent", "Pulse/0.1")

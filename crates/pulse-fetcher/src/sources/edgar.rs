@@ -116,6 +116,7 @@ async fn fetch_filing_type(
         week_ago, today, form_type, limit
     );
 
+    super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&url)
         .header("User-Agent", SEC_USER_AGENT)
@@ -270,6 +271,7 @@ async fn fetch_via_rss(
         form_type
     );
 
+    super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&url)
         .header("User-Agent", SEC_USER_AGENT)
@@ -334,6 +336,7 @@ async fn fetch_recent_filings_rss(
         form_type
     );
 
+    super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&url)
         .header("User-Agent", SEC_USER_AGENT)
@@ -410,6 +413,7 @@ async fn download_form4_xml(
     // Try the direct XML URL pattern
     let xml_url = format!("{}/{}.xml", base_url, accession_nodash);
 
+    super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&xml_url)
         .header("User-Agent", SEC_USER_AGENT)
@@ -421,6 +425,7 @@ async fn download_form4_xml(
     } else {
         // Try index page to find XML document
         let index_url = format!("{}/", base_url);
+        super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let index_resp = client
             .get(&index_url)
             .header("User-Agent", SEC_USER_AGENT)
@@ -448,6 +453,7 @@ async fn download_form4_xml(
 
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
 
+        super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let xml_resp = client
             .get(&full_xml_url)
             .header("User-Agent", SEC_USER_AGENT)
@@ -615,6 +621,7 @@ async fn download_8k_items(
 ) -> anyhow::Result<EightKData> {
     // Download the filing index to find the main 8-K document
     let index_url = format!("{}/", base_url);
+    super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&index_url)
         .header("User-Agent", SEC_USER_AGENT)
@@ -647,6 +654,7 @@ async fn download_8k_items(
 
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
 
+    super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let doc_resp = client
         .get(&doc_url)
         .header("User-Agent", SEC_USER_AGENT)
@@ -783,6 +791,7 @@ async fn fetch_13f_infotable_map(
         week_ago, today
     );
 
+    super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&url)
         .header("User-Agent", SEC_USER_AGENT)
@@ -838,6 +847,7 @@ async fn fetch_filing_type_13f(
         week_ago, today, limit
     );
 
+    super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(&url)
         .header("User-Agent", SEC_USER_AGENT)
@@ -964,6 +974,7 @@ async fn download_and_parse_13f(
     client: &reqwest::Client,
     url: &str,
 ) -> anyhow::Result<Vec<Holding>> {
+    super::API_CALLS.sec_edgar.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp = client
         .get(url)
         .header("User-Agent", SEC_USER_AGENT)

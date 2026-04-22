@@ -149,13 +149,15 @@ pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     }
 
-    // Log Finnhub API usage so Sources tab shows activity
+    // Log Finnhub API usage: 1 row per actual quote call (not batched)
     if updated > 0 {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd) VALUES ('finnhub', 'quote', 'refresh_prices', ?1, 0, 0.0)",
-            [updated as i64],
-        ).ok();
+        let mut stmt = conn.prepare(
+            "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd) VALUES ('finnhub', 'quote', 'refresh_prices', 0, 0, 0.0)"
+        ).map_err(|e| e.to_string())?;
+        for _ in 0..updated {
+            stmt.execute([]).ok();
+        }
     }
 
     Ok(updated)
@@ -225,6 +227,8 @@ pub struct SignalEvidence {
     pub source_stories: Vec<EvidenceStory>,
     pub price: Option<f64>,
     pub price_change_1d: Option<f64>,
+    pub price_date: Option<String>,      // staleness indicator for price
+    pub computed_at: Option<String>,     // staleness indicator for signal
     pub recommendation: String,
     pub position_size_pct: f64,
 }
@@ -242,19 +246,26 @@ pub fn get_signal_evidence(db: State<'_, DbState>, limit: Option<usize>) -> Resu
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let limit = limit.unwrap_or(10);
 
-    // Get top cross-signal entities — ONLY tradeable (with ticker)
+    // Get top cross-signal entities — ONLY tradeable (with ticker).
+    // 7-day freshness window prevents stale signals from firing Buy buttons.
     let mut stmt = conn
         .prepare(
-            "SELECT cs.entity_id, e.name, cs.ticker, cs.compound_score,
+            "WITH latest AS (
+               SELECT cs.*, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY computed_at DESC) AS rn
+               FROM cross_signals cs
+               WHERE cs.computed_at >= datetime('now', '-7 days')
+             )
+             SELECT cs.entity_id, e.name, cs.ticker, cs.compound_score,
                     cs.insider_signal, cs.institutional_flow, cs.news_momentum,
                     cs.government_signal, cs.search_trend, cs.patent_signal,
                     cs.supply_chain, cs.political_signal, cs.source_diversity,
-                    cs.convergence_detected
-             FROM cross_signals cs
+                    cs.convergence_detected, cs.computed_at
+             FROM latest cs
              JOIN entities e ON e.id = cs.entity_id
-             JOIN entity_tickers et ON et.entity_id = cs.entity_id
-             WHERE cs.compound_score > 0.05
+             WHERE cs.rn = 1
+               AND cs.compound_score > 0.05
                AND e.entity_type = 'company'
+               AND EXISTS (SELECT 1 FROM entity_tickers et WHERE et.entity_id = cs.entity_id)
              ORDER BY
                cs.source_diversity DESC,
                cs.compound_score DESC
@@ -262,7 +273,7 @@ pub fn get_signal_evidence(db: State<'_, DbState>, limit: Option<usize>) -> Resu
         )
         .map_err(|e| e.to_string())?;
 
-    let rows: Vec<(i64, String, Option<String>, f64, f64, f64, f64, f64, f64, f64, f64, f64, i64, bool)> = stmt
+    let rows: Vec<(i64, String, Option<String>, f64, f64, f64, f64, f64, f64, f64, f64, f64, i64, bool, Option<String>)> = stmt
         .query_map([limit as i64], |row| {
             Ok((
                 row.get(0)?, row.get::<_, String>(1).unwrap_or_default(),
@@ -270,6 +281,7 @@ pub fn get_signal_evidence(db: State<'_, DbState>, limit: Option<usize>) -> Resu
                 row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
                 row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
                 row.get(12)?, row.get::<_, i32>(13).unwrap_or(0) != 0,
+                row.get(14).ok(),
             ))
         })
         .map_err(|e| e.to_string())?
@@ -278,7 +290,7 @@ pub fn get_signal_evidence(db: State<'_, DbState>, limit: Option<usize>) -> Resu
 
     let mut evidence_list = Vec::new();
 
-    for (entity_id, name, ticker, score, insider, inst, news, gov, search, patent, supply, political, diversity, convergence) in rows {
+    for (entity_id, name, ticker, score, insider, inst, news, gov, search, patent, supply, political, diversity, convergence, computed_at) in rows {
         // Build human-readable reasons
         let mut reasons = Vec::new();
         if insider > 0.3 { reasons.push(format!("Insider buying signal ({:.0}%)", insider * 100.0)); }
@@ -315,14 +327,19 @@ pub fn get_signal_evidence(db: State<'_, DbState>, limit: Option<usize>) -> Resu
             })
             .unwrap_or_default();
 
-        // Get price
-        let (price, price_change) = ticker.as_ref().map(|t| {
-            let p: Option<(f64, Option<f64>)> = conn.query_row(
-                "SELECT close, change_1d FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
-                [t], |row| Ok((row.get(0)?, row.get(1)?)),
+        // Get price — restrict to last 3 days so stale prices don't fire Buy buttons
+        let (price, price_change, price_date) = ticker.as_ref().map(|t| {
+            let p: Option<(f64, Option<f64>, String)> = conn.query_row(
+                "SELECT close, change_1d, date FROM entity_prices
+                 WHERE ticker = ?1 AND date >= date('now', '-3 days')
+                 ORDER BY date DESC LIMIT 1",
+                [t], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).ok();
-            p.unwrap_or((0.0, None))
-        }).unwrap_or((0.0, None));
+            match p {
+                Some((c, ch, d)) => (c, ch, Some(d)),
+                None => (0.0, None, None),
+            }
+        }).unwrap_or((0.0, None, None));
 
         // Count how many signal types are active (>0.2)
         let active_dimensions = [insider, inst, news, gov, search, patent, supply, political]
@@ -355,6 +372,8 @@ pub fn get_signal_evidence(db: State<'_, DbState>, limit: Option<usize>) -> Resu
             source_stories,
             price: if price > 0.0 { Some(price) } else { None },
             price_change_1d: price_change,
+            price_date,
+            computed_at,
             recommendation,
             position_size_pct: position_pct,
         });

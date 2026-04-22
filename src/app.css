@@ -1,4 +1,8 @@
 @import 'tailwindcss';
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
+@import '@fontsource/inter/700.css';
 
 @theme {
 	--color-bg: #0a0a0f;
@@ -40,8 +44,8 @@
 	--color-relevance-mid: #eab308;
 	--color-relevance-low: #6b7280;
 
-	--font-sans: 'Inter', system-ui, -apple-system, sans-serif;
-	--font-mono: 'JetBrains Mono', 'SF Mono', monospace;
+	--font-sans: 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+	--font-mono: 'JetBrains Mono', Menlo, Monaco, monospace;
 }
 
 html {

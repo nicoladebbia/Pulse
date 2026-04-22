@@ -1,6 +1,9 @@
 pub mod google_news;
 pub mod rss_feeds;
 pub mod hacker_news;
+pub mod reddit;
+pub mod arxiv;
+pub mod biorxiv;
 pub mod usaspending;
 pub mod federal_register;
 pub mod sbir;
@@ -13,6 +16,98 @@ pub mod patents;
 pub mod wikipedia;
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Per-provider counter of actual HTTP requests made during a fetch run.
+/// Each source module bumps its counter once per real HTTP call.
+/// The pipeline reads these at the end of collect_all and writes 1
+/// api_usage row per call (not per batch).
+pub struct ApiCallCounters {
+    pub google_news: AtomicU32,
+    pub hacker_news: AtomicU32,
+    pub reddit: AtomicU32,
+    pub arxiv: AtomicU32,
+    pub biorxiv: AtomicU32,
+    pub rss_feeds: AtomicU32,
+    pub wikipedia: AtomicU32,
+    pub fred: AtomicU32,
+    pub fec: AtomicU32,
+    pub eia: AtomicU32,
+    pub sec_edgar: AtomicU32,
+    pub usaspending: AtomicU32,
+    pub federal_register: AtomicU32,
+    pub lda: AtomicU32,
+    pub uspto: AtomicU32,
+    pub sbir: AtomicU32,
+}
+
+impl ApiCallCounters {
+    const fn new() -> Self {
+        Self {
+            google_news: AtomicU32::new(0),
+            hacker_news: AtomicU32::new(0),
+            reddit: AtomicU32::new(0),
+            arxiv: AtomicU32::new(0),
+            biorxiv: AtomicU32::new(0),
+            rss_feeds: AtomicU32::new(0),
+            wikipedia: AtomicU32::new(0),
+            fred: AtomicU32::new(0),
+            fec: AtomicU32::new(0),
+            eia: AtomicU32::new(0),
+            sec_edgar: AtomicU32::new(0),
+            usaspending: AtomicU32::new(0),
+            federal_register: AtomicU32::new(0),
+            lda: AtomicU32::new(0),
+            uspto: AtomicU32::new(0),
+            sbir: AtomicU32::new(0),
+        }
+    }
+
+    /// Reset all counters to zero (call at start of each fetch run).
+    pub fn reset(&self) {
+        self.google_news.store(0, Ordering::Relaxed);
+        self.hacker_news.store(0, Ordering::Relaxed);
+        self.reddit.store(0, Ordering::Relaxed);
+        self.arxiv.store(0, Ordering::Relaxed);
+        self.biorxiv.store(0, Ordering::Relaxed);
+        self.rss_feeds.store(0, Ordering::Relaxed);
+        self.wikipedia.store(0, Ordering::Relaxed);
+        self.fred.store(0, Ordering::Relaxed);
+        self.fec.store(0, Ordering::Relaxed);
+        self.eia.store(0, Ordering::Relaxed);
+        self.sec_edgar.store(0, Ordering::Relaxed);
+        self.usaspending.store(0, Ordering::Relaxed);
+        self.federal_register.store(0, Ordering::Relaxed);
+        self.lda.store(0, Ordering::Relaxed);
+        self.uspto.store(0, Ordering::Relaxed);
+        self.sbir.store(0, Ordering::Relaxed);
+    }
+
+    /// Return (provider_name, call_count) pairs for all non-zero counters.
+    pub fn snapshot(&self) -> Vec<(&'static str, u32)> {
+        let pairs = [
+            ("google_news", self.google_news.load(Ordering::Relaxed)),
+            ("hacker_news", self.hacker_news.load(Ordering::Relaxed)),
+            ("reddit", self.reddit.load(Ordering::Relaxed)),
+            ("arxiv", self.arxiv.load(Ordering::Relaxed)),
+            ("biorxiv", self.biorxiv.load(Ordering::Relaxed)),
+            ("rss_feeds", self.rss_feeds.load(Ordering::Relaxed)),
+            ("wikipedia", self.wikipedia.load(Ordering::Relaxed)),
+            ("fred", self.fred.load(Ordering::Relaxed)),
+            ("fec", self.fec.load(Ordering::Relaxed)),
+            ("eia", self.eia.load(Ordering::Relaxed)),
+            ("sec_edgar", self.sec_edgar.load(Ordering::Relaxed)),
+            ("usaspending", self.usaspending.load(Ordering::Relaxed)),
+            ("federal_register", self.federal_register.load(Ordering::Relaxed)),
+            ("lda", self.lda.load(Ordering::Relaxed)),
+            ("uspto", self.uspto.load(Ordering::Relaxed)),
+            ("sbir", self.sbir.load(Ordering::Relaxed)),
+        ];
+        pairs.into_iter().filter(|(_, n)| *n > 0).collect()
+    }
+}
+
+pub static API_CALLS: ApiCallCounters = ApiCallCounters::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawArticle {
@@ -39,10 +134,13 @@ fn default_source_type() -> String {
 
 pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
     // Fetch news and financial sources concurrently
-    let (google, rss, hn, usa_spending, fed_register, sbir_awards, sec_edgar, fred_data, fec_data, eia_data, lda_data, patent_data) = tokio::join!(
+    let (google, rss, hn, reddit_posts, arxiv_papers, biorxiv_papers, usa_spending, fed_register, sbir_awards, sec_edgar, fred_data, fec_data, eia_data, lda_data, patent_data) = tokio::join!(
         google_news::fetch_all(),
         rss_feeds::fetch_all(),
         hacker_news::fetch(),
+        reddit::fetch(),
+        arxiv::fetch(),
+        biorxiv::fetch(),
         usaspending::fetch(),
         federal_register::fetch(),
         sbir::fetch(),
@@ -86,6 +184,36 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         Err(e) => {
             tracing::error!("Hacker News FAILED: {}", e);
             failed_sources.push("Hacker News");
+        }
+    }
+    match reddit_posts {
+        Ok(a) => {
+            tracing::info!("Reddit: {} articles", a.len());
+            articles.extend(a);
+        }
+        Err(e) => {
+            tracing::warn!("Reddit FAILED (non-fatal): {}", e);
+            failed_sources.push("Reddit");
+        }
+    }
+    match arxiv_papers {
+        Ok(a) => {
+            tracing::info!("ArXiv: {} articles", a.len());
+            articles.extend(a);
+        }
+        Err(e) => {
+            tracing::warn!("ArXiv FAILED (non-fatal): {}", e);
+            failed_sources.push("ArXiv");
+        }
+    }
+    match biorxiv_papers {
+        Ok(a) => {
+            tracing::info!("bioRxiv: {} articles", a.len());
+            articles.extend(a);
+        }
+        Err(e) => {
+            tracing::warn!("bioRxiv FAILED (non-fatal): {}", e);
+            failed_sources.push("bioRxiv");
         }
     }
 

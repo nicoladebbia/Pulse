@@ -9,7 +9,7 @@
 	import type { Story, BriefingWithStories, StoryTrendBadge } from '$lib/tauri/types';
 	import { isTauri, mockBriefingData } from '$lib/tauri/mock';
 	import { getStoryTrendBadges } from '$lib/tauri/commands';
-	import { isFetching, fetchDone, triggerFetch as storeTriggerFetch } from '$lib/stores/fetch';
+	import { isFetching, fetchDone } from '$lib/stores/fetch';
 	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
 
 	let trendBadges = $state<Map<number, StoryTrendBadge>>(new Map());
@@ -24,38 +24,7 @@
 
 	let loadError = $state<string | null>(null);
 	let loaded = $state(false);
-	let nudgeDismissed = $state(false);
-
-	// Compute briefing staleness
-	function getBriefingAgeHours(): number {
-		const createdAt = $currentBriefing?.briefing?.created_at;
-		if (!createdAt) return 0;
-		const created = new Date(createdAt + 'Z');
-		return (Date.now() - created.getTime()) / (1000 * 60 * 60);
-	}
-
-	let showNudge = $derived(getBriefingAgeHours() >= 6 && !nudgeDismissed && !$isFetching);
-
-	function formatBriefingTime(): string {
-		const createdAt = $currentBriefing?.briefing?.created_at;
-		if (!createdAt) return '';
-		const created = new Date(createdAt + 'Z');
-		return created.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-	}
-
-	function formatAgeText(): string {
-		const hours = Math.floor(getBriefingAgeHours());
-		if (hours < 1) return 'less than an hour ago';
-		if (hours === 1) return '1 hour ago';
-		return `${hours} hours ago`;
-	}
-
-	function handleNudgeRefresh() {
-		storeTriggerFetch();
-	}
-
 	function handleRefreshReload() {
-		nudgeDismissed = true;
 		fetchDone.set(false);
 		loadBriefing();
 	}
@@ -177,29 +146,6 @@
 		{:else if $isFetching}
 			<div class="bg-bg-card border border-ai/20 rounded-xl px-4 py-4">
 				<FetchTaskList />
-			</div>
-		{:else if showNudge}
-			<div class="flex items-center justify-between bg-ai/5 border border-ai/20 rounded-xl px-4 py-3">
-				<div class="flex items-center gap-3">
-					<div class="w-2 h-2 rounded-full bg-amber-400"></div>
-					<p class="text-sm text-text-secondary">
-						Your briefing is from <span class="text-text font-medium">{formatBriefingTime()}</span> — {formatAgeText()}.
-					</p>
-				</div>
-				<div class="flex items-center gap-2 shrink-0">
-					<button
-						class="text-xs px-3 py-1.5 rounded-lg bg-ai/15 text-ai border border-ai/25 hover:bg-ai/25 transition-colors"
-						onclick={handleNudgeRefresh}
-					>
-						{new Date().getHours() >= 12 ? 'Get evening briefing' : 'Get latest briefing'}
-					</button>
-					<button
-						class="text-xs text-text-muted hover:text-text transition-colors px-2 py-1.5"
-						onclick={() => nudgeDismissed = true}
-					>
-						Dismiss
-					</button>
-				</div>
 			</div>
 		{/if}
 

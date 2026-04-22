@@ -26,6 +26,7 @@ pub const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_res
 pub const MIGRATION_019: &str = include_str!("../../../migrations/019_position_management.sql");
 pub const MIGRATION_020: &str = include_str!("../../../migrations/020_performance_indexes.sql");
 pub const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.sql");
+pub const MIGRATION_022: &str = include_str!("../../../migrations/022_predictions_v2.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -555,6 +556,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_021)?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (21)", [])?;
+    }
+
+    if !applied.contains(&22) {
+        // Idempotent guard: only run if the v2 column doesn't yet exist.
+        if !column_exists(&conn, "insights", "target_metric") {
+            conn.execute_batch(MIGRATION_022)?;
+        }
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (22)", [])?;
     }
 
     // Ensure critical indexes exist (idempotent — some were lost by table rebuilds in earlier migrations)

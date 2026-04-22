@@ -1,7 +1,7 @@
 use tauri::State;
 
 use crate::db::DbState;
-use crate::services::predictions::{self, Prediction, PredictionStats};
+use crate::services::predictions::{self, CalibrationStats, Prediction, PredictionStats};
 
 #[tauri::command]
 pub fn expire_stale_predictions(db: State<DbState>) -> Result<usize, String> {
@@ -29,4 +29,11 @@ pub fn manually_validate_prediction(
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     predictions::manually_validate_prediction(&conn, id, &outcome).map_err(|e| e.to_string())
+}
+
+/// Get the latest calibration snapshot (4D: confidence/topic/timeframe/source).
+#[tauri::command]
+pub fn get_calibration_stats(db: State<DbState>) -> Result<CalibrationStats, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    predictions::get_calibration_stats(&conn).map_err(|e| e.to_string())
 }
