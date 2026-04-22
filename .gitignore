@@ -13,3 +13,7 @@ src-tauri/binaries/
 # Codesight codebase maps
 .codesight/
 .plans/
+
+# Local agent tooling caches (Claude Code, Serena)
+.claude/
+.serena/
