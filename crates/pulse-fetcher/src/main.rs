@@ -8,6 +8,7 @@ mod embeddings;
 pub(crate) mod market_prices;
 pub(crate) mod calibration;
 pub(crate) mod position_management;
+pub(crate) mod position_sizing;
 
 use chrono::Timelike;
 use clap::Parser;

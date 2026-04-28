@@ -300,40 +300,34 @@ mod tests {
     fn test_detect_cross_sector_pattern() {
         let conn = test_db();
 
-        // Create tech stories (old — source sector)
+        // Use dates relative to today so the test stays valid as time passes.
+        // The detector's recency_days window is measured from chrono::Local::now().
+        let today = chrono::Local::now().date_naive();
+        let source_briefing_date = today - chrono::Duration::days(90);
+        let target_briefing_date = today - chrono::Duration::days(5);
+
         let tech_stories: Vec<TestStory> = (0..10)
             .map(|i| TestStory::new("tech", &format!("Tech AI Story {i}")))
             .collect();
-        let (_bid1, tech_sids) = seed_briefing(&conn, "2026-01-15", &tech_stories);
+        let (_bid1, tech_sids) =
+            seed_briefing(&conn, &source_briefing_date.to_string(), &tech_stories);
 
-        // Create AI stories (recent — target sector)
         let ai_stories: Vec<TestStory> = (0..3)
             .map(|i| TestStory::new("ai", &format!("AI Regulation Story {i}")))
             .collect();
-        let (_bid2, ai_sids) = seed_briefing(&conn, "2026-03-25", &ai_stories);
+        let (_bid2, ai_sids) =
+            seed_briefing(&conn, &target_briefing_date.to_string(), &ai_stories);
 
-        // Seed "AI regulation" with 10 mentions in tech (old dates)
+        // Source-sector mentions span the older window.
         for (i, sid) in tech_sids.iter().enumerate() {
-            seed_mention(
-                &conn,
-                "AI regulation",
-                "topic",
-                *sid,
-                &format!("2026-01-{:02}", 10 + i),
-                "tech",
-            );
+            let d = source_briefing_date + chrono::Duration::days(i as i64);
+            seed_mention(&conn, "AI regulation", "topic", *sid, &d.to_string(), "tech");
         }
 
-        // Seed "AI regulation" with 3 mentions in AI (recent dates)
+        // Target-sector mentions cluster in the last few days, well inside recency_days=30.
         for (i, sid) in ai_sids.iter().enumerate() {
-            seed_mention(
-                &conn,
-                "AI regulation",
-                "topic",
-                *sid,
-                &format!("2026-03-{:02}", 20 + i),
-                "ai",
-            );
+            let d = target_briefing_date + chrono::Duration::days(i as i64);
+            seed_mention(&conn, "AI regulation", "topic", *sid, &d.to_string(), "ai");
         }
 
         let patterns = detect_cross_sector_patterns(&conn, 5, 2, 30).unwrap();

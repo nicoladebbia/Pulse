@@ -3456,7 +3456,8 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
         // Normalize each dimension — same scales as cross_signals.rs
         let insider_norm = normalize_signal(*insider_vol, 1_000_000.0);
         let inst_norm = normalize_signal(*inst_flow, 15.0); // Count of distinct 13F filers holding this stock
-        let news_norm = normalize_signal(*acceleration * *w7 as f64, 20.0);
+        // Pure acceleration ratio, gated by minimum sample. Mirrors cross_signals.rs.
+        let news_norm = if *w7 >= 3 { normalize_signal(*acceleration, 2.0) } else { 0.0 };
         // Government signal: contract value + regulatory/8-K severity composite
         let contract_norm = normalize_signal(*contract_val, 10_000_000.0);
         let reg_norm = normalize_signal(*reg_sentiment, 3.0);
@@ -3909,13 +3910,19 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
 
     let conn = rusqlite::Connection::open(db_path)?;
 
-    // Find convergence signals with tickers, not already in open trades
-    // Fetch all 8 signal dimensions for signal_profile JSON
+    // Find convergence signals with tickers, not already in open trades.
+    // Fetch all 8 normalized dimensions for signal_profile JSON, plus the raw
+    // signed insider net value (column 12) so we can veto on bearish insider activity.
+    // The normalized cs.insider_signal floors negatives to 0, so it can't
+    // distinguish "no insider data" from "heavy insider selling".
     let mut stmt = conn.prepare(
         "SELECT cs.entity_id, cs.ticker, cs.compound_score, e.name,
                 cs.insider_signal, cs.institutional_flow, cs.news_momentum,
                 cs.government_signal, cs.search_trend, cs.patent_signal,
-                cs.supply_chain, cs.political_signal
+                cs.supply_chain, cs.political_signal,
+                COALESCE((SELECT s.insider_buy_volume FROM signals s
+                          WHERE s.topic = LOWER(e.name)
+                          ORDER BY s.updated_at DESC LIMIT 1), 0) AS insider_raw
          FROM cross_signals cs
          JOIN entities e ON e.id = cs.entity_id
          WHERE cs.convergence_detected = 1
@@ -3929,13 +3936,14 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     )?;
 
     #[allow(clippy::type_complexity)]
-    let candidates: Vec<(i64, String, f64, String, f64, f64, f64, f64, f64, f64, f64, f64)> = stmt
+    let candidates: Vec<(i64, String, f64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)> = stmt
         .query_map([], |row| Ok((
             row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
             row.get::<_, f64>(4).unwrap_or(0.0), row.get::<_, f64>(5).unwrap_or(0.0),
             row.get::<_, f64>(6).unwrap_or(0.0), row.get::<_, f64>(7).unwrap_or(0.0),
             row.get::<_, f64>(8).unwrap_or(0.0), row.get::<_, f64>(9).unwrap_or(0.0),
             row.get::<_, f64>(10).unwrap_or(0.0), row.get::<_, f64>(11).unwrap_or(0.0),
+            row.get::<_, f64>(12).unwrap_or(0.0),
         )))?
         .filter_map(|r| r.ok())
         .collect();
@@ -3972,10 +3980,27 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     let entry_datetime = now.format("%Y-%m-%dT%H:%M:%S").to_string();
     let mut traded = 0;
 
-    for (entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political) in &candidates {
-        // Position sizing: 1-5% based on confidence
-        let pct = if *score > 0.6 { 0.05 } else if *score > 0.4 { 0.02 } else { 0.01 };
-        let notional = (buying_power * pct).min(10000.0).max(50.0);
+    // Veto threshold: heavy net insider selling. The $1M scale matches the
+    // positive-side normalize_signal scale, so -$1M is roughly the mirror image
+    // of what would have shown up as a meaningful BUY signal.
+    const INSIDER_VETO_THRESHOLD: f64 = -1_000_000.0;
+
+    for (entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political, insider_raw) in &candidates {
+        if *insider_raw < INSIDER_VETO_THRESHOLD {
+            tracing::info!(
+                "Auto-trade: vetoing {} ({}) — heavy insider selling (net ${:.0})",
+                name, ticker, insider_raw
+            );
+            continue;
+        }
+
+        let notional = match crate::position_sizing::entry_notional(buying_power, *score) {
+            Some(n) => n,
+            None => {
+                tracing::info!("Auto-trade: skipping {} — buying power below entry floor", ticker);
+                continue;
+            }
+        };
 
         tracing::info!("Auto-trade: {} ({}) — score {:.2}, notional ${:.2}", name, ticker, score, notional);
 
@@ -4110,7 +4135,13 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     .unwrap_or_default();
 
     for (trade_id, ticker, _old_score, new_score) in &scale_in_candidates {
-        let scale_notional = (buying_power * 0.01).min(5000.0).max(50.0); // Conservative scale-in
+        let scale_notional = match crate::position_sizing::scale_in_notional(buying_power) {
+            Some(n) => n,
+            None => {
+                tracing::info!("Scale-in: skipping {} — buying power below floor", ticker);
+                continue;
+            }
+        };
 
         tracing::info!("Scale-in: {} — score increased to {:.2}, adding ${:.2}", ticker, new_score, scale_notional);
 

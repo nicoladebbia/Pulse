@@ -846,10 +846,12 @@ mod tests {
         assert_eq!(stats.invalidated, 1);
         assert_eq!(stats.expired, 1);
 
-        // accuracy = (1 + 1) / (1 + 1 + 1 + 1) = 0.5
+        // accuracy excludes expired (deadline passed without resolution).
+        // accuracy = (validated + partially_validated) / (validated + partially_validated + invalidated)
+        //         = (1 + 1) / (1 + 1 + 1) = 2/3
         assert!(
-            (stats.accuracy_rate - 0.5).abs() < 1e-6,
-            "accuracy_rate should be 0.5, got {}",
+            (stats.accuracy_rate - 2.0 / 3.0).abs() < 1e-6,
+            "accuracy_rate should be 2/3, got {}",
             stats.accuracy_rate
         );
     }

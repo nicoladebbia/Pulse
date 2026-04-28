@@ -172,7 +172,9 @@ pub fn compute_all_cross_signals(conn: &Connection, today: &str) -> anyhow::Resu
         // Normalize each dimension to [0, 1]
         let insider_norm = normalize_signal(*insider_vol, 1_000_000.0); // $1M scale
         let inst_norm = normalize_signal(*inst_flow, 500_000.0);
-        let news_norm = normalize_signal(*acceleration * *w7 as f64, 20.0); // 20 mention-accelerations
+        // Pure acceleration ratio (rate_7d / rate_30d), gated by minimum sample.
+        // Without the floor, a single mention from a zero baseline blows up acceleration.
+        let news_norm = if *w7 >= 3 { normalize_signal(*acceleration, 2.0) } else { 0.0 };
         // Government signal: contract value + regulatory/8-K event severity composite
         let contract_norm = normalize_signal(*contract_val, 10_000_000.0);
         let reg_norm = normalize_signal(*reg_sentiment, 3.0); // 3 regulatory actions or 8-K severity*3
