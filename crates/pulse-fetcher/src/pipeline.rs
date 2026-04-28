@@ -1312,43 +1312,39 @@ async fn generate_freedoms_summary(curated: &[(&str, &crate::claude::SummarizedS
         input.push_str(&format!("[{}] {} — {}\n", freedom, story.headline, story.summary.chars().take(100).collect::<String>()));
     }
 
-    let system = r#"You write executive summaries for a daily Four Freedoms briefing covering Time, Wealth, Location, and Health.
+    let system = r#"You write the executive summary for a daily Four Freedoms briefing covering Time, Wealth, Location, and Health, plus a dedicated Whoop section when there is news worth reporting on the Whoop wearable.
 
-Write exactly 3-5 sentences of flowing prose describing what is happening across the four freedoms today. Name specific companies, people, dollar amounts, and trends. Cover at least three of the four freedoms. Connect stories when genuinely related.
+=== HARD FORMAT RULE — read this first ===
+
+Output is ONE single paragraph of 4-5 sentences. Flowing prose. No section labels. No headers. No bullets. No markdown of any kind — no asterisks, no bold, no italics, no colons used as labels. Do not write the words "Time Freedom", "Wealth Freedom", "Location Freedom", "Health Freedom", or "Whoop" as a section header anywhere in the output. Do not segment by category. Move between topics naturally inside one paragraph.
+
+=== CONTENT ===
+
+Describe what is happening across the categories today. Name specific companies, people, dollar amounts, tickers, and concrete numbers. Cover at least three of the five categories (Time, Wealth, Location, Health, Whoop). Mention Whoop only when there is genuine Whoop news in the input — otherwise skip it entirely rather than padding. Connect stories when they are genuinely related. Stay third-person and descriptive — this is a news briefing, not coaching.
 
 === VOICE: DESCRIPTIVE, NOT ADVISORY ===
 
-Report on events. Do NOT give the reader advice or recommendations.
+Report on events. Do NOT address the reader. Never use "you" or "your". Never use imperatives directed at the reader. Never use phrasings like "consider...", "explore...", "leverage...", "keep an eye on...", "watch for...", "build a presence...".
 
-FORBIDDEN phrasings — these address the reader directly and must NEVER appear:
-- "To optimize for X, consider..."
-- "Explore..."  "Leverage..."  "Consider investing in..."
-- "Keep an eye on..."  "Watch for..."
-- "Your wealth..."  "Your productivity..."
-- "Build a presence..."
-- Second-person "you" or "your" anywhere
-- Imperative verbs directed at the reader
+=== OPENING ===
 
-The summary is a news briefing, not a coaching session. Describe what's happening in the world, not what the reader should do about it.
+Start the FIRST sentence with a concrete subject — a company name, person, or specific trend. Do NOT start with "Here's...", "Today's...", "This summary...", "The following...", or any meta-framing.
 
-=== FORMAT ===
+=== EXAMPLE — exactly this format ===
 
-Start the FIRST sentence with a concrete subject — a company name, person, or trend. Do NOT start with "Here's...", "Today's...", "This summary...", "The following...", or any meta-description of the summary itself.
+GOOD (one paragraph, no labels, flowing):
+Microsoft's AI integration push is reshaping productivity tools while SpaceX's Starlink revenue hit $4.4B, shifting the economics of working remotely. A $292M Kelp DAO exploit underscored DeFi fragility even as Strategy overtook BlackRock in Bitcoin holdings, and Q1 2026 venture capital deployment hit a record $148B. New US Citizenship and Immigration Services guidance expanded STEM OPT eligibility to twelve additional fields, while Whoop launched a continuous glucose monitor priced at $299. A Trump executive order accelerated FDA review of psychedelic therapies, potentially opening a major mental-health treatment pipeline within the year.
 
-No preamble, no greeting, no meta-framing, no bullet points, no markdown, no labels, no headers. Just flowing prose.
+BAD — section-label format (NEVER produce this):
+**Time Freedom**: Google's AI-powered smart glasses are revolutionizing wearables. **Wealth Freedom**: Nasdaq's CEO predicts a fundamental shift in markets. **Location Freedom**: SpaceX is gearing up for its IPO.
 
-=== EXAMPLE ===
+BAD — advisory tone (NEVER produce this):
+To optimize for time freedom, consider leveraging AI tools. Explore the creator economy by building a presence on YouTube.
 
-Good (descriptive, third-person, no advice):
-Microsoft's AI integration push is reshaping productivity tools while SpaceX's Starlink revenue hit $4.4B, shifting location freedom economics. A $292M Kelp DAO exploit underscores DeFi fragility even as Strategy overtakes BlackRock in Bitcoin holdings. A new Trump executive order accelerates FDA review of psychedelic therapies, potentially opening a major mental-health treatment pipeline.
-
-Bad — advisory tone (NEVER produce this):
-To optimize for time freedom, consider leveraging AI tools like Nova Launcher. Explore the creator economy by building a presence on YouTube Gaming. Keep an eye on American Express's acquisition of Hyper.
-
-Bad — meta preamble (NEVER produce this):
+BAD — meta preamble (NEVER produce this):
 Here's a summary of today's four freedoms: ..."#;
 
-    let raw = client.call_text("llama-3.3-70b-versatile", system, &input, 350).await?;
+    let raw = client.call_text("llama-3.3-70b-versatile", system, &input, 600).await?;
     Ok(clean_theme_output(&raw))
 }
 
@@ -1366,6 +1362,38 @@ fn clean_theme_output(raw: &str) -> String {
 
     // Strip markdown bold/italic
     s = s.replace("**", "").replace("__", "");
+
+    // Strip freedom section labels if the model regressed to label format.
+    // The "X Freedom:" forms are unambiguous and safe to strip anywhere.
+    // The bare "X:" forms can match mid-sentence ("In Health: a new wearable...")
+    // so we only strip them at line starts where they signal a label-list regression.
+    const UNAMBIGUOUS_LABELS: &[&str] = &[
+        "Time Freedom:", "Wealth Freedom:", "Location Freedom:", "Health Freedom:",
+        "TIME FREEDOM:", "WEALTH FREEDOM:", "LOCATION FREEDOM:", "HEALTH FREEDOM:",
+        "Whoop Freedom:", "WHOOP FREEDOM:",
+    ];
+    for label in UNAMBIGUOUS_LABELS {
+        s = s.replace(label, "");
+    }
+    const BARE_LINE_LABELS: &[&str] = &[
+        "Time:", "Wealth:", "Location:", "Health:", "Whoop:", "WHOOP:",
+    ];
+    s = s
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            for label in BARE_LINE_LABELS {
+                if let Some(rest) = trimmed.strip_prefix(label) {
+                    return rest.trim_start().to_string();
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Collapse runs of whitespace introduced by the strip
+    while s.contains("  ") { s = s.replace("  ", " "); }
+    s = s.replace(" .", ".").replace(" ,", ",");
 
     // Smart preamble strip: if the text opens with a meta-framing clause
     // followed by a colon (e.g. "Here's a 2-4 sentence summary of today's
@@ -2393,7 +2421,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         let api_key = std::env::var("GROQ_API_KEY")
             .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
         let client = crate::claude::client::GroqClient::new(&api_key);
-        match client.pre_curate(&unique).await {
+        match client.pre_curate_freedoms(&unique).await {
             Ok(indices) => {
                 let curated: Vec<_> = indices.into_iter()
                     .filter_map(|i| unique.get(i).cloned())
@@ -2426,10 +2454,25 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
     let client = crate::claude::client::GroqClient::new(&api_key);
 
-    // Sort by importance and take top stories for curation
-    let mut sorted = summaries.clone();
+    // Stratified truncate: take the top 40 from EACH freedom_* sector, then
+    // re-sort the union by importance. Whoop and Health articles tend to score
+    // lower on raw importance than mainstream news; without stratification they
+    // get bumped off the curator's input window and the LLM returns whoop=0 /
+    // health=0 even when the source pool has plenty of candidates.
+    const PER_SECTOR_CAP: usize = 40;
+    let mut by_sector: std::collections::HashMap<String, Vec<crate::claude::SummarizedStory>> =
+        std::collections::HashMap::new();
+    for s in &summaries {
+        by_sector.entry(s.article.sector.clone()).or_default().push(s.clone());
+    }
+    let mut sorted: Vec<crate::claude::SummarizedStory> = Vec::new();
+    for bucket in by_sector.values_mut() {
+        bucket.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
+        bucket.truncate(PER_SECTOR_CAP);
+        sorted.extend(bucket.drain(..));
+    }
     sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
-    sorted.truncate(120);
+    tracing::info!("Freedoms: curator input = {} stories (stratified, max {}/sector)", sorted.len(), PER_SECTOR_CAP);
 
     let mut user_msg = String::new();
     for (i, s) in sorted.iter().enumerate() {
@@ -2458,6 +2501,8 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         wealth: Vec<usize>,
         location: Vec<usize>,
         health: Vec<usize>,
+        #[serde(default)]
+        whoop: Vec<usize>,
     }
     #[derive(serde::Deserialize)]
     struct FreedomsResponse {
@@ -2475,6 +2520,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         ("wealth", &parsed.curation.wealth),
         ("location", &parsed.curation.location),
         ("health", &parsed.curation.health),
+        ("whoop", &parsed.curation.whoop),
     ];
     for (label, indices) in &freedom_lists {
         let mut count = 0;
@@ -2646,6 +2692,7 @@ fn write_freedoms_to_db(
     let wealth_count = curated.iter().filter(|(f, _)| *f == "wealth").count();
     let location_count = curated.iter().filter(|(f, _)| *f == "location").count();
     let health_count = curated.iter().filter(|(f, _)| *f == "health").count();
+    let whoop_count = curated.iter().filter(|(f, _)| *f == "whoop").count();
     let total = curated.len();
 
     // Insert briefing with freedoms type
@@ -2741,8 +2788,8 @@ fn write_freedoms_to_db(
 
     tx.commit()?;
     tracing::info!(
-        "Wrote {} freedom stories to briefing {} (time={}, wealth={}, location={}, health={})",
-        total, briefing_id, time_count, wealth_count, location_count, health_count
+        "Wrote {} freedom stories to briefing {} (time={}, wealth={}, location={}, health={}, whoop={})",
+        total, briefing_id, time_count, wealth_count, location_count, health_count, whoop_count
     );
 
     Ok(())

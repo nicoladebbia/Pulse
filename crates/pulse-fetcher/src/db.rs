@@ -17,6 +17,7 @@ const MIGRATION_017: &str = include_str!("../../../migrations/017_financial_data
 const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_resolution.sql");
 const MIGRATION_019: &str = include_str!("../../../migrations/019_position_management.sql");
 const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.sql");
+const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -491,6 +492,14 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
             conn.execute_batch(MIGRATION_021)?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (21)", [])?;
+    }
+
+    // Migration 23: Add 'whoop' to freedom_stories CHECK constraint (rebuild table).
+    if !applied.contains(&23) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_023)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (23)", [])?;
+        tx.commit()?;
     }
 
     // Ensure composite indexes exist (idempotent)

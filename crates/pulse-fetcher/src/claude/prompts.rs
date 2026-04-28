@@ -93,41 +93,68 @@ A story belongs to TIME freedom ONLY if it is about:
 - Time management research, 4-day work week, deep work
 
 A story belongs to WEALTH freedom ONLY if it is about:
-- Investing / stock market / ETFs / specific tickers
-- Crypto / DeFi / Bitcoin / stablecoins
+- Investing / stock market / ETFs / specific tickers, macro/markets shifts
+- Crypto / DeFi / Bitcoin / specific tokens / stablecoins / regulation (PRIORITY — actively seek crypto stories)
+- Startup funding and VC dealflow — specific rounds, who raised what, valuations, notable investors (PRIORITY — actively seek dealflow stories)
+- Fintech infrastructure — payment rails, banking-as-a-service, stablecoin rails, neobanks, B2B fintech (PRIORITY)
 - Real estate investing, REITs, rental income
-- Startup funding (VC rounds, seed/Series A/IPO)
 - Business earnings, SaaS revenue, financial performance
-- Personal finance (FIRE, savings, tax strategies, fintech apps)
+- Personal finance (FIRE, savings, tax strategies, consumer fintech apps)
 
 A story belongs to LOCATION freedom ONLY if it is about:
-- Digital nomad visas / remote-work visas
+- US visa / immigration policy and changes — STEM OPT, H-1B, O-1, EB-1A, EB-2 NIW, J-1, green card pathways, USCIS rule changes, especially anything affecting F-1 students transitioning to work or stay status (PRIORITY — actively seek these)
+- Other countries' digital nomad / remote-work / talent visas, golden visas, second-citizenship programs
 - Relocation, expat life, moving abroad
-- Global mobility, second citizenship, golden visas
-- Travel tech for long-term travel (NOT tourism)
-- Cost-of-living comparisons, geo-arbitrage
-- Connectivity infrastructure that enables working anywhere (Starlink, eSIM, global internet) — ONLY if the story frames it as enabling location freedom, NOT as an investment/business story
+- Geo-arbitrage signals — cost-of-living shifts, tax residency rules, country-by-country tax/income comparisons
+- Travel and transport changes that expand where someone can go: new airline routes, new low-cost carriers, cheap-flight infrastructure, new hotels in interesting destinations, airport/rail infrastructure projects
+- Digital nomad tools and connectivity that enable working anywhere — Starlink, eSIM, global internet infrastructure (the tooling angle, not the IPO/valuation angle)
+- Cost-of-living comparisons between cities/countries
 
-A story belongs to HEALTH freedom ONLY if it is about:
-- Longevity research, anti-aging, lifespan extension
-- Biohacking (cold plunge, sauna, peptides, NAD, rapamycin)
-- Fitness tech (Whoop, Oura, CGM, wearables)
-- Nutrition science, gut health, microbiome
-- Sleep science, circadian rhythm
-- Mental health / psychedelic therapy
-- Preventive medicine, health screening, longevity clinics
+A story belongs to HEALTH freedom if it is about ANY of:
+- Product launches and buyable physical products — new wearables, health devices, fitness gear, biohacking hardware, supplements, sleep tech (TOP PRIORITY — actively seek)
+- New categories of consumer health tech — anything novel a person can buy, pre-order, or sign up for
+- Biohacking tools and protocols (cold plunge, sauna, peptides, NAD, rapamycin, fasting protocols, light therapy)
+- Fitness and recovery wearables and platforms (Whoop, Oura, CGM, Eight Sleep, Apple Health, Garmin, new entrants)
+- Sleep science, sleep tech, and sleep optimization gear
+- Nutrition science and supplement science — including studies that change what an individual would eat, supplement, or measure
+- Longevity science and biohacking research with consumer-actionable findings — protocols, dosages, biomarkers, supplements, screening
+- Mental health tech and tools (apps, devices, psychedelic-assisted therapy ecosystem if it affects what consumers can access)
+- Wearable data, quantified-self research, biometric measurement studies
+- Research breakthroughs that point toward near-term consumer impact — a new device validated for accuracy, a new biomarker that home tests can measure, a new compound entering trials
+
+DE-PRIORITIZE in HEALTH (prefer other genuine stories over these):
+- Athletic feats with no product or consumer-protocol angle (marathon records, sports records)
+- Pure academic findings with no plausible path to a consumer product, supplement, protocol, or measurement
+- Hospital operations / pharma earnings / insurance policy stories — those are WEALTH
+
+If after applying these rules you still find fewer than 10 strong Health stories, fill with the best remaining health-relevant stories rather than returning an empty list. The "10 per freedom" target should be hit unless the source pool genuinely lacks any health content.
+
+A story belongs to WHOOP if it is about ANY of:
+- Whoop the company, Whoop the device, Whoop firmware, Whoop app, Whoop features (Strain, Recovery, Sleep, Journal, Coach, etc.)
+- Whoop product launches, hardware releases, accessories, software updates
+- Whoop data, Whoop-derived research, studies using Whoop data, Whoop user findings
+- Heart rate variability (HRV) science, recovery training, sleep tracking research — when relevant to a Whoop user
+- Whoop competitor moves that directly affect Whoop users (Oura launches, Apple Watch features, Garmin updates) — only when the comparison or impact on Whoop is the actual angle
+- Will Ahmed (Whoop CEO), Whoop business news, Whoop partnerships, Whoop community findings
+
+Whoop stories should NOT also appear in Health. Once a story is assigned to whoop, do not also assign it to health. If a story is broadly about wearables but doesn't mention Whoop and isn't HRV/recovery science a Whoop user would care about, it goes to health (or wherever else it fits), not whoop.
+
+If fewer than 10 strong Whoop stories exist on a given day, return the best available — quality beats quantity, and an empty whoop list is acceptable on slow news days.
 
 === ROUTING DISCIPLINE ===
 
 Common miscategorizations to AVOID:
-- SpaceX/Starlink IPO news → WEALTH (investing story), NOT location
+- SpaceX/Starlink IPO or valuation news → WEALTH (investing story), NOT location
+- Starlink coverage expansion / new product / connectivity rollout → LOCATION (tooling that enables working anywhere)
 - Amazon Globalstar acquisition → WEALTH, NOT location
 - Stock moves on AI companies → WEALTH, NOT time (even if the company makes productivity AI)
 - "Work-life balance" policy stories → TIME, NOT health (even though it mentions stress)
-- Business stories about health companies → WEALTH, NOT health (unless about the actual health science)
+- Business stories about health companies (earnings, M&A) → WEALTH, NOT health
+- A health company shipping a new consumer product → HEALTH (product launch is the angle, not the business)
 - Remote-work platform IPOs → WEALTH, NOT time or location
+- B2B travel-tech business stories (e.g. "Duffel hits $900M run rate") → WEALTH, NOT location (Location is for things that change where a person can go)
 
-If a story is primarily about MONEY (valuation, revenue, stock price, IPO, acquisition price), it is WEALTH regardless of what industry it touches.
+If a story is primarily about MONEY (valuation, revenue, stock price, IPO, acquisition price), it is WEALTH regardless of what industry it touches. The exception: a product-launch story that mentions price is still HEALTH or LOCATION if the launch itself is the news.
 
 If a story spans two freedoms genuinely, pick the PRIMARY one based on what matters most to the reader's personal experience.
 
@@ -137,7 +164,7 @@ When possible, include at least 1 story from Reddit (r/...), 1 from ArXiv or bio
 
 === SELECTION ===
 
-Select EXACTLY 10 stories for EACH of the 4 freedoms (40 total).
+Select up to 10 stories for EACH of the 5 categories (Time, Wealth, Location, Health, Whoop) — up to 50 total.
 
 Within each freedom, aim for a MIX:
 - 3-4 actionable (tools, tactics the reader can use now)
@@ -146,9 +173,9 @@ Within each freedom, aim for a MIX:
 
 PRIORITIZE: specific (names companies/people/numbers) > new > actionable > relevant to a tech founder.
 
-If you cannot find 10 genuine stories for a freedom, include the best available but NEVER misclassify to fill the quota. Quality beats quantity.
+If you cannot find 10 genuine stories for a freedom, include the best available but NEVER misclassify to fill the quota. Quality beats quantity. Whoop in particular may have fewer than 10 stories on slow news days — that is fine.
 
-Format: {"time": [0, 2, 5, ...], "wealth": [1, 3, 6, ...], "location": [4, 7, 10, ...], "health": [11, 13, 16, ...]}
+Format: {"time": [0, 2, 5, ...], "wealth": [1, 3, 6, ...], "location": [4, 7, 10, ...], "health": [11, 13, 16, ...], "whoop": [22, 27, ...]}
 
 Return a single valid JSON object with key: curation."#;
 

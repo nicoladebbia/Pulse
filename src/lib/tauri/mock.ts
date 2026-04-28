@@ -233,6 +233,10 @@ export const mockFreedomsBriefing: FreedomsBriefing = {
 		makeFreedomStory(112, 'health', 'Rapamycin Analog Shows Promise in Human Longevity Trial', 'First large-scale human trial of a rapamycin derivative shows 15% reduction in aging biomarkers.'),
 		makeFreedomStory(113, 'health', 'Continuous Glucose Monitors for Non-Diabetics Go Mainstream', 'CGM adoption among healthy adults triples as metabolic health awareness grows.'),
 	],
+	whoop_stories: [
+		makeFreedomStory(120, 'whoop', 'Whoop 5.0 Adds On-Device Blood Pressure Estimation', 'New strap firmware unlocks pulse-wave-derived blood pressure trends without an external cuff.'),
+		makeFreedomStory(121, 'whoop', 'Whoop Coach Gets Multi-Day Recovery Forecasting', 'Whoop Coach now projects 7-day recovery trajectory based on training load and sleep debt.'),
+	],
 };
 
 // --- Chat mock streaming ---

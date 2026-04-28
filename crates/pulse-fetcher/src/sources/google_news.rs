@@ -115,6 +115,12 @@ const FEEDS: &[(&str, &str, &str)] = &[
     ("freedom_health", "Freedom: Nootropics", "https://news.google.com/rss/search?q=nootropics+OR+%22cognitive+enhancement%22+OR+%22brain+health%22+OR+%22focus+supplement%22+OR+%22smart+drugs%22+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("freedom_health", "Freedom: Running Endurance", "https://news.google.com/rss/search?q=marathon+OR+%22endurance+training%22+OR+%22zone+2+training%22+OR+%22VO2+max%22+OR+%22running+science%22+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("freedom_health", "Freedom: Recovery", "https://news.google.com/rss/search?q=%22muscle+recovery%22+OR+%22ice+bath%22+OR+%22red+light+therapy%22+OR+%22compression+therapy%22+OR+%22sports+recovery%22+when:1d&hl=en-US&gl=US&ceid=US:en"),
+
+    // Whoop-specific queries — feed the dedicated Whoop tile.
+    ("freedom_whoop", "Whoop: Product & Company", "https://news.google.com/rss/search?q=Whoop+strap+OR+%22Whoop+5.0%22+OR+%22Whoop+4.0%22+OR+%22Whoop+wearable%22+OR+%22Whoop+launch%22+OR+%22Whoop+update%22+when:7d&hl=en-US&gl=US&ceid=US:en"),
+    ("freedom_whoop", "Whoop: App & Features", "https://news.google.com/rss/search?q=%22Whoop+app%22+OR+%22Whoop+Coach%22+OR+%22Whoop+strain%22+OR+%22Whoop+recovery%22+OR+%22Whoop+sleep%22+OR+%22Whoop+journal%22+when:7d&hl=en-US&gl=US&ceid=US:en"),
+    ("freedom_whoop", "Whoop: Data & Research", "https://news.google.com/rss/search?q=Whoop+study+OR+Whoop+research+OR+%22Whoop+data%22+OR+%22HRV+training%22+OR+%22heart+rate+variability%22+wearable+when:14d&hl=en-US&gl=US&ceid=US:en"),
+    ("freedom_whoop", "Whoop: Competitors & Ecosystem", "https://news.google.com/rss/search?q=Whoop+vs+Oura+OR+Whoop+vs+%22Apple+Watch%22+OR+%22Whoop+integration%22+OR+%22Will+Ahmed%22+Whoop+when:7d&hl=en-US&gl=US&ceid=US:en"),
 ];
 
 pub async fn fetch_all() -> anyhow::Result<Vec<RawArticle>> {

@@ -27,6 +27,7 @@ pub const MIGRATION_019: &str = include_str!("../../../migrations/019_position_m
 pub const MIGRATION_020: &str = include_str!("../../../migrations/020_performance_indexes.sql");
 pub const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.sql");
 pub const MIGRATION_022: &str = include_str!("../../../migrations/022_predictions_v2.sql");
+pub const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -564,6 +565,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_022)?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (22)", [])?;
+    }
+
+    // Migration 23: Add 'whoop' to freedom_stories CHECK constraint (rebuild table)
+    if !applied.contains(&23) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_023)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (23)", [])?;
+        tx.commit()?;
     }
 
     // Ensure critical indexes exist (idempotent — some were lost by table rebuilds in earlier migrations)

@@ -26,9 +26,12 @@ pub struct FreedomsBriefing {
     pub wealth_stories: Vec<FreedomStory>,
     pub location_stories: Vec<FreedomStory>,
     pub health_stories: Vec<FreedomStory>,
+    pub whoop_stories: Vec<FreedomStory>,
 }
 
-fn load_all_freedom_stories(conn: &rusqlite::Connection, briefing_id: i64) -> Result<(Vec<FreedomStory>, Vec<FreedomStory>, Vec<FreedomStory>, Vec<FreedomStory>), String> {
+type FreedomBuckets = (Vec<FreedomStory>, Vec<FreedomStory>, Vec<FreedomStory>, Vec<FreedomStory>, Vec<FreedomStory>);
+
+fn load_all_freedom_stories(conn: &rusqlite::Connection, briefing_id: i64) -> Result<FreedomBuckets, String> {
     let mut stmt = conn.prepare(
         "SELECT id, freedom, headline, summary, key_facts, why_it_matters, what_to_watch,
                 importance_score, is_hero, original_url, source_name, published_at
@@ -61,6 +64,7 @@ fn load_all_freedom_stories(conn: &rusqlite::Connection, briefing_id: i64) -> Re
     let mut wealth = Vec::new();
     let mut location = Vec::new();
     let mut health = Vec::new();
+    let mut whoop = Vec::new();
 
     for story in all {
         match story.freedom.as_str() {
@@ -68,11 +72,12 @@ fn load_all_freedom_stories(conn: &rusqlite::Connection, briefing_id: i64) -> Re
             "wealth" => wealth.push(story),
             "location" => location.push(story),
             "health" => health.push(story),
+            "whoop" => whoop.push(story),
             _ => {}
         }
     }
 
-    Ok((time, wealth, location, health))
+    Ok((time, wealth, location, health, whoop))
 }
 
 #[tauri::command]
@@ -88,7 +93,7 @@ pub fn get_today_freedoms(db: State<'_, DbState>) -> Result<Option<FreedomsBrief
 
     let Some((bid, date, summary)) = row else { return Ok(None) };
 
-    let (time_stories, wealth_stories, location_stories, health_stories) = load_all_freedom_stories(&conn, bid)?;
+    let (time_stories, wealth_stories, location_stories, health_stories, whoop_stories) = load_all_freedom_stories(&conn, bid)?;
     Ok(Some(FreedomsBriefing {
         date,
         summary,
@@ -96,6 +101,7 @@ pub fn get_today_freedoms(db: State<'_, DbState>) -> Result<Option<FreedomsBrief
         wealth_stories,
         location_stories,
         health_stories,
+        whoop_stories,
     }))
 }
 
@@ -110,7 +116,7 @@ pub fn get_freedoms_by_date(db: State<'_, DbState>, date: String) -> Result<Opti
 
     let Some((bid, summary)) = row else { return Ok(None) };
 
-    let (time_stories, wealth_stories, location_stories, health_stories) = load_all_freedom_stories(&conn, bid)?;
+    let (time_stories, wealth_stories, location_stories, health_stories, whoop_stories) = load_all_freedom_stories(&conn, bid)?;
     Ok(Some(FreedomsBriefing {
         date,
         summary,
@@ -118,5 +124,6 @@ pub fn get_freedoms_by_date(db: State<'_, DbState>, date: String) -> Result<Opti
         wealth_stories,
         location_stories,
         health_stories,
+        whoop_stories,
     }))
 }

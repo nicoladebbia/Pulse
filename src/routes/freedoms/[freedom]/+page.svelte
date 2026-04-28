@@ -34,6 +34,7 @@
 			const keyMap: Record<string, keyof FreedomsBriefing> = {
 				time: 'time_stories', wealth: 'wealth_stories',
 				location: 'location_stories', health: 'health_stories',
+				whoop: 'whoop_stories',
 			};
 			if (!isTauri()) {
 				stories = (mockFreedomsBriefing[keyMap[freedom]] as FreedomStory[]) ?? [];
@@ -86,6 +87,7 @@
 		freedom === 'wealth' ? 'Impact on Your Wealth' :
 		freedom === 'time' ? 'Impact on Your Time' :
 		freedom === 'location' ? 'Impact on Your Mobility' :
+		freedom === 'whoop' ? 'Impact on Your Recovery' :
 		'Impact on Your Health'
 	);
 </script>

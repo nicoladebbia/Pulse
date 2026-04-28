@@ -74,7 +74,8 @@
 	let totalStories = $derived(
 		briefing
 			? briefing.time_stories.length + briefing.wealth_stories.length +
-			  briefing.location_stories.length + briefing.health_stories.length
+			  briefing.location_stories.length + briefing.health_stories.length +
+			  (briefing.whoop_stories?.length ?? 0)
 			: 0
 	);
 </script>
@@ -106,7 +107,7 @@
 			<h1 class="text-2xl font-light text-text tracking-wide mb-2">The Four Freedoms</h1>
 			{#if briefing}
 				<p class="text-sm text-text-muted font-light">
-					{totalStories} stories across time, wealth, location &amp; health
+					{totalStories} stories across time, wealth, location, health &amp; whoop
 				</p>
 			{/if}
 

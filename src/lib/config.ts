@@ -43,7 +43,15 @@ export const FREEDOM_CONFIG = {
 		description: 'Intelligence on longevity, biohacking, fitness tech, nutrition, mental health, sleep science, and wearables.',
 		motif: 'linear-gradient(180deg, var(--color-freedom-health-dim) 0%, transparent 40%)',
 	},
+	whoop: {
+		id: 'whoop', key: 'whoop_stories' as const,
+		label: 'Whoop', subtitle: 'Your wearable',
+		icon: '◐', color: 'var(--color-freedom-health)', dim: 'var(--color-freedom-health-dim)',
+		tagline: 'Whoop product, app, data, HRV, recovery science',
+		description: 'Intelligence on Whoop hardware, app updates, features, HRV and recovery research, and the wearable ecosystem.',
+		motif: 'linear-gradient(180deg, var(--color-freedom-health-dim) 0%, transparent 40%)',
+	},
 } as const;
 
 export type FreedomId = keyof typeof FREEDOM_CONFIG;
-export const FREEDOM_ORDER: FreedomId[] = ['time', 'wealth', 'location', 'health'];
+export const FREEDOM_ORDER: FreedomId[] = ['time', 'wealth', 'location', 'health', 'whoop'];

@@ -7,6 +7,33 @@ const FAST_MODEL: &str = "llama-3.1-8b-instant";
 const STRONG_MODEL: &str = "llama-3.3-70b-versatile";
 const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 
+const DAILY_PRE_CURATOR_SYSTEM: &str = r#"You are a news editor selecting the most newsworthy articles for a daily intelligence briefing covering 4 sectors: AI & LLMs, Miami Beach, Italy, and Tech & Innovation.
+
+From the list of raw articles below, select the BEST ~90 articles (roughly 22-25 per sector). Pick articles that are:
+- Substantive news (not clickbait, listicles, or opinion)
+- Non-duplicate (if two articles cover the same story, pick the better source)
+- High signal (major events, company news, product launches, policy changes)
+
+Return ONLY a JSON array of article indices, like: [0, 2, 5, 7, 11, ...]
+Select ~90 total. No explanation, just the JSON array."#;
+
+const FREEDOMS_PRE_CURATOR_SYSTEM: &str = r#"You are a news editor selecting the most newsworthy articles for a daily Four Freedoms briefing. The briefing has 5 categories, each tagged in the [sector] field of the input:
+
+- freedom_time: productivity, automation, AI agents replacing work, async/remote practices, creator economy
+- freedom_wealth: investing, markets, crypto, VC dealflow, fintech infrastructure, real estate, personal finance
+- freedom_location: US visa/immigration policy (especially F-1 transitions), digital-nomad/golden visas, geo-arbitrage, travel routes, remote-work connectivity tooling
+- freedom_health: longevity, biohacking, fitness/sleep tech, supplements, nutrition science, wearables, product launches
+- freedom_whoop: Whoop product/app/firmware/features, Whoop data/research, HRV and recovery science, Whoop-relevant competitor moves
+
+Select the BEST articles across all 5 categories — aim for roughly equal coverage, around 25-35 per category (so ~125-175 total when input is large). Pick articles that are:
+- Substantive news (not clickbait, listicles, or opinion)
+- Non-duplicate (if two articles cover the same story, pick the better source)
+- High signal (major events, company news, product launches, policy changes, research findings)
+- For freedom_whoop specifically: keep ALL substantive Whoop coverage even when it seems niche — Whoop news is sparse and we want the downstream curator to have the choice
+
+Return ONLY a JSON array of article indices, like: [0, 2, 5, 7, 11, ...]
+No explanation, just the JSON array."#;
+
 pub struct GroqClient {
     api_key: String,
     http: reqwest::Client,
@@ -445,15 +472,17 @@ impl GroqClient {
     /// ~90 most newsworthy articles from ~150-200 raw headlines, so we only
     /// pay for summarizing stories that will actually make the briefing.
     pub async fn pre_curate(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
-        let system = r#"You are a news editor selecting the most newsworthy articles for a daily intelligence briefing covering 4 sectors: AI & LLMs, Miami Beach, Italy, and Tech & Innovation.
+        self.pre_curate_with_prompt(articles, DAILY_PRE_CURATOR_SYSTEM).await
+    }
 
-From the list of raw articles below, select the BEST ~90 articles (roughly 22-25 per sector). Pick articles that are:
-- Substantive news (not clickbait, listicles, or opinion)
-- Non-duplicate (if two articles cover the same story, pick the better source)
-- High signal (major events, company news, product launches, policy changes)
+    /// Freedoms-pipeline pre-curator. Same mechanism as daily, but the system
+    /// prompt names the 5 freedom categories (Time/Wealth/Location/Health/Whoop)
+    /// so freedom articles are not down-weighted as off-sector noise.
+    pub async fn pre_curate_freedoms(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
+        self.pre_curate_with_prompt(articles, FREEDOMS_PRE_CURATOR_SYSTEM).await
+    }
 
-Return ONLY a JSON array of article indices, like: [0, 2, 5, 7, 11, ...]
-Select ~90 total. No explanation, just the JSON array."#;
+    async fn pre_curate_with_prompt(&self, articles: &[RawArticle], system: &str) -> anyhow::Result<Vec<usize>> {
 
         let mut user_msg = String::new();
         for (i, article) in articles.iter().enumerate() {

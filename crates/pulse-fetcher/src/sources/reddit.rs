@@ -23,6 +23,7 @@ const SUBREDDITS: &[(&str, &str, &str, &str)] = &[
     ("productivity", "top", "freedom_time", "relaxed"),
     ("longevity", "hot", "freedom_health", "strict"),
     ("Biohackers", "hot", "freedom_health", "strict"),
+    ("whoop", "hot", "freedom_whoop", "relaxed"),
 ];
 
 const BLACKLISTED_DOMAINS: &[&str] = &[

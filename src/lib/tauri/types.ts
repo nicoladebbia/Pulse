@@ -209,6 +209,7 @@ export interface FreedomsBriefing {
 	wealth_stories: FreedomStory[];
 	location_stories: FreedomStory[];
 	health_stories: FreedomStory[];
+	whoop_stories: FreedomStory[];
 }
 
 // === Project Ideas Types ===
