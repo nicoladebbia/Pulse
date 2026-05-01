@@ -174,7 +174,9 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
         }
     }
 
-    // Single query: get top 15 trending entities with sentiment in one pass
+    // Trends are scoped to the 4 freedom-news sectors. Financial-source entities
+    // (SEC filings, USASpending recipients, FedReg agencies) live under sector='finance'
+    // and feed the Signals page — they are NOT stories and must never reach Trends.
     let mut stmt = conn
         .prepare(
             "SELECT sig.id, sig.topic, sig.sector, sig.trajectory, sig.acceleration,
@@ -184,7 +186,10 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
              FROM signals sig
              JOIN entities e ON e.name_normalized = LOWER(sig.topic)
              JOIN entity_mentions em ON em.entity_id = e.id
+             JOIN stories s ON s.id = em.story_id
              WHERE sig.trajectory != 'dormant'
+               AND sig.sector IN ('ai', 'miami', 'italy', 'tech')
+               AND s.sector IN ('ai', 'miami', 'italy', 'tech')
                AND em.mentioned_at >= date('now', '-14 days')
              GROUP BY sig.id
              HAVING COUNT(em.id) >= 3 OR COUNT(DISTINCT em.mentioned_at) >= 2
@@ -193,8 +198,39 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // Garbage entity patterns to exclude from trends
+    // Generic garbage placeholders.
     const GARBAGE: &[&str] = &["n/a", "tbd", "unknown", "none", "other", "null", "test"];
+
+    // Substring blocklist for federal/political/financial-filing entities that
+    // occasionally leak into a sector via mentions but aren't real news subjects.
+    const NOISE_SUBSTRINGS: &[&str] = &[
+        "actblue",
+        "national aeronautics",
+        "general services administration",
+        "general service administration",
+        "federal register",
+        "department of the treasury",
+        "internal revenue service",
+        "securities and exchange commission",
+        " pac ",
+        " pac,",
+        "victory fund",
+        "for michigan",
+        "for america",
+        "campaign committee",
+        "(cik ",
+        " llc ",
+        " llp ",
+        " l.p.",
+        ", lp",
+        ", inc.",
+        ", inc ",
+        " ventures",
+        "fund i",
+        "fund ii",
+        "fund iii",
+        "grassroots",
+    ];
 
     let ranked: Vec<(i64, String, Option<String>, String, f64, i32, i32, f64)> = stmt
         .query_map([], |row| {
@@ -206,8 +242,24 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .filter(|r: &(i64, String, Option<String>, String, f64, i32, i32, f64)| {
-            let t = r.1.to_lowercase();
-            t.len() >= 2 && !GARBAGE.contains(&t.as_str()) && !t.contains("n/a")
+            let raw = &r.1;
+            let t = raw.to_lowercase();
+            if t.len() < 2 || GARBAGE.contains(&t.as_str()) || t.contains("n/a") {
+                return false;
+            }
+            // Drop entities that are clearly federal filings / PACs / fund vehicles.
+            let padded = format!(" {} ", t);
+            if NOISE_SUBSTRINGS.iter().any(|s| padded.contains(s) || t.contains(s)) {
+                return false;
+            }
+            // Drop ALL-CAPS names of >=3 tokens (typical of USASpending/SEC payloads).
+            let alpha: String = raw.chars().filter(|c| c.is_alphabetic()).collect();
+            let is_all_caps = !alpha.is_empty() && alpha.chars().all(|c| c.is_uppercase());
+            let token_count = raw.split_whitespace().count();
+            if is_all_caps && token_count >= 3 {
+                return false;
+            }
+            true
         })
         .collect();
 

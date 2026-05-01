@@ -151,7 +151,11 @@ async fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Resu
             continue;
         }
 
-        // Send sell order to Alpaca
+        // Send sell order to Alpaca. The DB close MUST be gated on this: a
+        // previous version updated the DB unconditionally, which produced
+        // DB↔Alpaca drift (ORCL was marked stopped_out in DB while still open
+        // at Alpaca, leaving an untracked position bleeding silently).
+        let mut alpaca_ok = !has_alpaca; // If we have no Alpaca, treat DB as source of truth.
         if has_alpaca {
             let sell_notional = position_size * close_fraction;
             let sell_order = serde_json::json!({
@@ -172,19 +176,37 @@ async fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Resu
             {
                 Ok(resp) if resp.status().is_success() => {
                     tracing::info!("Alpaca sell order placed: {} ${:.2} ({})", ticker, sell_notional, reason);
+                    alpaca_ok = true;
                 }
                 Ok(resp) => {
+                    let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
-                    tracing::warn!("Alpaca sell failed for {}: {}", ticker, body);
+                    tracing::warn!(
+                        "Alpaca sell REJECTED for {} (status {}): {} — leaving DB position open to avoid drift",
+                        ticker, status, body
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!("Alpaca sell request failed for {}: {}", ticker, e);
+                    tracing::warn!(
+                        "Alpaca sell request failed for {}: {} — leaving DB position open to avoid drift",
+                        ticker, e
+                    );
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        // Update DB
+        // Only update the DB if Alpaca actually accepted the order. Otherwise
+        // the next calibration pass will retry, and the position remains
+        // visible in the UI as still-open.
+        if !alpaca_ok {
+            tracing::warn!(
+                "Position {} ({}): close skipped due to Alpaca failure — will retry next calibration",
+                ticker, reason
+            );
+            continue;
+        }
+
         if close_fraction >= 1.0 {
             conn.execute(
                 "UPDATE paper_trades SET status = ?1, exit_price = ?2, exit_date = ?3, pnl = ?4, pnl_pct = ?5 WHERE id = ?6",

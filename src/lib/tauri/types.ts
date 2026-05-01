@@ -452,6 +452,7 @@ export interface PaperTrade {
 	status: string;
 	pnl: number | null;
 	pnl_pct: number | null;
+	trade_journal: string | null;
 }
 
 // === Portfolio Analytics ===

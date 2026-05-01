@@ -113,6 +113,8 @@ pub fn run() {
             commands::trading::get_trade_journal,
             commands::trading::run_backtest,
             commands::trading::get_backtest_history,
+            commands::trading::auto_backtest_if_due,
+            commands::trading::get_auto_trade_status,
             commands::trading::start_price_stream,
             commands::trading::stop_price_stream,
             commands::trading::get_stream_status,

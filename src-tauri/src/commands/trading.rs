@@ -39,7 +39,7 @@ pub fn get_paper_trades(db: State<'_, DbState>, status: Option<String>) -> Resul
         .prepare(
             "SELECT id, entity_id, ticker, direction, entry_price, entry_date,
                     exit_price, exit_date, position_size, confidence,
-                    signal_profile, status, pnl, pnl_pct
+                    signal_profile, status, pnl, pnl_pct, trade_journal
              FROM paper_trades WHERE status = ?1
              ORDER BY entry_date DESC LIMIT 50"
         )
@@ -62,6 +62,7 @@ pub fn get_paper_trades(db: State<'_, DbState>, status: Option<String>) -> Resul
                 status: row.get(11)?,
                 pnl: row.get(12)?,
                 pnl_pct: row.get(13)?,
+                trade_journal: row.get(14)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -138,6 +139,7 @@ pub async fn execute_trade(
         position_size: position_value, confidence,
         signal_profile, status: "open".to_string(),
         pnl: None, pnl_pct: None,
+        trade_journal: None,
     }))
 }
 
@@ -167,6 +169,147 @@ pub fn run_backtest(db: State<'_, DbState>, config: BacktestConfig) -> Result<Ba
 pub fn get_backtest_history(db: State<'_, DbState>) -> Result<Vec<BacktestResult>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     backtester::get_backtest_history(&conn, 10)
+}
+
+
+/// Daily auto-backtest. Triggered on app startup; runs at most once per day.
+///
+/// Gates:
+/// - Requires at least 90 days of cross_signals data (the day-90 threshold the
+///   user agreed to — fewer days produces statistical noise)
+/// - Skips if a backtest_results row already exists for today
+///
+/// Uses an expanding window: every day it runs, it tests on ALL data from the
+/// first cross_signals row to today. So day 91 has 91 days, day 92 has 92, etc.
+///
+/// Default parameters mirror the production trading path (compound score > 0.3,
+/// 5% position sizing, 90-day max hold) so the daily report measures what the
+/// auto-trader WOULD have done, had it been on.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutoBacktestStatus {
+    pub ran_today: bool,
+    pub days_of_data: i64,
+    pub threshold_days: i64,
+    pub last_result: Option<BacktestResult>,
+    pub message: String,
+}
+
+#[tauri::command]
+pub fn auto_backtest_if_due(db: State<'_, DbState>) -> Result<AutoBacktestStatus, String> {
+    const THRESHOLD_DAYS: i64 = 90;
+
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    // How many distinct days of cross_signals do we have?
+    let (min_date, max_date, days_of_data): (Option<String>, Option<String>, i64) = conn
+        .query_row(
+            "SELECT MIN(date(computed_at)), MAX(date(computed_at)), COUNT(DISTINCT date(computed_at))
+             FROM cross_signals WHERE ticker IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap_or((None, None, 0));
+
+    // Already ran today?
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let ran_today: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM backtest_results WHERE date(created_at) = ?1)",
+            [&today],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    let last_result: Option<BacktestResult> = backtester::get_backtest_history(&conn, 1)
+        .ok()
+        .and_then(|mut h| h.pop());
+
+    if days_of_data < THRESHOLD_DAYS {
+        return Ok(AutoBacktestStatus {
+            ran_today: false,
+            days_of_data,
+            threshold_days: THRESHOLD_DAYS,
+            last_result,
+            message: format!(
+                "Auto-backtest waiting: {} of {} days of data collected ({} days remaining).",
+                days_of_data, THRESHOLD_DAYS, THRESHOLD_DAYS - days_of_data
+            ),
+        });
+    }
+
+    if ran_today {
+        return Ok(AutoBacktestStatus {
+            ran_today: true,
+            days_of_data,
+            threshold_days: THRESHOLD_DAYS,
+            last_result,
+            message: "Already ran today.".to_string(),
+        });
+    }
+
+    // Build expanding-window config covering all available data.
+    let start_date = min_date.unwrap_or_else(|| {
+        // Fall back to "90 days ago" if for some reason min_date is null.
+        chrono::Local::now()
+            .date_naive()
+            .checked_sub_days(chrono::Days::new(THRESHOLD_DAYS as u64))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| today.clone())
+    });
+    let end_date = max_date.unwrap_or_else(|| today.clone());
+
+    let config = backtester::BacktestConfig {
+        start_date,
+        end_date,
+        min_score: 0.30,        // matches auto_trade_on_convergence threshold
+        stop_loss_pct: -10.0,   // realistic safety stop
+        take_profit_pct: 15.0,
+        max_hold_days: 90,      // matches position_management hard expiry
+        max_positions: 10,
+        position_size_pct: 5.0, // matches the high-score tier in position_sizing
+    };
+
+    let result = backtester::run_backtest(&conn, config)
+        .map_err(|e| format!("auto-backtest failed: {}", e))?;
+
+    let summary = format!(
+        "Auto-backtest ran: {} trades, {:.1}% hit rate, {:+.2}% return, Sharpe {:.2}, max DD {:.1}%",
+        result.trades_taken,
+        result.hit_rate,
+        result.total_return_pct,
+        result.sharpe_ratio,
+        result.max_drawdown_pct,
+    );
+
+    Ok(AutoBacktestStatus {
+        ran_today: true,
+        days_of_data,
+        threshold_days: THRESHOLD_DAYS,
+        last_result: Some(result),
+        message: summary,
+    })
+}
+
+/// Read-only kill-switch state. The auto-trader is disabled by default; the UI
+/// uses this to display a banner so the user can see at a glance whether
+/// trading automation is on.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutoTradeStatus {
+    pub enabled: bool,
+    pub reason: String,
+}
+
+#[tauri::command]
+pub fn get_auto_trade_status() -> Result<AutoTradeStatus, String> {
+    let enabled = std::env::var("AUTO_TRADE_ENABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    let reason = if enabled {
+        "AUTO_TRADE_ENABLED=true — auto-trader will place orders on convergence signals.".to_string()
+    } else {
+        "Auto-trader is OFF (default). Set AUTO_TRADE_ENABLED=true in .env to re-enable, but only after the daily auto-backtest shows a durable edge.".to_string()
+    };
+    Ok(AutoTradeStatus { enabled, reason })
 }
 
 /// Start live price streaming for open positions.

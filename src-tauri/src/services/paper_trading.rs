@@ -91,6 +91,7 @@ pub struct PaperTrade {
     pub status: String,
     pub pnl: Option<f64>,
     pub pnl_pct: Option<f64>,
+    pub trade_journal: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +247,7 @@ fn get_trades_by_status(conn: &Connection, status: &str) -> Result<Vec<PaperTrad
     let mut stmt = conn.prepare(
         "SELECT id, entity_id, ticker, direction, entry_price, entry_date,
                 exit_price, exit_date, position_size, confidence,
-                signal_profile, status, pnl, pnl_pct
+                signal_profile, status, pnl, pnl_pct, trade_journal
          FROM paper_trades WHERE status = ?1
          ORDER BY entry_date DESC LIMIT 50"
     )?;
@@ -268,6 +269,7 @@ fn get_trades_by_status(conn: &Connection, status: &str) -> Result<Vec<PaperTrad
                 status: row.get(11)?,
                 pnl: row.get(12)?,
                 pnl_pct: row.get(13)?,
+                trade_journal: row.get(14)?,
             })
         })?
         .filter_map(|r| r.ok())

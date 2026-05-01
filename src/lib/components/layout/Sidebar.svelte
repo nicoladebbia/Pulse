@@ -92,6 +92,7 @@
 		{ href: '/signals', label: 'Signals', icon: '⬡' },
 		{ href: '/freedoms', label: 'Freedoms', icon: '◇' },
 		{ href: '/predictions', label: 'Predictions', icon: '⊕' },
+		{ href: '/journal', label: 'Journal', icon: '☰' },
 		{ href: '/ask', label: 'Ask Pulse', icon: '◎' },
 	];
 

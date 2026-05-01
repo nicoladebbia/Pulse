@@ -191,6 +191,27 @@ export async function getBacktestHistory(): Promise<BacktestResult[]> {
 	return invoke('get_backtest_history');
 }
 
+export interface AutoBacktestStatus {
+	ran_today: boolean;
+	days_of_data: number;
+	threshold_days: number;
+	last_result: BacktestResult | null;
+	message: string;
+}
+
+export async function autoBacktestIfDue(): Promise<AutoBacktestStatus> {
+	return invoke('auto_backtest_if_due');
+}
+
+export interface AutoTradeStatus {
+	enabled: boolean;
+	reason: string;
+}
+
+export async function getAutoTradeStatus(): Promise<AutoTradeStatus> {
+	return invoke('get_auto_trade_status');
+}
+
 export async function startPriceStream(): Promise<void> {
 	return invoke('start_price_stream');
 }

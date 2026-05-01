@@ -599,6 +599,15 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Calibration failed (non-fatal): {}", e),
     }
 
+    // Phase 14.1: Daily portfolio snapshot (non-fatal). Runs after calibration
+    // so the equity reflects any closes Phase 14 just produced.
+    tracing::info!("Phase 14.1: Snapshotting portfolio...");
+    match snapshot_portfolio(db_path).await {
+        Ok(true) => tracing::info!("Portfolio snapshot recorded"),
+        Ok(false) => tracing::info!("Portfolio snapshot skipped"),
+        Err(e) => tracing::warn!("Portfolio snapshot failed (non-fatal): {}", e),
+    }
+
     // Phase 14.5: Generate predictions (Sonnet daily, Opus Sunday) (non-fatal)
     // Runs AFTER Phase 13 cross-signals are computed so predictions can
     // reference them. See plan .plans/signals-predictions-rework-plan.md Push 2.
@@ -3944,7 +3953,24 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
 
 /// Auto-execute paper trades when convergence signals are detected.
 /// Only trades entities with tickers, not already held, with convergence_detected = true.
+///
+/// SAFETY GATE: this is hard-disabled by default. Both the entry path and the
+/// scale-in path within this function only run when AUTO_TRADE_ENABLED=true is
+/// set in the environment. Pulse is a news/intelligence app first — the trading
+/// layer is dormant scaffolding that should not place real orders until a
+/// 6-month auto-backtest history demonstrates a durable edge.
 async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
+    // Hard kill switch. Default = OFF. Re-enable via `AUTO_TRADE_ENABLED=true`
+    // in `.env` once the auto-backtest has shown a positive expectancy across
+    // a meaningful window of resolved trades.
+    let trading_enabled = std::env::var("AUTO_TRADE_ENABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if !trading_enabled {
+        tracing::info!("Auto-trade: DISABLED (set AUTO_TRADE_ENABLED=true to re-enable)");
+        return Ok(0);
+    }
+
     let alpaca_key = match std::env::var("ALPACA_API_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => {
@@ -3958,27 +3984,38 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     let conn = rusqlite::Connection::open(db_path)?;
 
     // Find convergence signals with tickers, not already in open trades.
-    // Fetch all 8 normalized dimensions for signal_profile JSON, plus the raw
-    // signed insider net value (column 12) so we can veto on bearish insider activity.
-    // The normalized cs.insider_signal floors negatives to 0, so it can't
-    // distinguish "no insider data" from "heavy insider selling".
+    // cross_signals stores 1 row per (entity, day), so the same ticker can have
+    // multiple historical rows — we want the freshest row per ticker only,
+    // otherwise LIMIT N gets eaten by 5+ stale rows of the same name and the
+    // system places one trade per day on whichever ticker has the most history.
     let mut stmt = conn.prepare(
-        "SELECT cs.entity_id, cs.ticker, cs.compound_score, e.name,
-                cs.insider_signal, cs.institutional_flow, cs.news_momentum,
-                cs.government_signal, cs.search_trend, cs.patent_signal,
-                cs.supply_chain, cs.political_signal,
+        "WITH latest AS (
+             SELECT cs.entity_id, cs.ticker, cs.compound_score,
+                    cs.insider_signal, cs.institutional_flow, cs.news_momentum,
+                    cs.government_signal, cs.search_trend, cs.patent_signal,
+                    cs.supply_chain, cs.political_signal,
+                    cs.computed_at,
+                    ROW_NUMBER() OVER (PARTITION BY cs.ticker ORDER BY cs.computed_at DESC, cs.compound_score DESC) AS rn
+             FROM cross_signals cs
+             WHERE cs.convergence_detected = 1
+               AND cs.ticker IS NOT NULL
+               AND cs.compound_score > 0.3
+               AND cs.computed_at >= date('now', '-1 day')
+         )
+         SELECT l.entity_id, l.ticker, l.compound_score, e.name,
+                l.insider_signal, l.institutional_flow, l.news_momentum,
+                l.government_signal, l.search_trend, l.patent_signal,
+                l.supply_chain, l.political_signal,
                 COALESCE((SELECT s.insider_buy_volume FROM signals s
                           WHERE s.topic = LOWER(e.name)
                           ORDER BY s.updated_at DESC LIMIT 1), 0) AS insider_raw
-         FROM cross_signals cs
-         JOIN entities e ON e.id = cs.entity_id
-         WHERE cs.convergence_detected = 1
-           AND cs.ticker IS NOT NULL
-           AND cs.compound_score > 0.3
-           AND cs.ticker NOT IN (
+         FROM latest l
+         JOIN entities e ON e.id = l.entity_id
+         WHERE l.rn = 1
+           AND l.ticker NOT IN (
                SELECT ticker FROM paper_trades WHERE status = 'open'
            )
-         ORDER BY cs.compound_score DESC
+         ORDER BY l.compound_score DESC
          LIMIT 5"
     )?;
 
@@ -4018,10 +4055,30 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
 
+    // portfolio_value is the equity-based denominator for concentration limits.
+    // Buying power can swing with leverage and pending orders; portfolio_value
+    // is the stable "size of the pie" we want to cap each name against.
+    let portfolio_value: f64 = account.get("portfolio_value")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
     if buying_power < 100.0 {
         tracing::info!("Auto-trade: insufficient buying power (${:.2})", buying_power);
         return Ok(0);
     }
+
+    // Hard cap on per-ticker exposure. Without this, a bug or repeated signals
+    // can stack the same name into 20%+ of the portfolio (META did exactly this
+    // — 5x duplicate fills put 23% of equity into a single position before any
+    // human review). 5% is restrictive enough to *bite* against the existing
+    // $10k ENTRY_CAP at $100k portfolio sizes.
+    const MAX_PER_TICKER_PCT: f64 = 0.05;
+    let max_per_ticker_dollars = if portfolio_value > 0.0 {
+        portfolio_value * MAX_PER_TICKER_PCT
+    } else {
+        f64::INFINITY // No portfolio value reported — fall back to ENTRY_CAP only.
+    };
 
     let now = chrono::Local::now();
     let entry_datetime = now.format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -4048,6 +4105,38 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
                 continue;
             }
         };
+
+        // Concentration check: ask Alpaca for the current market value of any
+        // existing position in this ticker. If proposed notional + existing
+        // exposure would exceed MAX_PER_TICKER_PCT of portfolio_value, skip.
+        let existing_exposure: f64 = match client
+            .get(format!("https://paper-api.alpaca.markets/v2/positions/{}", ticker))
+            .header("APCA-API-KEY-ID", &alpaca_key)
+            .header("APCA-API-SECRET-KEY", &alpaca_secret)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                r.json::<serde_json::Value>().await.ok()
+                    .and_then(|v| v.get("market_value")
+                        .and_then(|m| m.as_str())
+                        .and_then(|s| s.parse::<f64>().ok()))
+                    .unwrap_or(0.0)
+            }
+            // 404 = no existing position, treat as 0 exposure. Other errors:
+            // be conservative and treat as 0 (the trade still gets capped by
+            // notional itself, just won't account for hidden exposure).
+            _ => 0.0,
+        };
+
+        if existing_exposure + notional > max_per_ticker_dollars {
+            tracing::warn!(
+                "Auto-trade: blocking {} ({}) — would push exposure to ${:.0} (existing ${:.0} + ${:.0}), cap is ${:.0} ({:.0}% of ${:.0} portfolio)",
+                name, ticker, existing_exposure + notional, existing_exposure, notional,
+                max_per_ticker_dollars, MAX_PER_TICKER_PCT * 100.0, portfolio_value
+            );
+            continue;
+        }
 
         tracing::info!("Auto-trade: {} ({}) — score {:.2}, notional ${:.2}", name, ticker, score, notional);
 
@@ -4127,7 +4216,31 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
                 }
             }
 
-            // Build signal_profile JSON matching calibration keys
+            // Capture the recent stories that drove this signal so the trade
+            // journal can show "we bought because of these specific headlines".
+            // Limit to the 8 most recent / most-cited stories per entity.
+            let story_refs: Vec<(i64, String, String)> = {
+                let mut s = match conn.prepare(
+                    "SELECT s.id, s.headline, s.source_name
+                     FROM entity_mentions em
+                     JOIN stories s ON s.id = em.story_id
+                     WHERE em.entity_id = ?1
+                       AND em.mentioned_at >= date('now', '-14 days')
+                     ORDER BY em.mentioned_at DESC, s.importance_score DESC
+                     LIMIT 8"
+                ) {
+                    Ok(stmt) => stmt,
+                    Err(_) => continue,
+                };
+                s.query_map([entity_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            };
+
+            // Build signal_profile JSON matching calibration keys.
+            // Now includes `stories[]` so the trade journal can reference the
+            // specific headlines that drove the entry decision.
             let signal_profile = serde_json::json!({
                 "insider": insider,
                 "institutional": inst,
@@ -4137,7 +4250,25 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
                 "patent": patent,
                 "supply_chain": supply,
                 "political": political,
+                "stories": story_refs.iter().map(|(id, head, src)| {
+                    serde_json::json!({"id": id, "headline": head, "source": src})
+                }).collect::<Vec<_>>(),
             });
+
+            // Re-check: the candidate query filtered open positions at fetch time,
+            // but Alpaca may have filled this order while another iteration was
+            // processing the same ticker. Refuse the second insert.
+            let already_open: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM paper_trades WHERE ticker = ?1 AND status = 'open')",
+                    [ticker.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if already_open {
+                tracing::warn!("Auto-trade: skipping duplicate insert for {} — already open", ticker);
+                continue;
+            }
 
             // Record in paper_trades with position management columns
             if let Err(e) = conn.execute(
@@ -4222,6 +4353,101 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     }
 
     Ok(traded)
+}
+
+/// Snapshot the live portfolio state into the `portfolio_snapshots` table.
+///
+/// Runs once per day (UNIQUE constraint on `date` column makes it idempotent
+/// via INSERT OR REPLACE). Pulls equity from Alpaca rather than aggregating
+/// `paper_trades.pnl` because the DB can drift from Alpaca and we want the
+/// snapshot to reflect ground truth, not our internal accounting.
+///
+/// MUST run AFTER Phase 14 (calibration) so any closes from this morning's
+/// signal-decay or trailing-stop checks are reflected in the recorded equity.
+async fn snapshot_portfolio(db_path: &Path) -> anyhow::Result<bool> {
+    let alpaca_key = match std::env::var("ALPACA_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            tracing::info!("Snapshot: skipping (ALPACA_API_KEY not set)");
+            return Ok(false);
+        }
+    };
+    let alpaca_secret = std::env::var("ALPACA_SECRET_KEY")
+        .map_err(|_| anyhow::anyhow!("ALPACA_SECRET_KEY not set"))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let account: serde_json::Value = client
+        .get("https://paper-api.alpaca.markets/v2/account")
+        .header("APCA-API-KEY-ID", &alpaca_key)
+        .header("APCA-API-SECRET-KEY", &alpaca_secret)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let portfolio_value: f64 = account.get("portfolio_value")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    if portfolio_value <= 0.0 {
+        tracing::warn!("Snapshot: Alpaca returned zero portfolio_value, skipping");
+        return Ok(false);
+    }
+
+    // Initial equity is whatever Alpaca says the account started with.
+    // Alpaca paper accounts default to $100k; if the user has a different
+    // baseline, the equity column would tell us — fall back to 100k.
+    const INITIAL_EQUITY: f64 = 100_000.0;
+    let total_pnl = portfolio_value - INITIAL_EQUITY;
+    let total_pnl_pct = (total_pnl / INITIAL_EQUITY) * 100.0;
+
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    let open_positions: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM paper_trades WHERE status = 'open'",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    // High-water mark = max(previous HWM, today's portfolio_value).
+    let prev_hwm: f64 = conn.query_row(
+        "SELECT MAX(high_water_mark) FROM portfolio_snapshots",
+        [],
+        |row| row.get::<_, Option<f64>>(0),
+    ).unwrap_or(None).unwrap_or(INITIAL_EQUITY);
+    let high_water_mark = prev_hwm.max(portfolio_value);
+    let drawdown_pct = if high_water_mark > 0.0 {
+        ((high_water_mark - portfolio_value) / high_water_mark) * 100.0
+    } else {
+        0.0
+    };
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    conn.execute(
+        "INSERT INTO portfolio_snapshots
+            (date, total_value, total_pnl, total_pnl_pct, open_positions, high_water_mark, drawdown_pct)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(date) DO UPDATE SET
+             total_value = excluded.total_value,
+             total_pnl = excluded.total_pnl,
+             total_pnl_pct = excluded.total_pnl_pct,
+             open_positions = excluded.open_positions,
+             high_water_mark = excluded.high_water_mark,
+             drawdown_pct = excluded.drawdown_pct",
+        rusqlite::params![today, portfolio_value, total_pnl, total_pnl_pct, open_positions, high_water_mark, drawdown_pct],
+    )?;
+
+    tracing::info!(
+        "Snapshot: ${:.0} equity, ${:+.0} PnL ({:+.2}%), {} open, HWM ${:.0}, DD {:.2}%",
+        portfolio_value, total_pnl, total_pnl_pct, open_positions, high_water_mark, drawdown_pct
+    );
+
+    Ok(true)
 }
 
 /// Enrich stored Form 4 stories that are missing transaction data.
