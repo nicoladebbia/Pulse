@@ -19,7 +19,14 @@
     },
     {
       "query": "Anthropic vs OpenAI competition",
-      "expected_headlines": [],
+      "expected_headlines": [
+        "Anthropic Surges Past OpenAI in Generative AI Software Spending",
+        "Anthropic Seeks $900 Billion Valuation, Potentially Overtaking OpenAI",
+        "Google's Internal Struggle Hands AI Coding Race to Anthropic and OpenAI",
+        "OpenAI Slams Anthropic in Memo to Shareholders",
+        "OpenAI Boosts Codex's Agentic Capabilities to Rival Claude Code",
+        "OpenAI Codex Gains Desktop Control to Rival Claude Code"
+      ],
       "notes": ""
     },
     {
@@ -85,7 +92,14 @@
     },
     {
       "query": "Microsoft AI strategy",
-      "expected_headlines": [],
+      "expected_headlines": [
+        "Microsoft and OpenAI Unveil Next Phase of Strategic Partnership",
+        "Microsoft and OpenAI Revise Their Deal for the Third Time",
+        "Microsoft Commits A$25 Billion to Expand AI Infrastructure",
+        "Microsoft's AI Data Center Goes Live Early",
+        "Microsoft Takes Over OpenAI's Planned Norway Stargate Data Center",
+        "Microsoft Valuation Check: AI Data Center Expansion"
+      ],
       "notes": ""
     },
     {
@@ -103,12 +117,21 @@
     },
     {
       "query": "AWS cloud growth AI",
-      "expected_headlines": [],
+      "expected_headlines": [
+        "AWS Sees Fastest Growth in Four Years as AI Demand Fuels Amazon's Cloud Surge",
+        "AWS and OpenAI Expand Partnership to Bring Frontier Intelligence",
+        "AWS Unveils Trio of Key AI Strategy Announcements",
+        "Amazon Bolsters AWS with New OpenAI Products",
+        "AWS Integrates Claude Opus 4.7 into Amazon Bedrock",
+        "Amazon Invests $33B in Anthropic, Promising $100B in AWS Spend"
+      ],
       "notes": ""
     },
     {
       "query": "Italian AI regulation antitrust",
-      "expected_headlines": [],
+      "expected_headlines": [
+        "Italy Closes Antitrust Probes into AI Firms After Commitments on 'Hallucination' Risks"
+      ],
       "notes": ""
     },
     {
@@ -144,7 +167,14 @@
     },
     {
       "query": "what is Anthropic doing",
-      "expected_headlines": [],
+      "expected_headlines": [
+        "Anthropic Seeks $900 Billion Valuation in Funding Talks",
+        "Anthropic Raises $30 Billion in Series G",
+        "Anthropic Nears $50B Raise at Up to $900B Valuation",
+        "Google to Invest Up to $40 Billion in Anthropic",
+        "Anthropic AI Discovers 2,000 Flaws",
+        "Anthropic's Mythos Model Raises Alarms for Future of Cybersecurity"
+      ],
       "notes": ""
     },
     {
@@ -186,7 +216,13 @@
     },
     {
       "query": "Sam Altman recent news",
-      "expected_headlines": [],
+      "expected_headlines": [
+        "Musk and Altman Face Off in Trial Over OpenAI's Future",
+        "OpenAI CFO at Odds with Sam Altman Over Missed Revenue Target",
+        "Elon Musk and Sam Altman Clash in Court Over OpenAI's Founding Mission",
+        "OpenAI Aligns with Trump's AI Regulation, Sam Altman Unveils Vision",
+        "Molotov Cocktail Attack on OpenAI CEO Sam Altman's Home"
+      ],
       "notes": ""
     },
     {
@@ -203,7 +239,14 @@
     },
     {
       "query": "SpaceX missions and launches",
-      "expected_headlines": [],
+      "expected_headlines": [
+        "Starship V3 Static Fire Successfully Conducted by SpaceX",
+        "Space Force considers major shift in launch contracts from ULA to SpaceX",
+        "Space Force Considers Major Shift to SpaceX for Launches",
+        "SpaceX Fires Up Next-Gen 'Version 3' Starship Ahead of Landmark May Test Flight",
+        "Starship Launch Imminent: SpaceX Conducts Successful Engine Test of Version 3",
+        "Blue Origin Successfully Reuses New Glenn Rocket, Challenging SpaceX's Dominance"
+      ],
       "notes": ""
     },
     {
@@ -261,7 +304,7 @@
         "Anthropic Brings Claude's AI Power to Microsoft Word",
         "OpenAI Launches $100 ChatGPT Pro Plan"
       ],
-      "notes": "Breaking: broad recent tech news — reduced to 4 high-signal stories"
+      "notes": "Breaking: broad recent tech news \u2014 reduced to 4 high-signal stories"
     },
     {
       "query": "Meta AI open source models",
@@ -295,7 +338,7 @@
         "Meta Commits Additional $21B to CoreWeave's AI Infrastructure",
         "Investment and AI Agent Deployment Surge as Execution Becomes Key"
       ],
-      "notes": "Analytical: trend/cause analysis — focused on investment-specific stories"
+      "notes": "Analytical: trend/cause analysis \u2014 focused on investment-specific stories"
     },
     {
       "query": "OpenAI vs Anthropic",
