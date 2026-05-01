@@ -151,7 +151,7 @@ pub struct ExpandedQuery {
 }
 
 impl ExpandedQuery {
-    fn from_original(message: &str) -> Self {
+    pub fn from_original(message: &str) -> Self {
         Self {
             fts_keywords: message.to_string(),
             semantic_text: message.to_string(),
