@@ -21,12 +21,15 @@
 	let isAsking = $state(false);
 	let storyEntities = $state<StoryEntityContext[]>([]);
 
-	// Load entity context
+	// Load entity context — capture id at call time so a stale response can't overwrite a newer story's entities
 	$effect(() => {
 		if (!isTauri()) return;
+		const requestedId = story.id;
 		const ipc = (window as any).__TAURI_INTERNALS__;
-		ipc?.invoke('get_story_entities', { storyId: story.id })
-			.then((e: StoryEntityContext[]) => { storyEntities = e; })
+		ipc?.invoke('get_story_entities', { storyId: requestedId })
+			.then((e: StoryEntityContext[]) => {
+				if (story.id === requestedId) storyEntities = e;
+			})
 			.catch(() => {});
 	});
 	let followUpQuery = $state('');

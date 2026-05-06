@@ -145,10 +145,10 @@ function daysAgo(n: number): string {
 
 export const mockArchiveBriefings: Briefing[] = [
 	mockBriefing,
-	{ id: 2, date: daysAgo(1), story_count: 5, ai_count: 2, miami_count: 1, italy_count: 1, tech_count: 1, status: 'complete', created_at: daysAgo(1), briefing_type: 'daily', executive_summary: 'Yesterday\'s key developments.' },
-	{ id: 3, date: daysAgo(1), story_count: 4, ai_count: 0, miami_count: 0, italy_count: 0, tech_count: 0, status: 'complete', created_at: daysAgo(1), briefing_type: 'freedoms', executive_summary: null },
-	{ id: 4, date: daysAgo(2), story_count: 6, ai_count: 3, miami_count: 1, italy_count: 1, tech_count: 1, status: 'complete', created_at: daysAgo(2), briefing_type: 'daily', executive_summary: 'Two days ago highlights.' },
-	{ id: 5, date: daysAgo(3), story_count: 4, ai_count: 1, miami_count: 1, italy_count: 1, tech_count: 1, status: 'complete', created_at: daysAgo(3), briefing_type: 'daily', executive_summary: null },
+	{ id: 2, date: daysAgo(1), story_count: 5, ai_count: 2, miami_count: 1, italy_count: 1, tech_count: 1, status: 'complete', created_at: daysAgo(1), briefing_type: 'daily', executive_summary: 'Yesterday\'s key developments.', time_label: null, hero_headline: null },
+	{ id: 3, date: daysAgo(1), story_count: 4, ai_count: 0, miami_count: 0, italy_count: 0, tech_count: 0, status: 'complete', created_at: daysAgo(1), briefing_type: 'freedoms', executive_summary: null, time_label: null, hero_headline: null },
+	{ id: 4, date: daysAgo(2), story_count: 6, ai_count: 3, miami_count: 1, italy_count: 1, tech_count: 1, status: 'complete', created_at: daysAgo(2), briefing_type: 'daily', executive_summary: 'Two days ago highlights.', time_label: null, hero_headline: null },
+	{ id: 5, date: daysAgo(3), story_count: 4, ai_count: 1, miami_count: 1, italy_count: 1, tech_count: 1, status: 'complete', created_at: daysAgo(3), briefing_type: 'daily', executive_summary: null, time_label: null, hero_headline: null },
 ];
 
 // --- Trends mock data ---
@@ -472,9 +472,9 @@ export const mockUsageStats: UsageStats = {
 		{ provider: 'tavily', model: 'search', total_input_tokens: 0, total_output_tokens: 0, total_cost_usd: 0, call_count: 5 },
 	],
 	daily: [
-		{ date: '2026-04-17', cost_usd: 0.08, call_count: 28 },
-		{ date: '2026-04-16', cost_usd: 0.12, call_count: 45 },
-		{ date: '2026-04-15', cost_usd: 0.09, call_count: 32 },
+		{ date: '2026-04-17', cost: 0.08 },
+		{ date: '2026-04-16', cost: 0.12 },
+		{ date: '2026-04-15', cost: 0.09 },
 	],
 };
 

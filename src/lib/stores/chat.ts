@@ -205,8 +205,9 @@ export async function sendMessage(message: string) {
 			}
 		});
 
-		// If this was a new thread, update the active thread
-		if (!threadId) {
+		// If this was a new thread, update the active thread —
+		// but skip when the user switched threads mid-stream (otherwise we'd yank them back).
+		if (!threadId && streamGeneration === myGeneration) {
 			await loadThreads();
 			const currentThreads = get(threads);
 			const newThread = currentThreads[0];

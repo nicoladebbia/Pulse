@@ -124,6 +124,7 @@
 		{ key: 'wealth_stories' as const, freedom: 'wealth', label: 'Wealth Freedom', color: 'var(--color-freedom-financial)' },
 		{ key: 'location_stories' as const, freedom: 'location', label: 'Location Freedom', color: 'var(--color-freedom-location)' },
 		{ key: 'health_stories' as const, freedom: 'health', label: 'Health Freedom', color: 'var(--color-freedom-health)' },
+		{ key: 'whoop_stories' as const, freedom: 'whoop', label: 'Whoop', color: 'var(--color-freedom-health)' },
 	];
 
 	const rangeOptions = [

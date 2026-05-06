@@ -480,7 +480,10 @@ pub fn merge_results(
                 (true, true) => MatchType::Both,
                 (true, false) => MatchType::Fts,
                 (false, true) => MatchType::Semantic,
-                (false, false) => unreachable!(),
+                (false, false) => {
+                    debug_assert!(false, "score id {} present without fts/semantic membership", id);
+                    MatchType::Fts
+                }
             };
             (id, score, match_type)
         })

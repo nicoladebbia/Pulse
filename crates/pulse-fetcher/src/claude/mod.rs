@@ -58,7 +58,7 @@ pub async fn translate_italian(articles: &[RawArticle]) -> anyhow::Result<Vec<Ra
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
 
-    let client = client::GroqClient::new(&api_key);
+    let client = client::GroqClient::new(&api_key)?;
     let mut result = articles.to_vec();
 
     let mut translated_count = 0;
@@ -85,7 +85,7 @@ pub async fn translate_italian(articles: &[RawArticle]) -> anyhow::Result<Vec<Ra
 pub async fn summarize_stories(articles: &[RawArticle], progress: Option<&crate::pipeline::ProgressWriter>) -> anyhow::Result<Vec<SummarizedStory>> {
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = client::GroqClient::new(&api_key);
+    let client = client::GroqClient::new(&api_key)?;
 
     let mut summaries = Vec::new();
     let chunks: Vec<_> = articles.chunks(10).collect();
@@ -130,7 +130,7 @@ pub async fn summarize_stories(articles: &[RawArticle], progress: Option<&crate:
 pub async fn analyze_cross_sector(stories: &[SummarizedStory]) -> anyhow::Result<AnalysisResult> {
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = client::GroqClient::new(&api_key);
+    let client = client::GroqClient::new(&api_key)?;
 
     // Sector-balanced selection: ensure each sector has at least 25 stories in the 120-story input
     let mut sorted = stories.to_vec();

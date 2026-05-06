@@ -123,13 +123,24 @@ pub async fn generate(
 
         match response {
             Some(resp) => {
+                let mut kept = 0usize;
+                let mut dropped = 0usize;
                 for (j, d) in resp.data.into_iter().enumerate() {
+                    if d.embedding.len() != 512 {
+                        tracing::warn!(
+                            "Batch {}: dropping story {} — got {} dims, expected 512",
+                            batch_idx + 1, batch_indices[j], d.embedding.len()
+                        );
+                        dropped += 1;
+                        continue;
+                    }
                     all_embeddings.push(StoryEmbedding {
                         story_index: batch_indices[j],
                         embedding: d.embedding,
                     });
+                    kept += 1;
                 }
-                tracing::info!("Batch {}: embedded {} stories", batch_idx + 1, chunk.len());
+                tracing::info!("Batch {}: embedded {} stories ({} dropped for bad dims)", batch_idx + 1, kept, dropped);
             }
             None => {
                 tracing::warn!("Batch {} failed: {}", batch_idx + 1, last_err.unwrap_or_default());

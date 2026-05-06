@@ -463,7 +463,7 @@ fn generate_trade_journal(
             }
         }
     }
-    top_signals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    top_signals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     top_signals.truncate(3);
 
     // Build narrative

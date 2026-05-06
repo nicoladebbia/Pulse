@@ -137,15 +137,16 @@ struct CurationResult {
 }
 
 impl GroqClient {
-    pub fn new(api_key: &str) -> Self {
-        Self {
+    pub fn new(api_key: &str) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+        Ok(Self {
             api_key: api_key.to_string(),
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .pool_max_idle_per_host(0)
-                .build()
-                .expect("failed to build HTTP client"),
-        }
+            http,
+        })
     }
 
     pub async fn call(&self, model: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {

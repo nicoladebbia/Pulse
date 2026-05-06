@@ -224,7 +224,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         tracing::info!("Pre-curating: selecting best articles from {} candidates...", news_articles.len());
         let api_key = std::env::var("GROQ_API_KEY")
             .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-        let client = crate::claude::client::GroqClient::new(&api_key);
+        let client = crate::claude::client::GroqClient::new(&api_key)?;
         match client.pre_curate(&news_articles).await {
             Ok(indices) => {
                 let curated: Vec<_> = indices.into_iter()
@@ -1314,7 +1314,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 async fn generate_freedoms_summary(curated: &[(&str, &crate::claude::SummarizedStory)]) -> anyhow::Result<String> {
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = crate::claude::client::GroqClient::new(&api_key);
+    let client = crate::claude::client::GroqClient::new(&api_key)?;
 
     let mut input = String::new();
     for (freedom, story) in curated {
@@ -1674,7 +1674,7 @@ async fn generate_predictions(
 async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult) -> anyhow::Result<String> {
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = crate::claude::client::GroqClient::new(&api_key);
+    let client = crate::claude::client::GroqClient::new(&api_key)?;
 
     // Build compact input: top 5 stories by importance + connections
     let mut sorted = analysis.curated_stories.clone();
@@ -1705,7 +1705,7 @@ async fn generate_deep_summaries(db_path: &std::path::Path, analysis: &crate::cl
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
     let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
 
     // Find stories with relevance_score >= 8 from today's briefing
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -1910,7 +1910,7 @@ fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddi
     }
 
     let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
 
     // Run migrations (transaction-wrapped, with ALTER TABLE guards)
     crate::db::run_migrations(&conn)?;
@@ -2429,7 +2429,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         tracing::info!("Freedoms: Pre-curating from {} articles...", unique.len());
         let api_key = std::env::var("GROQ_API_KEY")
             .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-        let client = crate::claude::client::GroqClient::new(&api_key);
+        let client = crate::claude::client::GroqClient::new(&api_key)?;
         match client.pre_curate_freedoms(&unique).await {
             Ok(indices) => {
                 let curated: Vec<_> = indices.into_iter()
@@ -2461,7 +2461,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     tracing::info!("Freedoms: Curating...");
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = crate::claude::client::GroqClient::new(&api_key);
+    let client = crate::claude::client::GroqClient::new(&api_key)?;
 
     // Stratified truncate: take the top 40 from EACH freedom_* sector, then
     // re-sort the union by importance. Whoop and Health articles tend to score
@@ -2672,7 +2672,7 @@ fn write_freedoms_to_db(
     }
 
     let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
 
     // Run migrations (transaction-wrapped, with ALTER TABLE guards)
     crate::db::run_migrations(&conn)?;
@@ -2859,7 +2859,7 @@ fn write_financial_stories(
     stories: &[crate::claude::SummarizedStory],
 ) -> anyhow::Result<usize> {
     let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
     crate::db::run_migrations(&conn)?;
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();

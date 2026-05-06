@@ -20,13 +20,12 @@ const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.
 const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
-fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({})", table))
-        .unwrap();
-    stmt.query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .any(|r| r.as_deref() == Ok(column))
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|r| r.as_deref() == Ok(column));
+    Ok(exists)
 }
 
 /// Run all pending migrations, each wrapped in a transaction for atomicity.
@@ -66,7 +65,7 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
 
     // Migration 5: ALTER TABLE stories ADD COLUMN context_prefix + FTS rebuild
     if !applied.contains(&5) {
-        if !column_exists(conn, "stories", "context_prefix") {
+        if !column_exists(conn, "stories", "context_prefix")? {
             conn.execute_batch("ALTER TABLE stories ADD COLUMN context_prefix TEXT;")?;
         }
         let sql_005_rest = MIGRATION_005
@@ -82,7 +81,7 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
 
     // Migration 6: ALTER TABLE freedom_stories ADD COLUMN context_prefix + FTS
     if !applied.contains(&6) {
-        if !column_exists(conn, "freedom_stories", "context_prefix") {
+        if !column_exists(conn, "freedom_stories", "context_prefix")? {
             conn.execute_batch("ALTER TABLE freedom_stories ADD COLUMN context_prefix TEXT;")?;
         }
         let sql_006_rest = MIGRATION_006
@@ -98,7 +97,7 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
 
     // Migration 7: ALTER TABLE briefings ADD COLUMN executive_summary
     if !applied.contains(&7) {
-        if !column_exists(conn, "briefings", "executive_summary") {
+        if !column_exists(conn, "briefings", "executive_summary")? {
             conn.execute_batch("ALTER TABLE briefings ADD COLUMN executive_summary TEXT;")?;
         }
         let tx = conn.unchecked_transaction()?;
@@ -117,10 +116,10 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         tx.execute_batch(&sql_008_tables)?;
         tx.commit()?;
 
-        if !column_exists(conn, "stories", "summary_depth") {
+        if !column_exists(conn, "stories", "summary_depth")? {
             conn.execute_batch("ALTER TABLE stories ADD COLUMN summary_depth TEXT DEFAULT 'standard';")?;
         }
-        if !column_exists(conn, "stories", "deep_summary") {
+        if !column_exists(conn, "stories", "deep_summary")? {
             conn.execute_batch("ALTER TABLE stories ADD COLUMN deep_summary TEXT;")?;
         }
 
@@ -132,7 +131,7 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     // Migration 9: Multiple daily briefings
     if !applied.contains(&9) {
         conn.execute_batch("DROP INDEX IF EXISTS idx_briefings_date_type;")?;
-        if !column_exists(conn, "briefings", "time_label") {
+        if !column_exists(conn, "briefings", "time_label")? {
             conn.execute_batch("ALTER TABLE briefings ADD COLUMN time_label TEXT;")?;
         }
         conn.execute_batch(
@@ -181,7 +180,7 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
 
         // Step 1: Recreate stories table with finance sector + source_type + financial_metadata
-        if !column_exists(conn, "stories", "source_type") {
+        if !column_exists(conn, "stories", "source_type")? {
             conn.execute_batch(
                 "CREATE TABLE stories_new (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -435,7 +434,7 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
             "regulatory_sentiment", "lobbying_spend_delta", "source_diversity",
         ];
         for col in &signal_cols {
-            if !column_exists(conn, "signals", col) {
+            if !column_exists(conn, "signals", col)? {
                 let col_type = if *col == "source_diversity" { "INTEGER" } else { "REAL" };
                 conn.execute_batch(&format!(
                     "ALTER TABLE signals ADD COLUMN {} {} DEFAULT 0;", col, col_type
@@ -456,7 +455,7 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         tx.execute_batch(MIGRATION_018)?;
 
         // Add canonical_id column to entities if not exists
-        if !column_exists(&tx, "entities", "canonical_id") {
+        if !column_exists(&tx, "entities", "canonical_id")? {
             tx.execute_batch("ALTER TABLE entities ADD COLUMN canonical_id INTEGER REFERENCES entity_canonical(id);")?;
             tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_entities_canonical ON entities(canonical_id);")?;
         }
@@ -470,16 +469,16 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_019)?;
 
-        if !column_exists(&tx, "paper_trades", "high_water_mark") {
+        if !column_exists(&tx, "paper_trades", "high_water_mark")? {
             tx.execute_batch("ALTER TABLE paper_trades ADD COLUMN high_water_mark REAL;")?;
         }
-        if !column_exists(&tx, "paper_trades", "trailing_stop") {
+        if !column_exists(&tx, "paper_trades", "trailing_stop")? {
             tx.execute_batch("ALTER TABLE paper_trades ADD COLUMN trailing_stop REAL;")?;
         }
-        if !column_exists(&tx, "paper_trades", "original_compound_score") {
+        if !column_exists(&tx, "paper_trades", "original_compound_score")? {
             tx.execute_batch("ALTER TABLE paper_trades ADD COLUMN original_compound_score REAL;")?;
         }
-        if !column_exists(&tx, "paper_trades", "scale_in_count") {
+        if !column_exists(&tx, "paper_trades", "scale_in_count")? {
             tx.execute_batch("ALTER TABLE paper_trades ADD COLUMN scale_in_count INTEGER DEFAULT 0;")?;
         }
 
@@ -488,7 +487,7 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if !applied.contains(&21) {
-        if !column_exists(conn, "paper_trades", "trade_journal") {
+        if !column_exists(conn, "paper_trades", "trade_journal")? {
             conn.execute_batch(MIGRATION_021)?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (21)", [])?;
