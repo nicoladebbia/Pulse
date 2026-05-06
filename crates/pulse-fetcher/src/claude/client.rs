@@ -1,6 +1,7 @@
 use super::{SummarizedStory, AnalysisResult, Connection, RelevanceScore, TrendDetection};
 use crate::sources::RawArticle;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 // Groq models — fast inference, OpenAI-compatible API
 const FAST_MODEL: &str = "llama-3.1-8b-instant";
@@ -37,6 +38,9 @@ No explanation, just the JSON array."#;
 pub struct GroqClient {
     api_key: String,
     http: reqwest::Client,
+    /// When set, every successful API call is logged to `api_usage` with real
+    /// `prompt_tokens` / `completion_tokens` from the Groq response.
+    db_path: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -64,6 +68,13 @@ struct ChatMessage {
 struct ChatResponse {
     choices: Option<Vec<ChatChoice>>,
     error: Option<ChatError>,
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
 }
 
 #[derive(Deserialize)]
@@ -137,7 +148,7 @@ struct CurationResult {
 }
 
 impl GroqClient {
-    pub fn new(api_key: &str) -> anyhow::Result<Self> {
+    pub fn new(api_key: &str, db_path: Option<PathBuf>) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .pool_max_idle_per_host(0)
@@ -146,10 +157,25 @@ impl GroqClient {
         Ok(Self {
             api_key: api_key.to_string(),
             http,
+            db_path,
         })
     }
 
-    pub async fn call(&self, model: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+    /// Log a successful API call with REAL token counts from the Groq response.
+    /// One row per actual call (not per phase) — retries and parse-fail repeats are billed
+    /// separately by Groq, and this matches that.
+    fn log_call(&self, model: &str, endpoint: &str, usage: &Usage) {
+        if let Some(ref path) = self.db_path {
+            if let Ok(conn) = rusqlite::Connection::open(path) {
+                crate::db::log_api_usage(
+                    &conn, "groq", model, endpoint,
+                    usage.prompt_tokens, usage.completion_tokens,
+                );
+            }
+        }
+    }
+
+    pub async fn call(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
         let request = ChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -210,6 +236,10 @@ impl GroqClient {
                 anyhow::bail!("Groq API error: {}", err.message);
             }
 
+            if let Some(ref u) = response.usage {
+                self.log_call(model, endpoint, u);
+            }
+
             let text = response
                 .choices
                 .and_then(|c| c.into_iter().next())
@@ -224,7 +254,7 @@ impl GroqClient {
 
     /// Like `call()` but returns plain text (no JSON response_format constraint).
     /// Used for executive summaries and other prose generation.
-    pub async fn call_text(&self, model: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+    pub async fn call_text(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
         let request = ChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -284,6 +314,10 @@ impl GroqClient {
                 anyhow::bail!("Groq API error: {}", err.message);
             }
 
+            if let Some(ref u) = response.usage {
+                self.log_call(model, endpoint, u);
+            }
+
             let text = response
                 .choices
                 .and_then(|c| c.into_iter().next())
@@ -303,7 +337,7 @@ impl GroqClient {
             title, snippet
         );
 
-        let text = self.call(FAST_MODEL, system, &user_msg, 500).await?;
+        let text = self.call(FAST_MODEL, "translate", system, &user_msg, 500).await?;
         let parsed: TranslationResponse = serde_json::from_str(&extract_json(&text))?;
         Ok((parsed.title_en, parsed.snippet_en))
     }
@@ -322,7 +356,7 @@ impl GroqClient {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
 
-            let text = match self.call(FAST_MODEL, system, &user_msg, 2000).await {
+            let text = match self.call(FAST_MODEL, "summarize", system, &user_msg, 2000).await {
                 Ok(t) => t,
                 Err(e) => {
                     last_err = Some(e);
@@ -395,7 +429,7 @@ impl GroqClient {
             stories.len()
         ));
 
-        let text = self.call(STRONG_MODEL, system, &user_msg, 8000).await?;
+        let text = self.call(STRONG_MODEL, "analyze", system, &user_msg, 8000).await?;
         let parsed: AnalysisResponse = serde_json::from_str(&extract_json(&text))?;
 
         if parsed.relevance_scores.len() < stories.len() {
@@ -473,17 +507,17 @@ impl GroqClient {
     /// ~90 most newsworthy articles from ~150-200 raw headlines, so we only
     /// pay for summarizing stories that will actually make the briefing.
     pub async fn pre_curate(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
-        self.pre_curate_with_prompt(articles, DAILY_PRE_CURATOR_SYSTEM).await
+        self.pre_curate_with_prompt(articles, DAILY_PRE_CURATOR_SYSTEM, "pre_curate").await
     }
 
     /// Freedoms-pipeline pre-curator. Same mechanism as daily, but the system
     /// prompt names the 5 freedom categories (Time/Wealth/Location/Health/Whoop)
     /// so freedom articles are not down-weighted as off-sector noise.
     pub async fn pre_curate_freedoms(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
-        self.pre_curate_with_prompt(articles, FREEDOMS_PRE_CURATOR_SYSTEM).await
+        self.pre_curate_with_prompt(articles, FREEDOMS_PRE_CURATOR_SYSTEM, "pre_curate_freedoms").await
     }
 
-    async fn pre_curate_with_prompt(&self, articles: &[RawArticle], system: &str) -> anyhow::Result<Vec<usize>> {
+    async fn pre_curate_with_prompt(&self, articles: &[RawArticle], system: &str, endpoint: &str) -> anyhow::Result<Vec<usize>> {
 
         let mut user_msg = String::new();
         for (i, article) in articles.iter().enumerate() {
@@ -495,7 +529,7 @@ impl GroqClient {
         }
         user_msg.push_str(&format!("\nSelect the best ~90 from these {} articles. Return JSON array of indices.", articles.len()));
 
-        let text = self.call_text(STRONG_MODEL, system, &user_msg, 2000).await?;
+        let text = self.call_text(STRONG_MODEL, endpoint, system, &user_msg, 2000).await?;
 
         // Parse the JSON array — try multiple extraction strategies
         let json_str = extract_json_array(&text);

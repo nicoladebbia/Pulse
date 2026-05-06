@@ -91,9 +91,60 @@ fn log_usage(db_path: &Path, provider: &str, model: &str, endpoint: &str, input_
     }
 }
 
+/// Default daily cost cap in USD. Override via PULSE_DAILY_COST_CAP env var.
+/// Set to a low value because Pulse should normally run for ~$0.30/day; anything
+/// above $0.50 means something is looping or a manual rerun got out of hand.
+const DEFAULT_DAILY_COST_CAP_USD: f64 = 0.50;
+
+/// Read today's accumulated API spend and abort if it's over the cap.
+/// Called at the top of `run()` / `run_freedoms()` so a stuck loop cannot keep
+/// burning money across multiple manual reruns in the same day.
+fn check_daily_cost_cap(db_path: &Path) -> anyhow::Result<()> {
+    let cap = std::env::var("PULSE_DAILY_COST_CAP")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_DAILY_COST_CAP_USD);
+
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        // If we can't open the DB at all, let the rest of the pipeline surface the real error.
+        Err(_) => return Ok(()),
+    };
+
+    let spent: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(estimated_cost_usd), 0.0)
+             FROM api_usage
+             WHERE date(created_at) = date('now')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+
+    if spent >= cap {
+        anyhow::bail!(
+            "Daily cost cap hit: ${:.4} spent today (cap: ${:.2}). \
+             Aborting before more API calls are made. \
+             Override with PULSE_DAILY_COST_CAP=<usd> env var.",
+            spent, cap
+        );
+    }
+
+    if spent > cap * 0.5 {
+        tracing::warn!(
+            "Daily spend so far: ${:.4} (cap ${:.2}, {:.0}% used)",
+            spent, cap, spent / cap * 100.0
+        );
+    }
+    Ok(())
+}
+
 pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let mut progress = ProgressWriter::new(db_path);
+
+    // Cost guardrail: bail before any LLM call if today's spend already crossed the cap.
+    check_daily_cost_cap(db_path)?;
 
     // Phase 0: Enrich Form 4 stories from previous runs (before EDGAR fetch burns SEC rate limit)
     tracing::info!("Phase 0: Enriching prior Form 4 filings with transaction data...");
@@ -224,14 +275,12 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         tracing::info!("Pre-curating: selecting best articles from {} candidates...", news_articles.len());
         let api_key = std::env::var("GROQ_API_KEY")
             .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-        let client = crate::claude::client::GroqClient::new(&api_key)?;
+        let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
         match client.pre_curate(&news_articles).await {
             Ok(indices) => {
                 let curated: Vec<_> = indices.into_iter()
                     .filter_map(|i| news_articles.get(i).cloned())
                     .collect();
-                log_usage(db_path, "groq", "llama-3.3-70b-versatile", "pre_curate",
-                    (news_articles.len() * 30) as i64, 500);
                 tracing::info!("Pre-curated to {} articles (saved {} summarization calls)",
                     curated.len(), news_articles.len() - curated.len());
                 curated
@@ -279,10 +328,11 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 3: Summarize pre-curated NEWS articles (not financial — they're already structured)
     progress.start_stage(3);
     tracing::info!("Phase 3: Summarizing {} stories...", articles_to_summarize.len());
-    let summaries = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress)).await?;
+    let summaries = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress), db_path).await?;
     let sum_count = summaries.len() as i64;
     let sum_failed = articles_to_summarize.len() as i64 - sum_count;
-    log_usage(db_path, "groq", "llama-3.1-8b-instant", "summarize", sum_count * 500, sum_count * 300);
+    // No hardcoded log_usage here — GroqClient now logs each summarize_story call
+    // with REAL token counts from the API response.
 
     if sum_failed > 0 {
         tracing::warn!("Summarized {}/{} stories ({} failed)", sum_count, articles_to_summarize.len(), sum_failed);
@@ -297,8 +347,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 4: Cross-sector analysis (news only)
     progress.start_stage(4);
     tracing::info!("Phase 4: Cross-sector analysis...");
-    let mut analysis = crate::claude::analyze_cross_sector(&summaries).await?;
-    log_usage(db_path, "groq", "llama-3.3-70b-versatile", "analyze", 8000, 2000);
+    let mut analysis = crate::claude::analyze_cross_sector(&summaries, db_path).await?;
 
     // Log sector distribution in curated stories
     {
@@ -316,10 +365,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 5: Executive summary (non-fatal)
     progress.start_stage(5);
     tracing::info!("Phase 5: Generating executive summary...");
-    let executive_summary = match generate_executive_summary(&analysis).await {
+    let executive_summary = match generate_executive_summary(&analysis, db_path).await {
         Ok(s) => {
             tracing::info!("Executive summary: {} chars", s.len());
-            log_usage(db_path, "groq", "llama-3.1-8b-instant", "executive_summary", 2000, 300);
             Some(s)
         }
         Err(e) => {
@@ -1311,10 +1359,10 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if denom == 0.0 { 0.0 } else { (dot / denom) as f32 }
 }
 
-async fn generate_freedoms_summary(curated: &[(&str, &crate::claude::SummarizedStory)]) -> anyhow::Result<String> {
+async fn generate_freedoms_summary(curated: &[(&str, &crate::claude::SummarizedStory)], db_path: &Path) -> anyhow::Result<String> {
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = crate::claude::client::GroqClient::new(&api_key)?;
+    let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 
     let mut input = String::new();
     for (freedom, story) in curated {
@@ -1353,7 +1401,7 @@ To optimize for time freedom, consider leveraging AI tools. Explore the creator 
 BAD — meta preamble (NEVER produce this):
 Here's a summary of today's four freedoms: ..."#;
 
-    let raw = client.call_text("llama-3.3-70b-versatile", system, &input, 600).await?;
+    let raw = client.call_text("llama-3.3-70b-versatile", "freedoms_executive_summary", system, &input, 600).await?;
     Ok(clean_theme_output(&raw))
 }
 
@@ -1671,10 +1719,10 @@ async fn generate_predictions(
     Ok(inserted)
 }
 
-async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult) -> anyhow::Result<String> {
+async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult, db_path: &Path) -> anyhow::Result<String> {
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = crate::claude::client::GroqClient::new(&api_key)?;
+    let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 
     // Build compact input: top 5 stories by importance + connections
     let mut sorted = analysis.curated_stories.clone();
@@ -1694,7 +1742,7 @@ async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult) ->
 
     let system = "You write executive summaries for a daily intelligence briefing. The reader is a tech founder in Miami who builds AI apps, Shopify tools, and iOS apps. Italian heritage, follows Serie A.\n\nWrite exactly 3-5 sentences synthesizing today's most important developments. Name specific companies, numbers, and developments. Be direct and insightful — no preamble, no bullet points, no greeting. Just flowing prose that answers 'what happened today?'";
 
-    client.call_text("llama-3.1-8b-instant", system, &input, 300).await
+    client.call_text("llama-3.1-8b-instant", "executive_summary", system, &input, 300).await
 }
 
 /// Generate deep summaries for stories with relevance_score >= 8.
@@ -2355,6 +2403,9 @@ Focus on MOST important entities (max 5 per story)."#,
 pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
 
+    // Cost guardrail: bail before any LLM call if today's spend already crossed the cap.
+    check_daily_cost_cap(db_path)?;
+
     // Phase 1: Collect from all sources, filter to freedom_* only
     tracing::info!("Freedoms: Collecting articles...");
     sources::API_CALLS.reset();
@@ -2429,7 +2480,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         tracing::info!("Freedoms: Pre-curating from {} articles...", unique.len());
         let api_key = std::env::var("GROQ_API_KEY")
             .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-        let client = crate::claude::client::GroqClient::new(&api_key)?;
+        let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
         match client.pre_curate_freedoms(&unique).await {
             Ok(indices) => {
                 let curated: Vec<_> = indices.into_iter()
@@ -2454,14 +2505,14 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 3: Summarize
     tracing::info!("Freedoms: Summarizing {} stories...", to_summarize.len());
-    let summaries = crate::claude::summarize_stories(&to_summarize, None).await?;
+    let summaries = crate::claude::summarize_stories(&to_summarize, None, db_path).await?;
     tracing::info!("Freedoms: {} summaries", summaries.len());
 
     // Phase 4: Curate with freedoms prompt
     tracing::info!("Freedoms: Curating...");
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = crate::claude::client::GroqClient::new(&api_key)?;
+    let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 
     // Stratified truncate: take the top 40 from EACH freedom_* sector, then
     // re-sort the union by importance. Whoop and Health articles tend to score
@@ -2495,6 +2546,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     let curation_text = client
         .call(
             "llama-3.3-70b-versatile",
+            "freedoms_analyze",
             crate::claude::prompts::FREEDOMS_ANALYSIS_SYSTEM,
             &user_msg,
             2000,
@@ -2551,7 +2603,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 5.5: Generate executive summary for freedoms (non-fatal)
     tracing::info!("Freedoms: Generating executive summary...");
-    match generate_freedoms_summary(&curated).await {
+    match generate_freedoms_summary(&curated, db_path).await {
         Ok(summary) => {
             if let Ok(conn) = rusqlite::Connection::open(db_path) {
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();

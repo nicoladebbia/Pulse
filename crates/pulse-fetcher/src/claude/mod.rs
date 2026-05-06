@@ -48,7 +48,7 @@ pub struct TrendDetection {
     pub trajectory: String,
 }
 
-pub async fn translate_italian(articles: &[RawArticle]) -> anyhow::Result<Vec<RawArticle>> {
+pub async fn translate_italian(articles: &[RawArticle], db_path: &std::path::Path) -> anyhow::Result<Vec<RawArticle>> {
     let italian: Vec<_> = articles.iter().filter(|a| a.language == "it").collect();
     if italian.is_empty() {
         return Ok(articles.to_vec());
@@ -58,7 +58,7 @@ pub async fn translate_italian(articles: &[RawArticle]) -> anyhow::Result<Vec<Ra
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
 
-    let client = client::GroqClient::new(&api_key)?;
+    let client = client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
     let mut result = articles.to_vec();
 
     let mut translated_count = 0;
@@ -82,10 +82,10 @@ pub async fn translate_italian(articles: &[RawArticle]) -> anyhow::Result<Vec<Ra
     Ok(result)
 }
 
-pub async fn summarize_stories(articles: &[RawArticle], progress: Option<&crate::pipeline::ProgressWriter>) -> anyhow::Result<Vec<SummarizedStory>> {
+pub async fn summarize_stories(articles: &[RawArticle], progress: Option<&crate::pipeline::ProgressWriter>, db_path: &std::path::Path) -> anyhow::Result<Vec<SummarizedStory>> {
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = client::GroqClient::new(&api_key)?;
+    let client = client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 
     let mut summaries = Vec::new();
     let chunks: Vec<_> = articles.chunks(10).collect();
@@ -127,10 +127,10 @@ pub async fn summarize_stories(articles: &[RawArticle], progress: Option<&crate:
     Ok(summaries)
 }
 
-pub async fn analyze_cross_sector(stories: &[SummarizedStory]) -> anyhow::Result<AnalysisResult> {
+pub async fn analyze_cross_sector(stories: &[SummarizedStory], db_path: &std::path::Path) -> anyhow::Result<AnalysisResult> {
     let api_key = std::env::var("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-    let client = client::GroqClient::new(&api_key)?;
+    let client = client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 
     // Sector-balanced selection: ensure each sector has at least 25 stories in the 120-story input
     let mut sorted = stories.to_vec();
