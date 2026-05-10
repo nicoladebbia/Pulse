@@ -95,7 +95,15 @@ pub fn classify_trajectory(window_7d: i64, window_30d: i64, acceleration: f64, d
 /// and upserts into the `signals` table.
 ///
 /// Returns the number of signals upserted.
+///
+/// Performance: rewritten 2026-05-10 from per-topic subqueries to per-metric
+/// GROUP BY. The fetcher-side equivalent was hanging at >25min on real data;
+/// this UI-side path is called less frequently but has the same quadratic
+/// pattern and would be unusable on a grown DB.
 pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
+    use std::collections::HashMap;
+    type Key = (String, String);
+
     let mut stmt = conn.prepare(
         "SELECT e.name, e.sector,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END) AS w7,
@@ -108,7 +116,7 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
          GROUP BY e.name, e.sector",
     )?;
 
-    let rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = stmt
+    let window_rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = stmt
         .query_map(params![today], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -122,8 +130,6 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to query entity mention windows")?;
 
-    let mut count = 0usize;
-
     // Check if source_diversity column exists (added by migration 017)
     let has_source_diversity = {
         let mut pragma = conn.prepare("PRAGMA table_info(signals)")?;
@@ -132,7 +138,107 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
             .any(|r| r.as_deref() == Ok("source_diversity"))
     };
 
-    for (topic, sector, w7, w30, w90, days_active) in &rows {
+    // Helper: load a single-metric GROUP BY into HashMap<(name_normalized, sector_or_empty), f64>.
+    // We key by name_normalized because the per-metric SQL groups on e.name_normalized
+    // (which matches an index), then we link back to (e.name, e.sector) at write time
+    // via the same lower-cased key.
+    let load_metric = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<HashMap<Key, f64>> {
+        let mut s = conn.prepare(sql)?;
+        let rows = s.query_map(p, |row| {
+            let name_norm: String = row.get(0)?;
+            let sector: Option<String> = row.get(1)?;
+            let val: f64 = row.get(2)?;
+            Ok(((name_norm, sector.unwrap_or_default()), val))
+        })?.filter_map(|r| r.ok());
+        Ok(rows.collect())
+    };
+
+    // Per-metric GROUP BY queries (only computed if signal columns exist).
+    let (diversity_map, insider_map, contract_map, lobby_map, reg_count_map, patent_map) =
+        if has_source_diversity {
+            let diversity = load_metric(
+                "SELECT e.name_normalized, e.sector, CAST(COUNT(DISTINCT s.source_name) AS REAL)
+                 FROM entity_mentions em
+                 JOIN entities e ON e.id = em.entity_id
+                 JOIN stories s ON s.id = em.story_id
+                 WHERE em.mentioned_at >= date(?1, '-7 days')
+                 GROUP BY e.name_normalized, e.sector",
+                &[&today],
+            ).unwrap_or_default();
+
+            let insider = load_metric(
+                "SELECT e.name_normalized, e.sector, COALESCE(SUM(
+                    CASE WHEN json_valid(s.financial_metadata)
+                         AND json_extract(s.financial_metadata, '$.filing_type') IN ('4', 'form4')
+                    THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.total_value') AS REAL), 0)
+                         * COALESCE(CAST(json_extract(s.financial_metadata, '$.signal_weight') AS REAL), 0.0)
+                    ELSE 0 END
+                 ), 0)
+                 FROM entity_mentions em
+                 JOIN entities e ON e.id = em.entity_id
+                 JOIN stories s ON s.id = em.story_id
+                 WHERE s.source_type = 'financial' AND em.mentioned_at >= date(?1, '-30 days')
+                 GROUP BY e.name_normalized, e.sector",
+                &[&today],
+            ).unwrap_or_default();
+
+            let contract = load_metric(
+                "SELECT e.name_normalized, e.sector, COALESCE(SUM(
+                    CASE WHEN json_valid(s.financial_metadata) AND s.source_name = 'USASpending'
+                    THEN COALESCE(json_extract(s.financial_metadata, '$.amount'), 0)
+                    ELSE 0 END
+                 ), 0)
+                 FROM entity_mentions em
+                 JOIN entities e ON e.id = em.entity_id
+                 JOIN stories s ON s.id = em.story_id
+                 WHERE s.source_type = 'financial' AND em.mentioned_at >= date(?1, '-90 days')
+                 GROUP BY e.name_normalized, e.sector",
+                &[&today],
+            ).unwrap_or_default();
+
+            let lobby = load_metric(
+                "SELECT e.name_normalized, e.sector, COALESCE(SUM(
+                    CASE WHEN json_valid(s.financial_metadata) AND s.source_name = 'Senate LDA'
+                    THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
+                    ELSE 0 END
+                 ), 0)
+                 FROM entity_mentions em
+                 JOIN entities e ON e.id = em.entity_id
+                 JOIN stories s ON s.id = em.story_id
+                 WHERE s.source_type = 'financial' AND em.mentioned_at >= date(?1, '-90 days')
+                 GROUP BY e.name_normalized, e.sector",
+                &[&today],
+            ).unwrap_or_default();
+
+            let reg_count = load_metric(
+                "SELECT e.name_normalized, e.sector, CAST(COUNT(*) AS REAL)
+                 FROM entity_mentions em
+                 JOIN entities e ON e.id = em.entity_id
+                 JOIN stories s ON s.id = em.story_id
+                 WHERE s.source_name = 'Federal Register' AND em.mentioned_at >= date(?1, '-30 days')
+                 GROUP BY e.name_normalized, e.sector",
+                &[&today],
+            ).unwrap_or_default();
+
+            let patent = load_metric(
+                "SELECT e.name_normalized, e.sector, CAST(COUNT(*) AS REAL)
+                 FROM entity_mentions em
+                 JOIN entities e ON e.id = em.entity_id
+                 JOIN stories s ON s.id = em.story_id
+                 WHERE (s.source_name = 'Google Patents' OR s.source_name = 'USPTO')
+                   AND em.mentioned_at >= date(?1, '-30 days')
+                 GROUP BY e.name_normalized, e.sector",
+                &[&today],
+            ).unwrap_or_default();
+
+            (diversity, insider, contract, lobby, reg_count, patent)
+        } else {
+            Default::default()
+        };
+
+    let mut count = 0usize;
+
+    for (topic, sector, w7, w30, w90, days_active) in &window_rows {
         let acc = compute_acceleration(*w7, *w30);
         let traj = classify_trajectory(*w7, *w30, acc, *days_active);
 
@@ -150,87 +256,14 @@ pub fn recompute_signals(conn: &Connection, today: &str) -> Result<usize> {
         )
         .context("failed to upsert signal")?;
 
-        // Compute source diversity: count distinct source_names mentioning this entity in last 7 days
         if has_source_diversity {
-            let diversity: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT s.source_name) FROM entity_mentions em
-                 JOIN stories s ON em.story_id = s.id
-                 JOIN entities e ON em.entity_id = e.id
-                 WHERE e.name_normalized = LOWER(?1) AND em.mentioned_at >= date(?2, '-7 days')",
-                params![topic, today],
-                |row| row.get(0),
-            ).unwrap_or(0);
-
-            // Insider buy volume — weighted by trade classification signal_weight
-            let insider_vol: f64 = conn.query_row(
-                "SELECT COALESCE(SUM(
-                    CASE WHEN json_valid(s.financial_metadata)
-                         AND json_extract(s.financial_metadata, '$.filing_type') IN ('4', 'form4')
-                    THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.total_value') AS REAL), 0)
-                         * COALESCE(CAST(json_extract(s.financial_metadata, '$.signal_weight') AS REAL), 0.0)
-                    ELSE 0 END
-                ), 0) FROM entity_mentions em
-                JOIN stories s ON em.story_id = s.id
-                JOIN entities e ON em.entity_id = e.id
-                WHERE e.name_normalized = LOWER(?1) AND s.source_type = 'financial'
-                  AND em.mentioned_at >= date(?2, '-30 days')",
-                params![topic, today],
-                |row| row.get(0),
-            ).unwrap_or(0.0);
-
-            let contract_val: f64 = conn.query_row(
-                "SELECT COALESCE(SUM(
-                    CASE WHEN json_valid(s.financial_metadata)
-                         AND s.source_name = 'USASpending'
-                    THEN COALESCE(json_extract(s.financial_metadata, '$.amount'), 0)
-                    ELSE 0 END
-                ), 0) FROM entity_mentions em
-                JOIN stories s ON em.story_id = s.id
-                JOIN entities e ON em.entity_id = e.id
-                WHERE e.name_normalized = LOWER(?1) AND s.source_type = 'financial'
-                  AND em.mentioned_at >= date(?2, '-90 days')",
-                params![topic, today],
-                |row| row.get(0),
-            ).unwrap_or(0.0);
-
-            // Lobbying spend (LDA)
-            let lobby_spend: f64 = conn.query_row(
-                "SELECT COALESCE(SUM(
-                    CASE WHEN json_valid(s.financial_metadata)
-                         AND s.source_name = 'Senate LDA'
-                    THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
-                    ELSE 0 END
-                ), 0) FROM entity_mentions em
-                JOIN stories s ON em.story_id = s.id
-                JOIN entities e ON em.entity_id = e.id
-                WHERE e.name_normalized = LOWER(?1) AND s.source_type = 'financial'
-                  AND em.mentioned_at >= date(?2, '-90 days')",
-                params![topic, today],
-                |row| row.get(0),
-            ).unwrap_or(0.0);
-
-            // Regulatory mentions (Federal Register)
-            let reg_count: f64 = conn.query_row(
-                "SELECT COUNT(*) FROM entity_mentions em
-                 JOIN stories s ON em.story_id = s.id
-                 JOIN entities e ON em.entity_id = e.id
-                 WHERE e.name_normalized = LOWER(?1) AND s.source_name = 'Federal Register'
-                   AND em.mentioned_at >= date(?2, '-30 days')",
-                params![topic, today],
-                |row| row.get::<_, i64>(0),
-            ).unwrap_or(0) as f64;
-
-            // Patent filings (Google Patents)
-            let patent_count: f64 = conn.query_row(
-                "SELECT COUNT(*) FROM entity_mentions em
-                 JOIN stories s ON em.story_id = s.id
-                 JOIN entities e ON em.entity_id = e.id
-                 WHERE e.name_normalized = LOWER(?1)
-                   AND (s.source_name = 'Google Patents' OR s.source_name = 'USPTO')
-                   AND em.mentioned_at >= date(?2, '-30 days')",
-                params![topic, today],
-                |row| row.get::<_, i64>(0),
-            ).unwrap_or(0) as f64;
+            let k: Key = (topic.to_lowercase(), sector.clone().unwrap_or_default());
+            let diversity = diversity_map.get(&k).copied().unwrap_or(0.0) as i64;
+            let insider_vol = insider_map.get(&k).copied().unwrap_or(0.0);
+            let contract_val = contract_map.get(&k).copied().unwrap_or(0.0);
+            let lobby_spend = lobby_map.get(&k).copied().unwrap_or(0.0);
+            let reg_count = reg_count_map.get(&k).copied().unwrap_or(0.0);
+            let patent_count = patent_map.get(&k).copied().unwrap_or(0.0);
 
             conn.execute(
                 "UPDATE signals SET source_diversity = ?1, insider_buy_volume = ?2, contract_value = ?3,

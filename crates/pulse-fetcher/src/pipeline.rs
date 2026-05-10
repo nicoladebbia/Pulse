@@ -532,6 +532,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     }
 
     // Phase 11: Resolve predictions (hybrid router: market/LLM/manual) (non-fatal)
+    progress.update_detail("Resolving predictions", 100.0);
     tracing::info!("Phase 11: Resolving predictions...");
     match validate_and_expire_predictions(db_path).await {
         Ok((resolved, expired)) => {
@@ -549,6 +550,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     }
 
     // Phase 11.5: Entity resolution — merge duplicate entities into canonical records
+    progress.update_detail("Resolving entities to canonical records", 100.0);
     tracing::info!("Phase 11.5: Resolving entities...");
     match resolve_entities(db_path) {
         Ok(count) => {
@@ -560,6 +562,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     }
 
     // Phase 12: Auto-populate ticker mappings + fetch market prices (non-fatal)
+    progress.update_detail("Fetching market prices", 100.0);
     tracing::info!("Phase 12: Fetching market prices...");
     {
         // First populate ticker mappings from SEC data
@@ -583,6 +586,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     }
 
     // Phase 12.5: Recompute entity signals before cross-signal detection
+    progress.update_detail("Recomputing entity signals", 100.0);
     tracing::info!("Phase 12.5: Recomputing entity signals...");
     {
         let conn = rusqlite::Connection::open(db_path)?;
@@ -598,6 +602,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     }
 
     // Phase 13: Cross-signal detection (non-fatal)
+    progress.update_detail("Computing cross-signal scores", 100.0);
     tracing::info!("Phase 13: Computing cross-signal scores...");
     match compute_cross_signals(db_path) {
         Ok(count) => {
@@ -622,6 +627,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     }
 
     // Phase 14: Automated calibration (non-fatal)
+    progress.update_detail("Calibrating signal weights", 100.0);
     tracing::info!("Phase 14: Running signal calibration...");
     match crate::calibration::run_calibration(db_path).await {
         Ok(report) => {
@@ -657,6 +663,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     }
 
     // Phase 14.5: Generate predictions (Sonnet daily, Opus Sunday) (non-fatal)
+    progress.update_detail("Generating predictions", 100.0);
     // Runs AFTER Phase 13 cross-signals are computed so predictions can
     // reference them. See plan .plans/signals-predictions-rework-plan.md Push 2.
     tracing::info!("Phase 14.5: Generating predictions...");
@@ -1779,7 +1786,12 @@ async fn generate_deep_summaries(db_path: &std::path::Path, analysis: &crate::cl
 
     tracing::info!("{} stories qualify for deep analysis", candidates.len());
 
-    let client = reqwest::Client::new();
+    // 60s per-request timeout — without this, a hung Anthropic connection
+    // (e.g. school-network DNS stall) freezes the whole pipeline indefinitely.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut count = 0;
 
     for (story_id, headline, summary, key_facts, why_it_matters, what_to_watch, sector) in &candidates {
@@ -3236,47 +3248,289 @@ fn resolve_ticker_sec(
 /// Recompute all entity signals from entity_mentions data.
 /// Pipeline version — matches src-tauri/src/services/signals.rs::recompute_signals
 /// plus new dimensions (lobbying, regulatory, patent).
+///
+/// Performance: rewritten 2026-05-10 from per-topic subqueries (O(topics × stories))
+/// to per-metric GROUP BY (O(stories) per metric). Was hanging at >25min on 6566
+/// topics × 9 subqueries × full canonical scan. Now ~9 single-pass queries.
 fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyhow::Result<usize> {
+    use std::collections::HashMap;
+
     // Check if entity_canonical table exists for canonical grouping
     let has_canonical: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_canonical')",
         [], |row| row.get(0),
     ).unwrap_or(false);
 
-    // Group by canonical entity when available — merges "NVIDIA Corp" + "Nvidia" + "NVIDIA CORPORATION"
-    let query = if has_canonical {
-        "SELECT COALESCE(ec.canonical_name, e.name) as topic, COALESCE(ec.sector, e.sector) as sector,
-            SUM(CASE WHEN em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END) AS w7,
-            SUM(CASE WHEN em.mentioned_at >= date(?1, '-30 days') THEN 1 ELSE 0 END) AS w30,
-            SUM(CASE WHEN em.mentioned_at >= date(?1, '-90 days') THEN 1 ELSE 0 END) AS w90,
-            COUNT(DISTINCT em.mentioned_at) AS days_active
-         FROM entities e
-         JOIN entity_mentions em ON em.entity_id = e.id
-         LEFT JOIN entity_canonical ec ON ec.id = e.canonical_id
-         WHERE em.mentioned_at >= date(?1, '-90 days')
-         GROUP BY COALESCE(ec.canonical_name, e.name), COALESCE(ec.sector, e.sector)"
+    // Build a temp table mapping entity_id -> (topic, sector). This makes every
+    // downstream metric a simple JOIN on entity_id (indexed) instead of a
+    // COALESCE(...) = ?  predicate that forces a full entities scan per topic.
+    conn.execute_batch("DROP TABLE IF EXISTS temp_topic_map;")?;
+    if has_canonical {
+        conn.execute_batch(
+            "CREATE TEMP TABLE temp_topic_map AS
+             SELECT e.id AS entity_id,
+                    COALESCE(ec.canonical_name, e.name) AS topic,
+                    COALESCE(ec.sector, e.sector) AS sector
+             FROM entities e
+             LEFT JOIN entity_canonical ec ON ec.id = e.canonical_id;
+             CREATE INDEX temp_topic_map_entity ON temp_topic_map(entity_id);
+             CREATE INDEX temp_topic_map_topic ON temp_topic_map(topic, sector);"
+        )?;
     } else {
-        "SELECT e.name, e.sector,
+        conn.execute_batch(
+            "CREATE TEMP TABLE temp_topic_map AS
+             SELECT e.id AS entity_id, e.name AS topic, e.sector AS sector
+             FROM entities e;
+             CREATE INDEX temp_topic_map_entity ON temp_topic_map(entity_id);
+             CREATE INDEX temp_topic_map_topic ON temp_topic_map(topic, sector);"
+        )?;
+    }
+
+    // Stage 1 — window counts (7d/30d/90d) + days_active per (topic, sector).
+    // Single pass over entity_mentions ⋈ temp_topic_map.
+    let mut stmt = conn.prepare(
+        "SELECT tm.topic, tm.sector,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END) AS w7,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-30 days') THEN 1 ELSE 0 END) AS w30,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-90 days') THEN 1 ELSE 0 END) AS w90,
             COUNT(DISTINCT em.mentioned_at) AS days_active
-         FROM entities e
-         JOIN entity_mentions em ON em.entity_id = e.id
+         FROM entity_mentions em
+         JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          WHERE em.mentioned_at >= date(?1, '-90 days')
-         GROUP BY e.name, e.sector"
-    };
+         GROUP BY tm.topic, tm.sector"
+    )?;
 
-    let mut stmt = conn.prepare(query)?;
-
-    let rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = stmt
+    let window_rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = stmt
         .query_map([today], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?
         .filter_map(|r| r.ok())
         .collect();
 
+    // Map (topic, sector) -> aggregated metrics. Sector key is normalized to
+    // empty string so it round-trips through HashMap (we restore Option<String> on write).
+    type Key = (String, String);
+    let key = |t: &str, s: &Option<String>| -> Key {
+        (t.to_string(), s.clone().unwrap_or_default())
+    };
+
+    // Helper: load a single-metric GROUP BY result into a HashMap<Key, f64>.
+    let load_metric = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<HashMap<Key, f64>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params, |row| {
+                let topic: String = row.get(0)?;
+                let sector: Option<String> = row.get(1)?;
+                let val: f64 = row.get(2)?;
+                Ok(((topic, sector.unwrap_or_default()), val))
+            })?
+            .filter_map(|r| r.ok());
+        Ok(rows.collect())
+    };
+
+    // Stage 2 — source diversity (last 7 days). Distinct source_names per topic.
+    let diversity_map: HashMap<Key, f64> = load_metric(
+        "SELECT tm.topic, tm.sector, CAST(COUNT(DISTINCT s.source_name) AS REAL)
+         FROM entity_mentions em
+         JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
+         JOIN stories s ON s.id = em.story_id
+         WHERE em.mentioned_at >= date(?1, '-7 days')
+         GROUP BY tm.topic, tm.sector",
+        &[&today],
+    ).unwrap_or_default();
+
+    // Stage 3 — insider buy volume (Form 4, last 30d), weighted by signal_weight.
+    let insider_map: HashMap<Key, f64> = load_metric(
+        "SELECT tm.topic, tm.sector, COALESCE(SUM(
+            CASE WHEN json_valid(s.financial_metadata)
+                 AND json_extract(s.financial_metadata, '$.filing_type') IN ('4', 'form4')
+            THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.total_value') AS REAL), 0)
+                 * COALESCE(CAST(json_extract(s.financial_metadata, '$.signal_weight') AS REAL), 0.0)
+            ELSE 0 END
+         ), 0)
+         FROM entity_mentions em
+         JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
+         JOIN stories s ON s.id = em.story_id
+         WHERE s.source_type = 'financial'
+           AND em.mentioned_at >= date(?1, '-30 days')
+         GROUP BY tm.topic, tm.sector",
+        &[&today],
+    ).unwrap_or_default();
+
+    // Stage 4 — government contract value (USASpending, last 90d).
+    let contract_map: HashMap<Key, f64> = load_metric(
+        "SELECT tm.topic, tm.sector, COALESCE(SUM(
+            CASE WHEN json_valid(s.financial_metadata)
+                 AND s.source_name LIKE '%USASpending%'
+            THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
+            ELSE 0 END
+         ), 0)
+         FROM entity_mentions em
+         JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
+         JOIN stories s ON s.id = em.story_id
+         WHERE s.source_type = 'financial'
+           AND em.mentioned_at >= date(?1, '-90 days')
+         GROUP BY tm.topic, tm.sector",
+        &[&today],
+    ).unwrap_or_default();
+
+    // Stage 5 — lobbying spend (LDA / Senate, last 90d).
+    let lobby_map: HashMap<Key, f64> = load_metric(
+        "SELECT tm.topic, tm.sector, COALESCE(SUM(
+            CASE WHEN json_valid(s.financial_metadata)
+                 AND (s.source_name LIKE '%LDA%' OR s.source_name LIKE '%Senate%')
+            THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
+            ELSE 0 END
+         ), 0)
+         FROM entity_mentions em
+         JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
+         JOIN stories s ON s.id = em.story_id
+         WHERE s.source_type = 'financial'
+           AND em.mentioned_at >= date(?1, '-90 days')
+         GROUP BY tm.topic, tm.sector",
+        &[&today],
+    ).unwrap_or_default();
+
+    // Stage 6 — Federal Register mentions (last 30d).
+    let reg_count_map: HashMap<Key, f64> = load_metric(
+        "SELECT tm.topic, tm.sector, CAST(COUNT(*) AS REAL)
+         FROM entity_mentions em
+         JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
+         JOIN stories s ON s.id = em.story_id
+         WHERE s.source_name LIKE '%Federal Register%'
+           AND em.mentioned_at >= date(?1, '-30 days')
+         GROUP BY tm.topic, tm.sector",
+        &[&today],
+    ).unwrap_or_default();
+
+    // Stage 7 — patent filings (USPTO / Google Patents, last 30d).
+    let patent_map: HashMap<Key, f64> = load_metric(
+        "SELECT tm.topic, tm.sector, CAST(COUNT(*) AS REAL)
+         FROM entity_mentions em
+         JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
+         JOIN stories s ON s.id = em.story_id
+         WHERE (s.source_name = 'USPTO' OR s.source_name = 'Google Patents')
+           AND em.mentioned_at >= date(?1, '-30 days')
+         GROUP BY tm.topic, tm.sector",
+        &[&today],
+    ).unwrap_or_default();
+
+    // Stage 8 — 8-K event severity (max severity, last 14d).
+    let event_severity_map: HashMap<Key, f64> = load_metric(
+        "SELECT tm.topic, tm.sector, COALESCE(MAX(
+            CASE WHEN json_valid(s.financial_metadata)
+                 AND json_extract(s.financial_metadata, '$.event_severity') IS NOT NULL
+            THEN CAST(json_extract(s.financial_metadata, '$.event_severity') AS REAL)
+            ELSE 0 END
+         ), 0)
+         FROM entity_mentions em
+         JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
+         JOIN stories s ON s.id = em.story_id
+         WHERE s.source_name LIKE '%EDGAR 8-K%'
+           AND em.mentioned_at >= date(?1, '-14 days')
+         GROUP BY tm.topic, tm.sector",
+        &[&today],
+    ).unwrap_or_default();
+
+    // Stage 9 — Wikipedia search-trend delta (last 7d).
+    let search_map: HashMap<Key, f64> = load_metric(
+        "SELECT tm.topic, tm.sector, COALESCE(SUM(
+            CASE WHEN json_valid(s.financial_metadata)
+                 AND s.source_name = 'Wikipedia Pageviews'
+            THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.views_delta_pct') AS REAL), 0)
+            ELSE 0 END
+         ), 0)
+         FROM entity_mentions em
+         JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
+         JOIN stories s ON s.id = em.story_id
+         WHERE s.source_type = 'financial'
+           AND em.mentioned_at >= date(?1, '-7 days')
+         GROUP BY tm.topic, tm.sector",
+        &[&today],
+    ).unwrap_or_default();
+
+    // Stage 10 — institutional flow (13F filings). Parse all 13F holdings JSON
+    // ONCE upfront, build issuer-name index, then look up per topic.
+    let inst_flow_map: HashMap<Key, f64> = {
+        let mut stmt = conn.prepare(
+            "SELECT s.financial_metadata FROM stories s
+             WHERE s.source_name LIKE '%13F%'
+               AND s.financial_metadata IS NOT NULL
+               AND json_valid(s.financial_metadata)
+               AND json_extract(s.financial_metadata, '$.holdings') IS NOT NULL
+               AND s.published_at >= date(?1, '-90 days')"
+        )?;
+
+        let metadata_rows: Vec<String> = stmt.query_map([today], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Pre-extract normalized issuer names per filing.
+        let normalize = |s: &str| -> String {
+            s.to_uppercase()
+                .replace(" INC", "").replace(" CORP", "").replace(" CO", "")
+                .replace(" LTD", "").replace(" LLC", "").replace(" PLC", "")
+                .replace(",", "").replace(".", "").trim().to_string()
+        };
+
+        // Per filing: set of normalized issuer names it holds.
+        let filings_issuers: Vec<std::collections::HashSet<String>> = metadata_rows.iter()
+            .filter_map(|md_str| serde_json::from_str::<serde_json::Value>(md_str).ok())
+            .map(|md| {
+                md.get("holdings")
+                    .and_then(|h| h.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|h| h.get("issuer").and_then(|i| i.as_str()).map(normalize))
+                        .collect::<std::collections::HashSet<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        // For each (topic, sector), count filings whose normalized issuer set
+        // matches (substring either way). This is still O(topics × filings) but
+        // the inner work is set lookup not SQL — typically a few hundred filings.
+        let topic_keys: Vec<(String, Option<String>)> = window_rows.iter()
+            .map(|(t, s, _, _, _, _)| (t.clone(), s.clone()))
+            .collect();
+
+        let mut map: HashMap<Key, f64> = HashMap::new();
+        for (topic, sector) in &topic_keys {
+            let topic_norm = normalize(topic);
+            if topic_norm.is_empty() { continue; }
+            let mut count = 0i64;
+            for issuer_set in &filings_issuers {
+                let hit = issuer_set.iter().any(|issuer_norm| {
+                    issuer_norm == &topic_norm
+                        || issuer_norm.contains(&topic_norm)
+                        || topic_norm.contains(issuer_norm)
+                });
+                if hit { count += 1; }
+            }
+            if count > 0 {
+                map.insert(key(topic, sector), count as f64);
+            }
+        }
+        map
+    };
+
+    // Stage 11 — sector-level FRED indicator (single value, applied to all rows).
+    let import_delta: f64 = conn.query_row(
+        "SELECT COALESCE(AVG(ABS(
+            CAST(json_extract(s.financial_metadata, '$.change_pct') AS REAL)
+         )), 0)
+         FROM stories s
+         WHERE s.source_name = 'FRED'
+           AND json_valid(s.financial_metadata)
+           AND json_extract(s.financial_metadata, '$.series_id') IN ('INDPRO', 'PPIACO', 'DCOILWTICO')
+           AND s.created_at >= datetime('now', '-7 days')",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(0.0);
+
+    // Final write — single transaction, two SQL statements per topic
+    // (upsert windows + update metrics). All metric lookups are O(1).
+    let tx = conn.unchecked_transaction()?;
     let mut count = 0usize;
 
-    for (topic, sector, w7, w30, w90, days_active) in &rows {
+    for (topic, sector, w7, w30, w90, days_active) in &window_rows {
         let rate_7d = *w7 as f64 / 7.0;
         let rate_30d = *w30 as f64 / 30.0;
         let acc = if *w30 == 0 { if *w7 > 0 { 10.0 } else { 0.0 } }
@@ -3292,7 +3546,7 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
             else if *w7 > 0 { "rising" }
             else { "dormant" };
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
              ON CONFLICT(topic, sector) DO UPDATE SET
@@ -3302,203 +3556,21 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
             rusqlite::params![topic, sector, w7, w30, w90, acc, traj],
         ).ok();
 
-        // Build entity match clause: match by canonical group if available, else by name
-        // This ensures all variants (NVIDIA Corp, Nvidia, NVIDIA CORPORATION) contribute to one signal
-        let entity_match_clause = if has_canonical {
-            "e.id IN (SELECT e2.id FROM entities e2 LEFT JOIN entity_canonical ec2 ON ec2.id = e2.canonical_id WHERE COALESCE(ec2.canonical_name, e2.name) = ?1)"
-        } else {
-            "LOWER(e.name) = LOWER(?1)"
-        };
-
-        // Source diversity — count distinct source_names across ALL linked entities
-        let diversity: i64 = conn.query_row(
-            &format!("SELECT COUNT(DISTINCT s.source_name) FROM entity_mentions em
-             JOIN stories s ON em.story_id = s.id
-             JOIN entities e ON em.entity_id = e.id
-             WHERE {} AND em.mentioned_at >= date(?2, '-7 days')", entity_match_clause),
-            rusqlite::params![topic, today],
-            |row| row.get(0),
-        ).unwrap_or(0);
-
-        // Insider buy volume (SEC Form 4) — weighted by trade classification
-        // Uses signal_weight from classify_insider_trade: strong_buy=1.0, moderate=0.6-0.7, sale=-0.3
-        let insider_vol: f64 = conn.query_row(
-            &format!("SELECT COALESCE(SUM(
-                CASE WHEN json_valid(s.financial_metadata)
-                     AND json_extract(s.financial_metadata, '$.filing_type') IN ('4', 'form4')
-                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.total_value') AS REAL), 0)
-                     * COALESCE(CAST(json_extract(s.financial_metadata, '$.signal_weight') AS REAL), 0.0)
-                ELSE 0 END
-            ), 0) FROM entity_mentions em
-            JOIN stories s ON em.story_id = s.id
-            JOIN entities e ON em.entity_id = e.id
-            WHERE {} AND s.source_type = 'financial'
-              AND em.mentioned_at >= date(?2, '-30 days')", entity_match_clause),
-            rusqlite::params![topic, today],
-            |row| row.get(0),
-        ).unwrap_or(0.0);
-
-        // Government contract value (USASpending)
-        let contract_val: f64 = conn.query_row(
-            &format!("SELECT COALESCE(SUM(
-                CASE WHEN json_valid(s.financial_metadata)
-                     AND s.source_name LIKE '%USASpending%'
-                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
-                ELSE 0 END
-            ), 0) FROM entity_mentions em
-            JOIN stories s ON em.story_id = s.id
-            JOIN entities e ON em.entity_id = e.id
-            WHERE {} AND s.source_type = 'financial'
-              AND em.mentioned_at >= date(?2, '-90 days')", entity_match_clause),
-            rusqlite::params![topic, today],
-            |row| row.get(0),
-        ).unwrap_or(0.0);
-
-        // Lobbying spend (LDA)
-        let lobby_spend: f64 = conn.query_row(
-            &format!("SELECT COALESCE(SUM(
-                CASE WHEN json_valid(s.financial_metadata)
-                     AND (s.source_name LIKE '%LDA%' OR s.source_name LIKE '%Senate%')
-                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.amount') AS REAL), 0)
-                ELSE 0 END
-            ), 0) FROM entity_mentions em
-            JOIN stories s ON em.story_id = s.id
-            JOIN entities e ON em.entity_id = e.id
-            WHERE {} AND s.source_type = 'financial'
-              AND em.mentioned_at >= date(?2, '-90 days')", entity_match_clause),
-            rusqlite::params![topic, today],
-            |row| row.get(0),
-        ).unwrap_or(0.0);
-
-        // Regulatory mentions (Federal Register)
-        let reg_count: f64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM entity_mentions em
-             JOIN stories s ON em.story_id = s.id
-             JOIN entities e ON em.entity_id = e.id
-             WHERE {} AND s.source_name LIKE '%Federal Register%'
-               AND em.mentioned_at >= date(?2, '-30 days')", entity_match_clause),
-            rusqlite::params![topic, today],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as f64;
-
-        // Patent filings (Google Patents or USPTO)
-        let patent_count: f64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM entity_mentions em
-             JOIN stories s ON em.story_id = s.id
-             JOIN entities e ON em.entity_id = e.id
-             WHERE {} AND (s.source_name = 'USPTO' OR s.source_name = 'Google Patents')
-               AND em.mentioned_at >= date(?2, '-30 days')", entity_match_clause),
-            rusqlite::params![topic, today],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as f64;
-
-        // 8-K event severity — max severity from recent 8-K filings for this entity
-        // Positive = bullish events (acquisition, earnings), Negative = bearish (impairment, delisting)
-        let event_severity_boost: f64 = conn.query_row(
-            &format!("SELECT COALESCE(MAX(
-                CASE WHEN json_valid(s.financial_metadata)
-                     AND json_extract(s.financial_metadata, '$.event_severity') IS NOT NULL
-                THEN CAST(json_extract(s.financial_metadata, '$.event_severity') AS REAL)
-                ELSE 0 END
-            ), 0) FROM entity_mentions em
-            JOIN stories s ON em.story_id = s.id
-            JOIN entities e ON em.entity_id = e.id
-            WHERE {} AND s.source_name LIKE '%EDGAR 8-K%'
-              AND em.mentioned_at >= date(?2, '-14 days')", entity_match_clause),
-            rusqlite::params![topic, today],
-            |row| row.get(0),
-        ).unwrap_or(0.0);
+        let k = key(topic, sector);
+        let diversity = diversity_map.get(&k).copied().unwrap_or(0.0) as i64;
+        let insider_vol = insider_map.get(&k).copied().unwrap_or(0.0);
+        let contract_val = contract_map.get(&k).copied().unwrap_or(0.0);
+        let lobby_spend = lobby_map.get(&k).copied().unwrap_or(0.0);
+        let reg_count = reg_count_map.get(&k).copied().unwrap_or(0.0);
+        let patent_count = patent_map.get(&k).copied().unwrap_or(0.0);
+        let event_boost = event_severity_map.get(&k).copied().unwrap_or(0.0);
+        let inst_flow = inst_flow_map.get(&k).copied().unwrap_or(0.0);
+        let search_delta = search_map.get(&k).copied().unwrap_or(0.0);
 
         // Composite regulatory_sentiment: Fed Reg count + 8-K event boost
-        // (regulatory_sentiment feeds into government_signal normalization)
-        let reg_composite = reg_count + (event_severity_boost * 3.0); // 8-K severity scaled to same range
+        let reg_composite = reg_count + (event_boost * 3.0);
 
-        // Institutional flow — count distinct 13F filers holding this entity's stock
-        // Parses holdings JSON from 13F financial_metadata to match by issuer name
-        let inst_flow: f64 = {
-            let topic_upper = topic.to_uppercase();
-            // Normalize: strip common suffixes for matching
-            let topic_normalized = topic_upper
-                .replace(" INC", "").replace(" CORP", "").replace(" CO", "")
-                .replace(" LTD", "").replace(" LLC", "").replace(" PLC", "")
-                .replace(",", "").replace(".", "").trim().to_string();
-
-            let mut stmt = conn.prepare(
-                "SELECT s.financial_metadata FROM stories s
-                 WHERE s.source_name LIKE '%13F%'
-                   AND s.financial_metadata IS NOT NULL
-                   AND json_valid(s.financial_metadata)
-                   AND json_extract(s.financial_metadata, '$.holdings') IS NOT NULL
-                   AND s.published_at >= date(?1, '-90 days')"
-            ).ok();
-
-            let mut holder_count = 0i64;
-            if let Some(ref mut stmt) = stmt {
-                let rows: Vec<String> = stmt.query_map(
-                    rusqlite::params![today],
-                    |row| row.get::<_, String>(0),
-                ).ok()
-                    .map(|iter| iter.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default();
-
-                for metadata_str in &rows {
-                    if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(metadata_str) {
-                        if let Some(holdings) = metadata.get("holdings").and_then(|h| h.as_array()) {
-                            let holds_entity = holdings.iter().any(|h| {
-                                if let Some(issuer) = h.get("issuer").and_then(|i| i.as_str()) {
-                                    let issuer_norm = issuer.to_uppercase()
-                                        .replace(" INC", "").replace(" CORP", "").replace(" CO", "")
-                                        .replace(" LTD", "").replace(" LLC", "").replace(" PLC", "")
-                                        .replace(",", "").replace(".", "").trim().to_string();
-                                    issuer_norm == topic_normalized
-                                        || issuer_norm.contains(&topic_normalized)
-                                        || topic_normalized.contains(&issuer_norm)
-                                } else {
-                                    false
-                                }
-                            });
-                            if holds_entity {
-                                holder_count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            holder_count as f64
-        };
-
-        // Search trend — Wikipedia page views as proxy for search interest
-        // Count of Wikipedia-sourced mentions (populated by fetch_wikipedia_pageviews)
-        let search_delta: f64 = conn.query_row(
-            &format!("SELECT COALESCE(SUM(
-                CASE WHEN json_valid(s.financial_metadata)
-                     AND s.source_name = 'Wikipedia Pageviews'
-                THEN COALESCE(CAST(json_extract(s.financial_metadata, '$.views_delta_pct') AS REAL), 0)
-                ELSE 0 END
-            ), 0) FROM entity_mentions em
-            JOIN stories s ON em.story_id = s.id
-            JOIN entities e ON em.entity_id = e.id
-            WHERE {} AND s.source_type = 'financial'
-              AND em.mentioned_at >= date(?2, '-7 days')", entity_match_clause),
-            rusqlite::params![topic, today],
-            |row| row.get(0),
-        ).unwrap_or(0.0);
-
-        // Supply chain — market-wide FRED indicators (PPI, Industrial Production, etc.)
-        // These are sector-level signals, not per-entity. Use absolute change_pct as signal strength.
-        let import_delta: f64 = conn.query_row(
-            "SELECT COALESCE(AVG(ABS(
-                CAST(json_extract(s.financial_metadata, '$.change_pct') AS REAL)
-            )), 0) FROM stories s
-            WHERE s.source_name = 'FRED'
-              AND json_valid(s.financial_metadata)
-              AND json_extract(s.financial_metadata, '$.series_id') IN ('INDPRO', 'PPIACO', 'DCOILWTICO')
-              AND s.created_at >= datetime('now', '-7 days')",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0.0);
-
-        conn.execute(
+        tx.execute(
             "UPDATE signals SET source_diversity = ?1, insider_buy_volume = ?2, contract_value = ?3,
                  lobbying_spend_delta = ?4, regulatory_sentiment = ?5, patent_filing_rate = ?6,
                  institutional_flow = ?7, search_trend_delta = ?8, import_volume_delta = ?9
@@ -3509,6 +3581,9 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
 
         count += 1;
     }
+
+    tx.commit()?;
+    conn.execute_batch("DROP TABLE IF EXISTS temp_topic_map;").ok();
 
     Ok(count)
 }
