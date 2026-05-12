@@ -18,6 +18,7 @@ const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_resolut
 const MIGRATION_019: &str = include_str!("../../../migrations/019_position_management.sql");
 const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.sql");
 const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
+const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_fts_porter.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -251,10 +252,11 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
             CREATE VIRTUAL TABLE stories_fts USING fts5(
                 headline, summary, key_facts, why_it_matters, context_prefix,
                 content='stories',
-                content_rowid='id'
+                content_rowid='id',
+                tokenize='porter unicode61'
             );
             INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                SELECT id, headline, summary, key_facts, why_it_matters, context_prefix FROM stories;
+                SELECT id, headline, summary, key_facts, why_it_matters, COALESCE(context_prefix, '') FROM stories;
 
             DROP TRIGGER IF EXISTS stories_fts_insert;
             DROP TRIGGER IF EXISTS stories_fts_delete;
@@ -262,19 +264,19 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
 
             CREATE TRIGGER stories_fts_insert AFTER INSERT ON stories BEGIN
                 INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, COALESCE(NEW.context_prefix, ''));
             END;
 
             CREATE TRIGGER stories_fts_delete AFTER DELETE ON stories BEGIN
                 INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, COALESCE(OLD.context_prefix, ''));
             END;
 
             CREATE TRIGGER stories_fts_update AFTER UPDATE ON stories BEGIN
                 INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+                VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, COALESCE(OLD.context_prefix, ''));
                 INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
-                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+                VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, COALESCE(NEW.context_prefix, ''));
             END;"
         )?;
 
@@ -498,6 +500,18 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_023)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (23)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 24: Rebuild stories_fts with porter unicode61 tokenizer, drop
+    // orphan triggers (stories_ai/_ad/_au from migration 005) and orphan index
+    // (idx_signals_topic from migration 003). Both the Tauri app and this
+    // fetcher run this migration — whichever opens the DB first applies it.
+    // See migration file header for full audit context (findings #32-#35).
+    if !applied.contains(&24) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_024)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (24)", [])?;
         tx.commit()?;
     }
 

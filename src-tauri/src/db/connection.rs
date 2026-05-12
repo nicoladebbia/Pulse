@@ -28,6 +28,7 @@ pub const MIGRATION_020: &str = include_str!("../../../migrations/020_performanc
 pub const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.sql");
 pub const MIGRATION_022: &str = include_str!("../../../migrations/022_predictions_v2.sql");
 pub const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
+pub const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_fts_porter.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -574,6 +575,17 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
 
+    // Migration 24: Rebuild stories_fts with porter unicode61 tokenizer, drop
+    // orphan triggers (stories_ai/_ad/_au from migration 005) and orphan index
+    // (idx_signals_topic from migration 003). See migration file header for
+    // full audit context (findings #32-#35).
+    if !applied.contains(&24) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_024)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (24)", [])?;
+        tx.commit()?;
+    }
+
     // Ensure critical indexes exist (idempotent — some were lost by table rebuilds in earlier migrations)
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_freedom_stories_bf ON freedom_stories(briefing_id, freedom, display_order);
@@ -591,4 +603,209 @@ pub fn initialize_in_memory() -> Result<Connection> {
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     run_migrations(&conn)?;
     Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Migration 024 must result in stories_fts using porter unicode61.
+    #[test]
+    fn migration_024_uses_porter_tokenizer() {
+        let conn = initialize_in_memory().expect("init in-memory DB");
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='stories_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query stories_fts schema");
+        assert!(
+            sql.contains("porter unicode61"),
+            "stories_fts should use porter unicode61 tokenizer, got: {}",
+            sql
+        );
+    }
+
+    /// Migration 024 must leave exactly 3 stories triggers (insert/delete/update)
+    /// and no orphans (stories_ai/_ad/_au from migration 005).
+    #[test]
+    fn migration_024_drops_orphan_triggers() {
+        let conn = initialize_in_memory().expect("init in-memory DB");
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='stories' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            names,
+            vec![
+                "stories_fts_delete".to_string(),
+                "stories_fts_insert".to_string(),
+                "stories_fts_update".to_string(),
+            ],
+            "expected exactly the 3 fts triggers; got: {:?}",
+            names
+        );
+    }
+
+    /// Migration 024 must drop the orphan idx_signals_topic from migration 003.
+    #[test]
+    fn migration_024_drops_orphan_index() {
+        let conn = initialize_in_memory().expect("init in-memory DB");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_signals_topic'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query idx_signals_topic");
+        assert_eq!(count, 0, "idx_signals_topic should be dropped, found {}", count);
+    }
+
+    /// Upgrade path: simulate a DB that has the migration-17 bugs in place
+    /// (FTS without porter tokenizer + orphan stories_ai/_ad/_au triggers +
+    /// orphan idx_signals_topic), record migrations 1-23 as applied, then run
+    /// migrations. Migration 024 should run exactly once and fix everything.
+    #[test]
+    fn migration_024_upgrade_path_fixes_buggy_state() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+        // First, bring the DB up to migration 23 the normal way.
+        run_migrations(&conn).expect("initial migrations");
+
+        // Now simulate the pre-024 buggy state: replace stories_fts with one
+        // that has the default tokenizer, and add the orphan stories_ai/_ad/_au
+        // triggers ALONGSIDE the existing fts_insert/_delete/_update triggers
+        // (production state after migration 017 ran). Also add orphan
+        // idx_signals_topic. Then DELETE the 024 marker so it re-runs.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS stories_fts_insert;
+             DROP TRIGGER IF EXISTS stories_fts_delete;
+             DROP TRIGGER IF EXISTS stories_fts_update;
+             DROP TABLE IF EXISTS stories_fts;
+             CREATE VIRTUAL TABLE stories_fts USING fts5(
+                 headline, summary, key_facts, why_it_matters, context_prefix,
+                 content='stories', content_rowid='id'
+             );
+             CREATE TRIGGER stories_ai AFTER INSERT ON stories BEGIN
+                 INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                 VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+             END;
+             CREATE TRIGGER stories_ad AFTER DELETE ON stories BEGIN
+                 INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                 VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+             END;
+             CREATE TRIGGER stories_au AFTER UPDATE ON stories BEGIN
+                 INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                 VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+                 INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                 VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+             END;
+             CREATE TRIGGER stories_fts_insert AFTER INSERT ON stories BEGIN
+                 INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                 VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+             END;
+             CREATE TRIGGER stories_fts_delete AFTER DELETE ON stories BEGIN
+                 INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                 VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+             END;
+             CREATE TRIGGER stories_fts_update AFTER UPDATE ON stories BEGIN
+                 INSERT INTO stories_fts(stories_fts, rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                 VALUES ('delete', OLD.id, OLD.headline, OLD.summary, OLD.key_facts, OLD.why_it_matters, OLD.context_prefix);
+                 INSERT INTO stories_fts(rowid, headline, summary, key_facts, why_it_matters, context_prefix)
+                 VALUES (NEW.id, NEW.headline, NEW.summary, NEW.key_facts, NEW.why_it_matters, NEW.context_prefix);
+             END;
+             CREATE INDEX IF NOT EXISTS idx_signals_topic ON signals(topic, sector);
+             DELETE FROM schema_migrations WHERE version = 24;"
+        ).expect("inject buggy state");
+
+        // Sanity check — confirm the buggy state actually got installed.
+        let sql_before: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='stories_fts'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(!sql_before.contains("porter unicode61"), "pre-test setup failed");
+
+        let trigger_count_before: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='stories'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(trigger_count_before, 6, "should have 6 triggers in buggy state (3 fts + 3 orphan)");
+
+        // Now run migrations again — migration 024 should fix everything.
+        run_migrations(&conn).expect("upgrade-path migration");
+
+        // Verify the fix
+        let sql_after: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='stories_fts'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(sql_after.contains("porter unicode61"), "FTS should have porter after 024");
+
+        let trigger_count_after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='stories'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(trigger_count_after, 3, "should have exactly 3 fts triggers after 024");
+
+        let idx_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_signals_topic'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(idx_count, 0, "idx_signals_topic should be dropped");
+
+        // And migration 024 should now be recorded as applied
+        let applied_24: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = 24",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(applied_24, 1, "migration 024 should be recorded once");
+    }
+
+    /// Porter stemming proof: "running" in headline must match a search for "runs".
+    #[test]
+    fn migration_024_porter_stemming_works() {
+        let conn = initialize_in_memory().expect("init in-memory DB");
+
+        // Seed a minimal briefing + story
+        conn.execute(
+            "INSERT INTO briefings (date, story_count, ai_count, miami_count, italy_count, tech_count, status)
+             VALUES ('2026-05-12', 1, 1, 0, 0, 0, 'complete')",
+            [],
+        ).unwrap();
+        let briefing_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO stories (
+                briefing_id, sector, original_title, original_url, source_name,
+                headline, summary, key_facts, why_it_matters, what_to_watch,
+                url_hash, title_hash
+            ) VALUES (?1, 'tech', 'Test', 'https://example.com/test', 'TestSrc',
+                      'OpenAI is running new experiments', 'Summary', '[]', 'Why', 'Watch',
+                      'h', 't')",
+            rusqlite::params![briefing_id],
+        ).unwrap();
+
+        // Search for "runs" — porter stemming should match "running"
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stories_fts WHERE stories_fts MATCH 'runs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts match");
+        assert!(
+            hits >= 1,
+            "porter stemming should match 'running' on a search for 'runs', got {} hits",
+            hits
+        );
+    }
 }
