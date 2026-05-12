@@ -8,7 +8,7 @@
 	import StoryExpanded from '$lib/components/stories/StoryExpanded.svelte';
 	import type { Story, BriefingWithStories, StoryTrendBadge } from '$lib/tauri/types';
 	import { isTauri, mockBriefingData } from '$lib/tauri/mock';
-	import { getStoryTrendBadges } from '$lib/tauri/commands';
+	import { getStoryTrendBadges, safeInvoke } from '$lib/tauri/commands';
 	import { isFetching, fetchDone } from '$lib/stores/fetch';
 	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
 
@@ -50,23 +50,20 @@
 				return;
 			}
 
-			const ipc = (window as any).__TAURI_INTERNALS__;
-			const result = await Promise.race([
-				ipc.invoke('get_today_briefing'),
-				new Promise((_, rej) => setTimeout(() => rej(new Error('Timed out loading briefing')), 10000))
+			const briefing = await Promise.race([
+				safeInvoke<BriefingWithStories | null>('get_today_briefing'),
+				new Promise<null>((_, rej) => setTimeout(() => rej(new Error('Timed out loading briefing')), 10000))
 			]);
 
-			currentBriefing.set(result as BriefingWithStories | null);
+			currentBriefing.set(briefing);
 
 			// Load trend badges for stories
-			const briefing = result as BriefingWithStories | null;
 			if (briefing?.stories?.length) {
 				const ids = briefing.stories.map(s => s.id);
-				getStoryTrendBadges(ids).then(badges => {
-					const map = new Map<number, StoryTrendBadge>();
-					for (const b of badges) map.set(b.story_id, b);
-					trendBadges = map;
-				}).catch(() => {});
+				const badges = await safeInvoke<StoryTrendBadge[]>('get_story_trend_badges', { storyIds: ids }, []);
+				const map = new Map<number, StoryTrendBadge>();
+				for (const b of badges) map.set(b.story_id, b);
+				trendBadges = map;
 			}
 		} catch (e: any) {
 			loadError = String(e?.message ?? e);

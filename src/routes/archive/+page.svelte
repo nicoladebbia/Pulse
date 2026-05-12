@@ -6,6 +6,7 @@
 	import { SECTORS, type SectorId } from '$lib/config';
 	import type { BriefingWithStories, Briefing, Story, FreedomsBriefing } from '$lib/tauri/types';
 	import { isTauri, mockArchiveBriefings, mockBriefingData, mockFreedomsBriefing } from '$lib/tauri/mock';
+	import { safeInvoke } from '$lib/tauri/commands';
 
 	let briefings = $state<Briefing[]>([]);
 	let selectedBriefing = $state<BriefingWithStories | null>(null);
@@ -26,51 +27,47 @@
 	async function loadArchive() {
 		loading = true;
 		error = null;
-		try {
-			if (!isTauri()) {
-				briefings = mockArchiveBriefings;
-				return;
-			}
-			const ipc = (window as any).__TAURI_INTERNALS__;
-			briefings = await ipc.invoke('list_briefings');
-		} catch (e: any) {
-			error = String(e?.message ?? e);
-		} finally {
+		if (!isTauri()) {
+			briefings = mockArchiveBriefings;
 			loading = false;
+			return;
 		}
+		const result = await safeInvoke<Briefing[]>('list_briefings');
+		if (result === null) {
+			error = 'Failed to load archive';
+		} else {
+			briefings = result;
+		}
+		loading = false;
 	}
 
 	async function selectDaily(briefingId: number) {
-		try {
-			if (!isTauri()) {
-				selectedBriefing = mockBriefingData;
-				selectedFreedoms = null;
-				viewMode = 'daily';
-				return;
-			}
-			const ipc = (window as any).__TAURI_INTERNALS__;
-			selectedBriefing = await ipc.invoke('get_briefing_by_id', { briefingId });
+		if (!isTauri()) {
+			selectedBriefing = mockBriefingData;
 			selectedFreedoms = null;
 			viewMode = 'daily';
-		} catch (e) {
-			console.error('Failed to load briefing:', e);
+			return;
+		}
+		const result = await safeInvoke<BriefingWithStories>('get_briefing_by_id', { briefingId });
+		if (result) {
+			selectedBriefing = result;
+			selectedFreedoms = null;
+			viewMode = 'daily';
 		}
 	}
 
 	async function selectFreedoms(date: string) {
-		try {
-			if (!isTauri()) {
-				selectedFreedoms = mockFreedomsBriefing;
-				selectedBriefing = null;
-				viewMode = 'freedoms';
-				return;
-			}
-			const ipc = (window as any).__TAURI_INTERNALS__;
-			selectedFreedoms = await ipc.invoke('get_freedoms_by_date', { date });
+		if (!isTauri()) {
+			selectedFreedoms = mockFreedomsBriefing;
 			selectedBriefing = null;
 			viewMode = 'freedoms';
-		} catch (e) {
-			console.error('Failed to load freedoms:', e);
+			return;
+		}
+		const result = await safeInvoke<FreedomsBriefing>('get_freedoms_by_date', { date });
+		if (result) {
+			selectedFreedoms = result;
+			selectedBriefing = null;
+			viewMode = 'freedoms';
 		}
 	}
 

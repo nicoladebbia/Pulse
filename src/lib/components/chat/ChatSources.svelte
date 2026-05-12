@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { expandedStoryId } from '$lib/stores/briefing';
-	import { getStoryHeadlines } from '$lib/tauri/commands';
+	import { getStoryHeadlines, safeCall } from '$lib/tauri/commands';
 	import { isTauri } from '$lib/tauri/mock';
 	import { SECTORS, type SectorId } from '$lib/config';
 	import type { StoryHeadline } from '$lib/tauri/types';
@@ -30,7 +30,7 @@
 		loaded = true;
 
 		if (isTauri()) {
-			getStoryHeadlines(validIds).then(h => { headlines = h; }).catch(() => {});
+			safeCall(() => getStoryHeadlines(validIds), []).then(h => { headlines = h; });
 		}
 	});
 

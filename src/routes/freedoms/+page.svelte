@@ -3,6 +3,7 @@
 	import type { FreedomsBriefing, FreedomStory } from '$lib/tauri/types';
 	import { FREEDOM_CONFIG, FREEDOM_ORDER } from '$lib/config';
 	import { isTauri, mockFreedomsBriefing } from '$lib/tauri/mock';
+	import { safeInvoke } from '$lib/tauri/commands';
 
 	let briefing = $state<FreedomsBriefing | null>(null);
 	let isLoading = $state(true);
@@ -52,23 +53,17 @@
 	async function loadFreedoms() {
 		isLoading = true;
 		error = null;
-		try {
-			if (!isTauri()) {
-				briefing = mockFreedomsBriefing;
-				return;
-			}
-			const ipc = (window as any).__TAURI_INTERNALS__;
-			if (selectedDate === todayStr()) {
-				briefing = await ipc.invoke('get_today_freedoms');
-			} else {
-				briefing = await ipc.invoke('get_freedoms_by_date', { date: selectedDate });
-			}
-		} catch (e: any) {
-			error = String(e?.message ?? e);
-			briefing = null;
-		} finally {
+		if (!isTauri()) {
+			briefing = mockFreedomsBriefing;
 			isLoading = false;
+			return;
 		}
+		const result = selectedDate === todayStr()
+			? await safeInvoke<FreedomsBriefing>('get_today_freedoms')
+			: await safeInvoke<FreedomsBriefing>('get_freedoms_by_date', { date: selectedDate });
+		briefing = result;
+		if (result === null) error = 'Failed to load freedoms';
+		isLoading = false;
 	}
 
 	let totalStories = $derived(

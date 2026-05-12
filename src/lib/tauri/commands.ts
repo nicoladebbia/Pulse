@@ -1,5 +1,27 @@
-import { invoke, Channel } from '@tauri-apps/api/core';
+import { invoke, Channel, type InvokeArgs } from '@tauri-apps/api/core';
 import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus } from './types';
+
+export function safeInvoke<T>(cmd: string, args?: InvokeArgs): Promise<T | null>;
+export function safeInvoke<T>(cmd: string, args: InvokeArgs | undefined, fallback: T): Promise<T>;
+export async function safeInvoke<T>(cmd: string, args?: InvokeArgs, fallback?: T): Promise<T | null> {
+	try {
+		return await invoke<T>(cmd, args);
+	} catch (err) {
+		console.error(`[invoke ${cmd} failed]`, err);
+		return fallback ?? null;
+	}
+}
+
+export function safeCall<T>(fn: () => Promise<T>): Promise<T | null>;
+export function safeCall<T>(fn: () => Promise<T>, fallback: T): Promise<T>;
+export async function safeCall<T>(fn: () => Promise<T>, fallback?: T): Promise<T | null> {
+	try {
+		return await fn();
+	} catch (err) {
+		console.error('[safeCall failed]', err);
+		return fallback ?? null;
+	}
+}
 
 export async function getTodayBriefing(): Promise<BriefingWithStories | null> {
 	return invoke('get_today_briefing');
