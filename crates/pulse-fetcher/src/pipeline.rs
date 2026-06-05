@@ -3025,7 +3025,18 @@ fn record_financial_dedup(db_path: &Path, articles: &[crate::claude::SummarizedS
 /// Compute cross-signal scores for entities after signal recomputation.
 /// This is called from the pipeline after entity extraction.
 /// Auto-populate entity_tickers from SEC company_tickers.json.
+/// Run the ticker-mapping backfill standalone (via `--mode backfill-tickers`),
+/// processing ALL unmapped entities in one pass instead of the daily 200-cap.
+/// Lets the CIK-mapping fix apply immediately rather than waiting ~37 daily runs.
+pub fn backfill_tickers(db_path: &Path) -> anyhow::Result<usize> {
+    populate_tickers_limited(db_path, 100_000)
+}
+
 fn populate_tickers(db_path: &Path) -> anyhow::Result<usize> {
+    populate_tickers_limited(db_path, 200)
+}
+
+fn populate_tickers_limited(db_path: &Path, limit: usize) -> anyhow::Result<usize> {
     let conn = rusqlite::Connection::open(db_path)?;
 
     // Check if entity_tickers table exists
@@ -3047,9 +3058,9 @@ fn populate_tickers(db_path: &Path) -> anyhow::Result<usize> {
              WHERE e.entity_type IN ('company', 'insider_trade', 'contract_award',
                    'patent_cluster', 'material_event', 'private_placement')
              AND e.id NOT IN (SELECT entity_id FROM entity_tickers)
-             LIMIT 200"
+             LIMIT ?1"
         )?;
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        stmt.query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?
             .filter_map(|r| r.ok())
             .collect()
     };
@@ -3195,13 +3206,17 @@ async fn download_sec_tickers_async() -> anyhow::Result<std::collections::HashMa
         anyhow::bail!("SEC company_tickers.json returned {}", resp.status());
     }
 
+    // SEC's company_tickers.json stores cik_str as an INTEGER (e.g. 1045810), not
+    // a string. Declaring it String made resp.json() fail with "error decoding
+    // response body" — silently killing the entire SEC ticker map. Deserialize as
+    // u64 and stringify (unpadded), which matches the zero-stripped CIK lookup.
     #[derive(serde::Deserialize)]
-    struct SecEntry { cik_str: String, ticker: String, title: String }
+    struct SecEntry { cik_str: u64, ticker: String, title: String }
 
     let raw: std::collections::HashMap<String, SecEntry> = resp.json().await?;
     let mut map = std::collections::HashMap::with_capacity(raw.len());
     for entry in raw.values() {
-        map.insert(entry.title.to_lowercase(), (entry.ticker.clone(), entry.cik_str.clone()));
+        map.insert(entry.title.to_lowercase(), (entry.ticker.clone(), entry.cik_str.to_string()));
     }
 
     // Write cache

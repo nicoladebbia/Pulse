@@ -103,6 +103,15 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Running Four Freedoms pipeline...");
             pipeline::run_freedoms(&db_path).await?;
         }
+        "backfill-tickers" => {
+            // Apply the CIK-mapping fix to ALL unmapped entities in one pass
+            // (the daily pipeline caps at 200/run). Expands the tradeable/watchlist universe.
+            tracing::info!("Backfilling ticker mappings for all unmapped entities...");
+            match pipeline::backfill_tickers(&db_path) {
+                Ok(n) => tracing::info!("Backfill complete: {} new ticker mappings", n),
+                Err(e) => tracing::error!("Ticker backfill failed: {}", e),
+            }
+        }
         "manage-positions" => {
             // Run ONLY the exit-evaluation phase. Honors EXIT_DRY_RUN (default true).
             tracing::info!("Running position management (exit evaluation) only...");
