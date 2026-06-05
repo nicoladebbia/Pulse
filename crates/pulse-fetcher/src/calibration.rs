@@ -16,14 +16,14 @@ use std::path::Path;
 /// Zeroed dimensions (no data source) excluded from compound score.
 /// Active weights sum to 1.0.
 const DEFAULT_WEIGHTS: &[(&str, f64)] = &[
-    ("insider_signal", 0.22),
-    ("institutional_flow", 0.05),   // SEC 13F institutional holdings (new, low weight until calibrated)
-    ("news_momentum", 0.22),
-    ("government_signal", 0.18),
-    ("search_trend", 0.05),         // Wikipedia Pageviews as proxy (new, low weight until calibrated)
-    ("patent_signal", 0.05),
-    ("supply_chain", 0.03),         // FRED macro indicators (INDPRO, PPI, WTI) as market-wide signal
-    ("political_signal", 0.20),
+    ("insider_signal", 0.2391),
+    ("institutional_flow", 0.0),    // ZEROED 2026-06-05: substring-match bug (ticker "X" = 61 funds); restore when fixed
+    ("news_momentum", 0.2391),
+    ("government_signal", 0.1848),
+    ("search_trend", 0.0543),       // Wikipedia Pageviews as proxy (offline/stale; low weight)
+    ("patent_signal", 0.0435),
+    ("supply_chain", 0.0),          // ZEROED 2026-06-05: market-wide constant, no per-entity discriminative power
+    ("political_signal", 0.2391),
 ];
 
 /// Run the full calibration pipeline.

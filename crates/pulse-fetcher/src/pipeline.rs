@@ -3106,8 +3106,13 @@ fn populate_tickers(db_path: &Path) -> anyhow::Result<usize> {
                     if let Some(cik_start) = name.to_lowercase().find("(cik") {
                         let cik_part = &name[cik_start..];
                         let cik_digits: String = cik_part.chars().filter(|c| c.is_ascii_digit()).collect();
-                        if !cik_digits.is_empty() {
-                            if let Some((ticker, cik)) = cik_map.get(&cik_digits) {
+                        // Entity names embed zero-padded 10-digit CIKs ("0001901440"),
+                        // but SEC's company_tickers.json stores cik_str unpadded
+                        // ("1901440"). Strip leading zeros so the lookup actually
+                        // matches — without this, 0 of ~1,500 CIK-bearing entities map.
+                        let cik_norm = cik_digits.trim_start_matches('0').to_string();
+                        if !cik_norm.is_empty() {
+                            if let Some((ticker, cik)) = cik_map.get(&cik_norm) {
                                 conn.execute(
                                     "INSERT OR IGNORE INTO entity_tickers (entity_id, ticker, cik, confidence)
                                      VALUES (?1, ?2, ?3, 0.95)",
@@ -3747,9 +3752,13 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
 /// Matches the weight order: [insider, institutional, news, government, search, patent, supply_chain, political]
 fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
     // [insider, institutional, news, government, search, patent, supply, political]
-    // All 7 active dimensions (patent stays low — USPTO API in migration).
-    // supply_chain uses FRED macro indicators as market-wide signal.
-    let defaults = [0.22, 0.05, 0.22, 0.17, 0.05, 0.04, 0.03, 0.22];
+    // institutional_flow (idx 1) and supply_chain (idx 6) are ZEROED: diagnosis
+    // (2026-06-05) found supply_chain is a market-wide constant with no per-entity
+    // discriminative power, and institutional_flow fires on a substring-match bug
+    // (ticker "X" matched 61 funds) — both were injecting noise / dilution. Their
+    // 0.08 is redistributed proportionally across the 6 live signals so weights
+    // still sum to 1.0. Restore when those signals are fixed (see findings).
+    let defaults = [0.2391, 0.0, 0.2391, 0.1848, 0.0543, 0.0435, 0.0, 0.2391];
 
     let json: Option<String> = conn.query_row(
         "SELECT value FROM user_profile WHERE key = 'calibrated_weights'",
