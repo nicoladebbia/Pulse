@@ -56,6 +56,11 @@ SCALES = {
     "lobbying": 100_000.0,
 }
 
+# Entry strategy: "convergence" (original 8-signal fusion) or "news" (news-led,
+# Path A). Set from --strategy in main(). Module-level so compute_signals_for_ticker
+# can branch without threading a param through run_replay/walk_forward.
+STRATEGY = "convergence"
+
 STOP_LOSS_PCT = -10.0
 MAX_HOLD_DAYS = 90
 # Realistic round-trip friction deducted from every trade's return: slippage on
@@ -244,11 +249,24 @@ def compute_signals_for_ticker(conn: sqlite3.Connection, ticker: str, as_of_date
     compound = sum(profile.get(k, 0) * w for k, w in WEIGHTS.items())
     compound = max(0.0, min(1.0, compound))
 
-    # Convergence: insider purchase signal must be present (the core edge)
-    # News alone is noise — we only trade when an insider is buying
+    # Convergence rule depends on STRATEGY (set from --strategy):
+    #
+    #  "convergence" (original): trade when insider OR government fires. But the
+    #     honest backtest showed insider is NOISE (p=0.805) and this rule never
+    #     lets news (the only significant dim, p=0.006) trigger a trade alone.
+    #
+    #  "news" (Path A): trade led by news-momentum, the one significant signal.
+    #     News must be strong; government can co-confirm. Insider is ignored as
+    #     an entry trigger since it tested as noise.
     has_insider = profile.get("insider", 0) > 0.15
     has_gov = profile.get("government", 0) > 0.15
-    convergence = has_insider or (has_gov and compound >= 0.25)
+    has_news = profile.get("news", 0) > 0.30
+
+    if STRATEGY == "news":
+        # News-led: a meaningful news-momentum spike, optionally confirmed by gov.
+        convergence = has_news or (has_gov and profile.get("news", 0) > 0.20)
+    else:
+        convergence = has_insider or (has_gov and compound >= 0.25)
 
     return {
         "compound": compound,
@@ -627,7 +645,13 @@ def main():
     parser.add_argument("--walk-forward", action="store_true", help="Run walk-forward analysis")
     parser.add_argument("--monte-carlo", type=int, default=0, help="Monte Carlo iterations")
     parser.add_argument("--window", type=int, default=60, help="Walk-forward window (days)")
+    parser.add_argument("--strategy", choices=["convergence", "news"], default="convergence",
+                        help="Entry strategy: convergence (8-signal fusion) or news (news-led)")
     args = parser.parse_args()
+
+    global STRATEGY
+    STRATEGY = args.strategy
+    print(f"Strategy: {STRATEGY}")
 
     if not os.path.exists(args.db):
         print(f"ERROR: Database not found: {args.db}")
