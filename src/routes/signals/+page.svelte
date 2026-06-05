@@ -103,7 +103,7 @@
 			if (!isTauri()) { isLoading = false; return; }
 			const [s, c, ev, e, p] = await Promise.all([
 				getCrossSignals(30).catch(() => []),
-				getConvergenceAlerts(10).catch(() => []),
+				getConvergenceAlerts(80).catch(() => []),
 				getSignalEvidence(15).catch(() => []),
 				getFinancialEvents(20).catch(() => []),
 				getEntityPrices(50).catch(() => []),
@@ -304,6 +304,52 @@
 		e.recommendation.startsWith('Strong Buy') || e.recommendation.startsWith('Buy')
 	));
 
+	// --- Convergence Watchlist (intelligence tool, NOT auto-trading) ---
+	// The auto-trading strategy backtested as no-edge (NO-GO, 2026-06-05), so the
+	// convergence engine is surfaced as a RESEARCH watchlist: "these companies have
+	// multiple independent signals stacking — go look", not "buy this".
+	const SIGNAL_LABELS: Record<string, { key: keyof CrossSignal; label: string; color: string }[]> = {
+		all: [
+			{ key: 'insider_signal', label: 'Insider', color: 'text-blue-300 bg-blue-500/10' },
+			{ key: 'news_momentum', label: 'News', color: 'text-amber-300 bg-amber-500/10' },
+			{ key: 'government_signal', label: 'Gov', color: 'text-emerald-300 bg-emerald-500/10' },
+			{ key: 'political_signal', label: 'Lobby', color: 'text-purple-300 bg-purple-500/10' },
+			{ key: 'institutional_flow', label: 'Institutional', color: 'text-cyan-300 bg-cyan-500/10' },
+			{ key: 'patent_signal', label: 'Patent', color: 'text-pink-300 bg-pink-500/10' },
+			{ key: 'search_trend', label: 'Search', color: 'text-indigo-300 bg-indigo-500/10' },
+			{ key: 'supply_chain', label: 'Supply', color: 'text-orange-300 bg-orange-500/10' },
+		],
+	};
+
+	// Which signals are firing (>0.3 normalized) for a convergence row.
+	function firingSignals(cs: CrossSignal) {
+		return SIGNAL_LABELS.all.filter(s => (cs[s.key] as number) > 0.3);
+	}
+
+	function isFreshToday(computedAt: string | null): boolean {
+		if (!computedAt) return false;
+		const today = new Date().toISOString().slice(0, 10);
+		return computedAt.slice(0, 10) === today;
+	}
+
+	// Clean the "(CIK 0001234567)" suffix off entity names for display.
+	function cleanName(name: string): string {
+		return name.replace(/\s*\(CIK\s*\d+\)\s*/i, '').trim();
+	}
+
+	// Watchlist = ONE row per company (the strongest recent convergence), not every
+	// daily snapshot. cross_signals stores 1 row per entity per day, so dedup by
+	// entity and keep the highest-scoring row.
+	const watchlist = $derived.by(() => {
+		const best = new Map<number, CrossSignal>();
+		for (const cs of convergence) {
+			const prev = best.get(cs.entity_id);
+			if (!prev || cs.compound_score > prev.compound_score) best.set(cs.entity_id, cs);
+		}
+		return [...best.values()].sort((a, b) => b.compound_score - a.compound_score);
+	});
+	const freshCount = $derived(watchlist.filter(w => isFreshToday(w.computed_at)).length);
+
 	// Keyboard shortcuts
 	function handleKeydown(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement) return;
@@ -400,9 +446,59 @@
 			</div>
 		{/if}
 
-		<!-- Actionable Signals (Buy/Strong Buy) -->
+		<!-- ===== Convergence Watchlist (research intelligence, not auto-trading) ===== -->
+		{#if watchlist.length > 0}
+			<div class="mb-6">
+				<div class="flex items-center justify-between mb-3">
+					<h2 class="text-xs font-semibold text-text uppercase tracking-wider">Convergence Watchlist</h2>
+					<span class="text-[10px] text-text-muted">
+						{watchlist.length} converging · {freshCount} new today
+					</span>
+				</div>
+				<p class="text-xs text-text-muted mb-3 leading-relaxed">
+					Companies where multiple independent signals are stacking. These are
+					<span class="text-text-secondary">research candidates</span> — surfaced for you to investigate, not trade automatically.
+				</p>
+				<div class="space-y-2">
+					{#each watchlist as cs}
+						{@const firing = firingSignals(cs)}
+						{@const fresh = isFreshToday(cs.computed_at)}
+						<div class="bg-bg-card border border-border rounded-xl px-5 py-4">
+							<div class="flex items-start justify-between gap-3">
+								<div class="min-w-0">
+									<div class="flex items-center gap-2 flex-wrap">
+										<span class="font-semibold text-text truncate">{cleanName(cs.entity_name)}</span>
+										{#if cs.ticker}
+											<span class="text-[10px] font-mono text-text-muted bg-bg px-1.5 py-0.5 rounded">{cs.ticker}</span>
+										{/if}
+										{#if fresh}
+											<span class="text-[9px] font-semibold uppercase tracking-wide text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded">New</span>
+										{/if}
+									</div>
+									<!-- Firing-signal badges: WHY this is converging -->
+									<div class="flex items-center gap-1.5 flex-wrap mt-2">
+										{#each firing as sig}
+											<span class="text-[10px] font-medium px-1.5 py-0.5 rounded {sig.color}">{sig.label}</span>
+										{/each}
+										<span class="text-[10px] text-text-muted ml-1">{cs.source_diversity} source{cs.source_diversity === 1 ? '' : 's'}</span>
+									</div>
+								</div>
+								<div class="text-right shrink-0">
+									<div class="text-base font-mono font-bold text-text">{(cs.compound_score * 100).toFixed(0)}%</div>
+									<div class="text-[10px] text-text-muted">convergence</div>
+								</div>
+							</div>
+						</div>
+					{/each}
+				</div>
+			</div>
+		{/if}
+
+		<!-- Manual trade shortcut — NOT an instruction. The auto-trading strategy
+		     backtested as no-edge; buying here is YOUR discretionary call. -->
 		{#if actionable.length > 0}
-			<h2 class="text-xs font-semibold text-emerald-400 uppercase tracking-wider mb-3">Action Required</h2>
+			<h2 class="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-1">Manual Trade · Discretionary</h2>
+			<p class="text-[11px] text-text-muted mb-3">Highest-scoring signals if you want to trade one by hand. Not a recommendation — the auto-strategy showed no edge.</p>
 			<div class="space-y-2 mb-6">
 				{#each actionable as ev}
 					<div class="bg-bg-card border border-emerald-500/20 rounded-xl px-5 py-4 flex items-center justify-between">
