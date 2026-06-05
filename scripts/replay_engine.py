@@ -32,16 +32,19 @@ from typing import Optional
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "pulse_historical.db")
 
-# Signal weights — must match pipeline.rs / cross_signals.rs
+# Signal weights — synced to cleaned live defaults (load_calibrated_weights in
+# pipeline.rs, 2026-06-05): institutional + supply_chain zeroed (dead/buggy),
+# their weight redistributed across live signals. Backtest measures the CLEANED
+# signal, not the old noisy one.
 WEIGHTS = {
-    "insider": 0.25,
+    "insider": 0.2391,
     "institutional": 0.0,
-    "news": 0.25,
-    "government": 0.20,
-    "search": 0.0,
-    "patent": 0.10,
+    "news": 0.2391,
+    "government": 0.1848,
+    "search": 0.0543,
+    "patent": 0.0435,
     "supply_chain": 0.0,
-    "political": 0.20,
+    "political": 0.2391,
 }
 
 # Normalization scales — must match pipeline.rs
@@ -55,6 +58,11 @@ SCALES = {
 
 STOP_LOSS_PCT = -10.0
 MAX_HOLD_DAYS = 90
+# Realistic round-trip friction deducted from every trade's return: slippage on
+# entry + exit (market orders cross the spread) + implicit costs. 20 bps total is
+# slightly conservative for liquid US equities; the previous backtest deducted
+# ZERO, which inflated every result. A real edge must survive friction.
+ROUND_TRIP_COST_PCT = 0.20
 CONVERGENCE_THRESHOLD = 0.2
 MIN_CONVERGENT_SIGNALS = 2
 MIN_SOURCE_DIVERSITY = 2
@@ -312,7 +320,7 @@ def run_replay(conn: sqlite3.Connection, start_date: str, end_date: str,
                     exit_date=date_str,
                     entry_price=pos.entry_price,
                     exit_price=price,
-                    pnl_pct=pos.pnl_pct,
+                    pnl_pct=pos.pnl_pct - ROUND_TRIP_COST_PCT,
                     holding_days=pos.days_held,
                     signal_score=pos.signal_score,
                     signal_profile=pos.signal_profile,
@@ -391,7 +399,7 @@ def run_replay(conn: sqlite3.Connection, start_date: str, end_date: str,
                 exit_date=end_date,
                 entry_price=pos.entry_price,
                 exit_price=price,
-                pnl_pct=pos.pnl_pct,
+                pnl_pct=pos.pnl_pct - ROUND_TRIP_COST_PCT,
                 holding_days=pos.days_held,
                 signal_score=pos.signal_score,
                 signal_profile=pos.signal_profile,
