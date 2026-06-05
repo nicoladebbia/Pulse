@@ -254,13 +254,15 @@ pub fn get_convergence_signals(conn: &Connection, limit: usize) -> anyhow::Resul
            SELECT cs.*, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY computed_at DESC) AS rn
            FROM cross_signals cs
          )
-         SELECT cs.entity_id, e.name, cs.ticker, cs.compound_score,
+         SELECT cs.entity_id, e.name,
+                COALESCE(cs.ticker, et.ticker) AS ticker, cs.compound_score,
                 cs.insider_signal, cs.institutional_flow, cs.news_momentum,
                 cs.government_signal, cs.search_trend, cs.patent_signal,
                 cs.supply_chain, cs.political_signal, cs.source_diversity,
                 cs.convergence_detected, cs.computed_at
          FROM latest cs
          LEFT JOIN entities e ON e.id = cs.entity_id
+         LEFT JOIN entity_tickers et ON et.entity_id = cs.entity_id
          WHERE cs.rn = 1 AND cs.convergence_detected = 1
          ORDER BY cs.compound_score DESC
          LIMIT ?1"

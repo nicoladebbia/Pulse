@@ -103,7 +103,7 @@
 			if (!isTauri()) { isLoading = false; return; }
 			const [s, c, ev, e, p] = await Promise.all([
 				getCrossSignals(30).catch(() => []),
-				getConvergenceAlerts(80).catch(() => []),
+				getConvergenceAlerts(40).catch(() => []),
 				getSignalEvidence(15).catch(() => []),
 				getFinancialEvents(20).catch(() => []),
 				getEntityPrices(50).catch(() => []),
@@ -337,18 +337,21 @@
 		return name.replace(/\s*\(CIK\s*\d+\)\s*/i, '').trim();
 	}
 
-	// Watchlist = ONE row per company (the strongest recent convergence), not every
-	// daily snapshot. cross_signals stores 1 row per entity per day, so dedup by
-	// entity and keep the highest-scoring row.
-	const watchlist = $derived.by(() => {
-		const best = new Map<number, CrossSignal>();
-		for (const cs of convergence) {
-			const prev = best.get(cs.entity_id);
-			if (!prev || cs.compound_score > prev.compound_score) best.set(cs.entity_id, cs);
-		}
-		return [...best.values()].sort((a, b) => b.compound_score - a.compound_score);
-	});
+	// Default to ticker-mapped companies only: having a ticker is a strong proxy
+	// for "real researchable public company" — it filters out the entity-extraction
+	// noise (CIA, MIT, lobbying disclosures, contract awards) that otherwise
+	// pollutes the list. Toggle off to see everything including unmapped entities.
+	let publicOnly = $state(true);
+
+	// Watchlist = converging companies, strongest first. The backend
+	// (get_convergence_signals) already returns one row per entity (latest).
+	const watchlist = $derived(
+		[...convergence]
+			.filter(cs => !publicOnly || !!cs.ticker)
+			.sort((a, b) => b.compound_score - a.compound_score)
+	);
 	const freshCount = $derived(watchlist.filter(w => isFreshToday(w.computed_at)).length);
+	const hiddenCount = $derived(convergence.filter(cs => !cs.ticker).length);
 
 	// Keyboard shortcuts
 	function handleKeydown(e: KeyboardEvent) {
@@ -447,18 +450,29 @@
 		{/if}
 
 		<!-- ===== Convergence Watchlist (research intelligence, not auto-trading) ===== -->
-		{#if watchlist.length > 0}
+		{#if convergence.length > 0}
 			<div class="mb-6">
 				<div class="flex items-center justify-between mb-3">
 					<h2 class="text-xs font-semibold text-text uppercase tracking-wider">Convergence Watchlist</h2>
-					<span class="text-[10px] text-text-muted">
-						{watchlist.length} converging · {freshCount} new today
-					</span>
+					<div class="flex items-center gap-3">
+						<span class="text-[10px] text-text-muted">
+							{watchlist.length} converging · {freshCount} new today
+						</span>
+						<button
+							onclick={() => publicOnly = !publicOnly}
+							class="text-[10px] px-2 py-1 rounded-md border transition-colors {publicOnly ? 'border-border text-text-muted hover:text-text-secondary' : 'border-blue-500/30 text-blue-300 bg-blue-500/10'}"
+							title={publicOnly ? `Showing public companies only. ${hiddenCount} unmapped entities hidden (agencies, private firms, noise).` : 'Showing all converging entities, including unmapped'}>
+							{publicOnly ? `Public only` : `All entities`}
+						</button>
+					</div>
 				</div>
 				<p class="text-xs text-text-muted mb-3 leading-relaxed">
 					Companies where multiple independent signals are stacking. These are
 					<span class="text-text-secondary">research candidates</span> — surfaced for you to investigate, not trade automatically.
 				</p>
+				{#if watchlist.length === 0}
+					<p class="text-xs text-text-muted italic">No public companies converging right now. Toggle "All entities" to see unmapped signals.</p>
+				{/if}
 				<div class="space-y-2">
 					{#each watchlist as cs}
 						{@const firing = firingSignals(cs)}
