@@ -103,6 +103,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Running Four Freedoms pipeline...");
             pipeline::run_freedoms(&db_path).await?;
         }
+        "manage-positions" => {
+            // Run ONLY the exit-evaluation phase. Honors EXIT_DRY_RUN (default true).
+            tracing::info!("Running position management (exit evaluation) only...");
+            match pipeline::run_position_management(&db_path).await {
+                Ok(n) => tracing::info!("Position management complete: {} action(s)", n),
+                Err(e) => tracing::error!("Position management failed: {}", e),
+            }
+        }
         other => {
             tracing::info!("Running in {} mode", other);
             pipeline::run(&db_path).await?;

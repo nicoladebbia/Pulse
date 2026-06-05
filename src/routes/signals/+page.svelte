@@ -2,7 +2,7 @@
 	import { isTauri } from '$lib/tauri/mock';
 	import {
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
-		executeTrade, getFinancialEvents, getSignalEvidence, getSourceHealth,
+		executeTrade, closePosition, getFinancialEvents, getSignalEvidence, getSourceHealth,
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getTradeJournal,
 		runBacktest, startPriceStream, stopPriceStream
 	} from '$lib/tauri/commands';
@@ -144,6 +144,24 @@
 			getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
 		} catch (e: any) {
 			tradeStatus = `Error: ${e?.message ?? e}`;
+		}
+	}
+
+	let closingId = $state<number | null>(null);
+
+	async function handleClose(tradeId: number, symbol: string) {
+		if (!confirm(`Close your ${symbol} position? This places a market sell on Alpaca.`)) return;
+		closingId = tradeId;
+		tradeStatus = `Closing ${symbol}...`;
+		try {
+			const result = await closePosition(tradeId);
+			const pnl = result.pnl_pct ?? 0;
+			tradeStatus = `Closed ${result.ticker} @ $${(result.exit_price ?? 0).toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%)`;
+			getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
+		} catch (e: any) {
+			tradeStatus = `${e?.message ?? e}`;
+		} finally {
+			closingId = null;
 		}
 	}
 
@@ -774,6 +792,7 @@
 					{#each portfolio.positions as pos}
 						{@const pnlPct = pos.unrealized_pl_pct * 100}
 						{@const isWinning = pos.unrealized_pl >= 0}
+						{@const dbTrade = portfolio.open_trades.find(t => t.ticker === pos.symbol)}
 						<div class="bg-bg-card border {isWinning ? 'border-emerald-500/15' : 'border-rose-500/15'} rounded-xl px-5 py-4">
 							<div class="flex items-center justify-between mb-2">
 								<div class="flex items-center gap-3">
@@ -797,6 +816,17 @@
 							<div class="mt-2 h-1 bg-border rounded-full overflow-hidden">
 								<div class="h-full rounded-full {isWinning ? 'bg-emerald-400' : 'bg-rose-400'}" style="width: {Math.min(Math.abs(pnlPct) * 5, 100)}%"></div>
 							</div>
+							{#if dbTrade}
+								<div class="mt-3 flex justify-end">
+									<button
+										onclick={() => handleClose(dbTrade.id, pos.symbol)}
+										disabled={closingId === dbTrade.id}
+										class="text-xs font-medium px-3 py-1.5 rounded-lg border border-rose-500/30 text-rose-300 hover:bg-rose-500/10 disabled:opacity-50 transition-colors"
+										title="Place a market sell on Alpaca and close this position">
+										{closingId === dbTrade.id ? 'Closing…' : 'Close position'}
+									</button>
+								</div>
+							{/if}
 						</div>
 					{/each}
 				</div>

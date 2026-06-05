@@ -143,6 +143,79 @@ pub async fn execute_trade(
     }))
 }
 
+/// Manually close an open paper position. Places a full sell on Alpaca and
+/// writes exit fields to the DB. Used by the Close button in the portfolio tab.
+#[tauri::command]
+pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<PaperTrade, String> {
+    // Gather trade info, drop lock before async Alpaca calls.
+    let (ticker, entry_price) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT ticker, entry_price FROM paper_trades
+             WHERE id = ?1 AND status = 'open'",
+            [trade_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+        )
+        .map_err(|_| format!("No open trade with id {}", trade_id))?
+    };
+
+    // Get the real held qty from Alpaca (DB stores dollar notional, not shares).
+    let positions = paper_trading::get_positions().await.map_err(|e| e.to_string())?;
+    let held_qty: f64 = positions
+        .iter()
+        .find(|p| p.symbol == ticker)
+        .and_then(|p| p.qty.parse().ok())
+        .unwrap_or(0.0);
+
+    if held_qty <= 0.0 {
+        // Alpaca has no position — reconcile the DB row to closed without an order.
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "UPDATE paper_trades SET status='closed', exit_date=?1 WHERE id=?2",
+            rusqlite::params![today, trade_id],
+        ).map_err(|e| e.to_string())?;
+        return Err(format!("{} not held on Alpaca — marked closed in DB", ticker));
+    }
+
+    // Place the sell.
+    let order = paper_trading::place_order(&ticker, held_qty, "sell")
+        .await
+        .map_err(|e| e.to_string())?;
+    let exit_price = order
+        .filled_avg_price
+        .as_deref()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0.0);
+    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+
+    // If we didn't get a fill price back synchronously, don't fabricate one;
+    // the order is live and the next pipeline run will reconcile it.
+    if exit_price <= 0.0 {
+        return Err(format!(
+            "Sell order {} placed for {} but not yet filled — it will reconcile on the next run",
+            order.id, ticker
+        ));
+    }
+
+    let pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0;
+    let pnl = (exit_price - entry_price) * held_qty;
+
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE paper_trades SET status='closed', exit_price=?1, exit_date=?2, pnl=?3, pnl_pct=?4
+         WHERE id=?5",
+        rusqlite::params![exit_price, now, pnl, pnl_pct, trade_id],
+    ).map_err(|e| e.to_string())?;
+    crate::services::api_usage::log_usage(&conn, "alpaca", "trading", "close_position", 0, 0).ok();
+
+    paper_trading::get_trades_from_db(&conn, "closed")
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|t| t.id == trade_id)
+        .ok_or_else(|| "Closed but could not re-read trade".to_string())
+}
+
 /// Get portfolio analytics: win rate, Sharpe, attribution, etc.
 #[tauri::command]
 pub fn get_portfolio_analytics(db: State<'_, DbState>) -> Result<PortfolioAnalytics, String> {

@@ -109,6 +109,7 @@ pub fn run() {
             commands::trading::get_portfolio,
             commands::trading::get_paper_trades,
             commands::trading::execute_trade,
+            commands::trading::close_position,
             commands::trading::get_portfolio_analytics,
             commands::trading::get_trade_journal,
             commands::trading::run_backtest,

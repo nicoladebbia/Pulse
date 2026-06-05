@@ -19,6 +19,7 @@ const MIGRATION_019: &str = include_str!("../../../migrations/019_position_manag
 const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.sql");
 const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
 const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_fts_porter.sql");
+const MIGRATION_025: &str = include_str!("../../../migrations/025_half_close_marker.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -512,6 +513,15 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_024)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (24)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 25: Add half_closed_at marker to paper_trades so the exit engine's
+    // CloseHalf action doesn't re-trigger every pipeline run. Both app + fetcher run it.
+    if !applied.contains(&25) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_025)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (25)", [])?;
         tx.commit()?;
     }
 

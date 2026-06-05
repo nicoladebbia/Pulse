@@ -175,6 +175,10 @@ export async function executeTrade(ticker: string, confidence: number): Promise<
 	return invoke('execute_trade', { ticker, confidence });
 }
 
+export async function closePosition(tradeId: number): Promise<PaperTrade> {
+	return invoke('close_position', { tradeId });
+}
+
 export async function getPortfolioAnalytics(): Promise<PortfolioAnalytics> {
 	return invoke('get_portfolio_analytics');
 }

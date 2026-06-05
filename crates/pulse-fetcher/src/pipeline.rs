@@ -626,6 +626,22 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Auto-trade failed (non-fatal): {}", e),
     }
 
+    // Phase 13.6: Manage open positions — evaluate exits (stops/targets/expiry).
+    // Unlike auto-BUY (gated off by AUTO_TRADE_ENABLED), exits are a SAFETY
+    // mechanism and run by default, but start in dry-run (EXIT_DRY_RUN=true)
+    // until verified. This is the half that was missing: positions never closed.
+    tracing::info!("Phase 13.6: Managing open positions (exit evaluation)...");
+    match manage_open_positions(db_path).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("Position management: {} exit action(s) taken", count);
+            } else {
+                tracing::info!("Position management: no exits triggered");
+            }
+        }
+        Err(e) => tracing::warn!("Position management failed (non-fatal): {}", e),
+    }
+
     // Phase 14: Automated calibration (non-fatal)
     progress.update_detail("Calibrating signal weights", 100.0);
     tracing::info!("Phase 14: Running signal calibration...");
@@ -4267,12 +4283,41 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
 
         tracing::info!("Auto-trade: {} ({}) — score {:.2}, notional ${:.2}", name, ticker, score, notional);
 
+        // Cross-run dedup: if the pipeline runs multiple times in a short window
+        // (launchd retry storm), the DB `already_open` guard can't help because the
+        // order is placed BEFORE the insert settles — that's how ORCL got 5 fills in
+        // 8 seconds on 2026-05-04. Two defenses:
+        //   1. Pre-place check: ask Alpaca if an OPEN order for this ticker exists.
+        //   2. Deterministic client_order_id keyed on ticker+day — Alpaca rejects a
+        //      duplicate client_order_id, so a second same-day order for the ticker
+        //      is refused at the source even if checks race.
+        let today_key = chrono::Local::now().format("%Y%m%d").to_string();
+        let client_order_id = format!("pulse-{}-{}", ticker, today_key);
+
+        let has_open_order = match client
+            .get(format!("https://paper-api.alpaca.markets/v2/orders?status=open&symbols={}", ticker))
+            .header("APCA-API-KEY-ID", &alpaca_key)
+            .header("APCA-API-SECRET-KEY", &alpaca_secret)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok()
+                .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+                .unwrap_or(false),
+            _ => false, // on error, fall through — client_order_id is the backstop
+        };
+        if has_open_order {
+            tracing::warn!("Auto-trade: skipping {} — open order already exists on Alpaca", ticker);
+            continue;
+        }
+
         let order = serde_json::json!({
             "symbol": ticker,
             "notional": format!("{:.2}", notional),
             "side": "buy",
             "type": "market",
-            "time_in_force": "day"
+            "time_in_force": "day",
+            "client_order_id": client_order_id
         });
 
         let resp = client
@@ -4411,7 +4456,13 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            tracing::warn!("Auto-trade: order failed for {} — {} {}", ticker, status, body);
+            // A duplicate client_order_id (same ticker, same day) is the dedup guard
+            // working as intended during a re-run race — log it as such, not as an error.
+            if body.contains("client_order_id") || status.as_u16() == 422 {
+                tracing::info!("Auto-trade: dedup blocked duplicate same-day order for {} ({})", ticker, status);
+            } else {
+                tracing::warn!("Auto-trade: order failed for {} — {} {}", ticker, status, body);
+            }
         }
 
         // Rate limit
@@ -4480,6 +4531,348 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     }
 
     Ok(traded)
+}
+
+/// Phase 13.6 — evaluate and act on exits for every open paper position.
+///
+/// This is the half of the loop that was missing: `position_management::
+/// evaluate_position` (ATR trailing stops, profit targets, time/signal decay)
+/// existed but was never called at runtime, so positions opened and NEVER
+/// closed. This wires it in.
+///
+/// Safety model:
+/// - Runs by default (exits are protective), unlike auto-BUY which is gated off.
+/// - `EXIT_DRY_RUN` (default TRUE) logs the decided action WITHOUT placing any
+///   sell order. Flip to false only after eyeballing the log.
+/// - Current price + sell qty come from Alpaca's own position record (ground
+///   truth), never from DB notional (which stores dollars, not shares).
+/// - Non-fills (pre-market `day` orders) are NOT marked closed — retried next run.
+///
+/// Returns the number of exit ACTIONS executed (orders placed, or in dry-run,
+/// actions that WOULD have been placed).
+/// Fetch the most recent FILLED sell fill price for a ticker from Alpaca.
+/// Used to record real exit P&L when a position closed between runs (e.g. a
+/// pre-market `day` order that filled after the open and is gone by next run).
+/// Returns (exit_price, filled_qty) or None.
+async fn latest_filled_sell(
+    client: &reqwest::Client, key: &str, secret: &str, ticker: &str,
+) -> Option<(f64, f64)> {
+    let resp = client
+        .get(format!(
+            "https://paper-api.alpaca.markets/v2/orders?status=closed&symbols={}&side=sell&limit=5&direction=desc",
+            ticker
+        ))
+        .header("APCA-API-KEY-ID", key)
+        .header("APCA-API-SECRET-KEY", secret)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let orders: serde_json::Value = resp.json().await.ok()?;
+    let arr = orders.as_array()?;
+    for o in arr {
+        if o.get("status").and_then(|v| v.as_str()) == Some("filled") {
+            let price = o.get("filled_avg_price")
+                .and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok());
+            let qty = o.get("filled_qty")
+                .and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok());
+            if let (Some(p), Some(q)) = (price, qty) {
+                if p > 0.0 {
+                    return Some((p, q));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Public entry point to run ONLY the position-exit evaluation (Phase 13.6) without
+/// the full daily pipeline. Used by `--mode manage-positions` for testing/manual runs.
+/// Honors EXIT_DRY_RUN like the in-pipeline call.
+pub async fn run_position_management(db_path: &Path) -> anyhow::Result<usize> {
+    manage_open_positions(db_path).await
+}
+
+async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
+    let dry_run = std::env::var("EXIT_DRY_RUN")
+        .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))
+        .unwrap_or(true); // default: dry-run ON
+
+    let alpaca_key = match std::env::var("ALPACA_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            tracing::info!("Position mgmt: skipping (ALPACA_API_KEY not set)");
+            return Ok(0);
+        }
+    };
+    let alpaca_secret = std::env::var("ALPACA_SECRET_KEY")
+        .map_err(|_| anyhow::anyhow!("ALPACA_SECRET_KEY not set"))?;
+
+    let conn = rusqlite::Connection::open(db_path)?;
+    // Ensure schema is current (idempotent) — needed when this runs standalone
+    // via `--mode manage-positions` without the full pipeline's migration pass.
+    crate::db::run_migrations(&conn)?;
+
+    // Pull every open position the DB tracks. entry_price/entry_date drive the
+    // exit math; original_compound_score drives signal-decay; half_closed_at
+    // gates CloseHalf from re-triggering.
+    #[allow(clippy::type_complexity)]
+    let open: Vec<(i64, String, f64, String, f64, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, ticker, entry_price, entry_date,
+                    COALESCE(original_compound_score, confidence, 0.30),
+                    half_closed_at
+             FROM paper_trades WHERE status = 'open'"
+        )?;
+        stmt.query_map([], |row| Ok((
+            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+            row.get::<_, f64>(4).unwrap_or(0.30),
+            row.get::<_, Option<String>>(5).unwrap_or(None),
+        )))?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    if open.is_empty() {
+        return Ok(0);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let now_dt = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let mut actions = 0usize;
+
+    for (trade_id, ticker, entry_price, entry_date, orig_score, half_closed_at) in &open {
+        // Ground truth from Alpaca: current_price + held qty. If Alpaca has no
+        // position (already liquidated elsewhere), reconcile the DB to closed.
+        let pos: Option<serde_json::Value> = match client
+            .get(format!("https://paper-api.alpaca.markets/v2/positions/{}", ticker))
+            .header("APCA-API-KEY-ID", &alpaca_key)
+            .header("APCA-API-SECRET-KEY", &alpaca_secret)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r.json().await.ok(),
+            Ok(r) if r.status().as_u16() == 404 => {
+                // Alpaca has no such position but DB says open — it closed between
+                // runs (e.g. a pre-market `day` sell that filled after the open).
+                // Record REAL P&L from the last filled sell so this exit shows up
+                // in analytics — a null-P&L close gets silently dropped by the
+                // win-rate / Sharpe queries (analytics.rs filters pnl_pct NOT NULL).
+                if !dry_run {
+                    if let Some((exit_p, _)) =
+                        latest_filled_sell(&client, &alpaca_key, &alpaca_secret, ticker).await
+                    {
+                        let pnl_pct = ((exit_p - entry_price) / entry_price) * 100.0;
+                        // We don't know the exact qty that was held at fill time;
+                        // pnl_pct is exact, pnl dollars uses entry notional as a proxy.
+                        conn.execute(
+                            "UPDATE paper_trades SET status='closed', exit_price=?1,
+                                exit_date=?2, pnl_pct=?3 WHERE id=?4",
+                            rusqlite::params![exit_p, today, pnl_pct, trade_id],
+                        ).ok();
+                        tracing::warn!(
+                            "Position mgmt: {} closed between runs — reconciled @ ${:.2} ({:+.1}%)",
+                            ticker, exit_p, pnl_pct
+                        );
+                    } else {
+                        // No fill record found — close without P&L rather than leave
+                        // a phantom-open row, but log it loudly for review.
+                        conn.execute(
+                            "UPDATE paper_trades SET status='closed', exit_date=?1 WHERE id=?2",
+                            rusqlite::params![today, trade_id],
+                        ).ok();
+                        tracing::warn!(
+                            "Position mgmt: {} absent on Alpaca, no sell fill found — closed with NULL pnl (review)",
+                            ticker
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "Position mgmt: {} open in DB but absent on Alpaca — would reconcile (dry-run)",
+                        ticker
+                    );
+                }
+                continue;
+            }
+            _ => {
+                tracing::warn!("Position mgmt: failed to fetch Alpaca position for {}, skipping", ticker);
+                continue;
+            }
+        };
+
+        let pos = match pos { Some(p) => p, None => continue };
+        let current_price: f64 = pos.get("current_price")
+            .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let held_qty: f64 = pos.get("qty")
+            .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
+        if current_price <= 0.0 || held_qty <= 0.0 {
+            tracing::warn!("Position mgmt: {} has no valid price/qty from Alpaca, skipping", ticker);
+            continue;
+        }
+
+        // Signal decay check first — cheapest, and a decayed thesis means exit
+        // regardless of price action.
+        let decayed = crate::position_management::check_signal_decay(&conn, ticker, *orig_score);
+
+        let action = crate::position_management::evaluate_position(
+            &conn, *trade_id, ticker, *entry_price, entry_date, current_price, &today,
+        );
+
+        // Decide final action: signal decay forces a full close (overrides Hold).
+        use crate::position_management::PositionAction;
+        let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
+        let (close_qty, reason): (f64, String) = match action {
+            PositionAction::CloseAll { reason } => (held_qty, reason),
+            PositionAction::CloseHalf { reason } => {
+                if half_closed_at.is_some() {
+                    // Already took profit on half — don't keep peeling. Hold the rest.
+                    tracing::info!("Position mgmt: {} CloseHalf suppressed (already half-closed)", ticker);
+                    (0.0, String::new())
+                } else {
+                    (held_qty / 2.0, reason)
+                }
+            }
+            PositionAction::TightenStop { .. } | PositionAction::Hold => {
+                if decayed {
+                    (held_qty, format!("signal_decay (orig {:.2}, pnl {:.1}%)", orig_score, pnl_pct))
+                } else {
+                    (0.0, String::new())
+                }
+            }
+        };
+
+        if close_qty <= 0.0 {
+            tracing::info!("Position mgmt: {} → HOLD (price ${:.2}, pnl {:.1}%)", ticker, current_price, pnl_pct);
+            continue;
+        }
+
+        let is_full = (close_qty - held_qty).abs() < 1e-6;
+        tracing::info!(
+            "Position mgmt: {} → {} {:.4}/{:.4} sh @ ${:.2} (pnl {:.1}%) — {}",
+            ticker, if is_full {"CLOSE"} else {"CLOSE_HALF"}, close_qty, held_qty,
+            current_price, pnl_pct, reason
+        );
+
+        if dry_run {
+            tracing::info!("Position mgmt: DRY_RUN — no order placed for {}", ticker);
+            actions += 1;
+            continue;
+        }
+
+        // --- Place the SELL order (live) ---
+        // Deterministic client_order_id keyed on ticker+day+half-vs-full prevents a
+        // launchd retry storm from double-selling (same bug class as the buy-side
+        // ORCL stacking). A full and a half close on the same day get distinct ids.
+        let today_key = chrono::Local::now().format("%Y%m%d").to_string();
+        let exit_coid = format!("pulse-exit-{}-{}-{}", ticker, today_key, if is_full {"full"} else {"half"});
+        let order = serde_json::json!({
+            "symbol": ticker,
+            "qty": format!("{:.9}", close_qty),
+            "side": "sell",
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": exit_coid
+        });
+        let resp = client
+            .post("https://paper-api.alpaca.markets/v2/orders")
+            .header("APCA-API-KEY-ID", &alpaca_key)
+            .header("APCA-API-SECRET-KEY", &alpaca_secret)
+            .json(&order)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("Position mgmt: sell failed for {} — {} {}", ticker, status, body);
+            continue;
+        }
+        let order_resp: serde_json::Value = resp.json().await?;
+        let order_id = order_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+
+        // Poll for fill (day orders may sit unfilled pre-market — that's fine).
+        let mut filled_price = 0.0;
+        let mut filled = false;
+        for attempt in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if let Ok(check) = client
+                .get(format!("https://paper-api.alpaca.markets/v2/orders/{}", order_id))
+                .header("APCA-API-KEY-ID", &alpaca_key)
+                .header("APCA-API-SECRET-KEY", &alpaca_secret)
+                .send().await
+            {
+                if let Ok(j) = check.json::<serde_json::Value>().await {
+                    if j.get("status").and_then(|v| v.as_str()) == Some("filled") {
+                        filled_price = j.get("filled_avg_price")
+                            .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(current_price);
+                        filled = true;
+                        break;
+                    }
+                    if attempt == 4 {
+                        tracing::warn!(
+                            "Position mgmt: sell for {} not filled in 5s (likely pre-market) — \
+                             order {} placed, will reconcile next run", ticker, order_id
+                        );
+                    }
+                }
+            }
+        }
+
+        crate::db::log_api_usage(&conn, "alpaca", "trading", "sell_order", 0, 0);
+
+        if !filled {
+            // Order is live but unfilled. Do NOT mark closed — next run sees it
+            // gone from Alpaca (or filled) and reconciles. Avoids ghost-closing.
+            actions += 1;
+            continue;
+        }
+
+        let exit_price = filled_price;
+        if is_full {
+            let pnl_pct_final = ((exit_price - entry_price) / entry_price) * 100.0;
+            let pnl_dollars = (exit_price - entry_price) * held_qty;
+            conn.execute(
+                "UPDATE paper_trades SET status='closed', exit_price=?1, exit_date=?2,
+                    pnl=?3, pnl_pct=?4 WHERE id=?5",
+                rusqlite::params![exit_price, now_dt, pnl_dollars, pnl_pct_final, trade_id],
+            ).ok();
+            tracing::info!("Position mgmt: CLOSED {} @ ${:.2} ({:+.1}%, ${:+.2})",
+                ticker, exit_price, pnl_pct_final, pnl_dollars);
+        } else {
+            // Half close: mark half_closed_at, keep position open. position_size
+            // is dollar-notional; halve it to reflect the reduced exposure.
+            // Record the realized gain on the SOLD half into pnl (cumulative) so
+            // analytics doesn't undercount profit-target winners; the remaining
+            // half's P&L is booked at full close.
+            let realized_half = (exit_price - entry_price) * close_qty;
+            conn.execute(
+                "UPDATE paper_trades SET half_closed_at=?1, position_size = position_size / 2.0,
+                    pnl = COALESCE(pnl, 0) + ?2 WHERE id=?3",
+                rusqlite::params![now_dt, realized_half, trade_id],
+            ).ok();
+            tracing::info!("Position mgmt: HALF-CLOSED {} @ ${:.2} (realized ${:+.2} on half)",
+                ticker, exit_price, realized_half);
+        }
+        actions += 1;
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    if dry_run && actions > 0 {
+        tracing::warn!(
+            "Position mgmt: {} exit action(s) were DRY-RUN only. Set EXIT_DRY_RUN=false to arm.",
+            actions
+        );
+    }
+
+    Ok(actions)
 }
 
 /// Snapshot the live portfolio state into the `portfolio_snapshots` table.
