@@ -104,7 +104,7 @@
 			const [s, c, ev, e, p] = await Promise.all([
 				getCrossSignals(30).catch(() => []),
 				getConvergenceAlerts(40).catch(() => []),
-				getSignalEvidence(15).catch(() => []),
+				getSignalEvidence(40).catch(() => []),
 				getFinancialEvents(20).catch(() => []),
 				getEntityPrices(50).catch(() => []),
 			]);
@@ -343,15 +343,32 @@
 	// pollutes the list. Toggle off to see everything including unmapped entities.
 	let publicOnly = $state(true);
 
-	// Watchlist = converging companies, strongest first. The backend
-	// (get_convergence_signals) already returns one row per entity (latest).
-	const watchlist = $derived(
-		[...convergence]
-			.filter(cs => !publicOnly || !!cs.ticker)
-			.sort((a, b) => b.compound_score - a.compound_score)
-	);
+	// Watchlist = converging companies, strongest first. The backend returns one
+	// row per entity, but distinct entities can share a ticker (Google + Alphabet
+	// → GOOGL), so dedup by ticker (keep highest score); unmapped rows dedup by
+	// entity_id.
+	const watchlist = $derived.by(() => {
+		const filtered = convergence.filter(cs => !publicOnly || !!cs.ticker);
+		const best = new Map<string, CrossSignal>();
+		for (const cs of filtered) {
+			const key = cs.ticker ?? `e:${cs.entity_id}`;
+			const prev = best.get(key);
+			if (!prev || cs.compound_score > prev.compound_score) best.set(key, cs);
+		}
+		return [...best.values()].sort((a, b) => b.compound_score - a.compound_score);
+	});
 	const freshCount = $derived(watchlist.filter(w => isFreshToday(w.computed_at)).length);
 	const hiddenCount = $derived(convergence.filter(cs => !cs.ticker).length);
+
+	// Match a watchlist company to its evidence (reasons + driving headlines) by
+	// name — get_signal_evidence is already fetched, no extra call. Lets each card
+	// expand to show WHY it's converging.
+	const evidenceByName = $derived.by(() => {
+		const m = new Map<string, typeof evidence[number]>();
+		for (const e of evidence) m.set(e.entity_name, e);
+		return m;
+	});
+	let expandedWatch = $state<number | null>(null);
 
 	// Keyboard shortcuts
 	function handleKeydown(e: KeyboardEvent) {
@@ -474,34 +491,67 @@
 					<p class="text-xs text-text-muted italic">No public companies converging right now. Toggle "All entities" to see unmapped signals.</p>
 				{/if}
 				<div class="space-y-2">
-					{#each watchlist as cs}
+					{#each watchlist as cs, idx}
 						{@const firing = firingSignals(cs)}
 						{@const fresh = isFreshToday(cs.computed_at)}
-						<div class="bg-bg-card border border-border rounded-xl px-5 py-4">
-							<div class="flex items-start justify-between gap-3">
-								<div class="min-w-0">
-									<div class="flex items-center gap-2 flex-wrap">
-										<span class="font-semibold text-text truncate">{cleanName(cs.entity_name)}</span>
-										{#if cs.ticker}
-											<span class="text-[10px] font-mono text-text-muted bg-bg px-1.5 py-0.5 rounded">{cs.ticker}</span>
-										{/if}
-										{#if fresh}
-											<span class="text-[9px] font-semibold uppercase tracking-wide text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded">New</span>
-										{/if}
+						{@const ev = evidenceByName.get(cs.entity_name)}
+						{@const isOpen = expandedWatch === idx}
+						{@const stories = ev?.source_stories ?? []}
+						<div class="bg-bg-card border border-border rounded-xl overflow-hidden">
+							<button class="w-full text-left px-5 py-4 hover:bg-white/[0.02] transition-colors"
+								onclick={() => expandedWatch = isOpen ? null : idx}>
+								<div class="flex items-start justify-between gap-3">
+									<div class="min-w-0">
+										<div class="flex items-center gap-2 flex-wrap">
+											<span class="font-semibold text-text truncate">{cleanName(cs.entity_name)}</span>
+											{#if cs.ticker}
+												<span class="text-[10px] font-mono text-text-muted bg-bg px-1.5 py-0.5 rounded">{cs.ticker}</span>
+											{/if}
+											{#if fresh}
+												<span class="text-[9px] font-semibold uppercase tracking-wide text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded">New</span>
+											{/if}
+										</div>
+										<!-- Firing-signal badges: WHY this is converging -->
+										<div class="flex items-center gap-1.5 flex-wrap mt-2">
+											{#each firing as sig}
+												<span class="text-[10px] font-medium px-1.5 py-0.5 rounded {sig.color}">{sig.label}</span>
+											{/each}
+											<span class="text-[10px] text-text-muted ml-1">{cs.source_diversity} source{cs.source_diversity === 1 ? '' : 's'}</span>
+											{#if stories.length > 0}
+												<span class="text-[10px] text-text-muted">· {isOpen ? '▾' : '▸'} {stories.length} headline{stories.length === 1 ? '' : 's'}</span>
+											{/if}
+										</div>
 									</div>
-									<!-- Firing-signal badges: WHY this is converging -->
-									<div class="flex items-center gap-1.5 flex-wrap mt-2">
-										{#each firing as sig}
-											<span class="text-[10px] font-medium px-1.5 py-0.5 rounded {sig.color}">{sig.label}</span>
-										{/each}
-										<span class="text-[10px] text-text-muted ml-1">{cs.source_diversity} source{cs.source_diversity === 1 ? '' : 's'}</span>
+									<div class="text-right shrink-0">
+										<div class="text-base font-mono font-bold text-text">{(cs.compound_score * 100).toFixed(0)}%</div>
+										<div class="text-[10px] text-text-muted">convergence</div>
 									</div>
 								</div>
-								<div class="text-right shrink-0">
-									<div class="text-base font-mono font-bold text-text">{(cs.compound_score * 100).toFixed(0)}%</div>
-									<div class="text-[10px] text-text-muted">convergence</div>
+							</button>
+							{#if isOpen}
+								<div class="px-5 pb-4 pt-1 border-t border-border/50">
+									{#if ev?.reasons?.length}
+										<ul class="mb-3 space-y-1">
+											{#each ev.reasons as reason}
+												<li class="text-xs text-text-secondary flex gap-1.5"><span class="text-text-muted">·</span>{reason}</li>
+											{/each}
+										</ul>
+									{/if}
+									{#if stories.length > 0}
+										<div class="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-1.5">Recent headlines</div>
+										<div class="space-y-1.5">
+											{#each stories.slice(0, 6) as story}
+												<div class="text-xs">
+													<span class="text-text-secondary">{story.headline}</span>
+													<span class="text-[10px] text-text-muted ml-1">— {story.source_name}</span>
+												</div>
+											{/each}
+										</div>
+									{:else}
+										<p class="text-xs text-text-muted italic">No headline evidence available for this company yet.</p>
+									{/if}
 								</div>
-							</div>
+							{/if}
 						</div>
 					{/each}
 				</div>
