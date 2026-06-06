@@ -146,6 +146,20 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Cost guardrail: bail before any LLM call if today's spend already crossed the cap.
     check_daily_cost_cap(db_path)?;
 
+    // Phase 0a: Entity-targeted Form 4 fetch — pull insider filings PER tracked CIK
+    // (the global EDGAR fetch only catches the recent-50, leaving ~83% of converging
+    // companies blind on insider, the largest-weighted signal). Runs before enrichment
+    // so today's new filings get their transaction details filled in the same run.
+    tracing::info!("Phase 0a: Fetching targeted Form 4 filings for tracked companies...");
+    match fetch_targeted_form4(db_path).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("Targeted Form 4: inserted {} new insider filings", count);
+            }
+        }
+        Err(e) => tracing::warn!("Targeted Form 4 fetch failed (non-fatal): {}", e),
+    }
+
     // Phase 0: Enrich Form 4 stories from previous runs (before EDGAR fetch burns SEC rate limit)
     tracing::info!("Phase 0: Enriching prior Form 4 filings with transaction data...");
     match enrich_form4_stories(db_path).await {
@@ -4992,6 +5006,169 @@ async fn snapshot_portfolio(db_path: &Path) -> anyhow::Result<bool> {
     );
 
     Ok(true)
+}
+
+/// Entity-targeted Form 4 fetch. The default EDGAR fetch grabs the global recent-50
+/// Form 4s (a firehose), so insider data only lands for whichever companies happen
+/// to file in that window — leaving ~83% of converging companies with no insider
+/// signal even though insider is the largest-weighted dimension (0.24).
+///
+/// This fetches Form 4s PER TRACKED CIK via SEC's submissions API, mirroring the
+/// proven per-CIK pattern in bootstrap_historical.py. Bounded to companies with a
+/// ticker mapping (the watchlist universe) and recent signal interest, throttled to
+/// stay under SEC's 10 req/s. Inserts new Form 4 stories that the existing
+/// enrichment phase + Stage 3 aggregation then pick up.
+///
+/// NOTE: SEC submissions API wants the 10-digit ZERO-PADDED CIK (opposite of the
+/// company_tickers.json unpadded form used in ticker mapping).
+/// Public entry point for `--mode fetch-form4` (standalone test/manual run).
+pub async fn run_targeted_form4(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    crate::db::run_migrations(&conn)?;
+    drop(conn);
+    fetch_targeted_form4(db_path).await
+}
+
+async fn fetch_targeted_form4(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    // Target CIKs: ticker-mapped entities that have appeared in cross_signals
+    // recently (the companies that actually feed the watchlist). Bounded to 150 to
+    // keep SEC calls reasonable (~1 req/company + throttle).
+    let ciks: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT et.cik, et.ticker
+             FROM entity_tickers et
+             JOIN cross_signals cs ON cs.entity_id = et.entity_id
+             WHERE et.cik IS NOT NULL AND et.cik != ''
+               AND cs.computed_at >= date('now', '-30 days')
+             LIMIT 150"
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    if ciks.is_empty() {
+        return Ok(0);
+    }
+
+    // Financial stories attach to the most recent briefing (stories.briefing_id is
+    // NOT NULL). If no briefing exists yet, skip — the daily pipeline creates one.
+    let briefing_id: i64 = match conn.query_row(
+        "SELECT id FROM briefings ORDER BY created_at DESC LIMIT 1", [], |row| row.get(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            tracing::warn!("Targeted Form 4: no briefing exists yet, skipping");
+            return Ok(0);
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let mut inserted = 0;
+
+    for (cik, ticker) in &ciks {
+        let padded = format!("{:0>10}", cik.trim_start_matches('0'));
+        let url = format!("https://data.sec.gov/submissions/CIK{}.json", padded);
+
+        let resp = match client.get(&url)
+            .header("User-Agent", "Pulse/1.0 (pulse-app@example.com)")
+            .send().await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) if r.status().as_u16() == 429 => {
+                tracing::warn!("Targeted Form 4: SEC 429, stopping after {} inserted", inserted);
+                break;
+            }
+            Ok(_) | Err(_) => { tokio::time::sleep(std::time::Duration::from_millis(150)).await; continue; }
+        };
+
+        let json: serde_json::Value = match resp.json().await {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+
+        // Recent filings live under filings.recent, parallel arrays.
+        let recent = &json["filings"]["recent"];
+        let forms = recent["form"].as_array();
+        let accessions = recent["accessionNumber"].as_array();
+        let dates = recent["filingDate"].as_array();
+        let (Some(forms), Some(accessions), Some(dates)) = (forms, accessions, dates) else {
+            tracing::warn!("Targeted Form 4: {} — recent arrays missing (forms/acc/dates)", ticker);
+            continue;
+        };
+
+        let company = json["name"].as_str().unwrap_or(ticker).to_string();
+
+        // Walk recent filings; pick Form 4s from the last 30 days not already stored.
+        let cutoff = chrono::Local::now().date_naive()
+            .checked_sub_days(chrono::Days::new(30))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+
+        for i in 0..forms.len().min(accessions.len()).min(dates.len()) {
+            if forms[i].as_str() != Some("4") { continue; }
+            let filing_date = dates[i].as_str().unwrap_or("");
+            if filing_date < cutoff.as_str() { break; } // recent is date-desc, stop early
+            let accession = accessions[i].as_str().unwrap_or("");
+            if accession.is_empty() { continue; }
+
+            // Skip if already stored.
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stories WHERE financial_metadata LIKE ?1)",
+                [format!("%{}%", accession)],
+                |row| row.get(0),
+            ).unwrap_or(false);
+            if exists { continue; }
+
+            // Insert a bare Form 4 story; transaction details get filled by the
+            // existing enrich_form4_stories phase on a later run.
+            let metadata = serde_json::json!({
+                "cik": cik,
+                "accession_number": accession,
+                "ticker": ticker,
+                "filing_date": filing_date,
+            });
+            let url_str = format!("https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={}", padded);
+            let headline = format!("{} insider filing (Form 4)", company);
+            let summary = format!("Form 4 insider transaction filed by {} on {}", company, filing_date);
+            // Unique URL per filing (accession-based) so url_hash doesn't collide.
+            let filing_url = format!("{}#{}", url_str, accession);
+            let res = conn.execute(
+                "INSERT OR IGNORE INTO stories
+                   (briefing_id, headline, original_title, original_url, content_snippet,
+                    source_name, source_type, financial_metadata, published_at, created_at,
+                    sector, summary, key_facts, why_it_matters, what_to_watch,
+                    url_hash, title_hash)
+                 VALUES (?1, ?2, ?2, ?3, ?6, 'SEC EDGAR 4', 'financial', ?4, ?5,
+                         datetime('now'), 'finance', ?6, '[]', '', '', ?7, ?8)",
+                rusqlite::params![
+                    briefing_id,
+                    headline,
+                    filing_url,
+                    metadata.to_string(),
+                    filing_date,
+                    summary,
+                    crate::dedup::url_hash(&filing_url),
+                    crate::dedup::title_hash(&headline),
+                ],
+            );
+            match res {
+                Ok(n) => inserted += n,
+                Err(e) => tracing::warn!("Targeted Form 4: insert failed for {} {}: {}", ticker, accession, e),
+            }
+        }
+
+        // SEC rate limit: stay well under 10 req/s.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    Ok(inserted)
 }
 
 /// Enrich stored Form 4 stories that are missing transaction data.

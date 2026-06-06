@@ -103,6 +103,13 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Running Four Freedoms pipeline...");
             pipeline::run_freedoms(&db_path).await?;
         }
+        "fetch-form4" => {
+            tracing::info!("Fetching targeted Form 4 filings for tracked companies...");
+            match pipeline::run_targeted_form4(&db_path).await {
+                Ok(n) => tracing::info!("Targeted Form 4 complete: {} new filings inserted", n),
+                Err(e) => tracing::error!("Targeted Form 4 fetch failed: {}", e),
+            }
+        }
         "backfill-tickers" => {
             // Apply the CIK-mapping fix to ALL unmapped entities in one pass
             // (the daily pipeline caps at 200/run). Expands the tradeable/watchlist universe.
