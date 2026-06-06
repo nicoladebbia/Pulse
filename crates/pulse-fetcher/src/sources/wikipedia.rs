@@ -56,7 +56,8 @@ async fn fetch_pageviews(entities: &[(String, String)]) -> anyhow::Result<Vec<Ra
 
     let today = chrono::Local::now();
     let end = today.format("%Y%m%d").to_string();
-    let start_7d = (today - chrono::Duration::days(7)).format("%Y%m%d").to_string();
+    // Pull 37 days; the recent-7d vs prior-30d split is done in-code below by
+    // slicing the returned daily series (no separate 7d query window needed).
     let start_37d = (today - chrono::Duration::days(37)).format("%Y%m%d").to_string();
     let today_str = today.format("%Y-%m-%d").to_string();
 
