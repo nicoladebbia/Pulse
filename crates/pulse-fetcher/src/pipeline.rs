@@ -4657,17 +4657,18 @@ async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
     // exit math; original_compound_score drives signal-decay; half_closed_at
     // gates CloseHalf from re-triggering.
     #[allow(clippy::type_complexity)]
-    let open: Vec<(i64, String, f64, String, f64, Option<String>)> = {
+    let open: Vec<(i64, String, f64, String, f64, Option<String>, f64)> = {
         let mut stmt = conn.prepare(
             "SELECT id, ticker, entry_price, entry_date,
                     COALESCE(original_compound_score, confidence, 0.30),
-                    half_closed_at
+                    half_closed_at, position_size
              FROM paper_trades WHERE status = 'open'"
         )?;
         stmt.query_map([], |row| Ok((
             row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
             row.get::<_, f64>(4).unwrap_or(0.30),
             row.get::<_, Option<String>>(5).unwrap_or(None),
+            row.get::<_, f64>(6).unwrap_or(0.0),
         )))?
         .filter_map(|r| r.ok())
         .collect()
@@ -4685,7 +4686,7 @@ async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
     let now_dt = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let mut actions = 0usize;
 
-    for (trade_id, ticker, entry_price, entry_date, orig_score, half_closed_at) in &open {
+    for (trade_id, ticker, entry_price, entry_date, orig_score, half_closed_at, position_size) in &open {
         // Ground truth from Alpaca: current_price + held qty. If Alpaca has no
         // position (already liquidated elsewhere), reconcile the DB to closed.
         let pos: Option<serde_json::Value> = match client
@@ -4708,11 +4709,16 @@ async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
                     {
                         let pnl_pct = ((exit_p - entry_price) / entry_price) * 100.0;
                         // We don't know the exact qty that was held at fill time;
-                        // pnl_pct is exact, pnl dollars uses entry notional as a proxy.
+                        // pnl_pct is exact, pnl dollars uses entry notional as a proxy:
+                        // implied shares = position_size (dollar notional) / entry_price,
+                        // times the per-share gain. Without this, pnl was left NULL/0 and
+                        // analytics silently dropped the close (pnl_pct NOT NULL filter
+                        // still passed, but win-rate $ aggregates were wrong).
+                        let pnl_dollars = (exit_p - entry_price) * (position_size / entry_price);
                         conn.execute(
                             "UPDATE paper_trades SET status='closed', exit_price=?1,
-                                exit_date=?2, pnl_pct=?3 WHERE id=?4",
-                            rusqlite::params![exit_p, today, pnl_pct, trade_id],
+                                exit_date=?2, pnl=?3, pnl_pct=?4 WHERE id=?5",
+                            rusqlite::params![exit_p, today, pnl_dollars, pnl_pct, trade_id],
                         ).ok();
                         tracing::warn!(
                             "Position mgmt: {} closed between runs — reconciled @ ${:.2} ({:+.1}%)",

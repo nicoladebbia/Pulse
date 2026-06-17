@@ -258,6 +258,16 @@ def compute_signals_for_ticker(conn: sqlite3.Connection, ticker: str, as_of_date
     #  "news" (Path A): trade led by news-momentum, the one significant signal.
     #     News must be strong; government can co-confirm. Insider is ignored as
     #     an entry trigger since it tested as noise.
+    #
+    #  RE-MEASURED 2026-06-17 (full 2yr historical, fixed overall-MC test):
+    #     news IS significant under convergence (p=0.006, n=25) but NOT under the
+    #     news strategy (p=0.547, n=130 — diluted). Either way the GATE FAILS:
+    #     <50 trades AND walk-forward OOS hit rate collapses to 34% (in-sample
+    #     60.6%) → classic overfit. A single in-sample-significant dimension is
+    #     NOT a tradeable edge. VERDICT stands: NO-GO, do not enable live trading.
+    #     The real blocker is data: historical DB has SEC filings only, so the 5
+    #     richer live signals (real news, search, lobbying, patents, institutional)
+    #     have no history to validate. See scripts/TRADING_STATUS.md.
     has_insider = profile.get("insider", 0) > 0.15
     has_gov = profile.get("government", 0) > 0.15
     has_news = profile.get("news", 0) > 0.30
@@ -493,19 +503,29 @@ def monte_carlo_test(trades: list[ClosedTrade], n_iter: int = 1000) -> dict:
     if len(trades) < 10:
         return {"overall_p_value": 1.0, "overall_significant": False, "dimensions": {}}
 
+    # Overall permutation test: does the compound signal score actually pick
+    # winners, or would random score-assignment do as well? We measure the
+    # score-weighted return — sum(signal_score * return) / n. Under the null
+    # (score carries no info) the score↔return pairing is arbitrary, so we
+    # shuffle the pairing and see how often random beats the real association.
+    #
+    # NOTE: the previous version shuffled the *return list* and recomputed the
+    # hit rate. Shuffling a list and counting positives is permutation-invariant
+    # — the hit rate was identical every iteration, so p_value was always ~1.0
+    # by construction. That test could never pass. This one actually varies.
     real_returns = [t.pnl_pct for t in trades]
-    real_hit_rate = sum(1 for r in real_returns if r > 0) / len(real_returns)
+    scores = [t.signal_score for t in trades]
+    real_stat = sum(s * r for s, r in zip(scores, real_returns)) / len(trades)
 
-    shuffled_hit_rates = []
+    shuffled_stats = []
+    returns_pool = real_returns.copy()
     for _ in range(n_iter):
-        shuffled = real_returns.copy()
-        random.shuffle(shuffled)
-        # Assign shuffled returns to same signals
-        hit_rate = sum(1 for r in shuffled if r > 0) / len(shuffled)
-        shuffled_hit_rates.append(hit_rate)
+        random.shuffle(returns_pool)
+        stat = sum(s * r for s, r in zip(scores, returns_pool)) / len(trades)
+        shuffled_stats.append(stat)
 
-    # p-value: fraction of shuffled results >= real result
-    p_value = sum(1 for s in shuffled_hit_rates if s >= real_hit_rate) / n_iter
+    # p-value: fraction of random pairings whose score-weighted return >= real
+    p_value = sum(1 for s in shuffled_stats if s >= real_stat) / n_iter
 
     # Per-dimension Monte Carlo
     dim_results = {}
