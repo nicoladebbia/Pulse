@@ -1,101 +1,147 @@
 # Pulse
 
-> A macOS desktop app that fetches, summarizes, and connects the day's news into an AI-curated intelligence briefing — then turns the signals into trends, predictions, and a paper-trading sandbox.
+**A local-first news-intelligence engine in Rust: a hybrid (BM25 + dense-vector) RAG pipeline with HyDE query expansion, two-stage reranking, and query-class-aware recency decay — shipped as a single Tauri 2 desktop app over a 22k-document SQLite corpus.**
 
-Pulse runs a scheduled fetch pipeline twice a day, pulls from a wide set of free public data sources, summarizes stories with Claude, embeds them for semantic search, and surfaces what's accelerating across sectors. The desktop app is a magazine-style reader with a RAG chat ("Ask"), entity trend tracking, calibrated predictions, and a paper-trading layer driven by the same signals.
+The interesting part of Pulse is not "an app that summarizes news." It's the retrieval layer: a multi-stage RAG pipeline written in Rust that fuses keyword and semantic search, rewrites and decomposes queries with an LLM, reranks with a cross-encoder, decays results by recency *differently depending on what kind of question was asked*, and degrades gracefully when any external model call fails — all running in-process against a local SQLite database with no vector-database dependency.
 
-## What it does
+---
 
-- **Daily briefing** — A curated, sector-organized briefing generated from the latest fetch, with per-story summaries, "why it matters", key facts, and cross-sector connection insights.
-- **Multi-source fetch pipeline** — Concurrently collects from ~16 free sources (see below), deduplicates, summarizes with Claude, and stores everything in SQLite.
-- **Ask (RAG chat)** — Streaming chat grounded in the story corpus, with retrieval, reranking, source citations, follow-ups, and thumbs-up/down feedback that feeds a source-reputation model.
-- **Signals & Trends** — Extracts named entities from stories, tracks 7/30/90-day mention windows, computes acceleration, and labels trajectories (rising / hot / dominant / fading / dormant).
-- **Cross-sector signals** — Convergence alerts and signal evidence linking entities across sectors, with live and historical price context.
-- **Predictions** — Forward-looking predictions with validation, calibration stats, and automatic expiry of stale predictions.
-- **Paper trading** — A paper-trading portfolio with trade execution, position management, exit evaluation, backtesting, a trade journal, and portfolio analytics. (Paper only — driven by signals, no real orders.)
-- **Four Freedoms** — A separate themed pipeline producing per-freedom briefing sections.
-- **Full-text search & archive** — FTS over the story corpus plus a browsable briefing archive.
+## The problem
+
+Retrieval-augmented generation over a news archive is hard for reasons that don't show up in a toy demo:
+
+- **Keyword search and semantic search fail on opposite queries.** BM25 nails `"NVDA Q3 earnings"` and whiffs on `"chip makers facing supply pressure"`; dense vectors do the reverse. You need both, fused, without one channel's noise drowning the other.
+- **Recency means different things for different questions.** `"what happened today"` should bury a relevant-but-old story; `"compare GPT-4 vs Claude over the last year"` should *not*. A single recency weight is wrong for both.
+- **Every quality stage is a network call to a flaky external model.** Query rewrite, embedding, reranking, and synthesis each hit a third-party API. Any one can time out. A naive pipeline turns one slow API into a hung UI or a crashed desktop app.
+
+Pulse's retrieval layer is built around these three facts.
+
+---
+
+## Architecture
+
+```
+                          ┌─────────────────────── SvelteKit (Svelte 5 runes) ───────────────────────┐
+                          │  Ask (RAG chat)   Briefing   Signals/Trends   Predictions   Paper journal │
+                          └───────────────────────────────┬──────────────────────────────────────────┘
+                                              Tauri IPC (typed commands, streaming Channel<T>)
+┌─────────────────────────────────────────────────────────┴───────────────────────────────────────────┐
+│ src-tauri/  — Rust backend (56 Tauri commands, all Result<T, String>, panic-free)                     │
+│                                                                                                       │
+│   Ask query ─▶ classify query type ─▶ ┌─ Haiku rewrite + HyDE + decompose ─┐ (parallel)               │
+│                (Breaking/Analytical/   └─ Voyage embed raw query ───────────┘                          │
+│                 Comparative/Advisory)            │                                                     │
+│                                                  ▼                                                     │
+│              entity/graph FTS expansion ─▶ HYBRID RETRIEVE ──┬─ BM25 FTS5 (field-weighted)            │
+│                                                              └─ brute-force cosine over embeddings     │
+│                                                  │                                                     │
+│              score-weighted RRF ─▶ query-class recency decay ─▶ 2-stage rerank ─▶ web fallback        │
+│                                                  │              (Voyage rerank-2-lite                  │
+│                                                  ▼               → Haiku → original order)             │
+│                                          stream synthesis (Sonnet) ─▶ Channel<ChatStreamEvent>        │
+│                                                                                                       │
+│   SQLite (rusqlite, bundled) — stories + FTS5 + 512-dim embedding blobs + entity graph                │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                  ▲
+┌─────────────────────────────────────────────────┴────────────────────────────────────────────────────┐
+│ crates/pulse-fetcher/  — standalone Rust binary, run by launchd at 08:00 / 21:00                       │
+│   collect (16 free sources, concurrent, non-fatal) ─▶ dedup ─▶ summarize (Haiku) ─▶ cross-sector       │
+│   analysis (Sonnet) ─▶ embed (Voyage) ─▶ extract entities ─▶ write SQLite                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Two Rust crates in one Cargo workspace: the Tauri app (`src-tauri/`, the query/serve side) and a headless fetcher (`crates/pulse-fetcher/`, the ingest side). They share one SQLite file and nothing else — the fetcher can run on a schedule with the app closed.
+
+---
+
+## Key engineering decisions & tradeoffs
+
+**1. Brute-force cosine instead of a vector index (sqlite-vec / FAISS / a vector DB).**
+Semantic search is a linear scan: deserialize every stored embedding (`bytemuck::cast_slice` over the raw little-endian blob — zero-copy, no per-element parsing) and compute cosine similarity against the query vector. At ~22k documents × 512 dims this is an O(n) scan with no index to build, invalidate, or keep consistent with the source-of-truth rows. Adding an ANN index (HNSW/IVF) would trade exact recall and operational simplicity for sub-linear latency the corpus doesn't yet need. The seam is a single function (`find_similar`); swapping in `sqlite-vec` is a contained change if the corpus outgrows a linear scan. **This is deliberate — the code does *not* use sqlite-vec today**, and the README says so rather than implying an index that isn't there.
+
+**2. Score-weighted Reciprocal Rank Fusion, not vanilla RRF.** Standard RRF fuses only on rank position (`1/(k+rank)`), discarding the magnitude of the similarity. Pulse keeps the raw scores: `contribution = raw_score / (k + rank + 1)`, with `k = 60` and a **1.3× boost on the semantic channel** — chosen because FTS5 returns more low-quality near-matches, so an unboosted fusion lets keyword noise outvote a strong semantic hit. A relative score cutoff (drop below `0.3 × top_score`, but always keep ≥3 results) trims the long tail without starving niche queries.
+
+**3. Recency decay is a function of the *query class*, not a constant.** A keyword heuristic classifies each question into Breaking / Analytical / Comparative / Advisory / General, and each class carries its own `(alpha, half_life)`: Breaking weights recency hard (`alpha=0.4, half_life=3d`), Comparative almost ignores it (`alpha=0.95, half_life=60d`). Final score = `alpha · relevance + (1 - alpha) · 0.5^(age_days / half_life)`. The same corpus answers "what's new today" and "how has this evolved over a year" without a mode switch from the user.
+
+**4. Every external-model stage is non-fatal and time-boxed.** This is the cross-cutting decision that makes the pipeline shippable as a desktop app:
+- Query rewrite: 3s timeout → falls back to the raw query. Also *skipped entirely* for queries under 6 words (a deliberate latency cut — short lookups don't benefit from HyDE).
+- Reranking: Voyage `rerank-2-lite` (8s timeout) → Haiku LLM-rerank → original fused order. Three tiers, each catching the one above.
+- Web search: only triggered when archive confidence is low; otherwise skipped to stay grounded and cheap.
+- Synthesis: streamed token-by-token over a Tauri `Channel`, with an `AtomicBool` abort flag so the user can cancel mid-generation.
+
+No single API failure can hang the UI or crash the webview — a property enforced in code (every `#[tauri::command]` returns `Result<T, String>`, and the project bans bare `.unwrap()` in command paths and `partial_cmp().unwrap()` anywhere, using `.unwrap_or(Ordering::Equal)` to survive NaN scores).
+
+---
+
+## Notable implementation details
+
+- **HyDE done right.** The query rewriter (Haiku) emits structured JSON — expanded keywords, a *hypothetical answer* for semantic matching, a parsed temporal filter (`"last quarter"` → an ISO date), and optional sub-queries for multi-entity questions. The hypothetical answer is embedded separately and merged into the same fusion, so a vague question retrieves against what a *good answer* would look like, not just the question's words.
+- **Query decomposition.** A multi-topic question ("compare X's AI strategy and Y's chip roadmap") is split into ≤3 sub-queries, each retrieved independently and merged — with a guard that only decomposes when there are genuinely 2+ distinct entities (most questions return `[]`).
+- **Entity-graph query expansion.** Before retrieval, the query is expanded with known entity aliases and graph neighbors from the corpus's own entity table (`"NVDA"` → `"NVDA Nvidia"`), so ticker/acronym/full-name mismatches don't cost recall.
+- **Field-weighted BM25.** FTS5 `bm25(stories_fts, 50, 1, 5, 5)` weights headline matches 50× body text, with a LIKE-based fallback if a malformed FTS query throws.
+- **An actual eval harness, not vibes.** `cargo run --bin pulse-eval` scores retrieval against **39 ground-truth cases** (`eval/cases.json`) computing **Recall@k, Precision@k, and MRR**, with ablation flags (`--no-hyde`, `--no-rerank`, `--no-graph`, `--no-entity-expand`, `--no-rewrite`) to measure each stage's marginal contribution, plus an `--auto-judge` mode that uses Haiku to label relevance. The pipeline is instrumented to be measured, not asserted.
+- **A backtester that says no.** The paper-trading layer includes a backtester with transaction costs and a Monte Carlo significance test; the git history shows it repeatedly returning honest **NO-GO** verdicts ("edge was small-sample noise") — the signal-driven trading stays paper-only by design.
+
+---
 
 ## Tech stack
 
-- **Desktop shell:** [Tauri 2](https://tauri.app/) (Rust backend)
-- **Frontend:** SvelteKit (Svelte 5 runes) + Tailwind CSS v4, static adapter, TypeScript, Vite 6
-- **Backend (`src-tauri/`):** Rust, `rusqlite` (bundled SQLite), Tauri commands organized by domain (briefing, stories, chat, trends, predictions, cross-signals, trading, usage)
-- **Fetch pipeline (`crates/pulse-fetcher/`):** Standalone Rust binary run on a schedule, async via Tokio + reqwest, `feed-rs` for RSS
-- **AI:** Anthropic Claude (Haiku 4.5 for story summaries / entity extraction, Sonnet 4.6 for cross-sector analysis); Voyage `voyage-3-lite` embeddings for semantic search
-- **Storage:** SQLite with FTS and vector embeddings; schema managed by numbered SQL migrations in `migrations/`
-- **Scheduling:** macOS `launchd` agent (`com.pulse.daily-fetch`) at 08:00 and 21:00
+| Layer | Choice |
+|-------|--------|
+| Desktop shell | Tauri 2 (Rust) |
+| Frontend | SvelteKit, Svelte 5 (runes), Tailwind CSS v4, TypeScript, Vite 6 |
+| Backend | Rust, `rusqlite` (bundled SQLite + FTS5), Tokio, `reqwest`, `async-trait` |
+| Fetcher | Standalone Rust binary, `feed-rs`, concurrent async ingest |
+| Embeddings | Voyage `voyage-3-lite` (512-dim) |
+| Rerank | Voyage `rerank-2-lite` → Haiku fallback |
+| LLMs | Claude Haiku 4.5 (rewrite / summarize / rerank), Sonnet (synthesis / cross-sector) |
+| Storage | SQLite — FTS5 + embedding blobs + entity graph, 25 numbered SQL migrations |
+| Scheduling | macOS `launchd` (08:00 / 21:00) |
 
-## Data sources
+---
 
-The fetcher collects from free public APIs and feeds, all non-fatal (a failed source is logged and skipped):
+## Running it
 
-Google News RSS, direct RSS feeds, Hacker News, Reddit, arXiv, bioRxiv, USASpending, Federal Register, SEC EDGAR, FRED, FEC, EIA, LDA lobbying disclosures, USPTO patents, SBIR, Wikipedia.
-
-## Project structure
-
-```
-src/                      SvelteKit frontend (routes: briefing, ask, signals, trends, predictions, ideas, journal, archive, freedoms)
-src-tauri/                Tauri 2 Rust backend (commands/, services/, db/, models/)
-crates/pulse-fetcher/     Standalone fetch + summarize + embed pipeline binary
-migrations/               Numbered SQLite schema migrations
-launchd/                  macOS launchd plist for scheduled fetches
-scripts/                  Sidecar build + launchd install/uninstall + Python backtester/replay tools
-eval/                     Retrieval/chat eval cases
-```
-
-## Setup
-
-Requirements: macOS, Rust toolchain, Node + [pnpm](https://pnpm.io/).
-
-1. **Install frontend dependencies**
-   ```bash
-   pnpm install
-   ```
-
-2. **Configure API keys** — copy `.env.example` to `.env` and fill in:
-   ```bash
-   cp .env.example .env
-   ```
-   ```
-   ANTHROPIC_API_KEY=sk-ant-...
-   VOYAGE_API_KEY=pa-...
-   CURRENTS_API_KEY=...
-   ```
-   The fetcher and the app load keys from `~/Projects/Pulse/.env` at runtime.
-
-## Run
+Requires macOS, a Rust toolchain, and Node + [pnpm](https://pnpm.io/).
 
 ```bash
-pnpm tauri dev                 # Run the desktop app in dev mode (frontend + Tauri)
-pnpm tauri build               # Production app build
+pnpm install                  # frontend deps
+cp .env.example .env          # then fill in ANTHROPIC_API_KEY, VOYAGE_API_KEY, CURRENTS_API_KEY
+
+pnpm tauri dev                # run the desktop app (frontend + Rust backend)
+pnpm tauri build             # production app build
 ```
 
-### Fetch pipeline
-
+**Fetch pipeline (headless):**
 ```bash
-cargo build -p pulse-fetcher                  # Build the fetcher (debug)
-cargo build --release -p pulse-fetcher        # Build for the scheduled agent
-./target/debug/pulse-fetcher --mode daily     # Manual fetch
-./target/debug/pulse-fetcher --mode daily --force   # Force re-fetch even if a briefing exists
+cargo build -p pulse-fetcher
+./target/debug/pulse-fetcher --mode daily          # one manual fetch
+./target/debug/pulse-fetcher --mode daily --force  # re-fetch even if today's briefing exists
 ```
 
-The fetcher supports additional modes, including: `daily`, `freedoms`, `manual`, `backfill-embeddings`, `extract-entities`, `fetch-form4`, `backfill-tickers`, and `manage-positions`.
-
-### Scheduled fetches (launchd)
-
+**Tests & evaluation:**
 ```bash
-./scripts/build-sidecar.sh        # Build the release fetcher + stage the Tauri sidecar binary
-./scripts/install-launchd.sh      # Install the launchd agent (runs at 08:00 and 21:00)
-./scripts/uninstall-launchd.sh    # Remove the agent
+cargo test                                          # 146 tests (fusion, cosine, recency, reranking, DB)
+cargo run --bin pulse-eval -- --k 10                # retrieval eval: Recall@k / Precision@k / MRR
+cargo run --bin pulse-eval -- --k 10 --no-rerank    # ablate the rerank stage
+pnpm check                                          # svelte-check
 ```
 
-### Type checking
-
+**Scheduled fetches:**
 ```bash
-pnpm check                        # svelte-kit sync + svelte-check
+./scripts/build-sidecar.sh && ./scripts/install-launchd.sh   # install the 08:00/21:00 agent
 ```
+
+---
 
 ## Status
 
-Personal project, actively developed. Versioned `0.1.0`. macOS-only. The trading layer is **paper trading only** — it simulates positions from signals and does not place real orders. API keys are required for the fetch pipeline, chat, embeddings, and predictions to function.
+Personal project, actively developed, `0.1.0`, **macOS-only**. Single-user and local-first by design — there is no server, no multi-tenancy, and no auth; the SQLite file on disk is the whole backend.
+
+Honest limitations, stated plainly:
+- **Semantic search is a brute-force linear scan**, not an indexed ANN search. Correct and simple at the current corpus size (~22k docs); it will need an index (the `sqlite-vec` swap) before it scales an order of magnitude larger.
+- **Query classification is keyword-heuristic**, not a learned classifier — cheap and debuggable, but it mis-routes adversarial phrasings.
+- The **trading layer is paper-only** and intentionally stays that way; the backtester has repeatedly found no real edge.
+- The pipeline depends on external APIs (Anthropic, Voyage, plus free data sources) — every stage degrades gracefully, but with no keys the RAG and fetch paths are inert.
+
+The numbers cited above (22k corpus, 512-dim embeddings, 146 tests, 39 eval cases, 56 commands, 16 sources, 25 migrations) are read from the code and database, not estimated. The eval harness exists and runs; this README does **not** quote eval *scores*, because they depend on a live API run and would go stale — run `pulse-eval` to produce current numbers.
