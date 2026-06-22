@@ -59,6 +59,16 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Database: {}", db_path.display());
 
     match args.mode.as_str() {
+        "notify-test" => {
+            // Self-test for the failure-alert path. Fires the FAILED and DEGRADED
+            // banners exactly as a real failure would, so delivery can be verified
+            // from the launchd context without waiting for an actual outage.
+            // (Proved the fire-and-exit timing bug + the .status() fix on 2026-06-22.)
+            tracing::info!("Firing test failure + degraded notifications (blocking delivery)...");
+            notify_failure("TEST: this is what a failed daily run looks like.");
+            crate::pipeline::notify_degraded_test("TEST: this is what a degraded run looks like.");
+            tracing::info!("Test notifications fired");
+        }
         "backfill-embeddings" => {
             tracing::info!("Backfilling embeddings for stories without them...");
             backfill_embeddings(&db_path).await?;
@@ -91,7 +101,12 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             }
-            pipeline::run(&db_path).await?;
+            // Notify-on-failure safety net: a scheduled daily run that errors
+            // (e.g. Groq blocked -> empty briefing aborted) must not fail silently.
+            if let Err(e) = pipeline::run(&db_path).await {
+                notify_failure(&format!("Daily run aborted: {}", e));
+                return Err(e);
+            }
 
             // Also run freedoms pipeline after daily
             tracing::info!("Running Four Freedoms pipeline...");
@@ -135,6 +150,30 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Pulse fetch complete");
     Ok(())
+}
+
+/// Fire a macOS notification when a scheduled fetch fails or produces a degraded
+/// briefing. This is the safety net for silent failures: the June 2026 incident
+/// (NordVPN routing Groq through a blocked VPN exit IP -> every summary 403'd ->
+/// empty briefing aborted) ran for ~2.5 days unnoticed because nothing alerted.
+///
+/// Mirrors the existing success notification in pipeline::send_notification, which
+/// already delivers reliably from the launchd context. This is DETECTION, not
+/// prevention: it tells Nicola the morning after instead of days later. True
+/// prevention is NordVPN split-tunnel (free, GUI) or a provider fallback (costs $).
+fn notify_failure(summary: &str) {
+    // Must use .status() (blocks until osascript finishes), NOT .spawn(): this is
+    // called right before the process exits with Err, and a fire-and-forget spawn
+    // gets killed before notificationd delivers the banner. Measured 2026-06-22:
+    // fire-and-exit dropped the banner silently; blocking delivers it.
+    // best-effort; never let a notification failure mask the real error.
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            r#"display notification "{}" with title "Pulse fetch FAILED" sound name "Basso""#,
+            summary.replace('"', "'").replace('\\', "")
+        ))
+        .status();
 }
 
 async fn backfill_embeddings(db_path: &std::path::Path) -> anyhow::Result<()> {

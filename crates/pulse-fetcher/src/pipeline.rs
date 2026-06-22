@@ -358,6 +358,21 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("No stories could be summarized — all API calls failed. Aborting to avoid storing empty briefing.");
     }
 
+    // Degraded-briefing alert: the run will continue (financial stories may have
+    // saved it from a hard abort), but if the news summarizer mostly failed the
+    // briefing is gutted. Without this, a Groq block that leaves financial intact
+    // returns Ok and fails silently — the same class of bug as the June 2026
+    // incident, just narrower. Threshold: <50% of attempted summaries succeeded.
+    let attempted = articles_to_summarize.len() as i64;
+    if attempted > 0 && sum_count * 2 < attempted {
+        let msg = format!(
+            "Only {}/{} news stories summarized — likely a blocked API (VPN?). Briefing is degraded.",
+            sum_count, attempted
+        );
+        tracing::error!("{}", msg);
+        notify_degraded(&msg);
+    }
+
     // Phase 4: Cross-sector analysis (news only)
     progress.start_stage(4);
     tracing::info!("Phase 4: Cross-sector analysis...");
@@ -5651,12 +5666,36 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
 }
 
 fn send_notification(story_count: usize) -> anyhow::Result<()> {
+    // .status() not .spawn(): blocks until delivery so the banner survives even
+    // if this is the last thing before exit (see notify_failure). Worked before
+    // only because post-processing kept the process alive afterward.
     std::process::Command::new("osascript")
         .arg("-e")
         .arg(format!(
             r#"display notification "Your daily briefing is ready. {} stories across 4 sectors." with title "Pulse" sound name "Glass""#,
             story_count
         ))
-        .spawn()?;
+        .status()?;
     Ok(())
+}
+
+/// Public test hook for `--mode notify-test`: exercises the degraded-alert path.
+pub fn notify_degraded_test(msg: &str) {
+    notify_degraded(msg);
+}
+
+/// Alert that a run completed but the news briefing is degraded (most summaries
+/// failed — typically a blocked API). Best-effort; mirrors send_notification's
+/// proven-from-launchd delivery path. Distinct from main::notify_failure, which
+/// fires only on a hard run-level Err.
+fn notify_degraded(msg: &str) {
+    // .status() not .spawn() — see notify_failure in main.rs. A fire-and-forget
+    // spawn is dropped if the process exits before notificationd delivers.
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            r#"display notification "{}" with title "Pulse fetch DEGRADED" sound name "Basso""#,
+            msg.replace('"', "'").replace('\\', "")
+        ))
+        .status();
 }
