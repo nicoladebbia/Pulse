@@ -542,21 +542,27 @@ impl GroqClient {
     /// cap (max_keep), so we only pay to summarize stories that can actually make
     /// the briefing AND every sector keeps representation.
     pub async fn pre_curate(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
-        self.pre_curate_with_prompt(articles, DAILY_PRE_CURATOR_SYSTEM, "pre_curate", 140).await
+        // Daily has 4 evenly-supplied sectors — scout (the cheap default) balances them fine.
+        self.pre_curate_with_prompt(articles, DAILY_PRE_CURATOR_SYSTEM, "pre_curate", 140, &strong_model()).await
     }
 
     /// Freedoms-pipeline pre-curator. Same mechanism as daily, but the system
     /// prompt names the 5 freedom categories (Time/Wealth/Location/Health/Whoop)
     /// so freedom articles are not down-weighted as off-sector noise.
     pub async fn pre_curate_freedoms(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
-        // NOTE: freedoms cap left intentionally loose (300) — the freedoms pipeline has a
-        // separate downstream collapse bug (stories drop to one category / fail to store);
-        // tightening this cap before that's fixed risks compounding it. See Task: freedoms
-        // collapse investigation. Daily path uses the tight sector-balanced cap (140).
-        self.pre_curate_with_prompt(articles, FREEDOMS_PRE_CURATOR_SYSTEM, "pre_curate_freedoms", 300).await
+        // Cap = 200 (40/sector × 5 freedom categories), matching the downstream curator's
+        // PER_SECTOR_CAP of 40. Summarizing more than the curator can consume wastes calls.
+        //
+        // MODEL: pinned to 70B (NOT the scout env default). Freedoms has 5 sectors with
+        // uneven supply (whoop/health are sparse); measured A/B showed scout selects only
+        // ~1.5% of an abundant health pool (5 of 344) and 0 whoop, while 70B selects ~20%
+        // (72 of 355) and keeps whoop — i.e. scout starves minority sectors here. The daily
+        // 4-symmetric-sector A/B couldn't catch this. 70B costs more but freedoms is one
+        // pre_curate call/run, so the delta is tiny vs the coverage it preserves.
+        self.pre_curate_with_prompt(articles, FREEDOMS_PRE_CURATOR_SYSTEM, "pre_curate_freedoms", 200, STRONG_MODEL_DEFAULT).await
     }
 
-    async fn pre_curate_with_prompt(&self, articles: &[RawArticle], system: &str, endpoint: &str, max_keep: usize) -> anyhow::Result<Vec<usize>> {
+    async fn pre_curate_with_prompt(&self, articles: &[RawArticle], system: &str, endpoint: &str, max_keep: usize, model: &str) -> anyhow::Result<Vec<usize>> {
 
         let mut user_msg = String::new();
         for (i, article) in articles.iter().enumerate() {
@@ -568,7 +574,7 @@ impl GroqClient {
         }
         user_msg.push_str(&format!("\nSelect the best ~{} from these {} articles, in priority order (most important first). Return JSON array of indices.", max_keep, articles.len()));
 
-        let text = self.call_text(&strong_model(), endpoint, system, &user_msg, 2000).await?;
+        let text = self.call_text(model, endpoint, system, &user_msg, 2000).await?;
 
         // Parse the JSON array — try multiple extraction strategies
         let json_str = extract_json_array(&text);
@@ -600,38 +606,71 @@ impl GroqClient {
             return Ok((0..articles.len()).collect());
         }
 
-        // Sector-balanced cap: the LLM ignores soft "~N" targets and over-selects
-        // (freedoms returned 587 → all summarized → only ~50 ever shown). A naive
-        // truncate to top-N collapses diversity, because the LLM ranks one hot sector
-        // (e.g. AI) first — top-100 came back 100 AI / 0 miami / 0 italy / 0 tech.
-        // Instead, round-robin across sectors taking each sector's best until max_keep,
-        // so every sector keeps representation while total volume still drops sharply.
-        if valid.len() > max_keep {
-            let before = valid.len();
-            // Group the kept indices by sector, preserving the LLM's priority order within each.
-            let mut by_sector: std::collections::BTreeMap<&str, std::collections::VecDeque<usize>> =
-                std::collections::BTreeMap::new();
-            for &i in &valid {
-                by_sector.entry(articles[i].sector.as_str()).or_default().push_back(i);
-            }
-            let mut balanced: Vec<usize> = Vec::with_capacity(max_keep);
-            // Round-robin: one from each sector per pass, best-first, until we hit the cap
-            // or every sector is drained.
-            while balanced.len() < max_keep {
-                let mut took_any = false;
-                for queue in by_sector.values_mut() {
-                    if balanced.len() >= max_keep { break; }
-                    if let Some(idx) = queue.pop_front() {
-                        balanced.push(idx);
-                        took_any = true;
-                    }
-                }
-                if !took_any { break; }
-            }
-            tracing::info!("Pre-curation: sector-balanced cap {} → {} ({} sectors)",
-                before, balanced.len(), by_sector.len());
-            valid = balanced;
+        // Sector-balanced selection. The LLM is unreliable two ways: it over-selects
+        // (returns 500+ when the prompt says ~90) AND it skews toward one hot sector
+        // (e.g. all AI, or all freedom_time) regardless of how rich the other sectors
+        // are in the input. A naive top-N truncate inherits the skew. The earlier
+        // "freedoms collapses to time-only" came from this: the LLM returned 166 time
+        // / 12 wealth / 0 of everything else even though health had 351 candidates.
+        //
+        // Fix: always round-robin to a per-sector floor, and BACKFILL each sector from
+        // the original input pool (best-first by input order) when the LLM under-picked
+        // it. This guarantees representation for every sector that HAS candidates, while
+        // capping the total at max_keep. A sector with no input candidates stays empty
+        // (correct — e.g. whoop on a genuinely quiet news day).
+        let before = valid.len();
+
+        // What the LLM picked, grouped by sector (priority order preserved).
+        let mut picked_by_sector: std::collections::BTreeMap<&str, std::collections::VecDeque<usize>> =
+            std::collections::BTreeMap::new();
+        for &i in &valid {
+            picked_by_sector.entry(articles[i].sector.as_str()).or_default().push_back(i);
         }
+        // The full input pool grouped by sector (for backfill), excluding already-picked.
+        let picked_set: std::collections::HashSet<usize> = valid.iter().copied().collect();
+        let mut pool_by_sector: std::collections::BTreeMap<&str, std::collections::VecDeque<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, a) in articles.iter().enumerate() {
+            if !picked_set.contains(&i) {
+                pool_by_sector.entry(a.sector.as_str()).or_default().push_back(i);
+            }
+        }
+        // Union of all sectors that have ANY candidate (picked or in pool).
+        let mut all_sectors: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        all_sectors.extend(picked_by_sector.keys().copied());
+        all_sectors.extend(pool_by_sector.keys().copied());
+
+        let per_sector_floor = if all_sectors.is_empty() { max_keep } else { max_keep / all_sectors.len().max(1) };
+        let mut balanced: Vec<usize> = Vec::with_capacity(max_keep);
+
+        // Pass 1: take up to per_sector_floor from each sector — LLM picks first, then
+        // backfill from the input pool so a sector the LLM ignored still gets filled.
+        for sector in &all_sectors {
+            let mut taken = 0;
+            if let Some(q) = picked_by_sector.get_mut(*sector) {
+                while taken < per_sector_floor { if let Some(idx) = q.pop_front() { balanced.push(idx); taken += 1; } else { break; } }
+            }
+            if let Some(q) = pool_by_sector.get_mut(*sector) {
+                while taken < per_sector_floor { if let Some(idx) = q.pop_front() { balanced.push(idx); taken += 1; } else { break; } }
+            }
+        }
+        // Pass 2: fill any remaining cap headroom round-robin from leftovers (picks then pool).
+        let mut progressing = true;
+        while balanced.len() < max_keep && progressing {
+            progressing = false;
+            for sector in &all_sectors {
+                if balanced.len() >= max_keep { break; }
+                let next = picked_by_sector.get_mut(*sector).and_then(|q| q.pop_front())
+                    .or_else(|| pool_by_sector.get_mut(*sector).and_then(|q| q.pop_front()));
+                if let Some(idx) = next { balanced.push(idx); progressing = true; }
+            }
+        }
+
+        let mut hist: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for &i in &balanced { *hist.entry(articles[i].sector.as_str()).or_insert(0) += 1; }
+        tracing::info!("Pre-curation: sector-balanced {} → {} (floor {}/sector, {:?})",
+            before, balanced.len(), per_sector_floor, hist);
+        valid = balanced;
 
         tracing::info!("Pre-curated {} articles from {} raw", valid.len(), articles.len());
         Ok(valid)

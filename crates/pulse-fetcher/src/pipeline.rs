@@ -2457,6 +2457,20 @@ Focus on MOST important entities (max 5 per story)."#,
     Ok(total_stored)
 }
 
+/// DIAGNOSTIC (Task #7): log the per-category count of freedom articles at a
+/// pipeline stage, so we can localize where health/whoop coverage drops to zero.
+fn log_freedom_histogram<'a>(stage: &str, sectors: impl Iterator<Item = &'a str>) {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for s in sectors {
+        *counts.entry(s).or_insert(0) += 1;
+    }
+    let summary: Vec<String> = ["freedom_time", "freedom_wealth", "freedom_location", "freedom_health", "freedom_whoop"]
+        .iter()
+        .map(|cat| format!("{}={}", cat.trim_start_matches("freedom_"), counts.get(cat).copied().unwrap_or(0)))
+        .collect();
+    tracing::info!("Freedoms[{}]: {}", stage, summary.join(" "));
+}
+
 pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
 
@@ -2481,6 +2495,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         .filter(|a| a.sector.starts_with("freedom_"))
         .collect();
     tracing::info!("Freedoms: {} raw articles", freedom_articles.len());
+    log_freedom_histogram("raw", freedom_articles.iter().map(|a| a.sector.as_str()));
 
     // Phase 1.5: Freshness filter — drop articles older than 72h.
     // Exempt academic sources (ArXiv, bioRxiv) which publish on weekly cycles
@@ -2510,6 +2525,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         .collect();
     let dropped = pre_fresh.saturating_sub(freedom_articles.len());
     tracing::info!("Freedoms: freshness filter dropped {} stale articles (news >72h, academic >14d); {} remain", dropped, freedom_articles.len());
+    log_freedom_histogram("after-freshness", freedom_articles.iter().map(|a| a.sector.as_str()));
 
     if freedom_articles.is_empty() {
         tracing::warn!("Freedoms: No freedom articles found, skipping");
@@ -2531,6 +2547,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     };
     let unique = crate::dedup::deduplicate_with_history(freedom_articles, historical_hashes, historical_titles);
     tracing::info!("Freedoms: {} after dedup", unique.len());
+    log_freedom_histogram("after-dedup (pre_curate INPUT)", unique.iter().map(|a| a.sector.as_str()));
 
     // Phase 2.5: Pre-curate if many articles
     let to_summarize = if unique.len() > 40 {
@@ -2544,6 +2561,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
                     .filter_map(|i| unique.get(i).cloned())
                     .collect();
                 tracing::info!("Freedoms: Pre-curated to {} articles", curated.len());
+                log_freedom_histogram("after-pre_curate (LLM selection)", curated.iter().map(|a| a.sector.as_str()));
                 curated
             }
             Err(e) => {
