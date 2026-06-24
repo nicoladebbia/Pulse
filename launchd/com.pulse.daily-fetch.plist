@@ -19,6 +19,12 @@
         <string>/Users/nicoladebbia</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <!-- Cost A/B (2026-06-24): use the cheaper Llama-4 Scout for the reasoning
+             steps (analyze + pre_curate), ~3.3x cheaper than 70B at equal quality.
+             Scout is a Groq Preview model — if it's ever deprecated, remove this
+             key and the binary falls back to llama-3.3-70b-versatile (the code default). -->
+        <key>PULSE_STRONG_MODEL</key>
+        <string>meta-llama/llama-4-scout-17b-16e-instruct</string>
     </dict>
 
     <key>StartCalendarInterval</key>

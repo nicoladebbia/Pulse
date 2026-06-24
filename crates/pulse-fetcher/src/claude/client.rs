@@ -5,8 +5,16 @@ use std::path::PathBuf;
 
 // Groq models — fast inference, OpenAI-compatible API
 const FAST_MODEL: &str = "llama-3.1-8b-instant";
-const STRONG_MODEL: &str = "llama-3.3-70b-versatile";
+const STRONG_MODEL_DEFAULT: &str = "llama-3.3-70b-versatile";
 const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+
+/// The "strong" model used for the reasoning steps (cross-sector analysis +
+/// pre-curation). Overridable via PULSE_STRONG_MODEL for cost A/B testing —
+/// e.g. `meta-llama/llama-4-scout-17b-16e-instruct` is ~5x cheaper on input.
+/// Defaults to llama-3.3-70b-versatile. Returned owned so callers pass &str.
+fn strong_model() -> String {
+    std::env::var("PULSE_STRONG_MODEL").unwrap_or_else(|_| STRONG_MODEL_DEFAULT.to_string())
+}
 
 const DAILY_PRE_CURATOR_SYSTEM: &str = r#"You are a news editor selecting the most newsworthy articles for a daily intelligence briefing covering 4 sectors: AI & LLMs, Miami Beach, Italy, and Tech & Innovation.
 
@@ -455,7 +463,7 @@ impl GroqClient {
             stories.len()
         ));
 
-        let text = self.call(STRONG_MODEL, "analyze", system, &user_msg, 8000).await?;
+        let text = self.call(&strong_model(), "analyze", system, &user_msg, 8000).await?;
         let parsed: AnalysisResponse = serde_json::from_str(&extract_json(&text))?;
 
         if parsed.relevance_scores.len() < stories.len() {
@@ -560,7 +568,7 @@ impl GroqClient {
         }
         user_msg.push_str(&format!("\nSelect the best ~{} from these {} articles, in priority order (most important first). Return JSON array of indices.", max_keep, articles.len()));
 
-        let text = self.call_text(STRONG_MODEL, endpoint, system, &user_msg, 2000).await?;
+        let text = self.call_text(&strong_model(), endpoint, system, &user_msg, 2000).await?;
 
         // Parse the JSON array — try multiple extraction strategies
         let json_str = extract_json_array(&text);
