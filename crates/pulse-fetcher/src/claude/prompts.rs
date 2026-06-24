@@ -65,13 +65,13 @@ Tasks:
 
 3. TRENDS: Identify 1-3 emerging trends. Format: [{"trend": "...", "story_ids": [1, 5], "trajectory": "emerging|growing|peaking|declining"}]
 
-4. CURATION: Select exactly 80 stories:
-   - ai: 20 stories (priority), first story = hero card
+4. CURATION: Select exactly 120 stories:
+   - ai: 30 stories (priority), first story = hero card
      PRIORITIZE: company news (OpenAI, Anthropic, Google, Meta, xAI), new model/product releases,
      developer tools, API updates, benchmarks. DEPRIORITIZE: policy, regulation, opinion pieces.
-   - miami: 20 stories — prioritize diverse local coverage: development/construction, real estate market, events/culture/nightlife, crime/safety, weather, tourism, restaurant/food scene. Cover the full picture of Miami Beach life.
-   - italy: 20 stories — ALL Italian news, not just politics. Prioritize: government/politics, economy/business, culture/food/fashion, Serie A football, science/space, society/lifestyle, Vatican/Pope. Give a full picture of what's happening in Italy today. Include at least 2 Serie A stories and at least 2 non-politics stories.
-   - tech: 20 stories — prioritize PHYSICAL products and real-world tech: smart home devices (smart fridges, smart appliances, home automation), consumer gadgets (headphones, wearables, fitness trackers), hardware releases (chips, GPUs, phones, laptops), robotics, EVs, drones, 3D printing, quantum computing, space tech. Also: startup launches, funding rounds, price drops on popular hardware. NOT just software news — focus on things you can touch.
+   - miami: 30 stories — prioritize diverse local coverage: development/construction, real estate market, events/culture/nightlife, crime/safety, weather, tourism, restaurant/food scene. Cover the full picture of Miami Beach life.
+   - italy: 30 stories — ALL Italian news, not just politics. Prioritize: government/politics, economy/business, culture/food/fashion, Serie A football, science/space, society/lifestyle, Vatican/Pope. Give a full picture of what's happening in Italy today. Include at least 2 Serie A stories and at least 2 non-politics stories.
+   - tech: 30 stories — prioritize PHYSICAL products and real-world tech: smart home devices (smart fridges, smart appliances, home automation), consumer gadgets (headphones, wearables, fitness trackers), hardware releases (chips, GPUs, phones, laptops), robotics, EVs, drones, 3D printing, quantum computing, space tech. Also: startup launches, funding rounds, price drops on popular hardware. NOT just software news — focus on things you can touch.
    Format: {"ai": [0, 2, 5...], "miami": [...], "italy": [...], "tech": [...]}
 
 Return a single valid JSON object with keys: connections, relevance_scores, trends, curation."#;

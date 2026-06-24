@@ -529,21 +529,26 @@ impl GroqClient {
             trends,
         })
     }
-    /// Pre-curate raw articles before summarization. Uses 70B to pick the
-    /// ~90 most newsworthy articles from ~150-200 raw headlines, so we only
-    /// pay for summarizing stories that will actually make the briefing.
+    /// Pre-curate raw articles before summarization. Uses 70B to pick the most
+    /// newsworthy articles from the raw pool, then applies a sector-balanced hard
+    /// cap (max_keep), so we only pay to summarize stories that can actually make
+    /// the briefing AND every sector keeps representation.
     pub async fn pre_curate(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
-        self.pre_curate_with_prompt(articles, DAILY_PRE_CURATOR_SYSTEM, "pre_curate").await
+        self.pre_curate_with_prompt(articles, DAILY_PRE_CURATOR_SYSTEM, "pre_curate", 140).await
     }
 
     /// Freedoms-pipeline pre-curator. Same mechanism as daily, but the system
     /// prompt names the 5 freedom categories (Time/Wealth/Location/Health/Whoop)
     /// so freedom articles are not down-weighted as off-sector noise.
     pub async fn pre_curate_freedoms(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
-        self.pre_curate_with_prompt(articles, FREEDOMS_PRE_CURATOR_SYSTEM, "pre_curate_freedoms").await
+        // NOTE: freedoms cap left intentionally loose (300) — the freedoms pipeline has a
+        // separate downstream collapse bug (stories drop to one category / fail to store);
+        // tightening this cap before that's fixed risks compounding it. See Task: freedoms
+        // collapse investigation. Daily path uses the tight sector-balanced cap (140).
+        self.pre_curate_with_prompt(articles, FREEDOMS_PRE_CURATOR_SYSTEM, "pre_curate_freedoms", 300).await
     }
 
-    async fn pre_curate_with_prompt(&self, articles: &[RawArticle], system: &str, endpoint: &str) -> anyhow::Result<Vec<usize>> {
+    async fn pre_curate_with_prompt(&self, articles: &[RawArticle], system: &str, endpoint: &str, max_keep: usize) -> anyhow::Result<Vec<usize>> {
 
         let mut user_msg = String::new();
         for (i, article) in articles.iter().enumerate() {
@@ -553,7 +558,7 @@ impl GroqClient {
                 i, article.sector, article.source_name, article.title
             ));
         }
-        user_msg.push_str(&format!("\nSelect the best ~90 from these {} articles. Return JSON array of indices.", articles.len()));
+        user_msg.push_str(&format!("\nSelect the best ~{} from these {} articles, in priority order (most important first). Return JSON array of indices.", max_keep, articles.len()));
 
         let text = self.call_text(STRONG_MODEL, endpoint, system, &user_msg, 2000).await?;
 
@@ -575,14 +580,49 @@ impl GroqClient {
                 anyhow::anyhow!("Pre-curation response was not a valid JSON array")
             })?;
 
-        // Validate indices
-        let valid: Vec<usize> = indices.into_iter()
+        // Validate indices (dedup preserves the LLM's priority order)
+        let mut seen = std::collections::HashSet::new();
+        let mut valid: Vec<usize> = indices.into_iter()
             .filter(|&i| i < articles.len())
+            .filter(|&i| seen.insert(i))
             .collect();
 
         if valid.len() < 20 {
             tracing::warn!("Pre-curation returned too few articles ({}), falling back to all", valid.len());
             return Ok((0..articles.len()).collect());
+        }
+
+        // Sector-balanced cap: the LLM ignores soft "~N" targets and over-selects
+        // (freedoms returned 587 → all summarized → only ~50 ever shown). A naive
+        // truncate to top-N collapses diversity, because the LLM ranks one hot sector
+        // (e.g. AI) first — top-100 came back 100 AI / 0 miami / 0 italy / 0 tech.
+        // Instead, round-robin across sectors taking each sector's best until max_keep,
+        // so every sector keeps representation while total volume still drops sharply.
+        if valid.len() > max_keep {
+            let before = valid.len();
+            // Group the kept indices by sector, preserving the LLM's priority order within each.
+            let mut by_sector: std::collections::BTreeMap<&str, std::collections::VecDeque<usize>> =
+                std::collections::BTreeMap::new();
+            for &i in &valid {
+                by_sector.entry(articles[i].sector.as_str()).or_default().push_back(i);
+            }
+            let mut balanced: Vec<usize> = Vec::with_capacity(max_keep);
+            // Round-robin: one from each sector per pass, best-first, until we hit the cap
+            // or every sector is drained.
+            while balanced.len() < max_keep {
+                let mut took_any = false;
+                for queue in by_sector.values_mut() {
+                    if balanced.len() >= max_keep { break; }
+                    if let Some(idx) = queue.pop_front() {
+                        balanced.push(idx);
+                        took_any = true;
+                    }
+                }
+                if !took_any { break; }
+            }
+            tracing::info!("Pre-curation: sector-balanced cap {} → {} ({} sectors)",
+                before, balanced.len(), by_sector.len());
+            valid = balanced;
         }
 
         tracing::info!("Pre-curated {} articles from {} raw", valid.len(), articles.len());

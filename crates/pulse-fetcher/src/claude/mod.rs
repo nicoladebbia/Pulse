@@ -132,13 +132,13 @@ pub async fn analyze_cross_sector(stories: &[SummarizedStory], db_path: &std::pa
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
     let client = client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 
-    // Sector-balanced selection: ensure each sector has at least 25 stories in the 120-story input
+    // Sector-balanced selection: ensure each sector has at least 35 stories in the 160-story input
     let mut sorted = stories.to_vec();
     sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
 
     let sectors = ["ai", "miami", "italy", "tech"];
-    let mut balanced = Vec::with_capacity(120);
-    let min_per_sector = 25;
+    let mut balanced = Vec::with_capacity(160);
+    let min_per_sector = 35;
 
     // First: take top stories per sector
     for sector in &sectors {
@@ -153,7 +153,7 @@ pub async fn analyze_cross_sector(stories: &[SummarizedStory], db_path: &std::pa
     // Fill remaining slots with top stories from any sector (by importance)
     let already: std::collections::HashSet<String> = balanced.iter().map(|s| s.article.url.clone()).collect();
     for s in &sorted {
-        if balanced.len() >= 120 { break; }
+        if balanced.len() >= 160 { break; }
         if !already.contains(&s.article.url) {
             balanced.push(s.clone());
         }
