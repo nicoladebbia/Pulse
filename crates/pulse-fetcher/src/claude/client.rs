@@ -216,6 +216,19 @@ impl GroqClient {
                 continue;
             }
 
+            // Transient/network-layer blocks (403 Access denied, 408 timeout, 5xx) are
+            // retryable — a single 8 AM network blip used to abort the whole daily run.
+            // Only genuinely fatal statuses (400 bad request, 401 unauthorized) bail.
+            let code = status.as_u16();
+            if !status.is_success() && (code == 403 || code == 408 || (500..600).contains(&code)) {
+                let body = resp.text().await.unwrap_or_default();
+                let delay = 15 * (attempt + 1) as u64;
+                tracing::warn!("Groq transient error {} (attempt {}): {}, retrying in {}s", status, attempt + 1, body.chars().take(120).collect::<String>(), delay);
+                last_err = Some(format!("HTTP {}: {}", status, body));
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+
             if !status.is_success() {
                 let body = resp.text().await?;
                 anyhow::bail!("Groq API error {}: {}", status, body);
@@ -290,6 +303,19 @@ impl GroqClient {
             if status.as_u16() == 429 {
                 let delay = 30 * (attempt + 1) as u64;
                 tracing::warn!("Rate limited (attempt {}), waiting {}s...", attempt + 1, delay);
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+
+            // Transient/network-layer blocks (403 Access denied, 408 timeout, 5xx) are
+            // retryable — a single 8 AM network blip used to abort the whole daily run.
+            // Only genuinely fatal statuses (400 bad request, 401 unauthorized) bail.
+            let code = status.as_u16();
+            if !status.is_success() && (code == 403 || code == 408 || (500..600).contains(&code)) {
+                let body = resp.text().await.unwrap_or_default();
+                let delay = 15 * (attempt + 1) as u64;
+                tracing::warn!("Groq transient error {} (attempt {}): {}, retrying in {}s", status, attempt + 1, body.chars().take(120).collect::<String>(), delay);
+                last_err = Some(format!("HTTP {}: {}", status, body));
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
