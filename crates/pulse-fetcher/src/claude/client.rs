@@ -239,6 +239,22 @@ impl GroqClient {
 
             if !status.is_success() {
                 let body = resp.text().await?;
+                // Groq's structured-output validator returns 400 json_validate_failed when
+                // the model emits a near-valid-but-broken JSON (stray escape, dropped brace).
+                // This is STOCHASTIC — a re-roll at temp 0.3 usually clears it, so it must not
+                // abort the whole briefing (this was the Phase-4 analyze killer on 2026-06-25).
+                // Exception: "max completion tokens reached" is NOT fixable by retry (the output
+                // is simply too long for max_tokens) — bail so it surfaces instead of looping.
+                if body.contains("json_validate_failed")
+                    && !body.contains("max completion tokens")
+                    && attempt + 1 < 4
+                {
+                    let delay = 5 * (attempt + 1) as u64;
+                    tracing::warn!("Groq json_validate_failed (attempt {}), re-rolling in {}s", attempt + 1, delay);
+                    last_err = Some(format!("HTTP {}: {}", status, body.chars().take(160).collect::<String>()));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
                 anyhow::bail!("Groq API error {}: {}", status, body);
             }
 
@@ -330,6 +346,22 @@ impl GroqClient {
 
             if !status.is_success() {
                 let body = resp.text().await?;
+                // Groq's structured-output validator returns 400 json_validate_failed when
+                // the model emits a near-valid-but-broken JSON (stray escape, dropped brace).
+                // This is STOCHASTIC — a re-roll at temp 0.3 usually clears it, so it must not
+                // abort the whole briefing (this was the Phase-4 analyze killer on 2026-06-25).
+                // Exception: "max completion tokens reached" is NOT fixable by retry (the output
+                // is simply too long for max_tokens) — bail so it surfaces instead of looping.
+                if body.contains("json_validate_failed")
+                    && !body.contains("max completion tokens")
+                    && attempt + 1 < 4
+                {
+                    let delay = 5 * (attempt + 1) as u64;
+                    tracing::warn!("Groq json_validate_failed (attempt {}), re-rolling in {}s", attempt + 1, delay);
+                    last_err = Some(format!("HTTP {}: {}", status, body.chars().take(160).collect::<String>()));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
                 anyhow::bail!("Groq API error {}: {}", status, body);
             }
 
@@ -463,7 +495,15 @@ impl GroqClient {
             stories.len()
         ));
 
-        let text = self.call(&strong_model(), "analyze", system, &user_msg, 8000).await?;
+        // analyze is PINNED to 70B (not the scout env default). This is the single
+        // largest structured-output call in the pipeline — 140 stories → 140
+        // relevance_scores + connections + trends + per-sector curation arrays. Measured
+        // A/B (2026-06-25): scout failed it twice on the same payload — once with a Groq
+        // 400 json_validate_failed (stray escape), once with a 200 whose body our serde
+        // rejected ("invalid type: map, expected usize" in the curation field). 70B passed
+        // the identical payload first try. pre_curate stays on the cheap scout (simpler
+        // index-list output it handles fine); only this call needs the stronger model.
+        let text = self.call(STRONG_MODEL_DEFAULT, "analyze", system, &user_msg, 8000).await?;
         let parsed: AnalysisResponse = serde_json::from_str(&extract_json(&text))?;
 
         if parsed.relevance_scores.len() < stories.len() {
