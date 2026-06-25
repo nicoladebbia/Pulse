@@ -20,6 +20,7 @@ const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.
 const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
 const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_fts_porter.sql");
 const MIGRATION_025: &str = include_str!("../../../migrations/025_half_close_marker.sql");
+const MIGRATION_026: &str = include_str!("../../../migrations/026_drop_stillborn_trend_tables.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -522,6 +523,15 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_025)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (25)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 26: Drop stillborn trend_threads/trend_points tables (0 rows, no
+    // writer or reader — never-implemented feature). Both app + fetcher run it.
+    if !applied.contains(&26) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_026)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (26)", [])?;
         tx.commit()?;
     }
 
