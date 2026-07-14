@@ -30,6 +30,7 @@ pub const MIGRATION_022: &str = include_str!("../../../migrations/022_prediction
 pub const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
 pub const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_fts_porter.sql");
 pub const MIGRATION_025: &str = include_str!("../../../migrations/025_half_close_marker.sql");
+pub const MIGRATION_026: &str = include_str!("../../../migrations/026_drop_stillborn_trend_tables.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -593,6 +594,15 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_025)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (25)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 26: Drop stillborn trend_threads/trend_points tables (0 rows, no
+    // writer or reader in either binary — never-implemented feature). See migration file.
+    if !applied.contains(&26) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_026)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (26)", [])?;
         tx.commit()?;
     }
 

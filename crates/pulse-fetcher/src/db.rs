@@ -20,6 +20,7 @@ const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.
 const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
 const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_fts_porter.sql");
 const MIGRATION_025: &str = include_str!("../../../migrations/025_half_close_marker.sql");
+const MIGRATION_026: &str = include_str!("../../../migrations/026_drop_stillborn_trend_tables.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -525,6 +526,15 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         tx.commit()?;
     }
 
+    // Migration 26: Drop stillborn trend_threads/trend_points tables (0 rows, no
+    // writer or reader — never-implemented feature). Both app + fetcher run it.
+    if !applied.contains(&26) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_026)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (26)", [])?;
+        tx.commit()?;
+    }
+
     // Ensure composite indexes exist (idempotent)
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_freedom_stories_bf ON freedom_stories(briefing_id, freedom, display_order);"
@@ -544,6 +554,7 @@ pub fn log_api_usage(
 ) {
     let cost = match (provider, model) {
         ("groq", m) if m.contains("8b") => (input_tokens as f64 * 0.05 + output_tokens as f64 * 0.08) / 1_000_000.0,
+        ("groq", m) if m.contains("scout") => (input_tokens as f64 * 0.11 + output_tokens as f64 * 0.34) / 1_000_000.0,
         ("groq", _) => (input_tokens as f64 * 0.59 + output_tokens as f64 * 0.79) / 1_000_000.0,
         ("anthropic", m) if m.contains("haiku") => (input_tokens as f64 * 0.25 + output_tokens as f64 * 1.25) / 1_000_000.0,
         ("anthropic", m) if m.contains("sonnet") => (input_tokens as f64 * 3.0 + output_tokens as f64 * 15.0) / 1_000_000.0,

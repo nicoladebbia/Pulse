@@ -5,8 +5,57 @@ use std::path::PathBuf;
 
 // Groq models — fast inference, OpenAI-compatible API
 const FAST_MODEL: &str = "llama-3.1-8b-instant";
-const STRONG_MODEL: &str = "llama-3.3-70b-versatile";
+const STRONG_MODEL_DEFAULT: &str = "llama-3.3-70b-versatile";
 const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+const MODELS_URL: &str = "https://api.groq.com/openai/v1/models";
+
+/// Preflight reachability probe. Groq blocks certain source IPs (NordVPN exit
+/// nodes when in Italy, the school network on Tuesdays) with a PRE-AUTH
+/// `403 "Access denied. Please check your network settings."`. That 403 persists
+/// for the whole retry window, so the per-call retries in `call()` cannot save a
+/// run started into a block — they just burn ~90 min then abort and fire the
+/// daily "not working" alert. This probe lets a scheduled run detect the block
+/// cheaply and exit silently instead, so a later slot (7am/12pm/6pm/10pm) can
+/// catch a reachable window.
+///
+/// Unauthenticated GET to `/models`: 403 = blocked (IP is on Groq's list),
+/// anything else (401 unauthorized / 200 / etc.) = reachable. No API key needed —
+/// the block is applied before auth, so an invalid/absent key still reproduces it.
+/// Returns `true` if Groq is reachable, `false` if blocked or the probe errored
+/// (fail-closed: a network error at probe time means don't start the pipeline).
+pub async fn groq_reachable() -> bool {
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match http.get(MODELS_URL).send().await {
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            if code == 403 {
+                tracing::warn!("Groq preflight: HTTP 403 — source IP blocked (VPN/network). Skipping run.");
+                false
+            } else {
+                tracing::info!("Groq preflight: HTTP {} — reachable.", code);
+                true
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Groq preflight: probe failed ({}) — treating as unreachable, skipping run.", e);
+            false
+        }
+    }
+}
+
+/// The "strong" model used for the reasoning steps (cross-sector analysis +
+/// pre-curation). Overridable via PULSE_STRONG_MODEL for cost A/B testing —
+/// e.g. `meta-llama/llama-4-scout-17b-16e-instruct` is ~5x cheaper on input.
+/// Defaults to llama-3.3-70b-versatile. Returned owned so callers pass &str.
+fn strong_model() -> String {
+    std::env::var("PULSE_STRONG_MODEL").unwrap_or_else(|_| STRONG_MODEL_DEFAULT.to_string())
+}
 
 const DAILY_PRE_CURATOR_SYSTEM: &str = r#"You are a news editor selecting the most newsworthy articles for a daily intelligence briefing covering 4 sectors: AI & LLMs, Miami Beach, Italy, and Tech & Innovation.
 
@@ -106,11 +155,19 @@ struct TranslationResponse {
     snippet_en: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct AnalysisResponse {
+    // Every field tolerant: the 70B model intermittently omits one (observed:
+    // `missing field curation` on an otherwise-complete object). A missing field
+    // must NOT throw away the whole briefing — we keep whatever the model DID return
+    // (e.g. connections) and derive the rest. See analyze() for the recovery logic.
+    #[serde(default)]
     connections: Vec<AnalysisConnection>,
+    #[serde(default)]
     relevance_scores: Vec<AnalysisRelevance>,
+    #[serde(default)]
     trends: Vec<AnalysisTrend>,
+    #[serde(default)]
     curation: CurationResult,
 }
 
@@ -135,7 +192,7 @@ struct AnalysisTrend {
     trajectory: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct CurationResult {
     #[serde(default)]
     ai: Vec<usize>,
@@ -216,8 +273,37 @@ impl GroqClient {
                 continue;
             }
 
+            // Transient/network-layer blocks (403 Access denied, 408 timeout, 5xx) are
+            // retryable — a single 8 AM network blip used to abort the whole daily run.
+            // Only genuinely fatal statuses (400 bad request, 401 unauthorized) bail.
+            let code = status.as_u16();
+            if !status.is_success() && (code == 403 || code == 408 || (500..600).contains(&code)) {
+                let body = resp.text().await.unwrap_or_default();
+                let delay = 15 * (attempt + 1) as u64;
+                tracing::warn!("Groq transient error {} (attempt {}): {}, retrying in {}s", status, attempt + 1, body.chars().take(120).collect::<String>(), delay);
+                last_err = Some(format!("HTTP {}: {}", status, body));
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+
             if !status.is_success() {
                 let body = resp.text().await?;
+                // Groq's structured-output validator returns 400 json_validate_failed when
+                // the model emits a near-valid-but-broken JSON (stray escape, dropped brace).
+                // This is STOCHASTIC — a re-roll at temp 0.3 usually clears it, so it must not
+                // abort the whole briefing (this was the Phase-4 analyze killer on 2026-06-25).
+                // Exception: "max completion tokens reached" is NOT fixable by retry (the output
+                // is simply too long for max_tokens) — bail so it surfaces instead of looping.
+                if body.contains("json_validate_failed")
+                    && !body.contains("max completion tokens")
+                    && attempt + 1 < 4
+                {
+                    let delay = 5 * (attempt + 1) as u64;
+                    tracing::warn!("Groq json_validate_failed (attempt {}), re-rolling in {}s", attempt + 1, delay);
+                    last_err = Some(format!("HTTP {}: {}", status, body.chars().take(160).collect::<String>()));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
                 anyhow::bail!("Groq API error {}: {}", status, body);
             }
 
@@ -294,8 +380,37 @@ impl GroqClient {
                 continue;
             }
 
+            // Transient/network-layer blocks (403 Access denied, 408 timeout, 5xx) are
+            // retryable — a single 8 AM network blip used to abort the whole daily run.
+            // Only genuinely fatal statuses (400 bad request, 401 unauthorized) bail.
+            let code = status.as_u16();
+            if !status.is_success() && (code == 403 || code == 408 || (500..600).contains(&code)) {
+                let body = resp.text().await.unwrap_or_default();
+                let delay = 15 * (attempt + 1) as u64;
+                tracing::warn!("Groq transient error {} (attempt {}): {}, retrying in {}s", status, attempt + 1, body.chars().take(120).collect::<String>(), delay);
+                last_err = Some(format!("HTTP {}: {}", status, body));
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+
             if !status.is_success() {
                 let body = resp.text().await?;
+                // Groq's structured-output validator returns 400 json_validate_failed when
+                // the model emits a near-valid-but-broken JSON (stray escape, dropped brace).
+                // This is STOCHASTIC — a re-roll at temp 0.3 usually clears it, so it must not
+                // abort the whole briefing (this was the Phase-4 analyze killer on 2026-06-25).
+                // Exception: "max completion tokens reached" is NOT fixable by retry (the output
+                // is simply too long for max_tokens) — bail so it surfaces instead of looping.
+                if body.contains("json_validate_failed")
+                    && !body.contains("max completion tokens")
+                    && attempt + 1 < 4
+                {
+                    let delay = 5 * (attempt + 1) as u64;
+                    tracing::warn!("Groq json_validate_failed (attempt {}), re-rolling in {}s", attempt + 1, delay);
+                    last_err = Some(format!("HTTP {}: {}", status, body.chars().take(160).collect::<String>()));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
                 anyhow::bail!("Groq API error {}: {}", status, body);
             }
 
@@ -429,8 +544,50 @@ impl GroqClient {
             stories.len()
         ));
 
-        let text = self.call(STRONG_MODEL, "analyze", system, &user_msg, 8000).await?;
-        let parsed: AnalysisResponse = serde_json::from_str(&extract_json(&text))?;
+        // analyze is PINNED to 70B (not the scout env default). This is the single
+        // largest structured-output call in the pipeline — 140 stories → 140
+        // relevance_scores + connections + trends + per-sector curation arrays. Measured
+        // A/B (2026-06-25): scout failed it twice on the same payload — once with a Groq
+        // 400 json_validate_failed (stray escape), once with a 200 whose body our serde
+        // rejected ("invalid type: map, expected usize" in the curation field). 70B passed
+        // the identical payload first try. pre_curate stays on the cheap scout (simpler
+        // index-list output it handles fine); only this call needs the stronger model.
+        let text = self.call(STRONG_MODEL_DEFAULT, "analyze", system, &user_msg, 8000).await?;
+        let json_str = extract_json(&text);
+        // Salvage the common serde-on-200 failure: Groq returns HTTP 200 whose body
+        // has DUPLICATE keys (e.g. `"relevance"` twice in one object). serde's derived
+        // struct deserializer rejects duplicates ("duplicate field `relevance`"), but
+        // serde_json::Value collapses them last-wins — so parse to Value first, then
+        // into the struct. Mirrors summarize_story's lenient fallback (this file).
+        let parsed: AnalysisResponse = match serde_json::from_str(&json_str) {
+            Ok(p) => p,
+            Err(strict_err) => serde_json::from_str::<serde_json::Value>(&json_str)
+                .ok()
+                .and_then(|val| serde_json::from_value(val).ok())
+                .ok_or_else(|| {
+                    // INSTRUMENTATION (not a fix): both parses failed. Log the RAW model
+                    // body — head + tail — so the NEXT free scheduled run reveals what Groq
+                    // actually returned (missing `curation`? truncated? which keys present?),
+                    // instead of us inferring the failure mode from serde's paraphrase.
+                    // Observed modes so far: dup-key `relevance` (salvageable, above), and a
+                    // clean `missing field curation` on a complete object that padded to the
+                    // 8000-token cap (model non-compliance, NOT truncation — a cut-off body
+                    // would be a SYNTAX error, not a clean missing-key). This log decides
+                    // whether a tolerant #[serde(default)] fix would recover the connections.
+                    let head: String = json_str.chars().take(800).collect();
+                    let tail: String = {
+                        let n = json_str.chars().count();
+                        json_str.chars().skip(n.saturating_sub(800)).collect()
+                    };
+                    tracing::error!(
+                        "analyze parse-fail — strict: {} | body_len={} chars | HEAD: {} | TAIL: {}",
+                        strict_err, json_str.chars().count(), head, tail
+                    );
+                    anyhow::anyhow!(
+                        "analyze: strict parse failed ({}) and Value salvage also failed", strict_err
+                    )
+                })?,
+        };
 
         if parsed.relevance_scores.len() < stories.len() {
             tracing::warn!(
@@ -451,73 +608,36 @@ impl GroqClient {
             tracing::warn!("Curation: 0 Italy stories — check Italy source feeds");
         }
 
-        let mut curated_indices: Vec<usize> = Vec::new();
-        curated_indices.extend(&parsed.curation.ai);
-        curated_indices.extend(&parsed.curation.miami);
-        curated_indices.extend(&parsed.curation.italy);
-        curated_indices.extend(&parsed.curation.tech);
-
-        let curated_stories: Vec<SummarizedStory> = curated_indices
-            .iter()
-            .filter_map(|&idx| stories.get(idx).cloned())
-            .collect();
-
-        let connections = parsed.connections
-            .into_iter()
-            .filter_map(|c| {
-                if c.story_ids.len() >= 2 {
-                    Some(Connection {
-                        story_idx_a: c.story_ids[0],
-                        story_idx_b: c.story_ids[1],
-                        connection: c.connection,
-                        insight: c.insight,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let relevance_scores = parsed.relevance_scores
-            .into_iter()
-            .map(|r| RelevanceScore {
-                story_idx: r.story_id,
-                relevance: r.relevance,
-                reason: r.reason,
-            })
-            .collect();
-
-        let trends = parsed.trends
-            .into_iter()
-            .map(|t| TrendDetection {
-                trend: t.trend,
-                story_indices: t.story_ids,
-                trajectory: t.trajectory,
-            })
-            .collect();
-
-        Ok(AnalysisResult {
-            curated_stories,
-            connections,
-            relevance_scores,
-            trends,
-        })
+        // All index remapping + curation lives in a pure function so it can be
+        // unit-tested without a live Groq call (see tests below).
+        Ok(build_analysis_result(parsed, stories))
     }
-    /// Pre-curate raw articles before summarization. Uses 70B to pick the
-    /// ~90 most newsworthy articles from ~150-200 raw headlines, so we only
-    /// pay for summarizing stories that will actually make the briefing.
+    /// Pre-curate raw articles before summarization. Uses 70B to pick the most
+    /// newsworthy articles from the raw pool, then applies a sector-balanced hard
+    /// cap (max_keep), so we only pay to summarize stories that can actually make
+    /// the briefing AND every sector keeps representation.
     pub async fn pre_curate(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
-        self.pre_curate_with_prompt(articles, DAILY_PRE_CURATOR_SYSTEM, "pre_curate").await
+        // Daily has 4 evenly-supplied sectors — scout (the cheap default) balances them fine.
+        self.pre_curate_with_prompt(articles, DAILY_PRE_CURATOR_SYSTEM, "pre_curate", 140, &strong_model()).await
     }
 
     /// Freedoms-pipeline pre-curator. Same mechanism as daily, but the system
     /// prompt names the 5 freedom categories (Time/Wealth/Location/Health/Whoop)
     /// so freedom articles are not down-weighted as off-sector noise.
     pub async fn pre_curate_freedoms(&self, articles: &[RawArticle]) -> anyhow::Result<Vec<usize>> {
-        self.pre_curate_with_prompt(articles, FREEDOMS_PRE_CURATOR_SYSTEM, "pre_curate_freedoms").await
+        // Cap = 200 (40/sector × 5 freedom categories), matching the downstream curator's
+        // PER_SECTOR_CAP of 40. Summarizing more than the curator can consume wastes calls.
+        //
+        // MODEL: pinned to 70B (NOT the scout env default). Freedoms has 5 sectors with
+        // uneven supply (whoop/health are sparse); measured A/B showed scout selects only
+        // ~1.5% of an abundant health pool (5 of 344) and 0 whoop, while 70B selects ~20%
+        // (72 of 355) and keeps whoop — i.e. scout starves minority sectors here. The daily
+        // 4-symmetric-sector A/B couldn't catch this. 70B costs more but freedoms is one
+        // pre_curate call/run, so the delta is tiny vs the coverage it preserves.
+        self.pre_curate_with_prompt(articles, FREEDOMS_PRE_CURATOR_SYSTEM, "pre_curate_freedoms", 200, STRONG_MODEL_DEFAULT).await
     }
 
-    async fn pre_curate_with_prompt(&self, articles: &[RawArticle], system: &str, endpoint: &str) -> anyhow::Result<Vec<usize>> {
+    async fn pre_curate_with_prompt(&self, articles: &[RawArticle], system: &str, endpoint: &str, max_keep: usize, model: &str) -> anyhow::Result<Vec<usize>> {
 
         let mut user_msg = String::new();
         for (i, article) in articles.iter().enumerate() {
@@ -527,9 +647,9 @@ impl GroqClient {
                 i, article.sector, article.source_name, article.title
             ));
         }
-        user_msg.push_str(&format!("\nSelect the best ~90 from these {} articles. Return JSON array of indices.", articles.len()));
+        user_msg.push_str(&format!("\nSelect the best ~{} from these {} articles, in priority order (most important first). Return JSON array of indices.", max_keep, articles.len()));
 
-        let text = self.call_text(STRONG_MODEL, endpoint, system, &user_msg, 2000).await?;
+        let text = self.call_text(model, endpoint, system, &user_msg, 2000).await?;
 
         // Parse the JSON array — try multiple extraction strategies
         let json_str = extract_json_array(&text);
@@ -549,15 +669,83 @@ impl GroqClient {
                 anyhow::anyhow!("Pre-curation response was not a valid JSON array")
             })?;
 
-        // Validate indices
-        let valid: Vec<usize> = indices.into_iter()
+        // Validate indices (dedup preserves the LLM's priority order)
+        let mut seen = std::collections::HashSet::new();
+        let mut valid: Vec<usize> = indices.into_iter()
             .filter(|&i| i < articles.len())
+            .filter(|&i| seen.insert(i))
             .collect();
 
         if valid.len() < 20 {
             tracing::warn!("Pre-curation returned too few articles ({}), falling back to all", valid.len());
             return Ok((0..articles.len()).collect());
         }
+
+        // Sector-balanced selection. The LLM is unreliable two ways: it over-selects
+        // (returns 500+ when the prompt says ~90) AND it skews toward one hot sector
+        // (e.g. all AI, or all freedom_time) regardless of how rich the other sectors
+        // are in the input. A naive top-N truncate inherits the skew. The earlier
+        // "freedoms collapses to time-only" came from this: the LLM returned 166 time
+        // / 12 wealth / 0 of everything else even though health had 351 candidates.
+        //
+        // Fix: always round-robin to a per-sector floor, and BACKFILL each sector from
+        // the original input pool (best-first by input order) when the LLM under-picked
+        // it. This guarantees representation for every sector that HAS candidates, while
+        // capping the total at max_keep. A sector with no input candidates stays empty
+        // (correct — e.g. whoop on a genuinely quiet news day).
+        let before = valid.len();
+
+        // What the LLM picked, grouped by sector (priority order preserved).
+        let mut picked_by_sector: std::collections::BTreeMap<&str, std::collections::VecDeque<usize>> =
+            std::collections::BTreeMap::new();
+        for &i in &valid {
+            picked_by_sector.entry(articles[i].sector.as_str()).or_default().push_back(i);
+        }
+        // The full input pool grouped by sector (for backfill), excluding already-picked.
+        let picked_set: std::collections::HashSet<usize> = valid.iter().copied().collect();
+        let mut pool_by_sector: std::collections::BTreeMap<&str, std::collections::VecDeque<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, a) in articles.iter().enumerate() {
+            if !picked_set.contains(&i) {
+                pool_by_sector.entry(a.sector.as_str()).or_default().push_back(i);
+            }
+        }
+        // Union of all sectors that have ANY candidate (picked or in pool).
+        let mut all_sectors: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        all_sectors.extend(picked_by_sector.keys().copied());
+        all_sectors.extend(pool_by_sector.keys().copied());
+
+        let per_sector_floor = if all_sectors.is_empty() { max_keep } else { max_keep / all_sectors.len().max(1) };
+        let mut balanced: Vec<usize> = Vec::with_capacity(max_keep);
+
+        // Pass 1: take up to per_sector_floor from each sector — LLM picks first, then
+        // backfill from the input pool so a sector the LLM ignored still gets filled.
+        for sector in &all_sectors {
+            let mut taken = 0;
+            if let Some(q) = picked_by_sector.get_mut(*sector) {
+                while taken < per_sector_floor { if let Some(idx) = q.pop_front() { balanced.push(idx); taken += 1; } else { break; } }
+            }
+            if let Some(q) = pool_by_sector.get_mut(*sector) {
+                while taken < per_sector_floor { if let Some(idx) = q.pop_front() { balanced.push(idx); taken += 1; } else { break; } }
+            }
+        }
+        // Pass 2: fill any remaining cap headroom round-robin from leftovers (picks then pool).
+        let mut progressing = true;
+        while balanced.len() < max_keep && progressing {
+            progressing = false;
+            for sector in &all_sectors {
+                if balanced.len() >= max_keep { break; }
+                let next = picked_by_sector.get_mut(*sector).and_then(|q| q.pop_front())
+                    .or_else(|| pool_by_sector.get_mut(*sector).and_then(|q| q.pop_front()));
+                if let Some(idx) = next { balanced.push(idx); progressing = true; }
+            }
+        }
+
+        let mut hist: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for &i in &balanced { *hist.entry(articles[i].sector.as_str()).or_insert(0) += 1; }
+        tracing::info!("Pre-curation: sector-balanced {} → {} (floor {}/sector, {:?})",
+            before, balanced.len(), per_sector_floor, hist);
+        valid = balanced;
 
         tracing::info!("Pre-curated {} articles from {} raw", valid.len(), articles.len());
         Ok(valid)
@@ -579,6 +767,100 @@ fn extract_json_array(text: &str) -> String {
     trimmed.to_string()
 }
 
+/// Turn a parsed analyze response + the analyze INPUT `stories` array into an
+/// `AnalysisResult`, remapping every model index onto the final curated array.
+///
+/// Two things this fixes, both load-bearing:
+///  1. Empty curation (the `missing field curation` non-compliance case) → derive the
+///     curated set from importance so the briefing still curates, while KEEPING the
+///     connections/relevance the model returned.
+///  2. The model's connection/relevance/trend indices reference the INPUT array, but
+///     the persist path resolves them positionally against `curated_stories`. Each
+///     index is translated to the story's position in `curated_stories` (matched by
+///     URL, the stable identity). Before this, an input index like 15 was read as
+///     curated position 15 — landing inside the sector-grouped block and producing the
+///     same-sector "cross-sector" connections seen in the DB (ai↔ai, miami↔miami).
+fn build_analysis_result(parsed: AnalysisResponse, stories: &[SummarizedStory]) -> AnalysisResult {
+    let mut curated_input_indices: Vec<usize> = Vec::new();
+    curated_input_indices.extend(&parsed.curation.ai);
+    curated_input_indices.extend(&parsed.curation.miami);
+    curated_input_indices.extend(&parsed.curation.italy);
+    curated_input_indices.extend(&parsed.curation.tech);
+
+    let curated_stories: Vec<SummarizedStory> = if curated_input_indices.is_empty() {
+        tracing::warn!(
+            "analyze: model returned empty curation — deriving curated set from importance \
+             (connections/relevance still kept from the model's response)"
+        );
+        super::degraded_analysis(stories).curated_stories
+    } else {
+        curated_input_indices
+            .iter()
+            .filter_map(|&idx| stories.get(idx).cloned())
+            .collect()
+    };
+
+    let curated_pos_by_url: std::collections::HashMap<&str, usize> = curated_stories
+        .iter()
+        .enumerate()
+        .map(|(pos, s)| (s.article.url.as_str(), pos))
+        .collect();
+    // input index -> curated position (None if that input story wasn't curated)
+    let remap = |input_idx: usize| -> Option<usize> {
+        stories
+            .get(input_idx)
+            .and_then(|s| curated_pos_by_url.get(s.article.url.as_str()).copied())
+    };
+
+    let connections: Vec<Connection> = parsed.connections
+        .into_iter()
+        .filter_map(|c| {
+            if c.story_ids.len() < 2 {
+                return None;
+            }
+            let a = remap(c.story_ids[0])?;
+            let b = remap(c.story_ids[1])?;
+            if a == b {
+                return None;
+            }
+            Some(Connection {
+                story_idx_a: a,
+                story_idx_b: b,
+                connection: c.connection,
+                insight: c.insight,
+            })
+        })
+        .collect();
+    tracing::info!("Cross-sector connections after remap: {} kept", connections.len());
+
+    let relevance_scores: Vec<RelevanceScore> = parsed.relevance_scores
+        .into_iter()
+        .filter_map(|r| {
+            remap(r.story_id).map(|pos| RelevanceScore {
+                story_idx: pos,
+                relevance: r.relevance,
+                reason: r.reason,
+            })
+        })
+        .collect();
+
+    let trends: Vec<TrendDetection> = parsed.trends
+        .into_iter()
+        .map(|t| TrendDetection {
+            trend: t.trend,
+            story_indices: t.story_ids.into_iter().filter_map(remap).collect(),
+            trajectory: t.trajectory,
+        })
+        .collect();
+
+    AnalysisResult {
+        curated_stories,
+        connections,
+        relevance_scores,
+        trends,
+    }
+}
+
 /// Extract JSON from a response that might have markdown code fences
 fn extract_json(text: &str) -> String {
     let trimmed = text.trim();
@@ -588,4 +870,171 @@ fn extract_json(text: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The salvage path in `analyze()`: a Groq HTTP-200 body with a DUPLICATE key
+    /// (`"relevance"` twice in one object) must not throw away the whole briefing.
+    /// serde's derived struct deserializer rejects duplicates; serde_json::Value
+    /// collapses them last-wins; from_value then succeeds. This test reproduces the
+    /// exact stochastic failure that degraded briefing 313 and asserts recovery.
+    #[test]
+    fn analyze_salvages_duplicate_relevance_key() {
+        // Note the duplicate `"relevance"` inside the first relevance_scores entry.
+        let json_str = r#"{
+            "connections": [],
+            "relevance_scores": [
+                {"story_id": 0, "relevance": 3, "reason": "first", "relevance": 8},
+                {"story_id": 1, "relevance": 5, "reason": "second"}
+            ],
+            "trends": [],
+            "curation": {"ai": [0], "miami": [], "italy": [], "tech": [1]}
+        }"#;
+
+        // Strict parse MUST fail on the duplicate key (this is the bug).
+        assert!(
+            serde_json::from_str::<AnalysisResponse>(json_str).is_err(),
+            "strict parse should reject the duplicate `relevance` key"
+        );
+
+        // Salvage path: Value collapses duplicates last-wins, then from_value succeeds.
+        let parsed: AnalysisResponse = serde_json::from_str::<serde_json::Value>(json_str)
+            .ok()
+            .and_then(|val| serde_json::from_value(val).ok())
+            .expect("Value salvage should recover the duplicate-key response");
+
+        assert_eq!(parsed.relevance_scores.len(), 2);
+        // last-wins: the second `relevance: 8` overrides the first `relevance: 3`.
+        assert_eq!(parsed.relevance_scores[0].relevance, 8);
+        assert_eq!(parsed.curation.ai, vec![0]);
+        assert_eq!(parsed.curation.tech, vec![1]);
+    }
+
+    // ---- fixtures for the build_analysis_result / index-remap tests ----
+
+    fn story(url: &str, sector: &str, importance: i32) -> SummarizedStory {
+        SummarizedStory {
+            article: crate::sources::RawArticle {
+                title: format!("t-{url}"),
+                url: url.to_string(),
+                source_name: "src".into(),
+                source_url: "http://src".into(),
+                published_at: None,
+                content_snippet: "snip".into(),
+                sector: sector.to_string(),
+                feed_id: "feed".into(),
+                language: "en".into(),
+                source_type: "news".into(),
+                financial_metadata: None,
+            },
+            headline: format!("h-{url}"),
+            summary: "s".into(),
+            key_facts: vec![],
+            why_it_matters: "w".into(),
+            what_to_watch: "".into(),
+            importance_score: importance,
+            sentiment: None,
+            novelty: None,
+            event_type: None,
+        }
+    }
+
+    /// A missing `curation` field must now parse (tolerant defaults) instead of erroring,
+    /// and the connections the model DID return must survive — this is the exact
+    /// non-compliance mode that degraded briefing 314.
+    #[test]
+    fn missing_curation_keeps_connections_and_derives_curation() {
+        // 4 input stories, one per sector, with a real cross-sector connection [0,1].
+        let input = vec![
+            story("a", "ai", 9),
+            story("b", "miami", 8),
+            story("c", "italy", 7),
+            story("d", "tech", 6),
+        ];
+        // Body OMITS curation entirely (model non-compliance). Tolerant parse must succeed.
+        let body = r#"{
+            "connections": [{"story_ids": [0, 1], "connection": "ai↔miami", "insight": "i"}],
+            "relevance_scores": [{"story_id": 2, "relevance": 9, "reason": "r"}],
+            "trends": []
+        }"#;
+        let parsed: AnalysisResponse = serde_json::from_str(body)
+            .expect("missing `curation` must parse with tolerant defaults");
+
+        let result = build_analysis_result(parsed, &input);
+
+        // Curation derived from importance → all 4 stories curated (each sector < 35 cap).
+        assert_eq!(result.curated_stories.len(), 4);
+        // The connection is KEPT (not thrown away) and remapped to curated positions.
+        assert_eq!(result.connections.len(), 1, "the model's connection must survive");
+        // Relevance for input story 2 ("c") is kept and remapped to its curated position.
+        assert_eq!(result.relevance_scores.len(), 1);
+        let c_pos = result.curated_stories.iter().position(|s| s.article.url == "c").unwrap();
+        assert_eq!(result.relevance_scores[0].story_idx, c_pos);
+    }
+
+    /// A body missing EVERYTHING (all defaults) must not crash: 0 connections, curation
+    /// derived from importance, news still flows. Never worse than the old behavior.
+    #[test]
+    fn empty_body_derives_curation_zero_connections() {
+        let input = vec![story("a", "ai", 5), story("b", "miami", 4)];
+        let parsed: AnalysisResponse = serde_json::from_str("{}").expect("empty object parses");
+        let result = build_analysis_result(parsed, &input);
+        assert_eq!(result.curated_stories.len(), 2);
+        assert_eq!(result.connections.len(), 0);
+        assert_eq!(result.relevance_scores.len(), 0);
+    }
+
+    /// The pre-existing Bug B regression: model indices reference the INPUT array, but the
+    /// persist path resolves positionally against curated_stories. When curation REORDERS
+    /// the input, a connection's endpoints must remap to the stories the model MEANT — not
+    /// collide onto whatever sits at those positions. Before the fix, connection [0,2]
+    /// (ai↔italy) with curation reordering would land on the wrong, often same-sector, rows.
+    #[test]
+    fn connection_indices_remap_through_reordered_curation() {
+        // Input order: [0]=ai, [1]=miami, [2]=italy, [3]=tech.
+        let input = vec![
+            story("a", "ai", 9),
+            story("b", "miami", 8),
+            story("c", "italy", 7),
+            story("d", "tech", 6),
+        ];
+        // Curation drops miami and keeps ai/italy/tech. The output is concatenated in
+        // fixed sector order (ai, miami, italy, tech), so with input indices
+        // {ai:[0], italy:[2], tech:[3]} the curated array = [a(ai), c(italy), d(tech)].
+        // The key point is that these curated POSITIONS (0,1,2) differ from the INPUT
+        // indices (0,2,3), so a naive positional resolve would corrupt the connection.
+        let body = r#"{
+            "connections": [
+                {"story_ids": [0, 2], "connection": "ai↔italy", "insight": "kept"},
+                {"story_ids": [0, 1], "connection": "ai↔miami(dropped)", "insight": "x"}
+            ],
+            "relevance_scores": [],
+            "trends": [],
+            "curation": {"ai": [0], "miami": [], "italy": [2], "tech": [3]}
+        }"#;
+        let parsed: AnalysisResponse = serde_json::from_str(body).unwrap();
+        let result = build_analysis_result(parsed, &input);
+
+        // curated order: ai(a)=0, italy(c)=1, tech(d)=2
+        assert_eq!(result.curated_stories.len(), 3);
+        assert_eq!(result.curated_stories[0].article.url, "a");
+        assert_eq!(result.curated_stories[1].article.url, "c");
+        assert_eq!(result.curated_stories[2].article.url, "d");
+
+        // Connection [0,2] = input ai(a)↔italy(c) → curated positions a=0, c=1.
+        // Input story 2 mapped to curated position 1 — the remap did real work (2 != 1).
+        // The second connection references input story 1 (miami), which wasn't curated → dropped.
+        assert_eq!(result.connections.len(), 1, "connection to a dropped story must be dropped");
+        let conn = &result.connections[0];
+        let sec_a = &result.curated_stories[conn.story_idx_a].article.sector;
+        let sec_b = &result.curated_stories[conn.story_idx_b].article.sector;
+        // The whole point: endpoints land on DIFFERENT sectors (ai & italy), as the model meant.
+        assert_ne!(sec_a, sec_b, "remapped connection must stay cross-sector");
+        let mut sectors = [sec_a.as_str(), sec_b.as_str()];
+        sectors.sort();
+        assert_eq!(sectors, ["ai", "italy"]);
+    }
 }

@@ -19,7 +19,7 @@ cargo build -p pulse-fetcher    # Build fetcher only
 ```
 
 ## Key Decisions
-- Haiku 4.5 for story summaries, Sonnet 4.6 for cross-sector analysis
+- Groq for the fetch pipeline: llama-3.1-8b-instant for short/exec summaries, llama-3.3-70b-versatile for story summaries + cross-sector analysis (NOT Anthropic — the `claude/` module name is legacy). Anthropic is only used by the in-app chat command.
 - SQLite + sqlite-vec for storage and vector search
 - Voyage-3-lite for embeddings (512 dims)
 - All news sources are free APIs (Google News RSS, HN, direct RSS, Currents)

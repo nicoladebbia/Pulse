@@ -354,14 +354,53 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         tracing::info!("Summarized all {} stories successfully", sum_count);
     }
 
-    if summaries.is_empty() && financial_stories.is_empty() {
-        anyhow::bail!("No stories could be summarized — all API calls failed. Aborting to avoid storing empty briefing.");
+    // Bail if NEWS is empty — not just when both news AND financial are empty.
+    // A block at the Groq summarize step leaves financial stories intact (they skip
+    // summarization), which previously wrote a financial-only, news-EMPTY briefing
+    // marked 'complete'. That gutted briefing became today's daily view (the "old
+    // stories" the app shows) AND masked the last good briefing. Bailing here instead
+    // means the run produces NO daily briefing this slot, the app keeps showing the
+    // last GOOD day, and a later slot (7am/12pm/6pm/10pm) retries once Groq is
+    // reachable — the news-based skip check in main.rs won't treat this as "done".
+    // The preflight probe should catch most blocks before we get here; this is the
+    // backstop for a block that starts mid-run (reachable at probe, blocked by summarize).
+    if summaries.is_empty() {
+        anyhow::bail!("No news stories could be summarized — likely a blocked API (VPN/network). Aborting so a later slot retries instead of storing a news-empty briefing.");
     }
 
-    // Phase 4: Cross-sector analysis (news only)
+    // Degraded-briefing alert: the run will continue (financial stories may have
+    // saved it from a hard abort), but if the news summarizer mostly failed the
+    // briefing is gutted. Without this, a Groq block that leaves financial intact
+    // returns Ok and fails silently — the same class of bug as the June 2026
+    // incident, just narrower. Threshold: <50% of attempted summaries succeeded.
+    let attempted = articles_to_summarize.len() as i64;
+    if attempted > 0 && sum_count * 2 < attempted {
+        let msg = format!(
+            "Only {}/{} news stories summarized — likely a blocked API (VPN?). Briefing is degraded.",
+            sum_count, attempted
+        );
+        tracing::error!("{}", msg);
+        notify_degraded(&msg);
+    }
+
+    // Phase 4: Cross-sector analysis (news only) — BEST-EFFORT, must not abort the run.
+    // The Groq block flips on/off mid-run: a run can pass the preflight probe and
+    // summarize all news, then get 403'd here at analyze (observed 2026-07-13 22:12).
+    // analyze sits UPSTREAM of the DB write (Phase 8), so a hard `?` here threw away
+    // every summarized story AND fired the false "FAILED" alert — reproducing both of
+    // the user's original symptoms on any intermittent-connectivity day. On failure we
+    // fall back to a degraded analysis (same stories, no cross-sector enrichment) so the
+    // news still persists. Also neutralizes the stochastic serde-on-200 abort inside
+    // analyze. See .plans/groq-vpn-block-plan.md.
     progress.start_stage(4);
     tracing::info!("Phase 4: Cross-sector analysis...");
-    let mut analysis = crate::claude::analyze_cross_sector(&summaries, db_path).await?;
+    let mut analysis = match crate::claude::analyze_cross_sector(&summaries, db_path).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("Cross-sector analysis failed ({}) — persisting news WITHOUT cross-sector enrichment (degraded briefing).", e);
+            crate::claude::degraded_analysis(&summaries)
+        }
+    };
 
     // Log sector distribution in curated stories
     {
@@ -748,7 +787,12 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
 
     // Done
     progress.finish();
-    send_notification(analysis.curated_stories.len())?;
+    // Best-effort: news is already persisted by now, so a flaky osascript must NOT
+    // turn a successful run into an Err (which would fire notify_failure — a false
+    // "FAILED" alert on a run that actually succeeded).
+    if let Err(e) = send_notification(analysis.curated_stories.len()) {
+        tracing::warn!("Success notification failed (non-fatal): {}", e);
+    }
 
     let duration = start.elapsed();
 
@@ -2442,6 +2486,20 @@ Focus on MOST important entities (max 5 per story)."#,
     Ok(total_stored)
 }
 
+/// DIAGNOSTIC (Task #7): log the per-category count of freedom articles at a
+/// pipeline stage, so we can localize where health/whoop coverage drops to zero.
+fn log_freedom_histogram<'a>(stage: &str, sectors: impl Iterator<Item = &'a str>) {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for s in sectors {
+        *counts.entry(s).or_insert(0) += 1;
+    }
+    let summary: Vec<String> = ["freedom_time", "freedom_wealth", "freedom_location", "freedom_health", "freedom_whoop"]
+        .iter()
+        .map(|cat| format!("{}={}", cat.trim_start_matches("freedom_"), counts.get(cat).copied().unwrap_or(0)))
+        .collect();
+    tracing::info!("Freedoms[{}]: {}", stage, summary.join(" "));
+}
+
 pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
 
@@ -2466,6 +2524,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         .filter(|a| a.sector.starts_with("freedom_"))
         .collect();
     tracing::info!("Freedoms: {} raw articles", freedom_articles.len());
+    log_freedom_histogram("raw", freedom_articles.iter().map(|a| a.sector.as_str()));
 
     // Phase 1.5: Freshness filter — drop articles older than 72h.
     // Exempt academic sources (ArXiv, bioRxiv) which publish on weekly cycles
@@ -2495,6 +2554,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         .collect();
     let dropped = pre_fresh.saturating_sub(freedom_articles.len());
     tracing::info!("Freedoms: freshness filter dropped {} stale articles (news >72h, academic >14d); {} remain", dropped, freedom_articles.len());
+    log_freedom_histogram("after-freshness", freedom_articles.iter().map(|a| a.sector.as_str()));
 
     if freedom_articles.is_empty() {
         tracing::warn!("Freedoms: No freedom articles found, skipping");
@@ -2516,6 +2576,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     };
     let unique = crate::dedup::deduplicate_with_history(freedom_articles, historical_hashes, historical_titles);
     tracing::info!("Freedoms: {} after dedup", unique.len());
+    log_freedom_histogram("after-dedup (pre_curate INPUT)", unique.iter().map(|a| a.sector.as_str()));
 
     // Phase 2.5: Pre-curate if many articles
     let to_summarize = if unique.len() > 40 {
@@ -2529,6 +2590,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
                     .filter_map(|i| unique.get(i).cloned())
                     .collect();
                 tracing::info!("Freedoms: Pre-curated to {} articles", curated.len());
+                log_freedom_histogram("after-pre_curate (LLM selection)", curated.iter().map(|a| a.sector.as_str()));
                 curated
             }
             Err(e) => {
@@ -5651,12 +5713,36 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
 }
 
 fn send_notification(story_count: usize) -> anyhow::Result<()> {
+    // .status() not .spawn(): blocks until delivery so the banner survives even
+    // if this is the last thing before exit (see notify_failure). Worked before
+    // only because post-processing kept the process alive afterward.
     std::process::Command::new("osascript")
         .arg("-e")
         .arg(format!(
             r#"display notification "Your daily briefing is ready. {} stories across 4 sectors." with title "Pulse" sound name "Glass""#,
             story_count
         ))
-        .spawn()?;
+        .status()?;
     Ok(())
+}
+
+/// Public test hook for `--mode notify-test`: exercises the degraded-alert path.
+pub fn notify_degraded_test(msg: &str) {
+    notify_degraded(msg);
+}
+
+/// Alert that a run completed but the news briefing is degraded (most summaries
+/// failed — typically a blocked API). Best-effort; mirrors send_notification's
+/// proven-from-launchd delivery path. Distinct from main::notify_failure, which
+/// fires only on a hard run-level Err.
+fn notify_degraded(msg: &str) {
+    // .status() not .spawn() — see notify_failure in main.rs. A fire-and-forget
+    // spawn is dropped if the process exits before notificationd delivers.
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            r#"display notification "{}" with title "Pulse fetch DEGRADED" sound name "Basso""#,
+            msg.replace('"', "'").replace('\\', "")
+        ))
+        .status();
 }

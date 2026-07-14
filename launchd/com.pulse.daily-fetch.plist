@@ -19,6 +19,14 @@
         <string>/Users/nicoladebbia</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <!-- Cost A/B: Llama-4 Scout for PRE_CURATE only (~3.3x cheaper, simple
+             index-list output it handles fine). analyze is pinned to 70B in code
+             (client.rs) regardless of this var — scout failed the large analyze
+             payload twice on 2026-06-25 (json_validate + serde type mismatch).
+             Scout is a Groq Preview model — if deprecated, remove this key and
+             pre_curate falls back to llama-3.3-70b (the code default). -->
+        <key>PULSE_STRONG_MODEL</key>
+        <string>meta-llama/llama-4-scout-17b-16e-instruct</string>
     </dict>
 
     <key>StartCalendarInterval</key>
