@@ -29,6 +29,11 @@ pub struct StoryEmbedding {
 pub async fn generate(
     stories: &[SummarizedStory],
     prefixes: Option<&[Option<String>]>,
+    // Heartbeat: called once per batch with (detail, sub_pct 0-100) so the caller can
+    // keep the progress file fresh across the 21s inter-batch rate-limit sleeps. Without
+    // this, embeddings runs 3-5 min with zero progress writes and the UI would misread a
+    // healthy run as interrupted. Optional so backfill/tests can pass a no-op.
+    mut heartbeat: impl FnMut(&str, f64),
 ) -> anyhow::Result<Vec<StoryEmbedding>> {
     let api_key = std::env::var("VOYAGE_API_KEY")
         .map_err(|_| anyhow::anyhow!("VOYAGE_API_KEY not set"))?;
@@ -70,7 +75,13 @@ pub async fn generate(
     const BATCH_SIZE: usize = 10;
     let mut all_embeddings: Vec<StoryEmbedding> = Vec::with_capacity(texts.len());
 
+    let total_batches = texts.chunks(BATCH_SIZE).len().max(1);
     for (batch_idx, chunk) in texts.chunks(BATCH_SIZE).enumerate() {
+        // Heartbeat BEFORE the 21s sleep so the progress file stays fresh across it.
+        heartbeat(
+            &format!("Embedding batch {}/{}", batch_idx + 1, total_batches),
+            (batch_idx as f64 / total_batches as f64) * 100.0,
+        );
         if batch_idx > 0 {
             // Rate limit: free tier = 3 RPM, so wait 21s between batches
             tracing::info!("Rate limit pause before batch {}...", batch_idx + 1);

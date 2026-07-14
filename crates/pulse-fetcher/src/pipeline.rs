@@ -55,6 +55,42 @@ impl ProgressWriter {
         let _ = self.atomic_write(&json);
     }
 
+    /// Write a fresh "running" record at the very start of a run. This clears any
+    /// terminal state (failed/interrupted) a PREVIOUS run left behind, so a fixed
+    /// failure never haunts the next fetch. Must fire before the pre-Phase-1 network
+    /// calls (form4/enrich) — otherwise the file shows the old state during them.
+    pub fn start_run(&self) {
+        let json = serde_json::json!({
+            "stage": "starting",
+            "stage_label": "Starting fetch…",
+            "stage_num": 0,
+            "total_stages": STAGE_WEIGHTS.len(),
+            "percent": 0,
+            "detail": null,
+            "started_at": self.started_at,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let _ = self.atomic_write(&json);
+    }
+
+    /// Re-stamp the "starting" record with a fresh updated_at + detail. Keeps the file
+    /// fresh during the pre-Phase-1 SEC calls (Form4 fetch/enrich), which can run tens of
+    /// seconds with no start_stage() — without this, heavy EDGAR throttling at the very
+    /// start of a healthy run could be misread as an interruption.
+    pub fn heartbeat_starting(&self, detail: &str) {
+        let json = serde_json::json!({
+            "stage": "starting",
+            "stage_label": "Starting fetch…",
+            "stage_num": 0,
+            "total_stages": STAGE_WEIGHTS.len(),
+            "percent": 0,
+            "detail": detail,
+            "started_at": self.started_at,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let _ = self.atomic_write(&json);
+    }
+
     fn write_progress(&self, detail: Option<&str>, sub_pct: f64) {
         let idx = self.current_stage.saturating_sub(1).min(STAGE_WEIGHTS.len() - 1);
         let (weight, stage_id, stage_label) = STAGE_WEIGHTS[idx];
@@ -81,6 +117,32 @@ impl ProgressWriter {
         std::fs::write(&tmp, serde_json::to_string(json).unwrap_or_default())?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+}
+
+/// The canonical progress-file path (same as `ProgressWriter::new`), so callers that
+/// don't hold a ProgressWriter (e.g. main.rs on an early bail) can still find it.
+pub fn progress_file_path(db_path: &Path) -> std::path::PathBuf {
+    db_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("fetch-progress.json")
+}
+
+/// Standalone durable-failure writer. Used by `ProgressWriter::fail` AND directly by
+/// main.rs when `pipeline::run` returns Err (the cost-cap bail can fire before any
+/// ProgressWriter method was called, so main.rs owns writing the terminal state).
+pub fn write_failed_state(path: &Path, reason: &str) {
+    let json = serde_json::json!({
+        "stage": "failed",
+        "stage_label": "Fetch failed",
+        "percent": 0,
+        "reason": reason.chars().take(200).collect::<String>(),
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, serde_json::to_string(&json).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -142,6 +204,10 @@ fn check_daily_cost_cap(db_path: &Path) -> anyhow::Result<()> {
 pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let mut progress = ProgressWriter::new(db_path);
+    // Stamp a fresh "running" record immediately (clears any prior failed/interrupted
+    // state) so the UI reflects THIS run during the pre-Phase-1 network calls below,
+    // which run for several seconds before the first start_stage().
+    progress.start_run();
 
     // Cost guardrail: bail before any LLM call if today's spend already crossed the cap.
     check_daily_cost_cap(db_path)?;
@@ -159,6 +225,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         }
         Err(e) => tracing::warn!("Targeted Form 4 fetch failed (non-fatal): {}", e),
     }
+    progress.heartbeat_starting("Fetching insider filings");
 
     // Phase 0: Enrich Form 4 stories from previous runs (before EDGAR fetch burns SEC rate limit)
     tracing::info!("Phase 0: Enriching prior Form 4 filings with transaction data...");
@@ -170,6 +237,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         }
         Err(e) => tracing::warn!("Form 4 enrichment failed (non-fatal): {}", e),
     }
+    progress.heartbeat_starting("Preparing sources");
 
     // Phase 1: Collect from all sources
     progress.start_stage(1);
@@ -491,7 +559,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     progress.start_stage(7);
     let news_count = analysis.curated_stories.len();
     tracing::info!("Phase 7.5: Generating embeddings for {} news stories...", news_count);
-    let embeddings = match crate::embeddings::generate(&analysis.curated_stories, prefixes.as_deref()).await {
+    let embeddings = match crate::embeddings::generate(&analysis.curated_stories, prefixes.as_deref(), |detail, pct| progress.update_detail(detail, pct)).await {
         Ok(embs) => {
             tracing::info!("Generated {} embeddings", embs.len());
             log_usage(db_path, "voyage", "voyage-3-lite", "embeddings", (embs.len() as i64) * 200, 0);
@@ -544,7 +612,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 9: Extract entities (non-fatal)
     progress.start_stage(9);
     tracing::info!("Phase 9: Extracting entities...");
-    match extract_entities_from_stories(db_path, &analysis).await {
+    match extract_entities_from_stories(db_path, &analysis, &progress).await {
         Ok(count) => {
             tracing::info!("Extracted {} entity mentions", count);
             // ~2000 tokens in, ~500 out per batch of 30 stories; ~3 batches for 80 stories
@@ -2199,7 +2267,7 @@ fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddi
     Ok(())
 }
 
-async fn extract_entities_from_stories(db_path: &Path, analysis: &crate::claude::AnalysisResult) -> anyhow::Result<usize> {
+async fn extract_entities_from_stories(db_path: &Path, analysis: &crate::claude::AnalysisResult, progress: &ProgressWriter) -> anyhow::Result<usize> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
@@ -2239,7 +2307,15 @@ async fn extract_entities_from_stories(db_path: &Path, analysis: &crate::claude:
     let mut total_stored = 0;
 
     // Process stories in batches of 15
+    let entity_batches = (analysis.curated_stories.len() + 29) / 30;
     for (batch_start, chunk) in analysis.curated_stories.chunks(30).enumerate().map(|(i, c)| (i * 30, c)) {
+        // Heartbeat: keep the progress file fresh so a long entity pass isn't misread as
+        // interrupted, and so the bar visibly advances within stage 9.
+        let batch_no = batch_start / 30 + 1;
+        progress.update_detail(
+            &format!("Extracting entities (batch {}/{})", batch_no, entity_batches.max(1)),
+            (batch_no as f64 / entity_batches.max(1) as f64) * 100.0,
+        );
         let mut stories_text = String::new();
         for (i, story) in chunk.iter().enumerate() {
             let global_idx = batch_start + i;
@@ -2773,7 +2849,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     // distinguish from daily stories. This lets semantic search surface them.
     tracing::info!("Freedoms: Generating embeddings...");
     let freedom_summaries: Vec<crate::claude::SummarizedStory> = curated.iter().map(|(_, s)| (*s).clone()).collect();
-    match crate::embeddings::generate(&freedom_summaries, None).await {
+    match crate::embeddings::generate(&freedom_summaries, None, |_, _| {}).await {
         Ok(embs) => {
             if let Ok(conn) = rusqlite::Connection::open(db_path) {
                 let mut stored = 0;
