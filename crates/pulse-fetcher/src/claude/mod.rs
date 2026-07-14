@@ -167,3 +167,42 @@ pub async fn analyze_cross_sector(stories: &[SummarizedStory], db_path: &std::pa
 
     client.analyze(&balanced).await
 }
+
+/// Degraded fallback for when `analyze_cross_sector` fails (e.g. Groq block flips
+/// on mid-run, or a stochastic serde-on-200 error). Returns an `AnalysisResult`
+/// carrying the SAME sector-balanced story set that analyze would have curated,
+/// but WITHOUT the cross-sector enrichment (connections/relevance/trends empty).
+/// This lets the pipeline persist the news it already summarized instead of
+/// throwing all of it away and firing a false "FAILED" alert — the daily briefing
+/// still lands, just without the cross-sector-connections feature for that day.
+pub fn degraded_analysis(stories: &[SummarizedStory]) -> AnalysisResult {
+    let mut sorted = stories.to_vec();
+    sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
+
+    let sectors = ["ai", "miami", "italy", "tech"];
+    let mut balanced = Vec::with_capacity(160);
+    let min_per_sector = 35;
+    for sector in &sectors {
+        balanced.extend(
+            sorted.iter()
+                .filter(|s| s.article.sector == *sector)
+                .take(min_per_sector)
+                .cloned(),
+        );
+    }
+    let already: std::collections::HashSet<String> =
+        balanced.iter().map(|s| s.article.url.clone()).collect();
+    for s in &sorted {
+        if balanced.len() >= 160 { break; }
+        if !already.contains(&s.article.url) {
+            balanced.push(s.clone());
+        }
+    }
+
+    AnalysisResult {
+        curated_stories: balanced,
+        connections: Vec::new(),
+        relevance_scores: Vec::new(),
+        trends: Vec::new(),
+    }
+}

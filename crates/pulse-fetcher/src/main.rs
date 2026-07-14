@@ -10,7 +10,6 @@ pub(crate) mod calibration;
 pub(crate) mod position_management;
 pub(crate) mod position_sizing;
 
-use chrono::Timelike;
 use clap::Parser;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -78,31 +77,45 @@ async fn main() -> anyhow::Result<()> {
             extract_entities(&db_path).await?;
         }
         "daily" => {
-            // Skip if we already have enough briefings for this time of day (unless --force)
-            // Morning run (before 2 PM) needs 1, evening run (after 2 PM) allows 2
+            // Idempotent skip: a day is "done" only if today's daily briefing already
+            // has NEWS stories. This is deliberately NOT `status='complete'` — a run
+            // blocked at the Groq summarize step still writes financial stories (they
+            // skip summarization) and marks the briefing complete with ZERO news, which
+            // is exactly the degraded state we want a LATER slot to retry, not skip.
+            // Success == news present (source_type='news'). See groq-vpn-block-plan.md.
             if !args.force && db_path.exists() {
                 let conn = rusqlite::Connection::open_with_flags(
                     &db_path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 )?;
-                let now = chrono::Local::now();
-                let today = now.format("%Y-%m-%d").to_string();
-                let hour = now.hour();
-                let max_allowed: i64 = if hour >= 14 { 2 } else { 1 };
-                let count: i64 = conn
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let news_today: i64 = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM briefings WHERE date = ?1 AND briefing_type = 'daily' AND status = 'complete'",
+                        "SELECT COUNT(*) FROM stories s \
+                         JOIN briefings b ON s.briefing_id = b.id \
+                         WHERE b.date = ?1 AND b.briefing_type = 'daily' AND s.source_type = 'news'",
                         [&today],
                         |row| row.get(0),
                     )
                     .unwrap_or(0);
-                if count >= max_allowed {
-                    tracing::info!("Already have {}/{} briefings for {}, skipping (use --force to override)", count, max_allowed, today);
+                if news_today > 0 {
+                    tracing::info!("Already fetched {} news stories for {} — skipping (use --force to override)", news_today, today);
                     return Ok(());
                 }
             }
-            // Notify-on-failure safety net: a scheduled daily run that errors
-            // (e.g. Groq blocked -> empty briefing aborted) must not fail silently.
+
+            // Preflight reachability probe: if the source IP is on Groq's blocklist
+            // (VPN exit node / school network) the whole run would 403 and abort after
+            // ~90 min, firing the daily "not working" alert. A blocked slot is EXPECTED,
+            // not a failure — exit 0 SILENTLY (no notification) so a later slot retries.
+            // With 4 daily slots (7am/12pm/6pm/10pm) one usually catches a clean window.
+            if !crate::claude::client::groq_reachable().await {
+                tracing::info!("Groq unreachable (blocked source IP) — skipping this slot silently, a later slot will retry.");
+                return Ok(());
+            }
+
+            // Notify-on-failure safety net: a scheduled daily run that errors AFTER a
+            // passing preflight (so the network was reachable) must not fail silently.
             if let Err(e) = pipeline::run(&db_path).await {
                 notify_failure(&format!("Daily run aborted: {}", e));
                 return Err(e);
