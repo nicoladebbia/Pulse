@@ -198,40 +198,6 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // Generic garbage placeholders.
-    const GARBAGE: &[&str] = &["n/a", "tbd", "unknown", "none", "other", "null", "test"];
-
-    // Substring blocklist for federal/political/financial-filing entities that
-    // occasionally leak into a sector via mentions but aren't real news subjects.
-    const NOISE_SUBSTRINGS: &[&str] = &[
-        "actblue",
-        "national aeronautics",
-        "general services administration",
-        "general service administration",
-        "federal register",
-        "department of the treasury",
-        "internal revenue service",
-        "securities and exchange commission",
-        " pac ",
-        " pac,",
-        "victory fund",
-        "for michigan",
-        "for america",
-        "campaign committee",
-        "(cik ",
-        " llc ",
-        " llp ",
-        " l.p.",
-        ", lp",
-        ", inc.",
-        ", inc ",
-        " ventures",
-        "fund i",
-        "fund ii",
-        "fund iii",
-        "grassroots",
-    ];
-
     let ranked: Vec<(i64, String, Option<String>, String, f64, i32, i32, f64)> = stmt
         .query_map([], |row| {
             Ok((
@@ -241,25 +207,10 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
+        // Drop federal-filing / PAC / LLC / ALL-CAPS gov-payload noise. Shared filter —
+        // see services::entity_noise (also applied to the Signals convergence watchlist).
         .filter(|r: &(i64, String, Option<String>, String, f64, i32, i32, f64)| {
-            let raw = &r.1;
-            let t = raw.to_lowercase();
-            if t.len() < 2 || GARBAGE.contains(&t.as_str()) || t.contains("n/a") {
-                return false;
-            }
-            // Drop entities that are clearly federal filings / PACs / fund vehicles.
-            let padded = format!(" {} ", t);
-            if NOISE_SUBSTRINGS.iter().any(|s| padded.contains(s) || t.contains(s)) {
-                return false;
-            }
-            // Drop ALL-CAPS names of >=3 tokens (typical of USASpending/SEC payloads).
-            let alpha: String = raw.chars().filter(|c| c.is_alphabetic()).collect();
-            let is_all_caps = !alpha.is_empty() && alpha.chars().all(|c| c.is_uppercase());
-            let token_count = raw.split_whitespace().count();
-            if is_all_caps && token_count >= 3 {
-                return false;
-            }
-            true
+            !crate::services::entity_noise::is_noise_entity(&r.1)
         })
         .collect();
 

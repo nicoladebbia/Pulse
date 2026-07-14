@@ -248,11 +248,22 @@ pub fn compute_all_cross_signals(conn: &Connection, today: &str) -> anyhow::Resu
 }
 
 /// Get entities with convergence detected, ordered by compound score.
+///
+/// Applies two read-path correctness controls the raw table doesn't enforce:
+///  - **Freshness (F3):** only rows computed in the last 7 days, matching `get_top_signals`
+///    and `get_signal_evidence`. Without this, months-old convergence rows surface as current.
+///  - **Noise (F2):** federal-filing / LLC / ALL-CAPS gov-payload entities are dropped via the
+///    shared `entity_noise` filter (same one the Trends radar uses). The SQL over-fetches so the
+///    post-filter result still reaches `limit` real companies.
 pub fn get_convergence_signals(conn: &Connection, limit: usize) -> anyhow::Result<Vec<CrossSignal>> {
+    // Over-fetch: noise entities are dropped after the query, so ask for more rows than needed
+    // to avoid a short list once the LLC/gov-filing rows are removed.
+    let fetch = (limit * 4).max(limit + 40) as i64;
     let mut stmt = conn.prepare(
         "WITH latest AS (
            SELECT cs.*, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY computed_at DESC) AS rn
            FROM cross_signals cs
+           WHERE computed_at >= date('now', '-7 days')
          )
          SELECT cs.entity_id, e.name,
                 COALESCE(cs.ticker, et.ticker) AS ticker, cs.compound_score,
@@ -269,7 +280,7 @@ pub fn get_convergence_signals(conn: &Connection, limit: usize) -> anyhow::Resul
     )?;
 
     let signals = stmt
-        .query_map([limit as i64], |row| {
+        .query_map([fetch], |row| {
             Ok(CrossSignal {
                 entity_id: row.get(0)?,
                 entity_name: row.get::<_, String>(1).unwrap_or_else(|_| "Unknown".to_string()),
@@ -289,6 +300,9 @@ pub fn get_convergence_signals(conn: &Connection, limit: usize) -> anyhow::Resul
             })
         })?
         .filter_map(|r| r.ok())
+        // F2: drop federal-filing / LLC / ALL-CAPS gov-payload noise entities.
+        .filter(|s: &CrossSignal| !crate::services::entity_noise::is_noise_entity(&s.entity_name))
+        .take(limit)
         .collect();
 
     Ok(signals)
