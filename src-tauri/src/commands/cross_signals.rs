@@ -431,14 +431,15 @@ pub fn get_source_health(db: State<'_, DbState>) -> Result<Vec<SourceHealth>, St
             ).unwrap_or(0)
         };
 
-        // Also check api_usage
+        // API-call count in the last 7 days. NOTE: api_usage logs one row per HTTP request
+        // regardless of whether any data came back, so this is "did we try", NOT "did we get
+        // data". It must never by itself mean a source is healthy (that was the old bug: a
+        // dead scraper that 200s an empty page every run looked "active").
         let api_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM api_usage WHERE provider = ?1 AND created_at >= datetime('now', '-7 days')",
             [api_provider],
             |row| row.get(0),
         ).unwrap_or(0);
-
-        let total = story_count.max(api_count);
 
         let last_fetch: Option<String> = conn.query_row(
             "SELECT MAX(created_at) FROM api_usage WHERE provider = ?1",
@@ -446,12 +447,39 @@ pub fn get_source_health(db: State<'_, DbState>) -> Result<Vec<SourceHealth>, St
             |row| row.get(0),
         ).unwrap_or(None);
 
-        let status = if total > 0 { "active" } else if name.contains("Patents") { "migrating" } else { "inactive" };
+        // Honest health (HIGH-1/HIGH-2). A source is only "active" if it PRODUCED DATA in the
+        // last 7 days. Sources that don't emit stories (Finnhub quotes, Alpaca execution — empty
+        // source_match) are judged by whether they're being called at all. A source that has
+        // produced stories historically but none in 7 days is "stale" (dead-but-firing: FRED,
+        // EIA, Google Patents were all still calling their APIs while producing nothing for
+        // 43-91 days). Never produced anything → "inactive".
+        let ever_produced: i64 = if source_match.is_empty() {
+            0
+        } else {
+            let q = if source_match.contains('%') {
+                "SELECT COUNT(*) FROM stories WHERE source_type = 'financial' AND source_name LIKE ?1"
+            } else {
+                "SELECT COUNT(*) FROM stories WHERE source_type = 'financial' AND source_name = ?1"
+            };
+            conn.query_row(q, [source_match], |row| row.get(0)).unwrap_or(0)
+        };
+
+        let (status, last_count) = if source_match.is_empty() {
+            // Non-story data source (Finnhub/Alpaca): active iff being called.
+            (if api_count > 0 { "active" } else { "inactive" }, api_count)
+        } else if story_count > 0 {
+            ("active", story_count)
+        } else if ever_produced > 0 {
+            // Produced before, nothing in 7 days — firing but dead.
+            ("stale", 0)
+        } else {
+            ("inactive", 0)
+        };
 
         health.push(SourceHealth {
             name: name.to_string(),
             status: status.to_string(),
-            last_count: total,
+            last_count,
             last_fetch,
             description: desc.to_string(),
         });

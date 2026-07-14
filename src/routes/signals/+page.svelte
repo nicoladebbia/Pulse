@@ -266,6 +266,7 @@
 	function statusDot(status: string): string {
 		if (status === 'active') return 'bg-emerald-400';
 		if (status === 'migrating') return 'bg-amber-400';
+		if (status === 'stale') return 'bg-amber-400'; // firing but produced no data in 7d
 		return 'bg-zinc-600';
 	}
 
@@ -1094,8 +1095,8 @@
 					<p class="text-xs text-text-muted mb-2">{src.description}</p>
 					<div class="flex items-center justify-between text-[10px]">
 						<span class="text-text-secondary font-mono">{src.last_count} items/week</span>
-						<span class="{src.status === 'active' ? 'text-emerald-400' : src.status === 'migrating' ? 'text-amber-400' : 'text-zinc-500'}">
-							{src.status === 'active' ? 'Active' : src.status === 'migrating' ? 'Migrating' : 'Inactive'}
+						<span class="{src.status === 'active' ? 'text-emerald-400' : (src.status === 'migrating' || src.status === 'stale') ? 'text-amber-400' : 'text-zinc-500'}">
+							{src.status === 'active' ? 'Active' : src.status === 'migrating' ? 'Migrating' : src.status === 'stale' ? 'No data 7d' : 'Inactive'}
 						</span>
 					</div>
 				</div>
