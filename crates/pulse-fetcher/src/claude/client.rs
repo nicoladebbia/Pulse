@@ -812,6 +812,14 @@ fn build_analysis_result(parsed: AnalysisResponse, stories: &[SummarizedStory]) 
             .and_then(|s| curated_pos_by_url.get(s.article.url.as_str()).copied())
     };
 
+    // Count same-sector pairs the model produced so we can observe, across free scheduled
+    // runs, whether it EVER emits genuine cross-sector connections. The model frequently
+    // returns pairs within one sector (e.g. ai↔ai) despite the prompt asking for
+    // cross-sector links; those are not valid instances of a feature literally named
+    // "cross-sector connections", so they are dropped (no fallback — empty-but-honest beats
+    // wrong-but-present). Making cross-sector pairs reliably APPEAR is a separate prompt-level
+    // fix (costs Groq); this filter only removes the same-sector garbage.
+    let mut same_sector_dropped = 0usize;
     let connections: Vec<Connection> = parsed.connections
         .into_iter()
         .filter_map(|c| {
@@ -823,6 +831,11 @@ fn build_analysis_result(parsed: AnalysisResponse, stories: &[SummarizedStory]) 
             if a == b {
                 return None;
             }
+            // Reject same-sector pairs: this is the honesty fix for "cross-sector connections".
+            if curated_stories[a].article.sector == curated_stories[b].article.sector {
+                same_sector_dropped += 1;
+                return None;
+            }
             Some(Connection {
                 story_idx_a: a,
                 story_idx_b: b,
@@ -831,7 +844,11 @@ fn build_analysis_result(parsed: AnalysisResponse, stories: &[SummarizedStory]) 
             })
         })
         .collect();
-    tracing::info!("Cross-sector connections after remap: {} kept", connections.len());
+    tracing::info!(
+        "Connections: {} cross-sector kept, {} same-sector dropped",
+        connections.len(),
+        same_sector_dropped
+    );
 
     let relevance_scores: Vec<RelevanceScore> = parsed.relevance_scores
         .into_iter()
@@ -1033,6 +1050,47 @@ mod tests {
         let sec_b = &result.curated_stories[conn.story_idx_b].article.sector;
         // The whole point: endpoints land on DIFFERENT sectors (ai & italy), as the model meant.
         assert_ne!(sec_a, sec_b, "remapped connection must stay cross-sector");
+        let mut sectors = [sec_a.as_str(), sec_b.as_str()];
+        sectors.sort();
+        assert_eq!(sectors, ["ai", "italy"]);
+    }
+
+    /// The honesty fix: the feature is literally named "cross-sector connections", yet the
+    /// 70B model routinely emits SAME-sector pairs (e.g. ai↔ai). Those are not valid
+    /// instances of the feature and must be dropped — empty-but-honest beats wrong-but-present.
+    /// A genuinely cross-sector pair in the same body must survive.
+    #[test]
+    fn same_sector_connections_are_dropped_cross_sector_kept() {
+        // Two AI stories + one Italy story, so a same-sector (ai↔ai) pair is possible.
+        let input = vec![
+            story("a", "ai", 9),
+            story("b", "ai", 8),
+            story("c", "italy", 7),
+        ];
+        let body = r#"{
+            "connections": [
+                {"story_ids": [0, 1], "connection": "ai↔ai(same-sector)", "insight": "drop"},
+                {"story_ids": [0, 2], "connection": "ai↔italy(cross)", "insight": "keep"}
+            ],
+            "relevance_scores": [],
+            "trends": [],
+            "curation": {"ai": [0, 1], "italy": [2]}
+        }"#;
+        let parsed: AnalysisResponse = serde_json::from_str(body).unwrap();
+        let result = build_analysis_result(parsed, &input);
+
+        // All 3 stories curated (each sector under cap).
+        assert_eq!(result.curated_stories.len(), 3);
+        // Only the cross-sector connection survives; the ai↔ai pair is dropped.
+        assert_eq!(
+            result.connections.len(),
+            1,
+            "same-sector connection must be dropped, cross-sector kept"
+        );
+        let conn = &result.connections[0];
+        let sec_a = &result.curated_stories[conn.story_idx_a].article.sector;
+        let sec_b = &result.curated_stories[conn.story_idx_b].article.sector;
+        assert_ne!(sec_a, sec_b, "surviving connection must be cross-sector");
         let mut sectors = [sec_a.as_str(), sec_b.as_str()];
         sectors.sort();
         assert_eq!(sectors, ["ai", "italy"]);
