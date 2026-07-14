@@ -41,7 +41,14 @@
 			: threads.filter(t => t.sector === sectorFilter);
 
 		if (sortBy === 'fastest') {
-			return [...base].sort((a, b) => b.acceleration - a.acceleration);
+			// Acceleration = (w7/7)/(w30/30). When all mentions are recent (w7==w30) it collapses
+			// to exactly 30/7 ≈ 4.286 — a huge tie-pile of ~1,700 signals. Sorting on acceleration
+			// alone floats that noise cluster above genuinely accelerating entities. Tiebreak by
+			// volume (mention_count * days_active) so real momentum wins within the tie.
+			return [...base].sort((a, b) =>
+				b.acceleration - a.acceleration ||
+				(b.mention_count * b.days_active) - (a.mention_count * a.days_active)
+			);
 		}
 		if (sortBy === 'connected') {
 			return [...base].sort((a, b) => b.related_entities.length - a.related_entities.length);
