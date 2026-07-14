@@ -4,8 +4,9 @@
 	import { page } from '$app/stores';
 	import { isTauri, mockBriefingData, mockUsageStats, mockTavilyQuota } from '$lib/tauri/mock';
 	import type { UsageStats, TavilyQuota, IntelligenceCounts, FinancialApiQuota } from '$lib/tauri/types';
-	import { isFetching, fetchDone, fetchError, triggerFetch as storeTriggerFetch } from '$lib/stores/fetch';
+	import { isFetching, fetchDone, triggerFetch as storeTriggerFetch } from '$lib/stores/fetch';
 	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
+	import FetchProgressBar from '$lib/components/FetchProgressBar.svelte';
 
 	let usageStats = $state<UsageStats | null>(null);
 	let tavilyQuota = $state<TavilyQuota | null>(null);
@@ -129,13 +130,12 @@
 		return `${diffDay}d ago`;
 	}
 
-	// Launchd schedules daily fetches at 8:00 AM and 9:00 PM local
+	// Launchd schedules daily fetches at 7 AM / 12 PM / 6 PM / 10 PM local (4 slots to
+	// catch a clean Groq window under the intermittent VPN/school-network IP block).
 	function nextFetchLabel(nowMs: number): string {
 		const d = new Date(nowMs);
-		const hour = d.getHours();
-		const minute = d.getMinutes();
-		const currentMin = hour * 60 + minute;
-		const schedules = [8 * 60, 21 * 60];
+		const currentMin = d.getHours() * 60 + d.getMinutes();
+		const schedules = [7 * 60, 12 * 60, 18 * 60, 22 * 60];
 		for (const s of schedules) {
 			if (s > currentMin) {
 				const h = Math.floor(s / 60);
@@ -143,7 +143,7 @@
 				return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 			}
 		}
-		return '08:00'; // tomorrow
+		return '07:00'; // tomorrow
 	}
 
 	let lastFetchedMs = $derived(
@@ -184,6 +184,10 @@
 
 	<!-- Refresh Briefing + fetch times -->
 	<div class="px-3 py-3 border-t border-border">
+		<!-- Always-visible progress bar: reflects manual AND scheduled/launchd runs,
+		     and surfaces the last run's failure/interruption even after the app reopens. -->
+		<FetchProgressBar />
+
 		{#if $isFetching}
 			<FetchTaskList compact />
 			{#if $fetchDone}
@@ -195,8 +199,10 @@
 			<button
 				class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm
 					transition-colors border border-border
-					text-text-secondary hover:bg-bg-card hover:text-text hover:border-ai/30"
+					text-text-secondary hover:bg-bg-card hover:text-text hover:border-ai/30
+					disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-text-secondary disabled:hover:border-border"
 				onclick={handleFetch}
+				disabled={$isFetching}
 			>
 				<span>↻</span>
 				<span>Refresh Briefing</span>
@@ -205,9 +211,6 @@
 				<button class="w-full text-[10px] text-center mt-1.5 text-ai hover:underline cursor-pointer" onclick={reloadBriefing}>
 					Done — reload briefing
 				</button>
-			{/if}
-			{#if $fetchError}
-				<p class="text-[10px] text-center mt-1.5 text-red-400">{$fetchError}</p>
 			{/if}
 		{/if}
 

@@ -117,6 +117,14 @@ async fn main() -> anyhow::Result<()> {
             // Notify-on-failure safety net: a scheduled daily run that errors AFTER a
             // passing preflight (so the network was reachable) must not fail silently.
             if let Err(e) = pipeline::run(&db_path).await {
+                // Durable failure record for the always-visible progress bar: a clean
+                // bail (cost cap, mid-run block) can happen before any ProgressWriter
+                // stage write, so main.rs stamps the terminal "failed" state here. This
+                // is what makes "run crashed 2h ago" queryable by the app.
+                pipeline::write_failed_state(
+                    &pipeline::progress_file_path(&db_path),
+                    &format!("{}", e),
+                );
                 notify_failure(&format!("Daily run aborted: {}", e));
                 return Err(e);
             }

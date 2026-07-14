@@ -1,21 +1,38 @@
 <script lang="ts">
 	import '../app.css';
-	import { onMount } from 'svelte';
 	import Sidebar from '$lib/components/layout/Sidebar.svelte';
 	import Header from '$lib/components/layout/Header.svelte';
 	import KeyboardHandler from '$lib/components/layout/KeyboardHandler.svelte';
 	import ShortcutHelp from '$lib/components/layout/ShortcutHelp.svelte';
 	import { isTauri } from '$lib/tauri/mock';
 	import { autoBacktestIfDue } from '$lib/tauri/commands';
+	import { startGlobalPolling, stopPolling } from '$lib/stores/fetch';
 	let { children } = $props();
 
-	onMount(() => {
-		if (!isTauri()) return;
-		// Fire-and-forget daily auto-backtest. Gated by day-90 threshold and
-		// once-per-day guard inside the Rust command — safe to call every load.
-		autoBacktestIfDue()
-			.then(s => console.info('[auto-backtest]', s.message))
-			.catch(e => console.warn('[auto-backtest] failed:', e));
+	// NOTE: use $effect, NOT onMount. With this app's SvelteKit config (ssr=false +
+	// prerender=true) the +layout onMount does not fire — the whole codebase drives
+	// startup from $effect (see Sidebar/+page). onMount here silently never ran, which
+	// is also why the pre-existing autoBacktestIfDue call had been dormant.
+	// Start the app-lifetime poller exactly once. Deliberately NO $effect cleanup return:
+	// an $effect re-run would fire the cleanup (stopPolling) and the `started` guard would
+	// then skip restarting it, silently killing the poller after a few ticks. The poller
+	// lives for the whole app session, so we start it once and never tear it down here.
+	let started = false;
+	$effect(() => {
+		if (started) return;
+		started = true;
+
+		// Always-on fetch-status poller (1s). Runs regardless of whether the app started
+		// the fetch, so the progress bar reflects scheduled launchd runs and crashes too.
+		startGlobalPolling(1000);
+
+		if (isTauri()) {
+			// Fire-and-forget daily auto-backtest. Gated by day-90 threshold and a
+			// once-per-day guard inside the Rust command — safe to call every load.
+			autoBacktestIfDue()
+				.then(s => console.info('[auto-backtest]', s.message))
+				.catch(e => console.warn('[auto-backtest] failed:', e));
+		}
 	});
 </script>
 

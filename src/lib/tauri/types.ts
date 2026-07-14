@@ -183,6 +183,12 @@ export interface FetchStatus {
 	detail: string | null;
 	elapsed_secs: number | null;
 	eta_secs: number | null;
+	/** Terminal state of the most recent run — drives the always-visible last-run line. */
+	last_status: 'complete' | 'failed' | 'interrupted' | 'running' | 'idle';
+	/** Human-readable reason when last_status === 'failed'. */
+	last_reason: string | null;
+	/** RFC3339 timestamp of the last progress write (for "Updated 2h ago"). */
+	last_at: string | null;
 }
 
 // === Freedom Types ===
