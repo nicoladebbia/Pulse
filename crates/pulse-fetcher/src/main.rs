@@ -155,6 +155,17 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::error!("Ticker backfill failed: {}", e),
             }
         }
+        "recanonicalize" => {
+            // Rebuild the entity-canonical graph from scratch under the fixed match logic,
+            // then re-run ticker/signal/cross-signal computation. Un-merges groups the old
+            // substring match over-merged (e.g. 129 unrelated companies -> canonical "Arm").
+            // Pure DB work, no Groq. Run against a copy first.
+            tracing::info!("Rebuilding entity-canonical graph (recanonicalize)...");
+            match pipeline::run_recanonicalize(&db_path) {
+                Ok(n) => tracing::info!("Recanonicalize complete: {} entities regrouped", n),
+                Err(e) => tracing::error!("Recanonicalize failed: {}", e),
+            }
+        }
         "manage-positions" => {
             // Run ONLY the exit-evaluation phase. Honors EXIT_DRY_RUN (default true).
             tracing::info!("Running position management (exit evaluation) only...");

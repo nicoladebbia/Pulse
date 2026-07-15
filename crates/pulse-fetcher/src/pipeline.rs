@@ -3184,8 +3184,111 @@ pub fn backfill_tickers(db_path: &Path) -> anyhow::Result<usize> {
     populate_tickers_limited(db_path, 100_000)
 }
 
+/// Rebuild the entity-canonical graph from scratch (via `--mode recanonicalize`).
+///
+/// `resolve_entities` only processes entities with a NULL `canonical_id`, so tightening the
+/// canonicalization match logic does NOT un-merge groups that were already over-merged (e.g. the
+/// 129 unrelated companies swept into canonical "Arm" by the old substring match). This standalone
+/// pass wipes the existing grouping and rebuilds it under the current (fixed) logic, then re-runs
+/// the downstream ticker + signal + cross-signal computation so the Signals tabs reflect clean
+/// groups. No Groq/LLM calls — pure DB work, safe to run against a copy first.
+pub fn run_recanonicalize(db_path: &Path) -> anyhow::Result<usize> {
+    {
+        let conn = rusqlite::Connection::open(db_path)?;
+        // Reset the poisoned grouping. entity_canonical is fully derived from entities, so
+        // clearing both and rebuilding is lossless (nothing else owns canonical rows).
+        tracing::info!("Recanonicalize: clearing existing canonical grouping...");
+        conn.execute("UPDATE entities SET canonical_id = NULL", [])?;
+        conn.execute("DELETE FROM entity_canonical", [])?;
+
+        // Purge the poisoned 0.6-confidence tickers (the old contains-match tier). These carried
+        // both a wrong ticker AND a wrong CIK (e.g. Arm Holdings got HYFM + Hydrofarm's CIK), which
+        // then force spurious ticker/CIK merges in resolve_entities. Deleting them drops those
+        // entities back into populate_tickers_limited's unmapped set (it skips ids already in
+        // entity_tickers), so they get re-resolved with the fixed word-boundary logic. A ticker
+        // whose ONLY source was a coincidentally-correct 0.6 guess is intentionally sacrificed —
+        // a lucky wrong-method match isn't worth keeping for "super correct".
+        let purged = conn.execute("DELETE FROM entity_tickers WHERE confidence = 0.6", [])?;
+        tracing::info!("Recanonicalize: purged {} poisoned 0.6-confidence tickers", purged);
+    }
+
+    // Rebuild canonical groups. resolve_entities processes up to 500 per call, so loop until
+    // it drains (returns 0). Bounded to avoid any pathological infinite loop.
+    let mut total = 0usize;
+    for _ in 0..500 {
+        let n = resolve_entities(db_path)?;
+        total += n;
+        if n == 0 {
+            break;
+        }
+    }
+    tracing::info!("Recanonicalize: resolved {} entities into canonical groups", total);
+
+    // Re-populate per-entity tickers (highest-confidence pick) across the whole table.
+    match populate_tickers_limited(db_path, 100_000) {
+        Ok(n) => tracing::info!("Recanonicalize: mapped {} entity tickers", n),
+        Err(e) => tracing::warn!("Recanonicalize ticker mapping failed (non-fatal): {}", e),
+    }
+
+    // Propagate those tickers up to the canonical groups. MUST run after ticker population —
+    // the resolve loop above ran before entity_tickers was filled, so canonical rows for
+    // newly-mapped entities are still NULL until this pass. Without it "Arm Holdings" stays
+    // stale (the exact symptom that outlived the interrupted run).
+    match refresh_canonical_tickers(db_path) {
+        Ok(n) => tracing::info!("Recanonicalize: propagated tickers to {} canonical groups", n),
+        Err(e) => tracing::warn!("Recanonicalize canonical ticker refresh failed (non-fatal): {}", e),
+    }
+
+    // Recompute entity signals + cross-signals from the clean groups so convergence is rebuilt.
+    {
+        let conn = rusqlite::Connection::open(db_path)?;
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        if let Err(e) = recompute_signals_pipeline(&conn, &today) {
+            tracing::warn!("Recanonicalize signal recompute failed (non-fatal): {}", e);
+        }
+    }
+    match compute_cross_signals(db_path) {
+        Ok(n) => tracing::info!("Recanonicalize: recomputed {} cross-signal scores", n),
+        Err(e) => tracing::warn!("Recanonicalize cross-signal computation failed (non-fatal): {}", e),
+    }
+
+    Ok(total)
+}
+
 fn populate_tickers(db_path: &Path) -> anyhow::Result<usize> {
     populate_tickers_limited(db_path, 200)
+}
+
+/// Propagate the best per-entity ticker up to each canonical group.
+///
+/// `resolve_entities` runs this same UPDATE at the end of each pass, but only against the
+/// `entity_tickers` rows that exist AT THAT MOMENT. During a full recanonicalize the resolve
+/// loop runs BEFORE `populate_tickers_limited` fills `entity_tickers`, so canonical rows for
+/// newly-mapped entities would stay NULL (this is exactly why "Arm Holdings" kept a stale
+/// ticker after the interrupted run). Call this AFTER ticker population to close the gap.
+/// This is the AUTHORITATIVE pick — it runs last, after all tickers are populated, so it
+/// deliberately does NOT gate on `ticker IS NULL`. The in-loop UPDATE at resolve_entities is
+/// first-write-wins across passes (a group's ticker locks in on the first pass that links any
+/// ticker, and a higher-confidence entity joining later can't replace it). Overwriting here
+/// with the full ORDER BY makes the highest-confidence linked ticker win regardless of pass
+/// order. The `id IN (...)` guard ensures the subquery always finds ≥1 linked ticker, so no
+/// canonical row is ever nulled by this.
+fn refresh_canonical_tickers(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute(
+        "UPDATE entity_canonical SET ticker = (
+            SELECT et.ticker FROM entity_tickers et
+            JOIN entities e ON e.id = et.entity_id
+            WHERE e.canonical_id = entity_canonical.id
+            ORDER BY et.confidence DESC, et.is_public DESC, et.last_verified DESC
+            LIMIT 1
+        ) WHERE id IN (
+            SELECT DISTINCT e.canonical_id FROM entities e
+            JOIN entity_tickers et ON et.entity_id = e.id
+            WHERE e.canonical_id IS NOT NULL
+        )",
+        [],
+    ).map_err(Into::into)
 }
 
 fn populate_tickers_limited(db_path: &Path, limit: usize) -> anyhow::Result<usize> {
@@ -3242,9 +3345,15 @@ fn populate_tickers_limited(db_path: &Path, limit: usize) -> anyhow::Result<usiz
         ).ok();
 
         if let Some((ticker, cik)) = ticker_from_metadata {
+            // Story financial_metadata.ticker is LLM-extracted at fetch time and NOT cross-checked
+            // against the entity — it can be flat wrong (story 2542 "Arm Holdings Wikipedia views"
+            // carried ticker=HYFM). It used to be stamped 1.0, OUTRANKING the authoritative SEC CIK
+            // match (0.95/0.98), so the group's ORDER BY confidence pick chose the LLM guess over a
+            // government identifier. Demoted below every SEC-derived source; only the SEC contains
+            // fallback (0.6) is weaker.
             conn.execute(
                 "INSERT OR IGNORE INTO entity_tickers (entity_id, ticker, cik, confidence)
-                 VALUES (?1, ?2, ?3, 1.0)",
+                 VALUES (?1, ?2, ?3, 0.75)",
                 rusqlite::params![entity_id, ticker, cik],
             )?;
             mapped += 1;
@@ -3276,9 +3385,12 @@ fn populate_tickers_limited(db_path: &Path, limit: usize) -> anyhow::Result<usiz
                         let cik_norm = cik_digits.trim_start_matches('0').to_string();
                         if !cik_norm.is_empty() {
                             if let Some((ticker, cik)) = cik_map.get(&cik_norm) {
+                                // CIK match = a government-registered identifier embedded in the
+                                // entity name. Strongest possible signal → TOP of the ladder (0.98),
+                                // above story-metadata (0.75) and every fuzzy name match.
                                 conn.execute(
                                     "INSERT OR IGNORE INTO entity_tickers (entity_id, ticker, cik, confidence)
-                                     VALUES (?1, ?2, ?3, 0.95)",
+                                     VALUES (?1, ?2, ?3, 0.98)",
                                     rusqlite::params![entity_id, ticker, cik],
                                 )?;
                                 mapped += 1;
@@ -3379,8 +3491,30 @@ async fn download_sec_tickers_async() -> anyhow::Result<std::collections::HashMa
     Ok(map)
 }
 
+/// Word-boundary containment: is `needle` a contiguous run of WHOLE WORDS inside `hay`?
+///
+/// Replaces raw `str::contains` in the entity/ticker resolution paths. The substring version
+/// merged any name/key containing a short token as a substring — "arm holdings" matched SEC key
+/// "hydrofarm holdings, inc" (…hydrof-ARM HOLDINGS…) → attached HYFM + Hydrofarm's CIK to the
+/// real Arm Holdings, poisoning the ticker AND forcing a CIK/ticker merge into Hydrofarm's group.
+/// Requiring whole-word alignment keeps legit hits ("apple" ⊂ "apple inc") and drops the bleed.
+/// `needle.len() < 3` returns false to avoid single-token noise (matches the ≥3 guards nearby).
+fn contains_words(hay: &str, needle: &str) -> bool {
+    if needle.len() < 3 {
+        return false;
+    }
+    let hay_tokens: Vec<&str> = hay.split_whitespace().collect();
+    let needle_tokens: Vec<&str> = needle.split_whitespace().collect();
+    if needle_tokens.is_empty() || needle_tokens.len() > hay_tokens.len() {
+        return false;
+    }
+    hay_tokens
+        .windows(needle_tokens.len())
+        .any(|w| w == needle_tokens.as_slice())
+}
+
 /// Resolve entity name to ticker using SEC data.
-/// Tries: exact match → suffix-stripped match → contains match.
+/// Tries: exact match → suffix-stripped match → word-boundary contains match.
 fn resolve_ticker_sec(
     name: &str,
     sec_map: &std::collections::HashMap<String, (String, String)>,
@@ -3399,9 +3533,10 @@ fn resolve_ticker_sec(
         return None;
     }
 
-    // 1. Exact match
+    // 1. Exact name match against SEC company list. Strong, but below a CIK match (0.98) —
+    // a name can collide, a CIK cannot. Was 1.0 (tied with story-metadata); now 0.95.
     if let Some((ticker, cik)) = sec_map.get(&name_lower) {
-        return Some((ticker.clone(), cik.clone(), 1.0));
+        return Some((ticker.clone(), cik.clone(), 0.95));
     }
 
     // 2. Strip common suffixes
@@ -3416,15 +3551,16 @@ fn resolve_ticker_sec(
         for (key, (ticker, cik)) in sec_map.iter() {
             let key_stripped = suffixes.iter().fold(key.as_str(), |s, sfx| s.trim_end_matches(sfx)).trim();
             if key_stripped == stripped {
-                return Some((ticker.clone(), cik.clone(), 0.8));
+                return Some((ticker.clone(), cik.clone(), 0.85));
             }
         }
     }
 
-    // 3. Contains match (min 5 chars to avoid false positives)
+    // 3. Word-boundary contains match (min 5 chars to avoid false positives).
+    // Was raw substring — "arm holdings" matched "hydrofarm holdings, inc" → HYFM poison.
     if name_lower.len() >= 5 {
         for (key, (ticker, cik)) in sec_map.iter() {
-            if key.contains(&name_lower) || name_lower.contains(key.as_str()) {
+            if contains_words(key, &name_lower) || contains_words(&name_lower, key) {
                 return Some((ticker.clone(), cik.clone(), 0.6));
             }
         }
@@ -5644,8 +5780,11 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
 
     if unresolved.is_empty() { return Ok(0); }
 
-    // Load existing canonical entities for matching
-    let existing_canonicals: Vec<(i64, String, Option<String>, Option<String>)> = {
+    // Load existing canonical entities for matching. MUTABLE: canonicals created during this
+    // loop are pushed back in (see the create branch) so a later entity in the SAME batch can
+    // match one an earlier entity just created. Without this, "Arm" (entity 122) and "Arm
+    // Holdings" (entity 21) split into two groups because 21 couldn't see the canonical 122 made.
+    let mut existing_canonicals: Vec<(i64, String, Option<String>, Option<String>)> = {
         let mut stmt = conn.prepare(
             "SELECT id, canonical_name, ticker, cik FROM entity_canonical"
         )?;
@@ -5675,6 +5814,9 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
         }
         n.trim().to_string()
     };
+
+    // Uses the module-scope `contains_words` (also used by resolve_ticker_sec) for the
+    // word-boundary name match below — "arm" no longer merges "hydrofarm"/"pharma".
 
     let mut resolved = 0usize;
 
@@ -5722,8 +5864,10 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
                     matched_canonical_id = Some(*cid);
                     break;
                 }
-                // Also try contains for short names (>= 5 chars)
-                if name_norm.len() >= 5 && (c_norm.contains(&name_norm) || name_norm.contains(&c_norm)) {
+                // Word-boundary containment (either direction). Requires whole-word alignment
+                // so "arm" no longer matches "hydrofarm"/"pharma"; "nvidia" still matches
+                // "nvidia corp". Min length enforced inside contains_words.
+                if contains_words(&c_norm, &name_norm) || contains_words(&name_norm, &c_norm) {
                     matched_canonical_id = Some(*cid);
                     break;
                 }
@@ -5750,6 +5894,12 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
                 "SELECT id FROM entity_canonical WHERE canonical_name = ?1",
                 [&canon_name], |row| row.get(0),
             ).ok();
+
+            // Make this new canonical visible to later entities in the SAME batch, so intra-batch
+            // duplicates ("Arm" then "Arm Holdings") collapse into it instead of each spawning a row.
+            if let Some(new_cid) = matched_canonical_id {
+                existing_canonicals.push((new_cid, canon_name.clone(), ticker.clone(), entity_cik.clone()));
+            }
         }
 
         // Link entity to canonical
@@ -5780,12 +5930,16 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
         }
     }
 
-    // Update canonical entities with best available ticker/CIK from linked entities
+    // Update canonical entities with best available ticker from linked entities.
+    // Pick the HIGHEST-CONFIDENCE ticker, not an arbitrary one — the old `LIMIT 1` with no
+    // ORDER BY grabbed a random linked ticker, so a polluted group could resolve to a junk
+    // 0.6-confidence mapping over the correct 0.95 one. Tie-break by is_public then most-recent.
     conn.execute_batch(
         "UPDATE entity_canonical SET ticker = (
             SELECT et.ticker FROM entity_tickers et
             JOIN entities e ON e.id = et.entity_id
             WHERE e.canonical_id = entity_canonical.id
+            ORDER BY et.confidence DESC, et.is_public DESC, et.last_verified DESC
             LIMIT 1
         ) WHERE ticker IS NULL AND id IN (
             SELECT DISTINCT e.canonical_id FROM entities e
