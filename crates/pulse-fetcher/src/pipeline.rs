@@ -4976,6 +4976,16 @@ pub async fn run_position_management(db_path: &Path) -> anyhow::Result<usize> {
     manage_open_positions(db_path).await
 }
 
+/// Run ONLY the auto-buy phase (Phase 13.5) in isolation — same gate, same
+/// candidate query, same Alpaca paper endpoint as the daily pipeline. Exists as a
+/// manual buy trigger: the daily run short-circuits at the "already fetched today"
+/// guard once the day's first slot succeeds, so later slots never reach Phase 13.5.
+/// This lets a fresh convergence set be acted on without a re-fetch. Still hard-gated
+/// by AUTO_TRADE_ENABLED; a no-op when disarmed. Paper-only (hardcoded endpoint).
+pub async fn run_auto_trade(db_path: &Path) -> anyhow::Result<usize> {
+    auto_trade_on_convergence(db_path).await
+}
+
 async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
     let dry_run = std::env::var("EXIT_DRY_RUN")
         .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))

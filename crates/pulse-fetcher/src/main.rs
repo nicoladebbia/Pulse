@@ -175,6 +175,17 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::error!("Position management failed: {}", e),
             }
         }
+        "auto-trade" => {
+            // Run ONLY the auto-buy phase (Phase 13.5) against the live PAPER account.
+            // Same gate (AUTO_TRADE_ENABLED), same candidate query, same paper endpoint
+            // as the daily pipeline — a no-op when disarmed. Manual buy trigger for when
+            // the daily run skipped Phase 13.5 at the already-fetched guard.
+            tracing::info!("Running auto-trade (buy path) only...");
+            match pipeline::run_auto_trade(&db_path).await {
+                Ok(n) => tracing::info!("Auto-trade complete: {} order(s) placed", n),
+                Err(e) => tracing::error!("Auto-trade failed: {}", e),
+            }
+        }
         "calibrate" => {
             // Run ONLY the calibration phase (Phase 14) in isolation. Calibration
             // is MEASURE-ONLY: it refreshes displayed P&L + computes Brier/hit-rate
