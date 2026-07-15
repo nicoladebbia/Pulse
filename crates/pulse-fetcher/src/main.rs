@@ -9,6 +9,7 @@ pub(crate) mod market_prices;
 pub(crate) mod calibration;
 pub(crate) mod position_management;
 pub(crate) mod position_sizing;
+pub(crate) mod edge_report;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -186,6 +187,16 @@ async fn main() -> anyhow::Result<()> {
                     r.positions_evaluated, r.brier_scores_updated, r.signal_analysis.total_resolved
                 ),
                 Err(e) => tracing::error!("Calibration failed: {}", e),
+            }
+        }
+        "edge-report" => {
+            // Step 6: re-measure the paper-trading edge on REAL fills placed after
+            // the 2026-07-15 ticker fix + arming. Reads ONLY paper_trades, applies an
+            // N-gate (no verdict below N=20), reports both % and $ expectancy, and
+            // refuses cross-condition comparison. Read-only — never trades.
+            match edge_report::run_edge_report(&db_path) {
+                Ok(_) => {}
+                Err(e) => tracing::error!("Edge report failed: {}", e),
             }
         }
         other => {
