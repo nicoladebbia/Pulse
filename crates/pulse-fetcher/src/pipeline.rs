@@ -3252,6 +3252,15 @@ pub fn run_recanonicalize(db_path: &Path) -> anyhow::Result<usize> {
         Err(e) => tracing::warn!("Recanonicalize cross-signal computation failed (non-fatal): {}", e),
     }
 
+    // compute_cross_signals only writes today's rows; historical cross_signals rows keep
+    // stale tickers from before this recanonicalization. The auto-buy window reads the last
+    // 1-day of rows, so a stale ticker (Arm's HYFM) would reach the money path. Re-derive
+    // every canonical-grouped row's ticker from the now-corrected entity_canonical mapping.
+    match refresh_cross_signal_tickers(db_path) {
+        Ok(n) => tracing::info!("Recanonicalize: repaired {} cross-signal tickers from canonical", n),
+        Err(e) => tracing::warn!("Recanonicalize cross-signal ticker repair failed (non-fatal): {}", e),
+    }
+
     Ok(total)
 }
 
@@ -3286,6 +3295,35 @@ fn refresh_canonical_tickers(db_path: &Path) -> anyhow::Result<usize> {
             SELECT DISTINCT e.canonical_id FROM entities e
             JOIN entity_tickers et ON et.entity_id = e.id
             WHERE e.canonical_id IS NOT NULL
+        )",
+        [],
+    ).map_err(Into::into)
+}
+
+/// Re-derive `cross_signals.ticker` from the corrected `entity_canonical` mapping.
+///
+/// `compute_cross_signals` only writes rows for `computed_at = today`, so historical
+/// rows keep whatever ticker was authoritative when they were written. After a
+/// re-canonicalization corrects `entity_canonical.ticker` (e.g. Arm HYFM→ARM), every
+/// prior cross_signals row for that entity is stale — and the auto-buy window
+/// (`computed_at >= date('now','-1 day')`) reads yesterday's rows, so stale tickers
+/// reach the money path. This repairs ALL canonical-grouped rows to match their
+/// canonical, mirroring `refresh_canonical_tickers`' authority.
+///
+/// SCOPE IS DELIBERATELY canonical-only: rows whose entity has NO canonical group
+/// (`canonical_id IS NULL`) are direct-mapped from a confident entity_tickers row
+/// (e.g. CORECIVIC→CXW 0.95, UNITIL→UTL 0.98) and are NOT touched — NULLing them
+/// would wipe legitimate signals. Emits real NULL where the canonical has no ticker
+/// (so the buy query's `ticker IS NOT NULL` gate correctly rejects e.g. CIA/EY/ICE).
+fn refresh_cross_signal_tickers(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute(
+        "UPDATE cross_signals SET ticker = (
+            SELECT ec.ticker FROM entities e
+            JOIN entity_canonical ec ON ec.id = e.canonical_id
+            WHERE e.id = cross_signals.entity_id
+        ) WHERE entity_id IN (
+            SELECT id FROM entities WHERE canonical_id IS NOT NULL
         )",
         [],
     ).map_err(Into::into)
