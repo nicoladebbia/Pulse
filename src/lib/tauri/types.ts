@@ -658,6 +658,9 @@ export interface EntityPrice {
 	ticker: string;
 	date: string;
 	close: number;
+	open: number | null;
+	high: number | null;
+	low: number | null;
 	change_1d: number | null;
 	change_7d: number | null;
 	change_30d: number | null;

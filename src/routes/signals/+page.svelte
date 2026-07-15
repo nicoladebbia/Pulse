@@ -30,6 +30,7 @@
 	let tradingConfidence = $state(0.6);
 	let tradeStatus = $state<string | null>(null);
 	let pricesRefreshing = $state(false);
+	let priceRefreshFailed = $state(false);
 	let analytics = $state<PortfolioAnalytics | null>(null);
 	let showAnalytics = $state(false);
 	let expandedTradeId = $state<number | null>(null);
@@ -106,7 +107,7 @@
 				getConvergenceAlerts(40).catch(() => []),
 				getSignalEvidence(40).catch(() => []),
 				getFinancialEvents(20).catch(() => []),
-				getEntityPrices(50).catch(() => []),
+				getEntityPrices(100).catch(() => []),
 			]);
 			signals = s;
 			convergence = c;
@@ -120,10 +121,11 @@
 			getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
 			// Refresh prices in background, then reload price list
 			pricesRefreshing = true;
+			priceRefreshFailed = false;
 			refreshPrices()
-				.then(() => getEntityPrices(50))
+				.then(() => getEntityPrices(100))
 				.then(p => { prices = p; })
-				.catch(() => {})
+				.catch(() => { priceRefreshFailed = true; })
 				.finally(() => { pricesRefreshing = false; });
 		} catch (e: any) {
 			error = String(e?.message ?? e);
@@ -224,6 +226,22 @@
 	function fmtPrice(val: number): string {
 		return val.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 	}
+
+	/**
+	 * Freshness of a daily price row for the Market tab.
+	 * Returns a short label + whether it's stale (>1 trading day old).
+	 * "today" / "1d ago" / "Nd ago". Weekends make 2-3d normal, so we only
+	 * badge as stale at >3 calendar days.
+	 */
+	function priceAge(dateStr: string): { label: string; stale: boolean } {
+		const days = Math.floor((Date.now() - Date.parse(dateStr + 'T00:00:00Z')) / 86_400_000);
+		if (days <= 0) return { label: 'today', stale: false };
+		if (days === 1) return { label: '1d ago', stale: false };
+		return { label: `${days}d ago`, stale: days > 3 };
+	}
+
+	// Toggle: show OHLC detail row in the Market table.
+	let showOhlc = $state(false);
 
 	function fmtPnl(val: number): string {
 		return `${val >= 0 ? '+' : ''}${fmtPrice(val)}`;
@@ -722,17 +740,33 @@
 				<p class="text-sm text-text-muted">Prices are fetched daily for entities with ticker mappings.</p>
 			</div>
 		{:else}
+			<div class="flex items-center justify-between mb-2 px-1">
+				<span class="text-xs text-text-muted">
+					{prices.length} tickers · most-recent close per ticker
+					{#if priceRefreshFailed}
+						<span class="text-amber-400" title="Today's Finnhub refresh failed — showing last stored prices">· refresh failed, showing stored</span>
+					{:else if pricesRefreshing}
+						<span class="text-text-muted">· refreshing…</span>
+					{/if}
+				</span>
+				<button
+					class="text-xs text-text-muted hover:text-text transition-colors"
+					onclick={() => (showOhlc = !showOhlc)}
+				>{showOhlc ? 'Hide OHLC' : 'Show OHLC'}</button>
+			</div>
 			<div class="bg-bg-card border border-border rounded-xl overflow-hidden">
-				<div class="grid grid-cols-6 px-4 py-2.5 text-[10px] text-text-muted uppercase tracking-wider border-b border-border">
+				<div class="grid grid-cols-7 px-4 py-2.5 text-[10px] text-text-muted uppercase tracking-wider border-b border-border">
 					<span class="col-span-2">Entity</span>
 					<span class="text-right">Price</span>
 					<span class="text-right">1D</span>
 					<span class="text-right">7D</span>
 					<span class="text-right">30D</span>
+					<span class="text-right">As of</span>
 				</div>
 				{#each prices as p}
-					<div class="grid grid-cols-6 px-4 py-2.5 items-center hover:bg-bg-card-hover transition-colors border-b border-border/50 last:border-0">
-						<div class="col-span-2 flex items-center gap-2">
+					{@const age = priceAge(p.date)}
+					<div class="grid grid-cols-7 px-4 py-2.5 items-center hover:bg-bg-card-hover transition-colors border-b border-border/50 last:border-0">
+						<div class="col-span-2 flex items-center gap-2 min-w-0">
 							<span class="text-sm font-mono font-semibold text-text">{p.ticker}</span>
 							{#if p.entity_name}
 								<span class="text-[10px] text-text-muted truncate">{p.entity_name}</span>
@@ -742,7 +776,20 @@
 						<span class="text-sm font-mono text-right {changeColor(p.change_1d)}">{fmtChange(p.change_1d)}</span>
 						<span class="text-sm font-mono text-right {changeColor(p.change_7d)}">{fmtChange(p.change_7d)}</span>
 						<span class="text-sm font-mono text-right {changeColor(p.change_30d)}">{fmtChange(p.change_30d)}</span>
+						<span
+							class="text-[10px] font-mono text-right {age.stale ? 'text-amber-400' : 'text-text-muted'}"
+							title={p.date}
+						>{age.label}</span>
 					</div>
+					{#if showOhlc}
+						<div class="grid grid-cols-7 px-4 pb-2 -mt-1 text-[10px] font-mono text-text-muted border-b border-border/50 last:border-0">
+							<span class="col-span-2"></span>
+							<span class="text-right">O {p.open != null ? p.open.toFixed(2) : '--'}</span>
+							<span class="text-right">H {p.high != null ? p.high.toFixed(2) : '--'}</span>
+							<span class="text-right">L {p.low != null ? p.low.toFixed(2) : '--'}</span>
+							<span class="col-span-2"></span>
+						</div>
+					{/if}
 				{/each}
 			</div>
 		{/if}
