@@ -3710,13 +3710,22 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
         Ok(rows.collect())
     };
 
-    // Stage 2 — source diversity (last 7 days). Distinct source_names per topic.
+    // Stage 2 — source diversity (last 30 days). Distinct source_names per topic.
+    // 30-day, NOT 7-day: news coverage is bursty, so a 7-day slice scores even
+    // well-covered entities at diversity=1 (Nvidia: 1 over 7d vs 9 over 30d,
+    // measured 2026-07-15). The convergence gate needs src_diversity>=2, and this
+    // UPDATE (written at ~3958) runs AFTER — and clobbers — the financial writer in
+    // extract_entities_from_financial_metadata, which already uses 30 days. A 7-day
+    // window here silently overwrote that broader count with 1 and starved the
+    // `positive>=2 && src_diversity>=2` convergence branch to ~32 of 2712 signals.
+    // 30d aligns both writers and the news timescale (raises it to ~133; the
+    // positive>=2 + compound>0.3 gates keep candidate volume bounded, not a firehose).
     let diversity_map: HashMap<Key, f64> = load_metric(
         "SELECT tm.topic, tm.sector, CAST(COUNT(DISTINCT s.source_name) AS REAL)
          FROM entity_mentions em
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
-         WHERE em.mentioned_at >= date(?1, '-7 days')
+         WHERE em.mentioned_at >= date(?1, '-30 days')
          GROUP BY tm.topic, tm.sector",
         &[&today],
     ).unwrap_or_default();
