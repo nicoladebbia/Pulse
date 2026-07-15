@@ -99,14 +99,22 @@ pub struct EdgeReport {
 pub fn run_edge_report(db_path: &Path) -> anyhow::Result<EdgeReport> {
     let conn = Connection::open(db_path)?;
 
-    // Resolved post-arm trades: (pnl_pct, pnl_dollars). date(entry_date) normalizes
-    // both 'YYYY-MM-DD' and full-timestamp entry_date formats.
+    // Resolved post-arm trades with a REAL realized outcome: (pnl_pct, pnl_dollars).
+    // A row with NULL pnl/exit_price is an unknown outcome (e.g. a 404/reconcile
+    // no-fill close), NOT a $0 flat trade — including it via COALESCE(...,0) would
+    // pad N and drag expectancy toward zero. Exclude it here; verify_pnl_writes
+    // separately alarms the human that such a row exists. The two must agree on the
+    // same dataset: flagged-for-review ⇒ excluded-from-measurement. date(entry_date)
+    // normalizes both 'YYYY-MM-DD' and full-timestamp entry_date formats.
     let rows: Vec<(f64, f64)> = {
         let mut stmt = conn.prepare(
-            "SELECT COALESCE(pnl_pct, 0.0), COALESCE(pnl, 0.0)
+            "SELECT pnl_pct, pnl
              FROM paper_trades
              WHERE status IN ('closed', 'stopped_out')
-               AND date(entry_date) >= ?1",
+               AND date(entry_date) >= ?1
+               AND pnl IS NOT NULL
+               AND pnl_pct IS NOT NULL
+               AND exit_price IS NOT NULL",
         )?;
         stmt.query_map([ARM_DATE], |r| Ok((r.get(0)?, r.get(1)?)))?
             .filter_map(|r| r.ok())
@@ -293,10 +301,15 @@ pub fn maybe_announce_edge_sample(db_path: &Path, now: &str, notify: Notifier) -
         return Ok(()); // already announced
     }
 
+    // Count the SAME set run_edge_report measures — resolved rows with a real
+    // realized outcome. A NULL-pnl no-fill row is excluded there, so it must be
+    // excluded here too; otherwise this could announce "N=20 ready" on a sample
+    // padded with phantom rows edge-report won't count, mis-tripping the gate.
     let resolved: usize = conn
         .query_row(
             "SELECT COUNT(*) FROM paper_trades
-             WHERE status IN ('closed', 'stopped_out') AND date(entry_date) >= ?1",
+             WHERE status IN ('closed', 'stopped_out') AND date(entry_date) >= ?1
+               AND pnl IS NOT NULL AND pnl_pct IS NOT NULL AND exit_price IS NOT NULL",
             [ARM_DATE],
             |r| r.get(0),
         )
@@ -502,5 +515,56 @@ mod tests {
         // next run — latched, silent even though still >= threshold
         maybe_announce_edge_sample(&path, "2026-07-16T18:00:00", &n).unwrap();
         assert_eq!(cap.count(), 1, "announce is latched — fires exactly once");
+    }
+
+    // The composition test the two units missed individually: on a dataset holding
+    // a NULL-pnl no-fill row, the verifier and the measurement must AGREE — the row
+    // is flagged-for-review (verifier alarms) AND excluded-from-measurement
+    // (edge-report + sample-counter don't count it). Without the NULL-exclusion fix,
+    // edge-report would COALESCE it to a $0 flat trade: N padded, expectancy dragged.
+    #[test]
+    fn verifier_and_measurement_agree_on_null_pnl_row() {
+        let (_f, path) = seed_conn();
+        // two real post-arm closes (one win, one loss) + one phantom no-fill close
+        insert(&path, "REALW", "2026-07-16", "closed", Some(12.0), Some(20.0), Some(20.0));
+        insert(&path, "REALL", "2026-07-16", "stopped_out", Some(8.0), Some(-20.0), Some(-20.0));
+        insert(&path, "GHOST", "2026-07-16", "closed", None, None, None); // 404/reconcile no-fill
+
+        // Measurement side: the phantom is EXCLUDED — N counts only the two real outcomes.
+        let rep = run_edge_report(&path).unwrap();
+        assert_eq!(rep.resolved, 2, "edge-report must exclude the NULL-pnl row from N");
+        assert_eq!(rep.wins, 1);
+        assert_eq!(rep.losses, 1);
+        // Expectancy reflects only real trades: +20% and -20% => 0%, NOT dragged by a phantom $0.
+        assert!((rep.expectancy_pct).abs() < 1e-9, "expectancy = mean(+20,-20) = 0, not diluted");
+
+        // Verifier side: the SAME phantom row IS flagged for review.
+        let cap = Capture::new();
+        let n = cap.notifier();
+        verify_pnl_writes(&path, "2026-07-16T12:00:00", &n).unwrap();
+        assert!(
+            cap.0.borrow().iter().any(|(t, _)| t.contains("BROKEN")),
+            "the row excluded from measurement must still be flagged by the verifier"
+        );
+
+        // Sample-counter side: counts the same set as edge-report — 2, not 3.
+        // (Seed 18 more real closes to cross MIN_SAMPLE only via real rows; the phantom
+        // must never be the row that trips the gate.)
+        for i in 0..(MIN_SAMPLE - 2) {
+            insert(&path, &format!("R{i}"), "2026-07-16", "closed", Some(11.0), Some(1.0), Some(10.0));
+        }
+        // Now: MIN_SAMPLE real + 1 phantom. Counter must announce (real count == MIN_SAMPLE).
+        let cap2 = Capture::new();
+        let n2 = cap2.notifier();
+        maybe_announce_edge_sample(&path, "2026-07-16T12:00:00", &n2).unwrap();
+        assert_eq!(cap2.count(), 1, "counter reaches N via real rows only, phantom excluded");
+
+        // Sanity: with the phantom REMOVED the report is unchanged for the two originals —
+        // i.e. its presence never contributed to the measured numbers.
+        Connection::open(&path).unwrap()
+            .execute("DELETE FROM paper_trades WHERE ticker = 'GHOST'", []).unwrap();
+        let rep_no_ghost = run_edge_report(&path).unwrap();
+        assert_eq!(rep_no_ghost.resolved, rep.resolved + (MIN_SAMPLE - 2),
+            "removing the phantom changes nothing measured — it was never counted");
     }
 }
