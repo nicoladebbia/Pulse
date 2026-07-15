@@ -763,6 +763,18 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Position management failed (non-fatal): {}", e),
     }
 
+    // Phase 13.7: Verify the realized-P&L WRITE on every close path (non-fatal).
+    // Path-agnostic table query over resolved post-arm rows — catches a bad/NULL
+    // pnl write from the sell branch OR the 404/reconcile no-fill branch, either of
+    // which would silently corrupt the edge-report substrate. Fires a permanent
+    // breakage alarm + a one-time "first close" runtime confirmation (rule #8).
+    {
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if let Err(e) = crate::edge_report::verify_pnl_writes(db_path, &now, &notify_info) {
+            tracing::warn!("P&L-write verification failed (non-fatal): {}", e);
+        }
+    }
+
     // Phase 14: Automated calibration (non-fatal)
     progress.update_detail("Calibrating signal weights", 100.0);
     tracing::info!("Phase 14: Running signal calibration...");
@@ -797,6 +809,16 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Ok(true) => tracing::info!("Portfolio snapshot recorded"),
         Ok(false) => tracing::info!("Portfolio snapshot skipped"),
         Err(e) => tracing::warn!("Portfolio snapshot failed (non-fatal): {}", e),
+    }
+
+    // Phase 14.2: Announce ONCE when the post-arm edge sample first reaches N=20
+    // (non-fatal). No verdict, no flag flip — a human runs `--mode edge-report`.
+    // Removes the "remember to check in weeks" dependency; latched, fires once.
+    {
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if let Err(e) = crate::edge_report::maybe_announce_edge_sample(db_path, &now, &notify_info) {
+            tracing::warn!("Edge-sample announce check failed (non-fatal): {}", e);
+        }
     }
 
     // Phase 14.5: Generate predictions (Sonnet daily, Opus Sunday) (non-fatal)
@@ -6020,6 +6042,19 @@ fn notify_degraded(msg: &str) {
         .arg(format!(
             r#"display notification "{}" with title "Pulse fetch DEGRADED" sound name "Basso""#,
             msg.replace('"', "'").replace('\\', "")
+        ))
+        .status();
+}
+
+/// General title+body notification (used by the edge-report money-path hooks).
+/// `.status()` not `.spawn()` for the same launchd-delivery reason as above.
+pub fn notify_info(title: &str, body: &str) {
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            r#"display notification "{}" with title "{}" sound name "Glass""#,
+            body.replace('"', "'").replace('\\', ""),
+            title.replace('"', "'").replace('\\', "")
         ))
         .status();
 }
