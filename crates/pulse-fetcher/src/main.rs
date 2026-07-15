@@ -163,6 +163,20 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::error!("Position management failed: {}", e),
             }
         }
+        "calibrate" => {
+            // Run ONLY the calibration phase (Phase 14) in isolation. Calibration
+            // is MEASURE-ONLY: it refreshes displayed P&L + computes Brier/hit-rate
+            // and NEVER places orders or closes trades. This mode exists to prove
+            // that: run it with an open position and confirm zero Alpaca sells.
+            tracing::info!("Running calibration (measure-only) in isolation...");
+            match calibration::run_calibration(&db_path).await {
+                Ok(r) => tracing::info!(
+                    "Calibration complete: {} positions measured, {} Brier scores, {} resolved",
+                    r.positions_evaluated, r.brier_scores_updated, r.signal_analysis.total_resolved
+                ),
+                Err(e) => tracing::error!("Calibration failed: {}", e),
+            }
+        }
         other => {
             tracing::info!("Running in {} mode", other);
             pipeline::run(&db_path).await?;

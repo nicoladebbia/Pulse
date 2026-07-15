@@ -9,12 +9,14 @@ use rusqlite::Connection;
 /// - Signal decay: close if convergence score drops below threshold
 
 /// What to do with a position.
+///
+/// (A `TightenStop` variant was removed 2026-07-15 — it was never constructed;
+/// `evaluate_position` writes the trailing stop directly and returns Hold/Close*.)
 #[derive(Debug)]
 pub enum PositionAction {
     Hold,
     CloseAll { reason: String },
     CloseHalf { reason: String },
-    TightenStop { new_stop: f64 },
 }
 
 /// Compute Average True Range (ATR) from recent price data.
@@ -212,6 +214,86 @@ fn days_held(entry_date: &str, today: &str) -> Option<i64> {
     let entry = chrono::NaiveDate::parse_from_str(entry_str, "%Y-%m-%d").ok()?;
     let now = chrono::NaiveDate::parse_from_str(today_str, "%Y-%m-%d").ok()?;
     Some((now - entry).num_days())
+}
+
+/// Write a human-readable trade journal entry on close.
+///
+/// Moved here from calibration.rs (2026-07-15): it is a position-lifecycle
+/// concern that must fire from the SINGLE exit authority (Phase 13.6
+/// `manage_open_positions`). Calibration used to call it, but calibration is
+/// now measure-only and no longer closes trades — so this lives with the exit
+/// path that actually closes them, or new closes stop producing journal text
+/// (the Portfolio exit-reasons feature depends on it).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_trade_journal(
+    conn: &Connection, trade_id: i64, ticker: &str,
+    entry_date: &str, exit_date: &str,
+    entry_price: f64, exit_price: f64,
+    position_size: f64, pnl_pct: f64, pnl_dollars: f64,
+    status: &str,
+) {
+    // Get signal profile and entity name
+    let profile: String = conn.query_row(
+        "SELECT signal_profile FROM paper_trades WHERE id = ?1",
+        [trade_id], |row| row.get(0),
+    ).unwrap_or_default();
+
+    let entity_name: Option<String> = conn.query_row(
+        "SELECT e.name FROM paper_trades pt JOIN entities e ON e.id = pt.entity_id WHERE pt.id = ?1",
+        [trade_id], |row| row.get(0),
+    ).ok();
+
+    let name = entity_name.as_deref().unwrap_or(ticker);
+
+    // Parse top signals
+    let mut top_signals: Vec<(String, f64)> = Vec::new();
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&profile) {
+        let dims = ["insider", "institutional", "news", "government", "search", "patent", "supply_chain", "political"];
+        for dim in dims {
+            if let Some(val) = parsed.get(dim).and_then(|v| v.as_f64()) {
+                if val > 0.05 { top_signals.push((dim.to_string(), val)); }
+            }
+        }
+    }
+    top_signals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top_signals.truncate(3);
+
+    // Build narrative
+    let drivers = if top_signals.is_empty() {
+        "convergence signals".to_string()
+    } else {
+        top_signals.iter()
+            .map(|(d, v)| format!("{} ({:.0}%)", d, v * 100.0))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let holding_days = chrono::NaiveDate::parse_from_str(entry_date, "%Y-%m-%d")
+        .and_then(|e| chrono::NaiveDate::parse_from_str(exit_date, "%Y-%m-%d").map(|x| (x - e).num_days()))
+        .unwrap_or(0);
+
+    let exit_reason = match status {
+        "stopped_out" => "trailing stop was hit",
+        "expired" => "the 90-day holding limit was reached",
+        "closed" if pnl_pct > 0.0 => "profit target was reached",
+        "closed" => "signal decay triggered an exit",
+        _ => "position was closed",
+    };
+
+    let journal = format!(
+        "Entered {} long on {} at ${:.2} driven by {}. Position size: ${:.0}. \
+         Exited after {} days at ${:.2} — {}{:.1}% (${}{:.0}) because {}.",
+        name, entry_date, entry_price, drivers, position_size,
+        holding_days, exit_price,
+        if pnl_pct >= 0.0 { "+" } else { "" }, pnl_pct,
+        if pnl_dollars >= 0.0 { "+" } else { "" }, pnl_dollars,
+        exit_reason,
+    );
+
+    conn.execute(
+        "UPDATE paper_trades SET trade_journal = ?1 WHERE id = ?2",
+        rusqlite::params![journal, trade_id],
+    ).ok();
 }
 
 #[cfg(test)]

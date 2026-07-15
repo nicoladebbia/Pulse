@@ -4921,7 +4921,7 @@ async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
                     (held_qty / 2.0, reason)
                 }
             }
-            PositionAction::TightenStop { .. } | PositionAction::Hold => {
+            PositionAction::Hold => {
                 if decayed {
                     (held_qty, format!("signal_decay (orig {:.2}, pnl {:.1}%)", orig_score, pnl_pct))
                 } else {
@@ -5025,6 +5025,15 @@ async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
                     pnl=?3, pnl_pct=?4 WHERE id=?5",
                 rusqlite::params![exit_price, now_dt, pnl_dollars, pnl_pct_final, trade_id],
             ).ok();
+            // Journal the close. This is the SINGLE exit authority (Phase 13.6),
+            // so it owns journal generation — calibration is measure-only and no
+            // longer closes trades. Without this, the Portfolio exit-reasons
+            // feature stops getting entries once auto-exits arm.
+            let reason_status = if reason.starts_with("signal_decay") { "closed" } else { "stopped_out" };
+            crate::position_management::generate_trade_journal(
+                &conn, *trade_id, ticker, entry_date, &today,
+                *entry_price, exit_price, *position_size, pnl_pct_final, pnl_dollars, reason_status,
+            );
             tracing::info!("Position mgmt: CLOSED {} @ ${:.2} ({:+.1}%, ${:+.2})",
                 ticker, exit_price, pnl_pct_final, pnl_dollars);
         } else {
