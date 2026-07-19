@@ -385,6 +385,328 @@ pub fn get_auto_trade_status() -> Result<AutoTradeStatus, String> {
     Ok(AutoTradeStatus { enabled, reason })
 }
 
+/// Mirror of pulse-fetcher's `position_management::compute_atr` — SMA of true
+/// ranges over `period` days from entity_prices. The fetcher crate is a binary
+/// and cannot be imported from here, so this copy must be kept in sync with
+/// crates/pulse-fetcher/src/position_management.rs.
+fn compute_atr(conn: &rusqlite::Connection, ticker: &str, period: usize) -> f64 {
+    let mut stmt = match conn.prepare(
+        "SELECT high, low, close FROM entity_prices
+         WHERE ticker = ?1 AND high IS NOT NULL AND low IS NOT NULL
+         ORDER BY date DESC LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return 0.0,
+    };
+
+    let candles: Vec<(f64, f64, f64)> = stmt
+        .query_map(rusqlite::params![ticker, period + 1], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    if candles.len() < 2 {
+        return 0.0;
+    }
+
+    let candles: Vec<_> = candles.into_iter().rev().collect();
+    let mut true_ranges = Vec::with_capacity(candles.len() - 1);
+    for i in 1..candles.len() {
+        let (high, low, _) = candles[i];
+        let prev_close = candles[i - 1].2;
+        let tr = (high - low)
+            .max((high - prev_close).abs())
+            .max((low - prev_close).abs());
+        true_ranges.push(tr);
+    }
+    if true_ranges.is_empty() {
+        return 0.0;
+    }
+    true_ranges.iter().sum::<f64>() / true_ranges.len() as f64
+}
+
+/// Days between entry_date and today, tolerating both date and datetime strings.
+fn detail_days_held(entry_date: &str, today: &str) -> Option<i64> {
+    let entry_str = entry_date.split('T').next().unwrap_or(entry_date);
+    let today_str = today.split('T').next().unwrap_or(today);
+    let entry = chrono::NaiveDate::parse_from_str(entry_str, "%Y-%m-%d").ok()?;
+    let now = chrono::NaiveDate::parse_from_str(today_str, "%Y-%m-%d").ok()?;
+    Some((now - entry).num_days())
+}
+
+/// A cross_signals row snapshot for the trade detail page.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TradeSignalSnapshot {
+    pub computed_at: Option<String>,
+    pub compound_score: f64,
+    pub insider: f64,
+    pub institutional: f64,
+    pub news: f64,
+    pub government: f64,
+    pub search: f64,
+    pub patent: f64,
+    pub supply_chain: f64,
+    pub political: f64,
+    pub source_diversity: i64,
+    pub convergence_detected: bool,
+}
+
+/// The live exit plan for an open trade — every level the exit engine
+/// (pulse-fetcher Phase 13.6) will act on, mirrored read-only.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TradeExitPlan {
+    pub current_price: f64,
+    pub price_date: Option<String>,
+    pub hard_stop_price: f64,
+    pub fixed_stop_price: f64,
+    pub no_atr_fallback: bool,
+    pub atr: f64,
+    pub atr_mult: f64,
+    pub high_water_mark: Option<f64>,
+    pub stored_trailing_stop: Option<f64>,
+    pub live_trailing_stop: Option<f64>,
+    pub profit_target_price: Option<f64>,
+    pub half_closed_at: Option<String>,
+    pub days_held: i64,
+    pub max_hold_date: Option<String>,
+    pub days_remaining: i64,
+    pub decay_original_score: f64,
+    pub decay_current_score: f64,
+    pub decay_threshold: f64,
+    pub decay_triggered: bool,
+}
+
+/// How the position size was derived (auto-trade sizing formula).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TradeSizing {
+    pub score: f64,
+    pub tier_pct: f64,
+    pub notional: f64,
+    pub entry_floor: f64,
+    pub entry_cap: f64,
+    pub clamped: bool,
+    pub implied_buying_power: Option<f64>,
+    pub scale_in_count: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TradeDetail {
+    pub trade: PaperTrade,
+    pub entity_name: Option<String>,
+    pub created_at: Option<String>,
+    pub alpaca_order_id: Option<String>,
+    pub entry_signals: Option<TradeSignalSnapshot>,
+    pub current_signals: Option<TradeSignalSnapshot>,
+    pub exit_plan: Option<TradeExitPlan>,
+    pub sizing: TradeSizing,
+}
+
+fn signal_snapshot(
+    conn: &rusqlite::Connection,
+    ticker: &str,
+    at_or_before: Option<&str>,
+) -> Option<TradeSignalSnapshot> {
+    let sql = if at_or_before.is_some() {
+        "SELECT computed_at, compound_score, insider_signal, institutional_flow,
+                news_momentum, government_signal, search_trend, patent_signal,
+                supply_chain, political_signal, source_diversity, convergence_detected
+         FROM cross_signals WHERE ticker = ?1 AND date(computed_at) <= date(?2)
+         ORDER BY computed_at DESC LIMIT 1"
+    } else {
+        "SELECT computed_at, compound_score, insider_signal, institutional_flow,
+                news_momentum, government_signal, search_trend, patent_signal,
+                supply_chain, political_signal, source_diversity, convergence_detected
+         FROM cross_signals WHERE ticker = ?1
+         ORDER BY computed_at DESC LIMIT 1"
+    };
+    let mut stmt = conn.prepare(sql).ok()?;
+    let map = |row: &rusqlite::Row| -> rusqlite::Result<TradeSignalSnapshot> {
+        Ok(TradeSignalSnapshot {
+            computed_at: row.get(0).ok(),
+            compound_score: row.get::<_, f64>(1).unwrap_or(0.0),
+            insider: row.get::<_, f64>(2).unwrap_or(0.0),
+            institutional: row.get::<_, f64>(3).unwrap_or(0.0),
+            news: row.get::<_, f64>(4).unwrap_or(0.0),
+            government: row.get::<_, f64>(5).unwrap_or(0.0),
+            search: row.get::<_, f64>(6).unwrap_or(0.0),
+            patent: row.get::<_, f64>(7).unwrap_or(0.0),
+            supply_chain: row.get::<_, f64>(8).unwrap_or(0.0),
+            political: row.get::<_, f64>(9).unwrap_or(0.0),
+            source_diversity: row.get::<_, i64>(10).unwrap_or(0),
+            convergence_detected: row.get::<_, i32>(11).unwrap_or(0) != 0,
+        })
+    };
+    match at_or_before {
+        Some(date) => stmt.query_row(rusqlite::params![ticker, date], map).ok(),
+        None => stmt.query_row([ticker], map).ok(),
+    }
+}
+
+/// Full forensics for one trade: entry provenance, the signal snapshot that
+/// fired it, the sizing derivation, and the live exit plan. Read-only — the
+/// exit numbers mirror pulse-fetcher's position_management constants (hard stop
+/// -15%, ATR(14) trailing stop at 2.0/1.5/1.0x by age, profit target entry +
+/// 3x ATR closing half at >= +10%, 90-day max hold, signal decay at
+/// max(30% of original, 0.05)).
+#[tauri::command]
+pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDetail, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    type FullRow = (
+        PaperTrade,
+        Option<String>,
+        Option<String>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<i64>,
+        Option<String>,
+    );
+    let (trade, created_at, alpaca_order_id, high_water_mark, stored_trailing_stop,
+         original_compound_score, scale_in_count, half_closed_at): FullRow = conn
+        .query_row(
+            "SELECT id, entity_id, ticker, direction, entry_price, entry_date,
+                    exit_price, exit_date, position_size, confidence,
+                    signal_profile, status, pnl, pnl_pct, trade_journal,
+                    created_at, alpaca_order_id, high_water_mark, trailing_stop,
+                    original_compound_score, scale_in_count, half_closed_at
+             FROM paper_trades WHERE id = ?1",
+            [trade_id],
+            |row| {
+                Ok((
+                    PaperTrade {
+                        id: row.get(0)?,
+                        entity_id: row.get(1)?,
+                        ticker: row.get(2)?,
+                        direction: row.get(3)?,
+                        entry_price: row.get(4)?,
+                        entry_date: row.get(5)?,
+                        exit_price: row.get(6)?,
+                        exit_date: row.get(7)?,
+                        position_size: row.get(8)?,
+                        confidence: row.get(9)?,
+                        signal_profile: row.get(10)?,
+                        status: row.get(11)?,
+                        pnl: row.get(12)?,
+                        pnl_pct: row.get(13)?,
+                        trade_journal: row.get(14)?,
+                    },
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                    row.get(19)?,
+                    row.get(20)?,
+                    row.get(21)?,
+                ))
+            },
+        )
+        .map_err(|_| format!("No trade with id {}", trade_id))?;
+
+    let entity_name: Option<String> = conn
+        .query_row(
+            "SELECT name FROM entities WHERE id = ?1",
+            [trade.entity_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let entry_signals = signal_snapshot(&conn, &trade.ticker, Some(trade.entry_date.as_str()));
+    let current_signals = signal_snapshot(&conn, &trade.ticker, None);
+
+    // Sizing derivation — mirrors position_sizing::entry_notional tiers.
+    let score = original_compound_score.unwrap_or(trade.confidence);
+    let tier_pct = if score > 0.6 { 0.05 } else if score > 0.4 { 0.02 } else { 0.01 };
+    let scale_ins = scale_in_count.unwrap_or(0);
+    let clamped = (trade.position_size - 50.0).abs() < 0.01
+        || (trade.position_size - 10_000.0).abs() < 0.01;
+    // Scale-ins add to position_size, so back-deriving buying power from the
+    // final notional is only valid for never-scaled, unclamped entries.
+    let implied_buying_power = if !clamped && scale_ins == 0 && tier_pct > 0.0 {
+        Some(trade.position_size / tier_pct)
+    } else {
+        None
+    };
+    let sizing = TradeSizing {
+        score,
+        tier_pct,
+        notional: trade.position_size,
+        entry_floor: 50.0,
+        entry_cap: 10_000.0,
+        clamped,
+        implied_buying_power,
+        scale_in_count: scale_ins,
+    };
+
+    // Exit plan — open positions only.
+    let exit_plan = if trade.status == "open" {
+        let (current_price, price_date): (f64, Option<String>) = conn
+            .query_row(
+                "SELECT close, date FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
+                [&trade.ticker],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((0.0, None));
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let days = detail_days_held(&trade.entry_date, &today).unwrap_or(0);
+        let atr = compute_atr(&conn, &trade.ticker, 14);
+        let atr_mult = if days >= 60 { 1.0 } else if days >= 30 { 1.5 } else { 2.0 };
+        // Mirror the engine: HWM is the max of the stored mark and the latest price.
+        let hwm_eff = high_water_mark
+            .unwrap_or(trade.entry_price)
+            .max(current_price.max(0.0));
+        let live_trailing_stop = if atr > 0.0 { Some(hwm_eff - atr * atr_mult) } else { None };
+        let profit_target_price = if atr > 0.0 { Some(trade.entry_price + atr * 3.0) } else { None };
+
+        let entry_day = trade.entry_date.split('T').next().unwrap_or(&trade.entry_date);
+        let max_hold_date = chrono::NaiveDate::parse_from_str(entry_day, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.checked_add_days(chrono::Days::new(90)))
+            .map(|d| d.format("%Y-%m-%d").to_string());
+
+        let decay_current_score = current_signals.as_ref().map(|s| s.compound_score).unwrap_or(0.0);
+        let decay_threshold = (score * 0.3).max(0.05);
+
+        Some(TradeExitPlan {
+            current_price,
+            price_date,
+            hard_stop_price: trade.entry_price * 0.85,
+            fixed_stop_price: trade.entry_price * 0.90,
+            no_atr_fallback: atr <= 0.0,
+            atr,
+            atr_mult,
+            high_water_mark,
+            stored_trailing_stop,
+            live_trailing_stop,
+            profit_target_price,
+            half_closed_at,
+            days_held: days,
+            max_hold_date,
+            days_remaining: (90 - days).max(0),
+            decay_original_score: score,
+            decay_current_score,
+            decay_threshold,
+            decay_triggered: decay_current_score < decay_threshold,
+        })
+    } else {
+        None
+    };
+
+    Ok(TradeDetail {
+        trade,
+        entity_name,
+        created_at,
+        alpaca_order_id,
+        entry_signals,
+        current_signals,
+        exit_plan,
+        sizing,
+    })
+}
+
 /// Start live price streaming for open positions.
 #[tauri::command]
 pub async fn start_price_stream(

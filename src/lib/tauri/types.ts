@@ -461,6 +461,67 @@ export interface PaperTrade {
 	trade_journal: string | null;
 }
 
+// === Trade Detail (forensics page) ===
+
+export interface TradeSignalSnapshot {
+	computed_at: string | null;
+	compound_score: number;
+	insider: number;
+	institutional: number;
+	news: number;
+	government: number;
+	search: number;
+	patent: number;
+	supply_chain: number;
+	political: number;
+	source_diversity: number;
+	convergence_detected: boolean;
+}
+
+export interface TradeExitPlan {
+	current_price: number;
+	price_date: string | null;
+	hard_stop_price: number;
+	fixed_stop_price: number;
+	no_atr_fallback: boolean;
+	atr: number;
+	atr_mult: number;
+	high_water_mark: number | null;
+	stored_trailing_stop: number | null;
+	live_trailing_stop: number | null;
+	profit_target_price: number | null;
+	half_closed_at: string | null;
+	days_held: number;
+	max_hold_date: string | null;
+	days_remaining: number;
+	decay_original_score: number;
+	decay_current_score: number;
+	decay_threshold: number;
+	decay_triggered: boolean;
+}
+
+export interface TradeSizing {
+	score: number;
+	tier_pct: number;
+	notional: number;
+	entry_floor: number;
+	entry_cap: number;
+	clamped: boolean;
+	implied_buying_power: number | null;
+	scale_in_count: number;
+}
+
+export interface TradeDetail {
+	trade: PaperTrade;
+	entity_name: string | null;
+	created_at: string | null;
+	alpaca_order_id: string | null;
+	entry_signals: TradeSignalSnapshot | null;
+	current_signals: TradeSignalSnapshot | null;
+	exit_plan: TradeExitPlan | null;
+	sizing: TradeSizing;
+}
+
 // === Portfolio Analytics ===
 
 export interface PortfolioAnalytics {

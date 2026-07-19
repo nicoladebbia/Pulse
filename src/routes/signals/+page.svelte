@@ -12,6 +12,7 @@
 		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate
 	} from '$lib/tauri/types';
 	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
+	import { parseTradeReason, fmtReasonSignals } from '$lib/trade-reason';
 
 	let signals = $state<CrossSignal[]>([]);
 	let convergence = $state<CrossSignal[]>([]);
@@ -132,46 +133,6 @@
 		} finally {
 			isLoading = false;
 		}
-	}
-
-	// signal_profile is a JSON string with three historical shapes:
-	// auto trades  → {"government":0.7,...,"stories":[...]}  (flat signal scores)
-	// manual       → {"source":"manual","confidence":...}
-	// reconciled   → {"source":"reconciled"}
-	// Older stories entries may be plain strings; newer ones {title, source}.
-	type TradeReason =
-		| { kind: 'auto'; signals: { label: string; score: number }[]; stories: { title: string; source: string | null }[] }
-		| { kind: 'manual' }
-		| { kind: 'reconciled' };
-
-	function parseTradeReason(profileJson: string | null | undefined): TradeReason | null {
-		if (!profileJson) return null;
-		try {
-			const p = JSON.parse(profileJson);
-			if (typeof p !== 'object' || p === null) return null;
-			if (p.source === 'manual') return { kind: 'manual' };
-			if (p.source === 'reconciled') return { kind: 'reconciled' };
-			const signals = Object.entries(p)
-				.filter(([k, v]) => k !== 'stories' && typeof v === 'number' && v > 0.05)
-				.map(([k, v]) => ({ label: k.replace(/_/g, ' '), score: v as number }))
-				.sort((a, b) => b.score - a.score);
-			const stories = (Array.isArray(p.stories) ? p.stories : [])
-				.map((s: any) => {
-					if (typeof s === 'string') return { title: s, source: null };
-					const t = s?.headline ?? s?.title;
-					return typeof t === 'string' ? { title: t, source: s.source ?? null } : null;
-				})
-				.filter((s: any): s is { title: string; source: string | null } => s !== null)
-				.slice(0, 3);
-			if (signals.length === 0 && stories.length === 0) return null;
-			return { kind: 'auto', signals, stories };
-		} catch {
-			return null;
-		}
-	}
-
-	function fmtReasonSignals(signals: { label: string; score: number }[]): string {
-		return signals.slice(0, 4).map(s => `${s.label} ${(s.score * 100).toFixed(0)}%`).join(' · ');
 	}
 
 	async function handleTrade(ticker: string, confidence: number) {
@@ -1045,7 +1006,11 @@
 						<div class="bg-bg-card border {isWinning ? 'border-emerald-500/15' : 'border-rose-500/15'} rounded-xl px-5 py-4">
 							<div class="flex items-center justify-between mb-2">
 								<div class="flex items-center gap-3">
-									<span class="text-sm font-mono font-bold text-text">{pos.symbol}</span>
+									{#if dbTrade}
+										<a href="/signals/trade/{dbTrade.id}" class="text-sm font-mono font-bold text-text hover:text-blue-300 transition-colors" title="Full trade details">{pos.symbol} <span class="text-[10px] text-text-muted font-normal">&rarr;</span></a>
+									{:else}
+										<span class="text-sm font-mono font-bold text-text">{pos.symbol}</span>
+									{/if}
 									<span class="text-xs text-text-muted">{pos.qty.toFixed(2)} shares</span>
 								</div>
 								<div class="text-right">
@@ -1156,11 +1121,14 @@
 									{/if}
 								</div>
 							</button>
-							{#if expandedTradeId === trade.id && tradeJournals[trade.id]}
+							{#if expandedTradeId === trade.id}
 								<div class="px-4 pb-3 pt-1">
-									<div class="bg-bg border border-border rounded-lg p-3">
-										<p class="text-xs text-text-secondary leading-relaxed">{tradeJournals[trade.id].journal}</p>
-									</div>
+									{#if tradeJournals[trade.id]}
+										<div class="bg-bg border border-border rounded-lg p-3">
+											<p class="text-xs text-text-secondary leading-relaxed">{tradeJournals[trade.id].journal}</p>
+										</div>
+									{/if}
+									<a href="/signals/trade/{trade.id}" class="inline-block mt-2 text-[11px] text-blue-400 hover:text-blue-300 transition-colors">Full trade details &rarr;</a>
 								</div>
 							{/if}
 						</div>
