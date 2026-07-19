@@ -134,6 +134,46 @@
 		}
 	}
 
+	// signal_profile is a JSON string with three historical shapes:
+	// auto trades  → {"government":0.7,...,"stories":[...]}  (flat signal scores)
+	// manual       → {"source":"manual","confidence":...}
+	// reconciled   → {"source":"reconciled"}
+	// Older stories entries may be plain strings; newer ones {title, source}.
+	type TradeReason =
+		| { kind: 'auto'; signals: { label: string; score: number }[]; stories: { title: string; source: string | null }[] }
+		| { kind: 'manual' }
+		| { kind: 'reconciled' };
+
+	function parseTradeReason(profileJson: string | null | undefined): TradeReason | null {
+		if (!profileJson) return null;
+		try {
+			const p = JSON.parse(profileJson);
+			if (typeof p !== 'object' || p === null) return null;
+			if (p.source === 'manual') return { kind: 'manual' };
+			if (p.source === 'reconciled') return { kind: 'reconciled' };
+			const signals = Object.entries(p)
+				.filter(([k, v]) => k !== 'stories' && typeof v === 'number' && v > 0.05)
+				.map(([k, v]) => ({ label: k.replace(/_/g, ' '), score: v as number }))
+				.sort((a, b) => b.score - a.score);
+			const stories = (Array.isArray(p.stories) ? p.stories : [])
+				.map((s: any) => {
+					if (typeof s === 'string') return { title: s, source: null };
+					const t = s?.headline ?? s?.title;
+					return typeof t === 'string' ? { title: t, source: s.source ?? null } : null;
+				})
+				.filter((s: any): s is { title: string; source: string | null } => s !== null)
+				.slice(0, 3);
+			if (signals.length === 0 && stories.length === 0) return null;
+			return { kind: 'auto', signals, stories };
+		} catch {
+			return null;
+		}
+	}
+
+	function fmtReasonSignals(signals: { label: string; score: number }[]): string {
+		return signals.slice(0, 4).map(s => `${s.label} ${(s.score * 100).toFixed(0)}%`).join(' · ');
+	}
+
 	async function handleTrade(ticker: string, confidence: number) {
 		tradeStatus = `Placing order for ${ticker}...`;
 		try {
@@ -1001,6 +1041,7 @@
 						{@const pnlPct = pos.unrealized_pl_pct * 100}
 						{@const isWinning = pos.unrealized_pl >= 0}
 						{@const dbTrade = portfolio.open_trades.find(t => t.ticker === pos.symbol)}
+						{@const reason = dbTrade ? parseTradeReason(dbTrade.signal_profile) : null}
 						<div class="bg-bg-card border {isWinning ? 'border-emerald-500/15' : 'border-rose-500/15'} rounded-xl px-5 py-4">
 							<div class="flex items-center justify-between mb-2">
 								<div class="flex items-center gap-3">
@@ -1020,6 +1061,27 @@
 								<span>Entry: ${pos.avg_entry_price.toFixed(2)} &rarr; Now: ${pos.current_price.toFixed(2)}</span>
 								<span>Cost: {fmtPrice(pos.avg_entry_price * pos.qty)} &rarr; {fmtPrice(pos.market_value)}</span>
 							</div>
+							{#if dbTrade}
+								<div class="mt-1.5 text-[11px] text-text-muted">
+									<span>Opened {dbTrade.entry_date.slice(0, 10)}</span>
+									{#if reason?.kind === 'auto'}
+										<span> &middot; auto-buy on signal convergence: <span class="font-mono text-text-secondary">{fmtReasonSignals(reason.signals)}</span></span>
+									{:else if reason?.kind === 'manual'}
+										<span> &middot; manual trade</span>
+									{:else if reason?.kind === 'reconciled'}
+										<span> &middot; imported from Alpaca</span>
+									{/if}
+								</div>
+								{#if reason?.kind === 'auto' && reason.stories.length > 0}
+									<ul class="mt-1 space-y-0.5">
+										{#each reason.stories as story}
+											<li class="text-[11px] text-text-secondary truncate">
+												&ldquo;{story.title}&rdquo;{#if story.source}<span class="text-text-muted"> — {story.source}</span>{/if}
+											</li>
+										{/each}
+									</ul>
+								{/if}
+							{/if}
 							<!-- P&L bar -->
 							<div class="mt-2 h-1 bg-border rounded-full overflow-hidden">
 								<div class="h-full rounded-full {isWinning ? 'bg-emerald-400' : 'bg-rose-400'}" style="width: {Math.min(Math.abs(pnlPct) * 5, 100)}%"></div>
@@ -1049,6 +1111,7 @@
 						{@const pnl = trade.pnl_pct ?? 0}
 						{@const isGreen = pnl >= 0}
 						{@const isClosed = trade.status !== 'open'}
+						{@const reason = parseTradeReason(trade.signal_profile)}
 						<div>
 							<button class="w-full text-left px-4 py-3 {isClosed ? 'hover:bg-white/[0.02]' : ''} transition-colors"
 								onclick={() => isClosed && toggleTradeJournal(trade.id)} disabled={!isClosed}>
@@ -1062,6 +1125,13 @@
 											trade.status === 'stopped_out' ? 'bg-rose-500/15 text-rose-400' :
 											'bg-zinc-500/15 text-zinc-400'
 										}">{trade.status}</span>
+										{#if reason?.kind === 'auto'}
+											<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-indigo-500/15 text-indigo-400" title="Opened automatically on signal convergence: {fmtReasonSignals(reason.signals)}">auto</span>
+										{:else if reason?.kind === 'manual'}
+											<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-zinc-500/15 text-zinc-400">manual</span>
+										{:else if reason?.kind === 'reconciled'}
+											<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-zinc-500/15 text-zinc-400" title="Imported from Alpaca during ledger reconciliation">imported</span>
+										{/if}
 									</div>
 									<div class="flex items-center gap-2">
 										{#if hasPnl}

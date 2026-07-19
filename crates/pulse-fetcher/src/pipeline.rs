@@ -4771,25 +4771,39 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
 
             // Capture the recent stories that drove this signal so the trade
             // journal can show "we bought because of these specific headlines".
-            // Limit to the 8 most recent / most-cited stories per entity.
-            let story_refs: Vec<(i64, String, String)> = {
-                let mut s = match conn.prepare(
+            // Mentions often land on an alias row of the same company ("Arm" vs
+            // "ARM HOLDINGS PLC"), so include every entity mapped to the trade's
+            // ticker. Grouping by ticker, NOT entities.canonical_id — canonical
+            // groups are polluted (AIRI's contains Fitbit; ARM's canonical is
+            // Vertex Pharma), which would attach unrelated headlines as the
+            // trade's "reason". 30-day window matches the source_diversity
+            // starvation fix. The order has already executed on Alpaca by this
+            // point, so a story-lookup failure must never skip recording the
+            // trade — every error path degrades to an empty list, never
+            // `continue`.
+            let story_refs: Vec<(i64, String, String)> = conn
+                .prepare(
                     "SELECT s.id, s.headline, s.source_name
                      FROM entity_mentions em
                      JOIN stories s ON s.id = em.story_id
-                     WHERE em.entity_id = ?1
-                       AND em.mentioned_at >= date('now', '-14 days')
+                     WHERE em.entity_id IN (
+                           SELECT entity_id FROM entity_tickers WHERE ticker = ?2
+                           UNION SELECT ?1
+                       )
+                       AND em.mentioned_at >= date('now', '-30 days')
                      ORDER BY em.mentioned_at DESC, s.importance_score DESC
                      LIMIT 8"
-                ) {
-                    Ok(stmt) => stmt,
-                    Err(_) => continue,
-                };
-                s.query_map([entity_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                )
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map(
+                        rusqlite::params![entity_id, ticker.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
                     .ok()
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default()
-            };
+                })
+                .unwrap_or_default();
 
             // Build signal_profile JSON matching calibration keys.
             // Now includes `stories[]` so the trade journal can reference the
