@@ -102,10 +102,17 @@ pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
     // Get tickers to refresh (from DB, drop lock before async)
     let tickers: Vec<(i64, String)> = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
+        // Open-position tickers always refresh first — they feed the trade
+        // detail page and exit-level display; the confidence-ranked rest fill
+        // the remaining slots (same fix as pulse-fetcher market_prices.rs).
         let mut stmt = conn.prepare(
-            "SELECT et.entity_id, et.ticker FROM entity_tickers et
-             WHERE et.is_public = 1 AND et.confidence >= 0.8
-             ORDER BY et.confidence DESC LIMIT 25"
+            "SELECT MIN(et.entity_id), et.ticker FROM entity_tickers et
+             WHERE et.is_public = 1 AND (et.confidence >= 0.8
+                 OR et.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open'))
+             GROUP BY et.ticker
+             ORDER BY (et.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open')) DESC,
+                      MAX(et.confidence) DESC
+             LIMIT 25"
         ).map_err(|e| e.to_string())?;
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(|e| e.to_string())?

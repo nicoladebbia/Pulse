@@ -186,6 +186,17 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::error!("Auto-trade failed: {}", e),
             }
         }
+        "refresh-prices" => {
+            // Run ONLY the market-price fetch (Phase 12.5) in isolation: quotes
+            // for tickers missing today's row (open positions first) plus the
+            // 35-day candle backfill for fresh tickers. Read-only toward
+            // trading — never places orders.
+            tracing::info!("Running market-price refresh only...");
+            match market_prices::fetch_prices(&db_path).await {
+                Ok(n) => tracing::info!("Price refresh complete: {} quotes stored", n),
+                Err(e) => tracing::error!("Price refresh failed: {}", e),
+            }
+        }
         "calibrate" => {
             // Run ONLY the calibration phase (Phase 14) in isolation. Calibration
             // is MEASURE-ONLY: it refreshes displayed P&L + computes Brier/hit-rate
