@@ -8,6 +8,17 @@ export type TradeReason =
 	| { kind: 'manual' }
 	| { kind: 'reconciled' };
 
+// pipeline.rs::load_calibrated_weights hardcodes institutional_flow and
+// supply_chain to ZERO weight in the compound score that actually gates
+// entries — institutional_flow fires on a known substring-match bug (ticker
+// "X" matched 61 funds), supply_chain is a market-wide constant with no
+// per-entity signal. Their raw values are still stored in signal_profile for
+// audit purposes, but they carry zero decision weight, so they must NEVER be
+// shown as part of "why this trade fired" — that's misleading by omission of
+// their true (non-)role. Excluded here at the source so every consumer
+// (position card convergence line, fallback signal bars) inherits the fix.
+const ZERO_WEIGHT_SIGNAL_KEYS = new Set(['institutional', 'supply_chain']);
+
 export function parseTradeReason(profileJson: string | null | undefined): TradeReason | null {
 	if (!profileJson) return null;
 	try {
@@ -16,7 +27,7 @@ export function parseTradeReason(profileJson: string | null | undefined): TradeR
 		if (p.source === 'manual') return { kind: 'manual' };
 		if (p.source === 'reconciled') return { kind: 'reconciled' };
 		const signals = Object.entries(p)
-			.filter(([k, v]) => k !== 'stories' && typeof v === 'number' && v > 0.05)
+			.filter(([k, v]) => k !== 'stories' && !ZERO_WEIGHT_SIGNAL_KEYS.has(k) && typeof v === 'number' && v > 0.05)
 			.map(([k, v]) => ({ label: k.replace(/_/g, ' '), score: v as number }))
 			.sort((a, b) => b.score - a.score);
 		const stories = (Array.isArray(p.stories) ? p.stories : [])

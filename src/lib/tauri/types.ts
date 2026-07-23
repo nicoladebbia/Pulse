@@ -493,7 +493,7 @@ export interface TradeExitPlan {
 	half_closed_at: string | null;
 	days_held: number;
 	max_hold_date: string | null;
-	days_remaining: number;
+	days_remaining: number | null;
 	decay_original_score: number;
 	decay_current_score: number;
 	decay_threshold: number;
@@ -520,6 +520,12 @@ export interface TradeDetail {
 	current_signals: TradeSignalSnapshot | null;
 	exit_plan: TradeExitPlan | null;
 	sizing: TradeSizing;
+}
+
+export interface TradeRationale {
+	text: string;
+	generated_at: string;
+	cached: boolean;
 }
 
 // === Portfolio Analytics ===

@@ -1,11 +1,13 @@
 use rusqlite::Connection;
 
-/// Position management: ATR-based trailing stops, profit targets, time/signal decay.
+/// Position management: ATR-based trailing stops, profit targets, signal decay.
 ///
-/// Replaces the primitive -10% stop-loss + 90-day expiry with adaptive exits:
-/// - Trailing stop at 2x ATR below high-water mark (tightens with age)
+/// Long-term design (2026-07-23): no calendar-based max hold — a position is
+/// held indefinitely until a stop, target, or signal decay closes it. The
+/// trailing stop is flat (does not tighten with age) so short-term volatility
+/// doesn't shake out a long-term thesis.
+/// - Trailing stop at 3x ATR below high-water mark (flat, no time-based tightening)
 /// - Profit target at 3x ATR from entry (close 50%)
-/// - Time decay: tighten stop after 30d (1.5x ATR) and 60d (1.0x ATR)
 /// - Signal decay: close if convergence score drops below threshold
 
 /// What to do with a position.
@@ -67,19 +69,17 @@ pub fn compute_atr(conn: &Connection, ticker: &str, period: usize) -> f64 {
 
 /// Evaluate an open position and decide what to do.
 ///
-/// Returns a `PositionAction` based on:
-/// - ATR-based trailing stop (adapts to volatility)
+/// Long-term design — no calendar-based expiry. Returns a `PositionAction`
+/// based on:
+/// - ATR-based trailing stop, flat 3x ATR regardless of how long it's been held
 /// - Profit target at 3x ATR
-/// - Time decay (tighter stops as position ages)
 /// - Hard stop-loss at -15% (safety net if ATR is too wide)
 pub fn evaluate_position(
     conn: &Connection,
     trade_id: i64,
     ticker: &str,
     entry_price: f64,
-    entry_date: &str,
     current_price: f64,
-    today: &str,
 ) -> PositionAction {
     if current_price <= 0.0 || entry_price <= 0.0 {
         return PositionAction::Hold;
@@ -97,24 +97,15 @@ pub fn evaluate_position(
     // Compute ATR for this ticker
     let atr = compute_atr(conn, ticker, 14);
     if atr <= 0.0 {
-        // No ATR data — fall back to fixed stop-loss
+        // No ATR data — fall back to fixed stop-loss. No time-based fallback
+        // expiry anymore (long-term design has no calendar-based max hold).
         if pnl_pct <= -10.0 {
             return PositionAction::CloseAll {
                 reason: format!("fixed_stop_loss ({:.1}%, no ATR data)", pnl_pct),
             };
         }
-        // Fall back to 90-day expiry
-        if let Some(days) = days_held(entry_date, today) {
-            if days >= 90 {
-                return PositionAction::CloseAll {
-                    reason: format!("expired ({}d, no ATR data)", days),
-                };
-            }
-        }
         return PositionAction::Hold;
     }
-
-    let days = days_held(entry_date, today).unwrap_or(0);
 
     // Get or compute high-water mark
     let hwm: f64 = conn
@@ -135,15 +126,9 @@ pub fn evaluate_position(
         .ok();
     }
 
-    // ATR multiplier decreases with time (tighter stops as position ages)
-    let atr_mult = if days >= 60 {
-        1.0 // Very tight after 60 days
-    } else if days >= 30 {
-        1.5 // Tighter after 30 days
-    } else {
-        2.0 // Normal trailing stop
-    };
-
+    // Flat trailing stop — does not tighten with age (long-term design:
+    // short-term volatility shouldn't shake out a long-term thesis).
+    let atr_mult = 3.0;
     let trailing_stop = hwm - (atr * atr_mult);
 
     // Update trailing_stop in DB
@@ -174,13 +159,6 @@ pub fn evaluate_position(
         };
     }
 
-    // Max hold: 90 days hard expiry
-    if days >= 90 {
-        return PositionAction::CloseAll {
-            reason: format!("max_hold_expired ({}d, {:.1}%)", days, pnl_pct),
-        };
-    }
-
     PositionAction::Hold
 }
 
@@ -205,15 +183,6 @@ pub fn check_signal_decay(
     // Signal has decayed if score dropped to less than 30% of original
     // OR below absolute minimum of 0.05
     current_score < (original_score * 0.3).max(0.05)
-}
-
-fn days_held(entry_date: &str, today: &str) -> Option<i64> {
-    // Accept both "2026-04-15" and "2026-04-15T15:41:05" formats
-    let entry_str = entry_date.split('T').next().unwrap_or(entry_date);
-    let today_str = today.split('T').next().unwrap_or(today);
-    let entry = chrono::NaiveDate::parse_from_str(entry_str, "%Y-%m-%d").ok()?;
-    let now = chrono::NaiveDate::parse_from_str(today_str, "%Y-%m-%d").ok()?;
-    Some((now - entry).num_days())
 }
 
 /// Write a human-readable trade journal entry on close.
@@ -298,26 +267,6 @@ pub fn generate_trade_journal(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn test_atr_mult_by_age() {
-        // Day 0-29: 2.0x ATR
-        // Day 30-59: 1.5x ATR
-        // Day 60+: 1.0x ATR
-        // Just verify the logic matches
-        assert_eq!(if 10 >= 60 { 1.0 } else if 10 >= 30 { 1.5 } else { 2.0 }, 2.0);
-        assert_eq!(if 35 >= 60 { 1.0 } else if 35 >= 30 { 1.5 } else { 2.0 }, 1.5);
-        assert_eq!(if 65 >= 60 { 1.0 } else if 65 >= 30 { 1.5 } else { 2.0 }, 1.0);
-    }
-
-    #[test]
-    fn test_days_held() {
-        assert_eq!(days_held("2026-01-01", "2026-01-31"), Some(30));
-        assert_eq!(days_held("2026-01-01", "2026-04-01"), Some(90));
-        assert_eq!(days_held("invalid", "2026-01-01"), None);
-    }
-
     #[test]
     fn test_signal_decay_threshold() {
         // Original score 0.5 → decay if current < 0.15 (30% of 0.5)

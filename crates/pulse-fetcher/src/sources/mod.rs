@@ -6,7 +6,6 @@ pub mod arxiv;
 pub mod biorxiv;
 pub mod usaspending;
 pub mod federal_register;
-pub mod sbir;
 pub mod edgar;
 pub mod fred;
 pub mod fec;
@@ -38,7 +37,6 @@ pub struct ApiCallCounters {
     pub federal_register: AtomicU32,
     pub lda: AtomicU32,
     pub uspto: AtomicU32,
-    pub sbir: AtomicU32,
 }
 
 impl ApiCallCounters {
@@ -59,7 +57,6 @@ impl ApiCallCounters {
             federal_register: AtomicU32::new(0),
             lda: AtomicU32::new(0),
             uspto: AtomicU32::new(0),
-            sbir: AtomicU32::new(0),
         }
     }
 
@@ -80,7 +77,6 @@ impl ApiCallCounters {
         self.federal_register.store(0, Ordering::Relaxed);
         self.lda.store(0, Ordering::Relaxed);
         self.uspto.store(0, Ordering::Relaxed);
-        self.sbir.store(0, Ordering::Relaxed);
     }
 
     /// Return (provider_name, call_count) pairs for all non-zero counters.
@@ -101,7 +97,6 @@ impl ApiCallCounters {
             ("federal_register", self.federal_register.load(Ordering::Relaxed)),
             ("lda", self.lda.load(Ordering::Relaxed)),
             ("uspto", self.uspto.load(Ordering::Relaxed)),
-            ("sbir", self.sbir.load(Ordering::Relaxed)),
         ];
         pairs.into_iter().filter(|(_, n)| *n > 0).collect()
     }
@@ -134,7 +129,7 @@ fn default_source_type() -> String {
 
 pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
     // Fetch news and financial sources concurrently
-    let (google, rss, hn, reddit_posts, arxiv_papers, biorxiv_papers, usa_spending, fed_register, sbir_awards, sec_edgar, fred_data, fec_data, eia_data, lda_data, patent_data) = tokio::join!(
+    let (google, rss, hn, reddit_posts, arxiv_papers, biorxiv_papers, usa_spending, fed_register, sec_edgar, fred_data, fec_data, eia_data, lda_data, patent_data) = tokio::join!(
         google_news::fetch_all(),
         rss_feeds::fetch_all(),
         hacker_news::fetch(),
@@ -143,7 +138,6 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         biorxiv::fetch(),
         usaspending::fetch(),
         federal_register::fetch(),
-        sbir::fetch(),
         edgar::fetch(),
         fred::fetch(),
         fec::fetch(),
@@ -237,14 +231,6 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
             tracing::warn!("Federal Register FAILED (non-fatal): {}", e);
             failed_sources.push("Federal Register");
         }
-    }
-    match sbir_awards {
-        Ok(a) if !a.is_empty() => {
-            tracing::info!("SBIR: {} financial articles", a.len());
-            articles.extend(a);
-        }
-        Ok(_) => {} // SBIR API frequently returns 404 (deprecated), don't log as failure
-        Err(_) => {} // Silently skip — API is deprecated
     }
     match sec_edgar {
         Ok(a) => {

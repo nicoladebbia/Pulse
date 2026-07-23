@@ -471,7 +471,7 @@ pub struct TradeExitPlan {
     pub half_closed_at: Option<String>,
     pub days_held: i64,
     pub max_hold_date: Option<String>,
-    pub days_remaining: i64,
+    pub days_remaining: Option<i64>,
     pub decay_original_score: f64,
     pub decay_current_score: f64,
     pub decay_threshold: f64,
@@ -617,11 +617,12 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
     let current_signals = signal_snapshot(&conn, &trade.ticker, None);
 
     // Sizing derivation — mirrors position_sizing::entry_notional tiers.
+    // Long-term design (2026-07-23): doubled from 1%/2%/5%, cap $10K -> $20K.
     let score = original_compound_score.unwrap_or(trade.confidence);
-    let tier_pct = if score > 0.6 { 0.05 } else if score > 0.4 { 0.02 } else { 0.01 };
+    let tier_pct = if score > 0.6 { 0.10 } else if score > 0.4 { 0.05 } else { 0.02 };
     let scale_ins = scale_in_count.unwrap_or(0);
     let clamped = (trade.position_size - 50.0).abs() < 0.01
-        || (trade.position_size - 10_000.0).abs() < 0.01;
+        || (trade.position_size - 20_000.0).abs() < 0.01;
     // Scale-ins add to position_size, so back-deriving buying power from the
     // final notional is only valid for never-scaled, unclamped entries.
     let implied_buying_power = if !clamped && scale_ins == 0 && tier_pct > 0.0 {
@@ -634,7 +635,7 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         tier_pct,
         notional: trade.position_size,
         entry_floor: 50.0,
-        entry_cap: 10_000.0,
+        entry_cap: 20_000.0,
         clamped,
         implied_buying_power,
         scale_in_count: scale_ins,
@@ -653,19 +654,15 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let days = detail_days_held(&trade.entry_date, &today).unwrap_or(0);
         let atr = compute_atr(&conn, &trade.ticker, 14);
-        let atr_mult = if days >= 60 { 1.0 } else if days >= 30 { 1.5 } else { 2.0 };
+        // Long-term design (2026-07-23): flat 3x ATR, no time-based tightening,
+        // no calendar-based max hold — mirrors position_management.rs.
+        let atr_mult = 3.0;
         // Mirror the engine: HWM is the max of the stored mark and the latest price.
         let hwm_eff = high_water_mark
             .unwrap_or(trade.entry_price)
             .max(current_price.max(0.0));
         let live_trailing_stop = if atr > 0.0 { Some(hwm_eff - atr * atr_mult) } else { None };
         let profit_target_price = if atr > 0.0 { Some(trade.entry_price + atr * 3.0) } else { None };
-
-        let entry_day = trade.entry_date.split('T').next().unwrap_or(&trade.entry_date);
-        let max_hold_date = chrono::NaiveDate::parse_from_str(entry_day, "%Y-%m-%d")
-            .ok()
-            .and_then(|d| d.checked_add_days(chrono::Days::new(90)))
-            .map(|d| d.format("%Y-%m-%d").to_string());
 
         let decay_current_score = current_signals.as_ref().map(|s| s.compound_score).unwrap_or(0.0);
         let decay_threshold = (score * 0.3).max(0.05);
@@ -684,8 +681,8 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
             profit_target_price,
             half_closed_at,
             days_held: days,
-            max_hold_date,
-            days_remaining: (90 - days).max(0),
+            max_hold_date: None,
+            days_remaining: None,
             decay_original_score: score,
             decay_current_score,
             decay_threshold,
@@ -705,6 +702,225 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         exit_plan,
         sizing,
     })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TradeRationale {
+    pub text: String,
+    pub generated_at: String,
+    pub cached: bool,
+}
+
+/// Facts pulled from `signal_profile` JSON — same shapes `trade-reason.ts` parses.
+/// Kept separate from the DB row so the async LLM call below never holds the lock.
+struct RationaleFacts {
+    ticker: String,
+    entity_name: Option<String>,
+    entry_date: String,
+    entry_price: f64,
+    position_size: f64,
+    status: String,
+    pnl_pct: Option<f64>,
+    signals: Vec<(String, f64)>,
+    stories: Vec<(String, Option<String>)>,
+}
+
+/// `load_calibrated_weights` (pipeline.rs) hardcodes institutional_flow and
+/// supply_chain to ZERO weight in the compound score that actually gates
+/// entries (institutional_flow: known substring-match bug; supply_chain:
+/// market-wide constant, no per-entity signal). Their raw values sit in
+/// signal_profile for audit purposes but never influenced any trade decision,
+/// so they're excluded here at the source — the LLM must never be handed a
+/// zero-weight number and asked to narrate it as corroborating evidence.
+const ZERO_WEIGHT_SIGNAL_KEYS: [&str; 2] = ["institutional", "supply_chain"];
+
+fn parse_signal_profile_facts(profile_json: &str) -> (Vec<(String, f64)>, Vec<(String, Option<String>)>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(profile_json) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(obj) = v.as_object() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut signals: Vec<(String, f64)> = obj
+        .iter()
+        .filter(|(k, _)| k.as_str() != "stories" && !ZERO_WEIGHT_SIGNAL_KEYS.contains(&k.as_str()))
+        .filter_map(|(k, val)| val.as_f64().map(|score| (k.replace('_', " "), score)))
+        .filter(|(_, score)| *score > 0.05)
+        .collect();
+    signals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let stories: Vec<(String, Option<String>)> = obj
+        .get("stories")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    if let Some(title) = s.as_str() {
+                        Some((title.to_string(), None))
+                    } else {
+                        let title = s.get("headline").or_else(|| s.get("title"))?.as_str()?;
+                        let source = s.get("source").and_then(|v| v.as_str()).map(String::from);
+                        Some((title.to_string(), source))
+                    }
+                })
+                .take(3)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (signals, stories)
+}
+
+fn build_rationale_prompt(f: &RationaleFacts) -> String {
+    let mut lines = vec![
+        format!("Ticker: {}", f.ticker),
+        format!("Entity: {}", f.entity_name.as_deref().unwrap_or(&f.ticker)),
+        format!("Entry date: {}", f.entry_date.split('T').next().unwrap_or(&f.entry_date)),
+        format!("Entry price: ${:.2}", f.entry_price),
+        format!("Position size: ${:.0}", f.position_size),
+        format!("Status: {}", f.status),
+    ];
+    if let Some(pct) = f.pnl_pct {
+        lines.push(format!("P&L so far: {:+.1}%", pct));
+    }
+    if f.signals.is_empty() {
+        lines.push("Signals: none recorded (manual or imported trade).".to_string());
+    } else {
+        let s = f.signals.iter().map(|(k, v)| format!("{} {:.0}%", k, v * 100.0)).collect::<Vec<_>>().join(", ");
+        lines.push(format!("Signals that fired at entry (share of max strength): {}", s));
+    }
+    if f.stories.is_empty() {
+        lines.push("Headlines captured at entry: none — the signal came from structured filings/data, not news.".to_string());
+    } else {
+        let s = f.stories.iter()
+            .map(|(t, src)| match src {
+                Some(s) => format!("\"{}\" ({})", t, s),
+                None => format!("\"{}\"", t),
+            })
+            .collect::<Vec<_>>().join("; ");
+        lines.push(format!("Headlines captured at entry: {}", s));
+    }
+    lines.join("\n")
+}
+
+/// Get (or lazily generate + cache) a plain-English rationale for why an auto-trade
+/// fired. Generated ONCE per trade via Claude Haiku, grounded ONLY in the facts
+/// above — no invented catalysts. Cached in `paper_trades.ai_rationale` so a
+/// re-view never re-calls the API; pass `regenerate: true` to force a fresh call.
+#[tauri::command]
+pub async fn get_trade_rationale(
+    db: State<'_, DbState>,
+    trade_id: i64,
+    regenerate: bool,
+) -> Result<TradeRationale, String> {
+    let facts = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+        if !regenerate {
+            let cached: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT ai_rationale, ai_rationale_at FROM paper_trades WHERE id = ?1",
+                    [trade_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+            if let Some((text, generated_at)) = cached {
+                return Ok(TradeRationale { text, generated_at, cached: true });
+            }
+        }
+
+        let (ticker, entity_id, entry_date, entry_price, position_size, status, pnl_pct, signal_profile): (
+            String, i64, String, f64, f64, String, Option<f64>, String,
+        ) = conn
+            .query_row(
+                "SELECT ticker, entity_id, entry_date, entry_price, position_size, status, pnl_pct, signal_profile
+                 FROM paper_trades WHERE id = ?1",
+                [trade_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+            )
+            .map_err(|_| format!("No trade with id {}", trade_id))?;
+        let entity_name: Option<String> = conn
+            .query_row("SELECT name FROM entities WHERE id = ?1", [entity_id], |row| row.get(0))
+            .ok();
+        let (signals, stories) = parse_signal_profile_facts(&signal_profile);
+
+        RationaleFacts {
+            ticker, entity_name, entry_date, entry_price, position_size, status, pnl_pct, signals, stories,
+        }
+    };
+    // Lock dropped above — safe to await from here.
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY not set. Add it to .env".to_string())?;
+    let prompt = build_rationale_prompt(&facts);
+    let text = call_haiku_for_rationale(&api_key, &prompt).await?;
+    let generated_at = chrono::Utc::now().to_rfc3339();
+
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE paper_trades SET ai_rationale = ?1, ai_rationale_at = ?2 WHERE id = ?3",
+            rusqlite::params![text, generated_at, trade_id],
+        )
+        .map_err(|e| e.to_string())?;
+        crate::services::api_usage::log_usage(
+            &conn, "anthropic", crate::services::conversation::CONVERSATION_MODEL_FAST,
+            "trade_rationale", (prompt.len() / 4) as i64, (text.len() / 4) as i64,
+        ).ok();
+    }
+
+    Ok(TradeRationale { text, generated_at, cached: false })
+}
+
+async fn call_haiku_for_rationale(api_key: &str, facts: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let system = "You explain a paper-trading system's past automated decisions to the \
+        person reviewing their own portfolio. Write 3-4 plain-English sentences: \
+        (1) why THIS trade fired — the specific signal categories and their strength; \
+        (2) the algorithmic thesis — why the system treats that signal combination as \
+        bullish in general (e.g. lobbying/political activity and government contract \
+        signals are treated as leading indicators of future revenue for a small-cap; \
+        news momentum signals attention/flow). Use ONLY the facts given — never invent \
+        news, catalysts, financials, or company details not listed, and never claim this \
+        specific company will go up. If headlines were captured, summarize what they were \
+        about; if not, say plainly the signal came from structured filings/data rather \
+        than news. (3) End with one blunt sentence: this strategy's historical backtest \
+        showed NO measured statistical edge (overfit, failed out-of-sample) — it is \
+        running live only as an unproven forward paper-test with fake money, not vetted \
+        investment advice. Do not soften or omit this caveat. No markdown, no preamble, \
+        no quotes around the output, no disclaimers about being an AI.";
+    let body = serde_json::json!({
+        "model": crate::services::conversation::CONVERSATION_MODEL_FAST,
+        "max_tokens": 280,
+        "system": system,
+        "messages": [{"role": "user", "content": facts}]
+    });
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Anthropic request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Anthropic API {}: {}", status, body));
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = json["content"][0]["text"].as_str().unwrap_or("").trim().to_string();
+    if text.is_empty() {
+        return Err("Anthropic returned an empty rationale".to_string());
+    }
+    Ok(text)
 }
 
 /// Start live price streaming for open positions.

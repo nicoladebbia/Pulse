@@ -31,6 +31,7 @@ pub const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_wh
 pub const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_fts_porter.sql");
 pub const MIGRATION_025: &str = include_str!("../../../migrations/025_half_close_marker.sql");
 pub const MIGRATION_026: &str = include_str!("../../../migrations/026_drop_stillborn_trend_tables.sql");
+pub const MIGRATION_027: &str = include_str!("../../../migrations/027_ai_trade_rationale.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -603,6 +604,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_026)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (26)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 27: Cache column for the AI-generated trade rationale (get_trade_rationale).
+    if !applied.contains(&27) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_027)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (27)", [])?;
         tx.commit()?;
     }
 

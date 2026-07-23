@@ -5,14 +5,6 @@ use serde::Deserialize;
 /// API: https://api.eia.gov/v2/
 /// Free key. Env var: EIA_API_KEY
 
-/// Key energy series to track
-const SERIES: &[(&str, &str, &str)] = &[
-    // (route, series description, data key)
-    ("petroleum/pri/spt/data", "WTI Crude Oil Spot Price", "value"),
-    ("natural-gas/pri/sum/data", "Natural Gas Spot Price", "value"),
-    ("electricity/retail-sales/data", "Electricity Retail Sales", "revenue"),
-];
-
 #[derive(Deserialize)]
 struct EiaResponse {
     response: Option<EiaData>,
@@ -129,7 +121,10 @@ async fn fetch_petroleum(client: &reqwest::Client, api_key: &str) -> anyhow::Res
             published_at: Some(period.to_string()),
             content_snippet,
             sector: "finance".to_string(),
-            feed_id: format!("eia_petroleum_{}", product_id.to_lowercase()),
+            // 2026-07-23: same bug as FRED — feed_id/url never varied by date,
+            // so dedup (feed_id, url) permanently discarded every day after
+            // the first successful fetch. Appending period fixes it.
+            feed_id: format!("eia_petroleum_{}_{}", product_id.to_lowercase(), period),
             language: "en".to_string(),
             source_type: "financial".to_string(),
             financial_metadata: Some(serde_json::to_string(&metadata).unwrap_or_default()),
@@ -194,7 +189,8 @@ async fn fetch_natgas(client: &reqwest::Client, api_key: &str) -> anyhow::Result
                 published_at: Some(period.to_string()),
                 content_snippet,
                 sector: "finance".to_string(),
-                feed_id: "eia_natgas".to_string(),
+                // 2026-07-23: same permanent-dedup bug as petroleum above.
+                feed_id: format!("eia_natgas_{}", period),
                 language: "en".to_string(),
                 source_type: "financial".to_string(),
                 financial_metadata: Some(serde_json::to_string(&metadata).unwrap_or_default()),

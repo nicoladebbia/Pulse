@@ -4,12 +4,12 @@
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
 		executeTrade, closePosition, getFinancialEvents, getSignalEvidence, getSourceHealth,
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getTradeJournal,
-		runBacktest, startPriceStream, stopPriceStream
+		runBacktest, startPriceStream, stopPriceStream, getTradeRationale
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics,
-		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate
+		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate, TradeRationale
 	} from '$lib/tauri/types';
 	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
 	import { parseTradeReason, fmtReasonSignals } from '$lib/trade-reason';
@@ -36,6 +36,8 @@
 	let showAnalytics = $state(false);
 	let expandedTradeId = $state<number | null>(null);
 	let tradeJournals = $state<Record<number, TradeJournal>>({});
+	let aiRationales = $state<Record<number, TradeRationale>>({});
+	let aiRationaleFailed = $state<Record<number, boolean>>({});
 	let showBacktest = $state(false);
 	let backtestRunning = $state(false);
 	let backtestResult = $state<BacktestResult | null>(null);
@@ -97,6 +99,44 @@
 		})();
 		return () => { cancelled = true; if (unlisten) unlisten(); };
 	});
+
+	// Lazily fetch (and DB-cache, one Haiku call ever per trade) the AI "why this
+	// trade" take for each open auto-buy position. Fire-and-forget: a failure just
+	// leaves the raw signal-convergence line showing, never blocks the page.
+	// `portfolio` gets reassigned on every live price tick (see the price-update
+	// effect above) once streaming is on, which re-runs this effect — the
+	// in-flight guard stops a tick landing mid-request from firing a duplicate
+	// call for the same trade before the first one resolves and caches.
+	const aiRationalesInFlight = new Set<number>();
+	$effect(() => {
+		const openTrades = portfolio?.open_trades ?? [];
+		for (const t of openTrades) {
+			if (aiRationales[t.id] || aiRationaleFailed[t.id] || aiRationalesInFlight.has(t.id)) continue;
+			const reason = parseTradeReason(t.signal_profile);
+			if (reason?.kind !== 'auto') continue;
+			aiRationalesInFlight.add(t.id);
+			getTradeRationale(t.id).then(r => {
+				aiRationales = { ...aiRationales, [t.id]: r };
+			}).catch(() => {
+				aiRationaleFailed = { ...aiRationaleFailed, [t.id]: true };
+			}).finally(() => {
+				aiRationalesInFlight.delete(t.id);
+			});
+		}
+	});
+
+	// The rationale prompt structures sentence 1 as the mechanical "what fired"
+	// line and sentence 2 as the actual bull-thesis reasoning — pull sentence 2
+	// specifically for the card so the "why" survives truncation, not whichever
+	// sentence boundary the model happened to land on. A static caveat is always
+	// appended in the template (not model text) so it can't be silently dropped.
+	function splitSentences(text: string): string[] {
+		return text.match(/[^.!?]+[.!?]+(?:\s+|$)/g)?.map(s => s.trim()) ?? [text.trim()];
+	}
+	function bullThesisSentence(text: string): string {
+		const sentences = splitSentences(text);
+		return sentences[1] ?? sentences[0] ?? text;
+	}
 
 	async function loadData() {
 		error = null;
@@ -1037,6 +1077,12 @@
 										<span> &middot; imported from Alpaca</span>
 									{/if}
 								</div>
+								{#if reason?.kind === 'auto' && aiRationales[dbTrade.id]}
+									<p class="mt-1 text-[11px] text-indigo-300/90 leading-relaxed">
+										<span class="text-indigo-400/70 font-medium">AI take:</span> {bullThesisSentence(aiRationales[dbTrade.id].text)}
+										<span class="text-text-muted"> (unproven strategy, paper-only — not investment advice)</span>
+									</p>
+								{/if}
 								{#if reason?.kind === 'auto' && reason.stories.length > 0}
 									<ul class="mt-1 space-y-0.5">
 										{#each reason.stories as story}

@@ -634,7 +634,17 @@ async fn download_8k_items(
 
     let index_html = resp.text().await?;
 
-    // Find the primary 8-K document (usually .htm or .html, not exhibits)
+    // Find the primary 8-K document (usually .htm or .html, not exhibits).
+    // 2026-07-23: this previously matched SEC.gov's own site-navigation links
+    // (/index.htm, /search/search.htm, etc.) — they appear earlier in the
+    // page than the actual per-filing directory table and pass the same
+    // extension/exhibit filter, so `.find()` always landed on nav chrome
+    // instead of the real document. Verified live: EVERY one of 1,584
+    // stored 8-K stories ended up with an empty content_preview and the
+    // "other_event" placeholder classification — 0% ever got a real
+    // severity. Fix: require the href to actually live inside the filing's
+    // own EDGAR directory, and skip the filing's own index/metadata pages
+    // (which also sit in that directory and match the extension filter).
     let doc_href = index_html
         .split("href=\"")
         .skip(1)
@@ -642,12 +652,18 @@ async fn download_8k_items(
         .find(|href| {
             let h = href.to_lowercase();
             (h.ends_with(".htm") || h.ends_with(".html"))
+                && h.contains("/archives/edgar/data/")
+                && !h.contains("-index.htm") && !h.contains("-index-headers.htm")
                 && !h.contains("ex-") && !h.contains("exhibit")
                 && !h.contains("r1.htm") && !h.contains("r2.htm")
         });
 
     let doc_url = match doc_href {
         Some(href) if href.starts_with("http") => href.to_string(),
+        // SEC's directory listing uses root-relative absolute paths
+        // (/Archives/edgar/data/...) — joining these to base_url instead of
+        // the domain produced a malformed, doubled-up URL that 404s.
+        Some(href) if href.starts_with('/') => format!("https://www.sec.gov{}", href),
         Some(href) => format!("{}/{}", base_url, href),
         None => anyhow::bail!("No 8-K document found in index"),
     };

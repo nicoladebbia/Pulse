@@ -38,7 +38,6 @@ pub const FINANCIAL_RATE_LIMITS: &[(&str, i64, i64, i64, &str)] = &[
     ("alpaca",            200,   -1,   -1,     "Alpaca (200/min)"),
     ("lda",                -1,   -1,   -1,     "Senate LDA (no limit)"),
     ("uspto",              -1,   -1,   -1,     "Google Patents (no limit)"),
-    ("sbir",               -1,   -1,   -1,     "SBIR (no limit)"),
     // News / content APIs
     ("google_news",        -1,   -1,   -1,     "Google News RSS"),
     ("hacker_news",        -1,   -1,   -1,     "Hacker News (Algolia)"),

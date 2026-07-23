@@ -4029,13 +4029,21 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
          insider_vol, inst_flow, contract_val, patent_rate,
          search_delta, import_delta, reg_sentiment, lobby_delta) in &rows
     {
-        // Normalize each dimension — same scales as cross_signals.rs
+        // Normalize each dimension.
         let insider_norm = normalize_signal(*insider_vol, 1_000_000.0);
         let inst_norm = normalize_signal(*inst_flow, 15.0); // Count of distinct 13F filers holding this stock
-        // Pure acceleration ratio, gated by minimum sample. Mirrors cross_signals.rs.
+        // Pure acceleration ratio, gated by minimum sample.
         let news_norm = if *w7 >= 3 { normalize_signal(*acceleration, 2.0) } else { 0.0 };
-        // Government signal: contract value + regulatory/8-K severity composite
-        let contract_norm = normalize_signal(*contract_val, 10_000_000.0);
+        // Government signal: contract value + regulatory/8-K severity composite.
+        // 2026-07-23: scale was $10M — measured against real USASpending data,
+        // even the 10th percentile contract ($69.5M) already saturates a $10M
+        // sigmoid to 99.9%, and ALL 543 nonzero contract_value rows in the DB
+        // crossed the 0.3 threshold. Every contract from $12M to $410B was
+        // normalizing to ~1.0, giving contract_norm zero discriminative power
+        // despite government_signal carrying real 0.1848 weight. Rescaled to
+        // $200M, anchored to the real median ($220M) so the sigmoid actually
+        // spreads across the observed range (p10=$69.5M, p75=$797M, p90=$3.1B).
+        let contract_norm = normalize_signal(*contract_val, 200_000_000.0);
         let reg_norm = normalize_signal(*reg_sentiment, 3.0);
         let gov_norm = (contract_norm * 0.6 + reg_norm * 0.4).min(1.0);
         let search_norm = normalize_signal(*search_delta, 50.0);
@@ -4055,8 +4063,15 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
             .max(0.0).min(1.0);
 
         // Convergence: 3+ signals > 0.3 AND source_diversity >= 3
-        let positive = [insider_norm, inst_norm, news_norm, gov_norm,
-            search_norm, patent_norm, supply_norm, political_norm]
+        // institutional_flow and supply_chain are excluded here — both are
+        // zero-weighted in `compound` (weights[1]/weights[6], known bugs: the
+        // substring-match false-positive and the market-wide constant), so
+        // they must not be allowed to swing the convergence gate either.
+        // Measured 2026-07-23: 363/1130 real candidates had institutional_flow
+        // > 0.3, and 3 of those relied on it as the deciding vote (only 1 other
+        // real dim also > 0.3) — including META on 2026-04-27.
+        let positive = [insider_norm, news_norm, gov_norm,
+            search_norm, patent_norm, political_norm]
             .iter().filter(|&&v| v > 0.3).count();
         // Convergence: 2+ signals > 0.3 AND diversity >= 2, OR very high compound score
         let convergence = (positive >= 2 && *src_diversity >= 2) || compound >= 0.40;
@@ -5133,7 +5148,7 @@ async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
         let decayed = crate::position_management::check_signal_decay(&conn, ticker, *orig_score);
 
         let action = crate::position_management::evaluate_position(
-            &conn, *trade_id, ticker, *entry_price, entry_date, current_price, &today,
+            &conn, *trade_id, ticker, *entry_price, current_price,
         );
 
         // Decide final action: signal decay forces a full close (overrides Hold).

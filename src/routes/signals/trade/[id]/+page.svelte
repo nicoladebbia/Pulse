@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { page } from '$app/stores';
 	import { isTauri } from '$lib/tauri/mock';
-	import { getTradeDetail } from '$lib/tauri/commands';
-	import type { TradeDetail, TradeSignalSnapshot } from '$lib/tauri/types';
+	import { getTradeDetail, getTradeRationale } from '$lib/tauri/commands';
+	import type { TradeDetail, TradeSignalSnapshot, TradeRationale } from '$lib/tauri/types';
 	import { parseTradeReason } from '$lib/trade-reason';
 
 	let tradeId = $derived(Number($page.params.id));
@@ -10,6 +10,9 @@
 	let error = $state<string | null>(null);
 	let isLoading = $state(true);
 	let loadedId = $state<number | null>(null);
+	let rationale = $state<TradeRationale | null>(null);
+	let rationaleLoading = $state(false);
+	let rationaleError = $state<string | null>(null);
 
 	$effect(() => {
 		const id = tradeId;
@@ -22,6 +25,8 @@
 		isLoading = true;
 		error = null;
 		detail = null;
+		rationale = null;
+		rationaleError = null;
 		if (!isTauri()) { isLoading = false; return; }
 		if (!Number.isFinite(id)) {
 			error = 'Invalid trade id';
@@ -35,6 +40,21 @@
 		} finally {
 			isLoading = false;
 		}
+		if (detail && parseTradeReason(detail.trade.signal_profile)?.kind === 'auto') {
+			loadRationale(id, false);
+		}
+	}
+
+	async function loadRationale(id: number, regenerate: boolean) {
+		rationaleLoading = true;
+		rationaleError = null;
+		try {
+			rationale = await getTradeRationale(id, regenerate);
+		} catch (e: any) {
+			rationaleError = String(e?.message ?? e);
+		} finally {
+			rationaleLoading = false;
+		}
 	}
 
 	const DIMS: { key: keyof TradeSignalSnapshot; label: string }[] = [
@@ -47,6 +67,12 @@
 		{ key: 'patent', label: 'patent filings' },
 		{ key: 'supply_chain', label: 'supply chain' }
 	];
+	// pipeline.rs::load_calibrated_weights hardcodes these to ZERO weight in the
+	// compound score that actually gates entries (institutional_flow: known
+	// substring-match bug; supply_chain: market-wide constant). This is the
+	// forensics page, so we still show the raw values — just flagged, since
+	// they never influenced this or any trade's entry decision.
+	const ZERO_WEIGHT_DIMS = new Set<keyof TradeSignalSnapshot>(['institutional', 'supply_chain']);
 
 	let reason = $derived(detail ? parseTradeReason(detail.trade.signal_profile) : null);
 	let isOpen = $derived(detail?.trade.status === 'open');
@@ -175,6 +201,32 @@
 			{@const sz = detail.sizing}
 			<div class="mt-4 bg-bg-card border border-border rounded-xl p-5">
 				<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Why this trade</h2>
+
+				<div class="mb-4 pb-4 border-b border-border/50">
+					{#if rationale}
+						<p class="text-xs text-text-secondary leading-relaxed">
+							<span class="text-indigo-400 font-medium">AI take:</span> {rationale.text}
+						</p>
+						<button
+							class="mt-2 text-[10px] text-text-muted hover:text-text-secondary transition-colors disabled:opacity-50"
+							disabled={rationaleLoading}
+							onclick={() => loadRationale(tradeId, true)}
+						>
+							{rationaleLoading ? 'Regenerating…' : 'Regenerate'}
+						</button>
+					{:else if rationaleLoading}
+						<p class="text-xs text-text-muted italic">Generating AI take…</p>
+					{:else if rationaleError}
+						<p class="text-xs text-rose-400/80">AI take failed: {rationaleError}</p>
+						<button
+							class="mt-1 text-[10px] text-text-muted hover:text-text-secondary transition-colors"
+							onclick={() => loadRationale(tradeId, true)}
+						>
+							Retry
+						</button>
+					{/if}
+				</div>
+
 				{#if detail.entry_signals}
 					{@const es = detail.entry_signals}
 					<div class="space-y-1.5">
@@ -184,9 +236,12 @@
 								<div class="flex items-center gap-3 text-xs">
 									<span class="w-40 shrink-0 text-text-muted">{d.label}</span>
 									<div class="flex-1 h-1.5 bg-border rounded-full overflow-hidden">
-										<div class="h-full rounded-full bg-indigo-400/80" style="width: {Math.min(v * 100, 100)}%"></div>
+										<div class="h-full rounded-full {ZERO_WEIGHT_DIMS.has(d.key) ? 'bg-zinc-500/50' : 'bg-indigo-400/80'}" style="width: {Math.min(v * 100, 100)}%"></div>
 									</div>
 									<span class="w-10 text-right font-mono text-text-secondary">{(v * 100).toFixed(0)}%</span>
+									{#if ZERO_WEIGHT_DIMS.has(d.key)}
+										<span class="text-[9px] text-amber-400/70 shrink-0" title="Hardcoded to 0% weight in the compound score — never influenced this or any entry decision.">0% weight</span>
+									{/if}
 								</div>
 							{/if}
 						{/each}
@@ -234,7 +289,7 @@
 				<p class="text-xs text-text-secondary leading-relaxed">
 					Compound score <span class="font-mono">{sz.score.toFixed(2)}</span> lands in the
 					<span class="font-mono">{(sz.tier_pct * 100).toFixed(0)}%</span> tier
-					(&gt;0.60 &rarr; 5%, &gt;0.40 &rarr; 2%, otherwise 1% of buying power).
+					(&gt;0.60 &rarr; 10%, &gt;0.40 &rarr; 5%, otherwise 2% of buying power).
 					{#if sz.implied_buying_power !== null}
 						{(sz.tier_pct * 100).toFixed(0)}% of the {fmt$(sz.implied_buying_power, 0)} buying power
 						available at entry = <span class="font-mono text-text">{fmt$(sz.notional, 0)}</span>.
@@ -263,7 +318,7 @@
 				{#if plan.no_atr_fallback}
 					<div class="mb-3 text-[11px] text-amber-400/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
 						No ATR price data for {t.ticker} — the engine falls back to a fixed −10% stop
-						({fmt$(plan.fixed_stop_price)}) plus the 90-day expiry instead of ATR-based levels.
+						({fmt$(plan.fixed_stop_price)}) instead of ATR-based levels.
 					</div>
 				{/if}
 
@@ -276,7 +331,7 @@
 								<span class="text-text-muted"> ({distPct(plan.live_trailing_stop, plan.current_price)})</span>
 								— closes ALL. High-water {fmt$(plan.high_water_mark ?? t.entry_price)} −
 								ATR {fmt$(plan.atr)} × {plan.atr_mult.toFixed(1)}
-								<span class="text-text-muted">(multiplier tightens with age: 2.0× under 30d, 1.5× from 30d, 1.0× from 60d)</span>
+								<span class="text-text-muted">(flat — does not tighten with age; long-term design)</span>
 							</span>
 						</div>
 					{/if}
@@ -304,8 +359,13 @@
 					<div class="py-2.5 grid grid-cols-[9rem_1fr] gap-x-4">
 						<span class="text-text-muted font-medium">Max hold</span>
 						<span class="text-text-secondary leading-relaxed">
-							<span class="font-mono text-text">{plan.max_hold_date ?? '—'}</span>
-							— {plan.days_remaining} of 90 days remain, then closes ALL.
+							{#if plan.max_hold_date}
+								<span class="font-mono text-text">{plan.max_hold_date}</span>
+								— {plan.days_remaining} days remain, then closes ALL.
+							{:else}
+								No hard time limit — long-term design. Held {plan.days_held} day{plan.days_held === 1 ? '' : 's'} so far;
+								only the stop, profit target, or signal decay ever close this position.
+							{/if}
 						</span>
 					</div>
 					<div class="py-2.5 grid grid-cols-[9rem_1fr] gap-x-4">
@@ -344,6 +404,9 @@
 								<span class="w-40 shrink-0 text-text-muted">{d.label}</span>
 								<span class="font-mono text-text-secondary">{(then * 100).toFixed(0)}% &rarr; {(now * 100).toFixed(0)}%</span>
 								{#if now < then * 0.5}<span class="text-[10px] text-rose-400/80">fading</span>{/if}
+								{#if ZERO_WEIGHT_DIMS.has(d.key)}
+									<span class="text-[9px] text-amber-400/70" title="Hardcoded to 0% weight in the compound score.">0% weight</span>
+								{/if}
 							</div>
 						{/if}
 					{/each}

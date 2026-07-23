@@ -176,7 +176,14 @@ async fn fetch_series(
         published_at: latest.date.clone(),
         content_snippet,
         sector: "finance".to_string(),
-        feed_id: format!("fred_{}", series_id.to_lowercase()),
+        // 2026-07-23: dedup keys on (feed_id, url), and neither varied by date —
+        // so after each series' first-ever successful fetch, every later day's
+        // genuinely new reading was silently discarded as a duplicate forever.
+        // Confirmed exactly: 20 series in SERIES, 20 total FRED stories in the
+        // DB, frozen since the first run. Appending the observation date makes
+        // each day's real update a distinct row while still deduping same-day
+        // re-fetches (multiple fetch cycles per day hit the same date).
+        feed_id: format!("fred_{}_{}", series_id.to_lowercase(), latest_date),
         language: "en".to_string(),
         source_type: "financial".to_string(),
         financial_metadata: Some(serde_json::to_string(&metadata).unwrap_or_default()),
