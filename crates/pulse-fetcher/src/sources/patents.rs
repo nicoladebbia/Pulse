@@ -1,4 +1,5 @@
 use super::RawArticle;
+use chrono::Datelike;
 
 /// Google Patents — Recent patent publications.
 ///
@@ -7,10 +8,26 @@ use super::RawArticle;
 ///
 /// This replaces the defunct PatentsView API (migrating to data.uspto.gov).
 /// The XHR endpoint is undocumented — if it breaks, fetch() returns empty vec.
-
-/// Top assignees to search — covers major tech companies that file frequently.
-/// We search these explicitly, then match any results to our entity database.
-/// Kept small (1 per request) to avoid Google's bot detection on large queries.
+///
+/// 2026-07-23: this source went fully silent for 52 days (last new story
+/// 2026-06-01) despite the endpoint responding fine when called in isolation
+/// (verified live: a single assignee query returned 160 real, current
+/// results). Reproduced the actual failure mode directly: a burst of ~4
+/// requests in quick succession got Google's "Sorry... unusual traffic" 503
+/// bot-detection page, which the old code's per-run loop of 10 sequential
+/// requests (one per assignee, 5s apart) was well within range of tripping —
+/// especially since this runs concurrently with google_news (many
+/// google.com-domain feeds) inside the same `tokio::join!`, so cumulative
+/// Google-domain request volume from this IP is higher than it looks from
+/// this module alone. Also confirmed independently: the `assignee:"X"`
+/// query clause doesn't actually filter results (a same-day live test showed
+/// assignees like "Capital One Services, Llc" and "Wells Fargo Bank, N.A."
+/// returned for an Apple-only query, with `total_num_results` in the
+/// hundreds of thousands) — so querying all 10 assignees was mostly just
+/// re-fetching overlapping broad results 10x, not 10x the coverage.
+/// Fix: 1 request per run instead of 10, rotating through the assignee list
+/// by day-of-year so all 10 still get covered over time, with no filtering
+/// benefit lost since the assignee clause wasn't filtering anyway.
 const PATENT_ASSIGNEES: &[&str] = &[
     "Apple", "Google", "Microsoft", "Amazon", "Meta",
     "NVIDIA", "Intel", "Tesla", "Qualcomm", "Samsung",
@@ -22,26 +39,21 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    let mut articles = Vec::new();
+    let idx = (chrono::Local::now().ordinal0() as usize) % PATENT_ASSIGNEES.len();
+    let assignee = PATENT_ASSIGNEES[idx];
 
-    // Search 1 assignee per request with 5s delay to avoid Google's bot detection
-    for assignee in PATENT_ASSIGNEES {
-        match fetch_patents_batch(&client, &[assignee]).await {
-            Ok(batch) => {
-                if !batch.is_empty() {
-                    tracing::debug!("Google Patents: {} results for {}", batch.len(), assignee);
-                }
-                articles.extend(batch);
-            }
-            Err(e) => tracing::debug!("Google Patents failed for {}: {}", assignee, e),
+    let articles = match fetch_patents_batch(&client, &[assignee]).await {
+        Ok(batch) => batch,
+        Err(e) => {
+            tracing::debug!("Google Patents failed for {}: {}", assignee, e);
+            Vec::new()
         }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
+    };
 
     if articles.is_empty() {
-        tracing::info!("Google Patents: no results (endpoint may be unavailable)");
+        tracing::info!("Google Patents: no results for {} (endpoint may be unavailable)", assignee);
     } else {
-        tracing::info!("Google Patents: {} patent articles", articles.len());
+        tracing::info!("Google Patents: {} patent articles ({})", articles.len(), assignee);
     }
 
     Ok(articles)

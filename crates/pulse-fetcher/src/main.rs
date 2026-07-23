@@ -9,6 +9,7 @@ pub(crate) mod market_prices;
 pub(crate) mod calibration;
 pub(crate) mod position_management;
 pub(crate) mod position_sizing;
+pub(crate) mod edge_report;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -155,12 +156,69 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::error!("Ticker backfill failed: {}", e),
             }
         }
+        "recanonicalize" => {
+            // Rebuild the entity-canonical graph from scratch under the fixed match logic,
+            // then re-run ticker/signal/cross-signal computation. Un-merges groups the old
+            // substring match over-merged (e.g. 129 unrelated companies -> canonical "Arm").
+            // Pure DB work, no Groq. Run against a copy first.
+            tracing::info!("Rebuilding entity-canonical graph (recanonicalize)...");
+            match pipeline::run_recanonicalize(&db_path) {
+                Ok(n) => tracing::info!("Recanonicalize complete: {} entities regrouped", n),
+                Err(e) => tracing::error!("Recanonicalize failed: {}", e),
+            }
+        }
         "manage-positions" => {
             // Run ONLY the exit-evaluation phase. Honors EXIT_DRY_RUN (default true).
             tracing::info!("Running position management (exit evaluation) only...");
             match pipeline::run_position_management(&db_path).await {
                 Ok(n) => tracing::info!("Position management complete: {} action(s)", n),
                 Err(e) => tracing::error!("Position management failed: {}", e),
+            }
+        }
+        "auto-trade" => {
+            // Run ONLY the auto-buy phase (Phase 13.5) against the live PAPER account.
+            // Same gate (AUTO_TRADE_ENABLED), same candidate query, same paper endpoint
+            // as the daily pipeline — a no-op when disarmed. Manual buy trigger for when
+            // the daily run skipped Phase 13.5 at the already-fetched guard.
+            tracing::info!("Running auto-trade (buy path) only...");
+            match pipeline::run_auto_trade(&db_path).await {
+                Ok(n) => tracing::info!("Auto-trade complete: {} order(s) placed", n),
+                Err(e) => tracing::error!("Auto-trade failed: {}", e),
+            }
+        }
+        "refresh-prices" => {
+            // Run ONLY the market-price fetch (Phase 12.5) in isolation: quotes
+            // for tickers missing today's row (open positions first) plus the
+            // 35-day candle backfill for fresh tickers. Read-only toward
+            // trading — never places orders.
+            tracing::info!("Running market-price refresh only...");
+            match market_prices::fetch_prices(&db_path).await {
+                Ok(n) => tracing::info!("Price refresh complete: {} quotes stored", n),
+                Err(e) => tracing::error!("Price refresh failed: {}", e),
+            }
+        }
+        "calibrate" => {
+            // Run ONLY the calibration phase (Phase 14) in isolation. Calibration
+            // is MEASURE-ONLY: it refreshes displayed P&L + computes Brier/hit-rate
+            // and NEVER places orders or closes trades. This mode exists to prove
+            // that: run it with an open position and confirm zero Alpaca sells.
+            tracing::info!("Running calibration (measure-only) in isolation...");
+            match calibration::run_calibration(&db_path).await {
+                Ok(r) => tracing::info!(
+                    "Calibration complete: {} positions measured, {} Brier scores, {} resolved",
+                    r.positions_evaluated, r.brier_scores_updated, r.signal_analysis.total_resolved
+                ),
+                Err(e) => tracing::error!("Calibration failed: {}", e),
+            }
+        }
+        "edge-report" => {
+            // Step 6: re-measure the paper-trading edge on REAL fills placed after
+            // the 2026-07-15 ticker fix + arming. Reads ONLY paper_trades, applies an
+            // N-gate (no verdict below N=20), reports both % and $ expectancy, and
+            // refuses cross-condition comparison. Read-only — never trades.
+            match edge_report::run_edge_report(&db_path) {
+                Ok(_) => {}
+                Err(e) => tracing::error!("Edge report failed: {}", e),
             }
         }
         other => {

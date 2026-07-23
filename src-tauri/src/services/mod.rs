@@ -1,5 +1,6 @@
 pub mod api_usage;
 pub mod brave_search;
+pub mod entity_noise;
 pub mod causality;
 #[allow(dead_code)]
 pub mod contrarian;

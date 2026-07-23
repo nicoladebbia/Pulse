@@ -5,18 +5,21 @@
 //! and the scale-in path so that the two cannot drift apart.
 
 const ENTRY_FLOOR: f64 = 50.0;
-const ENTRY_CAP: f64 = 10_000.0;
+const ENTRY_CAP: f64 = 20_000.0;
 const SCALE_IN_PCT: f64 = 0.01;
 const SCALE_IN_CAP: f64 = 5_000.0;
 
 /// Tier the compound score into a portfolio-percentage allocation.
+/// Long-term design (2026-07-23): doubled from 1%/2%/5% — fewer, bigger,
+/// longer-held positions fit a conviction-based long-term approach better
+/// than many small short-term-sized trades.
 fn tier_pct(score: f64) -> f64 {
     if score > 0.6 {
-        0.05
+        0.10
     } else if score > 0.4 {
-        0.02
+        0.05
     } else {
-        0.01
+        0.02
     }
 }
 
@@ -48,33 +51,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_high_score_uses_5pct() {
+    fn entry_high_score_uses_10pct() {
         let n = entry_notional(100_000.0, 0.7).unwrap();
-        assert!((n - 5_000.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn entry_mid_score_uses_2pct() {
-        let n = entry_notional(100_000.0, 0.5).unwrap();
-        assert!((n - 2_000.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn entry_low_score_uses_1pct() {
-        let n = entry_notional(100_000.0, 0.35).unwrap();
-        assert!((n - 1_000.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn entry_respects_cap() {
-        // 5% of $1M = $50K, must clamp to $10K
-        let n = entry_notional(1_000_000.0, 0.7).unwrap();
         assert!((n - 10_000.0).abs() < 0.01);
     }
 
     #[test]
+    fn entry_mid_score_uses_5pct() {
+        let n = entry_notional(100_000.0, 0.5).unwrap();
+        assert!((n - 5_000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn entry_low_score_uses_2pct() {
+        let n = entry_notional(100_000.0, 0.35).unwrap();
+        assert!((n - 2_000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn entry_respects_cap() {
+        // 10% of $1M = $100K, must clamp to $20K
+        let n = entry_notional(1_000_000.0, 0.7).unwrap();
+        assert!((n - 20_000.0).abs() < 0.01);
+    }
+
+    #[test]
     fn entry_respects_floor() {
-        // 1% of $200 = $2, must clamp up to $50
+        // 2% of $200 = $4, must clamp up to $50
         let n = entry_notional(200.0, 0.3).unwrap();
         assert!((n - 50.0).abs() < 0.01);
     }

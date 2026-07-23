@@ -243,37 +243,54 @@ pub async fn get_portfolio_with_trades(
     })
 }
 
-fn get_trades_by_status(conn: &Connection, status: &str) -> Result<Vec<PaperTrade>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, entity_id, ticker, direction, entry_price, entry_date,
-                exit_price, exit_date, position_size, confidence,
-                signal_profile, status, pnl, pnl_pct, trade_journal
-         FROM paper_trades WHERE status = ?1
-         ORDER BY entry_date DESC LIMIT 50"
-    )?;
+/// Column list + row-mapper shared by the status queries.
+const TRADE_COLUMNS: &str = "id, entity_id, ticker, direction, entry_price, entry_date, \
+     exit_price, exit_date, position_size, confidence, \
+     signal_profile, status, pnl, pnl_pct, trade_journal";
 
-    let trades = stmt
-        .query_map([status], |row| {
-            Ok(PaperTrade {
-                id: row.get(0)?,
-                entity_id: row.get(1)?,
-                ticker: row.get(2)?,
-                direction: row.get(3)?,
-                entry_price: row.get(4)?,
-                entry_date: row.get(5)?,
-                exit_price: row.get(6)?,
-                exit_date: row.get(7)?,
-                position_size: row.get(8)?,
-                confidence: row.get(9)?,
-                signal_profile: row.get(10)?,
-                status: row.get(11)?,
-                pnl: row.get(12)?,
-                pnl_pct: row.get(13)?,
-                trade_journal: row.get(14)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+fn map_trade_row(row: &rusqlite::Row) -> rusqlite::Result<PaperTrade> {
+    Ok(PaperTrade {
+        id: row.get(0)?,
+        entity_id: row.get(1)?,
+        ticker: row.get(2)?,
+        direction: row.get(3)?,
+        entry_price: row.get(4)?,
+        entry_date: row.get(5)?,
+        exit_price: row.get(6)?,
+        exit_date: row.get(7)?,
+        position_size: row.get(8)?,
+        confidence: row.get(9)?,
+        signal_profile: row.get(10)?,
+        status: row.get(11)?,
+        pnl: row.get(12)?,
+        pnl_pct: row.get(13)?,
+        trade_journal: row.get(14)?,
+    })
+}
+
+fn get_trades_by_status(conn: &Connection, status: &str) -> Result<Vec<PaperTrade>> {
+    // SEV1: "closed" must include every terminal state, not just status='closed'. The DB
+    // has 6 stopped_out rows that were silently hidden — two-thirds of the ledger. Any
+    // non-open status (closed, stopped_out, expired) is a completed trade the user should
+    // see. "open" and other specific statuses still match exactly.
+    let sql = if status == "closed" {
+        format!(
+            "SELECT {TRADE_COLUMNS} FROM paper_trades \
+             WHERE status != 'open' ORDER BY COALESCE(exit_date, entry_date) DESC LIMIT 50"
+        )
+    } else {
+        format!(
+            "SELECT {TRADE_COLUMNS} FROM paper_trades \
+             WHERE status = ?1 ORDER BY entry_date DESC LIMIT 50"
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
+
+    let trades = if status == "closed" {
+        stmt.query_map([], map_trade_row)?.filter_map(|r| r.ok()).collect()
+    } else {
+        stmt.query_map([status], map_trade_row)?.filter_map(|r| r.ok()).collect()
+    };
 
     Ok(trades)
 }

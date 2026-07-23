@@ -29,17 +29,35 @@
         <string>meta-llama/llama-4-scout-17b-16e-instruct</string>
     </dict>
 
+    <!-- 4 fixed slots: 7am, 12pm, 6pm, 10pm. Groq blocks the VPN/school source IP
+         intermittently (per-exit-server), so a single fixed time misses most days.
+         Each run does a cheap preflight probe (client.rs::groq_reachable) and exits
+         in <2s if blocked, so 4 slots is nearly free and catches whatever reachable
+         window opens. The news-based skip check (main.rs) makes extra slots no-ops
+         once the day already has news. See .plans/groq-vpn-block-plan.md. -->
     <key>StartCalendarInterval</key>
     <array>
         <dict>
             <key>Hour</key>
-            <integer>8</integer>
+            <integer>7</integer>
             <key>Minute</key>
             <integer>0</integer>
         </dict>
         <dict>
             <key>Hour</key>
-            <integer>21</integer>
+            <integer>12</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>22</integer>
             <key>Minute</key>
             <integer>0</integer>
         </dict>

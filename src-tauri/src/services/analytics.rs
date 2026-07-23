@@ -1,6 +1,15 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
+/// Parse a stored trade date that may be either `YYYY-MM-DD` or a full timestamp
+/// `YYYY-MM-DDTHH:MM:SS`. Historical rows are mixed (SEV3): `parse_from_str(_, "%Y-%m-%d")`
+/// silently rejected the timestamped ones, making hold-times read "0 days". Take the leading
+/// 10 chars (the date) before parsing so both shapes work.
+fn parse_trade_date(s: &str) -> Option<chrono::NaiveDate> {
+    let date_part = s.get(..10).unwrap_or(s);
+    chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
+}
+
 // ---------------------------------------------------------------------------
 // Analytics types
 // ---------------------------------------------------------------------------
@@ -133,8 +142,8 @@ pub fn compute_analytics(conn: &Connection) -> Result<PortfolioAnalytics, String
 
     // Holding days
     let holding_days: Vec<f64> = closed.iter().filter_map(|t| {
-        let entry = chrono::NaiveDate::parse_from_str(&t.entry_date, "%Y-%m-%d").ok()?;
-        let exit = chrono::NaiveDate::parse_from_str(&t.exit_date, "%Y-%m-%d").ok()?;
+        let entry = parse_trade_date(&t.entry_date)?;
+        let exit = parse_trade_date(&t.exit_date)?;
         Some((exit - entry).num_days() as f64)
     }).collect();
     let avg_holding_days = if holding_days.is_empty() { 0.0 }
@@ -528,16 +537,19 @@ fn generate_journal_text(
 
     // Exit narrative
     if let (Some(exit_d), Some(exit_p), Some(pnl_p)) = (exit_date, exit_price, pnl_pct) {
-        let holding_days = chrono::NaiveDate::parse_from_str(entry_date, "%Y-%m-%d")
-            .and_then(|e| chrono::NaiveDate::parse_from_str(exit_d, "%Y-%m-%d").map(|x| (x - e).num_days()))
-            .unwrap_or(0);
+        let holding_days = match (parse_trade_date(entry_date), parse_trade_date(exit_d)) {
+            (Some(e), Some(x)) => (x - e).num_days(),
+            _ => 0,
+        };
 
+        // SEV2: the DB has no close_reason column, so we can only state the reason the STATUS
+        // actually encodes. stopped_out/expired were written by the old exit engine and carry a
+        // real reason. A plain 'closed' row is a manual close with the reason NOT recorded — do
+        // not invent "signal decay"/"profit target" (fabricated claims the data can't support).
         let exit_reason = match status {
-            "stopped_out" => "trailing stop was hit",
+            "stopped_out" => "the trailing stop was hit",
             "expired" => "the 90-day holding limit was reached",
-            "closed" if pnl_p > 0.0 => "profit target was reached",
-            "closed" => "signal decay triggered an exit",
-            _ => "position was closed",
+            _ => "it was closed manually (exit reason not recorded)",
         };
 
         let pnl_str = if let Some(pnl_d) = pnl {
@@ -592,5 +604,33 @@ fn empty_analytics(open_count: usize) -> PortfolioAnalytics {
         sector_exposure: Vec::new(),
         monthly_returns: Vec::new(),
         equity_curve: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_trade_date_handles_both_shapes() {
+        // Date-only (the 3 rows that used to work).
+        let d1 = parse_trade_date("2026-04-15").unwrap();
+        // Full timestamp (the 6 rows the old parser silently rejected → "0 days").
+        let d2 = parse_trade_date("2026-06-08T21:17:52").unwrap();
+        assert_eq!((d2 - d1).num_days(), 54);
+    }
+
+    #[test]
+    fn parse_trade_date_timestamped_hold_is_nonzero() {
+        // Regression for SEV3: id 1 held 9 days but journaled "0 days" under the old parser.
+        let entry = parse_trade_date("2026-04-15T15:41:05").unwrap();
+        let exit = parse_trade_date("2026-04-24T08:18:39").unwrap();
+        assert_eq!((exit - entry).num_days(), 9);
+    }
+
+    #[test]
+    fn parse_trade_date_rejects_garbage() {
+        assert!(parse_trade_date("not-a-date").is_none());
+        assert!(parse_trade_date("").is_none());
     }
 }

@@ -33,15 +33,24 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
     let conn = Connection::open(db_path)?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    // Get all tickers that need price updates today
+    // Get all tickers that need price updates today. Open-position tickers are
+    // pinned to the FRONT of the list: the exit engine's ATR levels (trailing
+    // stop, profit target) read entity_prices candles, and with ~4,100 public
+    // tickers competing for 200 slots on a confidence tie-break, a held ticker
+    // can otherwise never get a single candle (ARM: 0 rows while holding a
+    // $4k position — found 2026-07-19). Front position also keeps them ahead
+    // of any Finnhub 429s that hit later in the list. GROUP BY dedups tickers
+    // mapped by multiple entity rows so they don't burn extra API slots.
     let tickers: Vec<(i64, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT et.entity_id, et.ticker FROM entity_tickers et
+            "SELECT MIN(et.entity_id), et.ticker FROM entity_tickers et
              WHERE et.is_public = 1
              AND et.ticker NOT IN (
                  SELECT ticker FROM entity_prices WHERE date = ?1
              )
-             ORDER BY et.confidence DESC
+             GROUP BY et.ticker
+             ORDER BY (et.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open')) DESC,
+                      MAX(et.confidence) DESC
              LIMIT 200"
         )?;
         stmt.query_map([&today], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -109,11 +118,16 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
 
     tracing::info!("Finnhub: stored {} prices ({} errors)", stored, errors);
 
-    // Backfill 30-day candle history for tickers missing 7d/30d changes
+    // Backfill 30-day candle history for tickers missing 7d/30d changes.
+    // Open-position tickers first — on a day with many fresh tickers the
+    // LIMIT 30 otherwise picks an arbitrary subset and a held ticker can miss
+    // the cut (ARM did on 2026-07-19).
     let needs_backfill: Vec<String> = {
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT ep.ticker FROM entity_prices ep
+            "SELECT ep.ticker FROM entity_prices ep
              WHERE ep.date = ?1 AND (ep.change_7d IS NULL OR ep.change_30d IS NULL)
+             GROUP BY ep.ticker
+             ORDER BY (ep.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open')) DESC
              LIMIT 30"
         )?;
         stmt.query_map([&today], |row| row.get::<_, String>(0))?
@@ -212,7 +226,100 @@ fn compute_change(conn: &Connection, ticker: &str, current_price: f64, days: i64
 }
 
 /// Backfill candle history for a ticker (used during daily pipeline).
+///
+/// Primary source: Alpaca's free IEX daily bars (same keys the trading side
+/// already uses) — verified live against ARM 2026-07-19, recent closes match
+/// the consolidated tape within cents. The legacy Finnhub candle endpoint is
+/// premium-gated on the current key (403 "You don't have access to this
+/// resource", so it had silently never backfilled anything) and is only
+/// attempted when Alpaca keys are absent.
 async fn backfill_candles(
+    client: &reqwest::Client,
+    api_key: &str,
+    conn: &Connection,
+    ticker: &str,
+    days_back: i64,
+) -> anyhow::Result<usize> {
+    let alpaca_key = std::env::var("ALPACA_API_KEY").unwrap_or_default();
+    let alpaca_secret = std::env::var("ALPACA_SECRET_KEY").unwrap_or_default();
+    if !alpaca_key.is_empty() && !alpaca_secret.is_empty() {
+        return backfill_candles_alpaca(client, &alpaca_key, &alpaca_secret, conn, ticker, days_back).await;
+    }
+    backfill_candles_finnhub(client, api_key, conn, ticker, days_back).await
+}
+
+/// Alpaca daily bars → entity_prices rows. INSERT OR IGNORE keeps existing
+/// quote-sourced rows (e.g. today's) authoritative.
+async fn backfill_candles_alpaca(
+    client: &reqwest::Client,
+    alpaca_key: &str,
+    alpaca_secret: &str,
+    conn: &Connection,
+    ticker: &str,
+    days_back: i64,
+) -> anyhow::Result<usize> {
+    let start = (chrono::Utc::now() - chrono::Duration::days(days_back))
+        .format("%Y-%m-%d")
+        .to_string();
+    let url = format!(
+        "https://data.alpaca.markets/v2/stocks/{}/bars?timeframe=1Day&start={}&limit=60&adjustment=raw&feed=iex",
+        ticker, start
+    );
+
+    let resp = client
+        .get(&url)
+        .header("APCA-API-KEY-ID", alpaca_key)
+        .header("APCA-API-SECRET-KEY", alpaca_secret)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Alpaca bars API returned {}", resp.status());
+    }
+
+    let data: serde_json::Value = resp.json().await?;
+    let bars = match data.get("bars").and_then(|v| v.as_array()) {
+        Some(b) if !b.is_empty() => b.clone(),
+        _ => return Ok(0),
+    };
+
+    let entity_id: Option<i64> = conn
+        .query_row(
+            "SELECT MIN(entity_id) FROM entity_tickers WHERE ticker = ?1",
+            [ticker],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let mut stored = 0;
+    for bar in &bars {
+        // "t" is RFC3339 ("2026-06-15T04:00:00Z") — the date prefix is the day.
+        let date: String = bar
+            .get("t")
+            .and_then(|v| v.as_str())
+            .map(|t| t.chars().take(10).collect())
+            .unwrap_or_default();
+        let close = bar.get("c").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if date.len() != 10 || close <= 0.0 {
+            continue;
+        }
+        let open = bar.get("o").and_then(|v| v.as_f64());
+        let high = bar.get("h").and_then(|v| v.as_f64());
+        let low = bar.get("l").and_then(|v| v.as_f64());
+
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_prices (entity_id, ticker, date, open, close, high, low)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![entity_id, ticker, date, open, close, high, low],
+        )?;
+        stored += 1;
+    }
+
+    crate::db::log_api_usage(conn, "alpaca", "bars", "backfill_candles", 0, 0);
+    Ok(stored)
+}
+
+/// Legacy Finnhub candle backfill — premium-only on free keys.
+async fn backfill_candles_finnhub(
     client: &reqwest::Client,
     api_key: &str,
     conn: &Connection,

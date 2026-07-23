@@ -70,9 +70,10 @@ pub struct SignalAnalysis {
     pub dead_signals: Vec<String>, // dimensions with < 50% hit rate
 }
 
-/// Evaluate open paper trades using ATR-based position management.
-/// Closes positions via Alpaca API when exit conditions are met.
-async fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Result<usize> {
+/// Refresh the displayed P&L on open paper trades (MEASURE-ONLY).
+/// Does NOT close positions or place orders — Phase 13.6 `manage_open_positions`
+/// is the single exit authority. See the body comment for why.
+async fn evaluate_open_positions(conn: &Connection, _today: &str) -> anyhow::Result<usize> {
     let open_trades: Vec<(i64, String, f64, String, f64, f64)> = {
         let mut stmt = conn.prepare(
             "SELECT id, ticker, entry_price, entry_date, COALESCE(original_compound_score, confidence), position_size
@@ -90,18 +91,21 @@ async fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Resu
         return Ok(0);
     }
 
-    tracing::info!("Calibration: evaluating {} open positions", open_trades.len());
+    tracing::info!("Calibration: measuring P&L on {} open positions (measure-only)", open_trades.len());
 
-    // Set up Alpaca client for selling
-    let alpaca_key = std::env::var("ALPACA_API_KEY").unwrap_or_default();
-    let alpaca_secret = std::env::var("ALPACA_SECRET_KEY").unwrap_or_default();
-    let has_alpaca = !alpaca_key.is_empty() && !alpaca_secret.is_empty();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
+    // MEASURE-ONLY (2026-07-15). Calibration used to be a SECOND seller here:
+    // it called evaluate_position + placed Alpaca sell orders + closed trades,
+    // bypassing the EXIT_DRY_RUN kill switch entirely (a duplicate of Phase 13.6
+    // `manage_open_positions` without the flag). That is removed. Phase 13.6 is
+    // now the SINGLE exit authority; calibration only refreshes the displayed
+    // P&L on still-open positions.
+    //
+    // Deliberately does NOT call evaluate_position/check_signal_decay: those
+    // write high_water_mark/trailing_stop, and doing so here — from STALE
+    // entity_prices — would fight Phase 13.6's writes from fresh Alpaca prices,
+    // corrupting the exact stop 13.6 depends on. Raw P&L from last close only.
     let mut evaluated = 0;
-    for (trade_id, ticker, entry_price, entry_date, original_score, position_size) in &open_trades {
+    for (trade_id, ticker, entry_price, _entry_date, _original_score, position_size) in &open_trades {
         let current_price: f64 = conn
             .query_row(
                 "SELECT close FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
@@ -117,113 +121,11 @@ async fn evaluate_open_positions(conn: &Connection, today: &str) -> anyhow::Resu
         let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
         let pnl_dollars = pnl_pct / 100.0 * position_size;
 
-        use crate::position_management::{evaluate_position, check_signal_decay, PositionAction};
-
-        let action = evaluate_position(conn, *trade_id, ticker, *entry_price, entry_date, current_price, today);
-        let signal_decayed = check_signal_decay(conn, ticker, *original_score);
-
-        // Determine if we need to close (full or half)
-        let (should_close, close_fraction, status_str, reason) = match &action {
-            PositionAction::CloseAll { reason } => (true, 1.0, "stopped_out", reason.clone()),
-            PositionAction::CloseHalf { reason } => (true, 0.5, "open", reason.clone()),
-            PositionAction::Hold if signal_decayed => {
-                let s = if pnl_pct > 0.0 { "closed" } else { "expired" };
-                (true, 1.0, s, "signal_decay".to_string())
-            }
-            PositionAction::TightenStop { new_stop } => {
-                conn.execute(
-                    "UPDATE paper_trades SET trailing_stop = ?1 WHERE id = ?2",
-                    rusqlite::params![new_stop, trade_id],
-                )?;
-                (false, 0.0, "", String::new())
-            }
-            _ => (false, 0.0, "", String::new()),
-        };
-
-        if !should_close {
-            // Update live P&L for tracking even on Hold
-            conn.execute(
-                "UPDATE paper_trades SET pnl = ?1, pnl_pct = ?2 WHERE id = ?3",
-                rusqlite::params![pnl_dollars, pnl_pct, trade_id],
-            ).ok();
-            tracing::info!("Position hold: {} — {:.1}% (${:.2})", ticker, pnl_pct, pnl_dollars);
-            evaluated += 1;
-            continue;
-        }
-
-        // Send sell order to Alpaca. The DB close MUST be gated on this: a
-        // previous version updated the DB unconditionally, which produced
-        // DB↔Alpaca drift (ORCL was marked stopped_out in DB while still open
-        // at Alpaca, leaving an untracked position bleeding silently).
-        let mut alpaca_ok = !has_alpaca; // If we have no Alpaca, treat DB as source of truth.
-        if has_alpaca {
-            let sell_notional = position_size * close_fraction;
-            let sell_order = serde_json::json!({
-                "symbol": ticker,
-                "notional": format!("{:.2}", sell_notional),
-                "side": "sell",
-                "type": "market",
-                "time_in_force": "day"
-            });
-
-            match client
-                .post("https://paper-api.alpaca.markets/v2/orders")
-                .header("APCA-API-KEY-ID", &alpaca_key)
-                .header("APCA-API-SECRET-KEY", &alpaca_secret)
-                .json(&sell_order)
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::info!("Alpaca sell order placed: {} ${:.2} ({})", ticker, sell_notional, reason);
-                    alpaca_ok = true;
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    tracing::warn!(
-                        "Alpaca sell REJECTED for {} (status {}): {} — leaving DB position open to avoid drift",
-                        ticker, status, body
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Alpaca sell request failed for {}: {} — leaving DB position open to avoid drift",
-                        ticker, e
-                    );
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-
-        // Only update the DB if Alpaca actually accepted the order. Otherwise
-        // the next calibration pass will retry, and the position remains
-        // visible in the UI as still-open.
-        if !alpaca_ok {
-            tracing::warn!(
-                "Position {} ({}): close skipped due to Alpaca failure — will retry next calibration",
-                ticker, reason
-            );
-            continue;
-        }
-
-        if close_fraction >= 1.0 {
-            conn.execute(
-                "UPDATE paper_trades SET status = ?1, exit_price = ?2, exit_date = ?3, pnl = ?4, pnl_pct = ?5 WHERE id = ?6",
-                rusqlite::params![status_str, current_price, today, pnl_dollars, pnl_pct, trade_id],
-            )?;
-            // Auto-generate trade journal on close
-            generate_trade_journal(conn, *trade_id, ticker, entry_date, today, *entry_price, current_price, *position_size, pnl_pct, pnl_dollars, status_str);
-            tracing::info!("Position closed: {} — {:.1}% (${:.2}) — {}", ticker, pnl_pct, pnl_dollars, reason);
-        } else {
-            // Half close — reduce position size, don't change status
-            let new_size = position_size * (1.0 - close_fraction);
-            conn.execute(
-                "UPDATE paper_trades SET position_size = ?1 WHERE id = ?2",
-                rusqlite::params![new_size, trade_id],
-            )?;
-            tracing::info!("Position halved: {} — {:.1}% — {}", ticker, pnl_pct, reason);
-        }
+        conn.execute(
+            "UPDATE paper_trades SET pnl = ?1, pnl_pct = ?2 WHERE id = ?3",
+            rusqlite::params![pnl_dollars, pnl_pct, trade_id],
+        ).ok();
+        tracing::info!("Position P&L: {} — {:.1}% (${:.2})", ticker, pnl_pct, pnl_dollars);
         evaluated += 1;
     }
 
@@ -429,77 +331,6 @@ fn compute_confidence_calibration(conn: &Connection) -> anyhow::Result<Vec<(f64,
     Ok(calibration)
 }
 
-// ---------------------------------------------------------------------------
-// Trade journal auto-generation on close
-// ---------------------------------------------------------------------------
-
-fn generate_trade_journal(
-    conn: &Connection, trade_id: i64, ticker: &str,
-    entry_date: &str, exit_date: &str,
-    entry_price: f64, exit_price: f64,
-    position_size: f64, pnl_pct: f64, pnl_dollars: f64,
-    status: &str,
-) {
-    // Get signal profile and entity name
-    let profile: String = conn.query_row(
-        "SELECT signal_profile FROM paper_trades WHERE id = ?1",
-        [trade_id], |row| row.get(0),
-    ).unwrap_or_default();
-
-    let entity_name: Option<String> = conn.query_row(
-        "SELECT e.name FROM paper_trades pt JOIN entities e ON e.id = pt.entity_id WHERE pt.id = ?1",
-        [trade_id], |row| row.get(0),
-    ).ok();
-
-    let name = entity_name.as_deref().unwrap_or(ticker);
-
-    // Parse top signals
-    let mut top_signals: Vec<(String, f64)> = Vec::new();
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&profile) {
-        let dims = ["insider", "institutional", "news", "government", "search", "patent", "supply_chain", "political"];
-        for dim in dims {
-            if let Some(val) = parsed.get(dim).and_then(|v| v.as_f64()) {
-                if val > 0.05 { top_signals.push((dim.to_string(), val)); }
-            }
-        }
-    }
-    top_signals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    top_signals.truncate(3);
-
-    // Build narrative
-    let drivers = if top_signals.is_empty() {
-        "convergence signals".to_string()
-    } else {
-        top_signals.iter()
-            .map(|(d, v)| format!("{} ({:.0}%)", d, v * 100.0))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    let holding_days = chrono::NaiveDate::parse_from_str(entry_date, "%Y-%m-%d")
-        .and_then(|e| chrono::NaiveDate::parse_from_str(exit_date, "%Y-%m-%d").map(|x| (x - e).num_days()))
-        .unwrap_or(0);
-
-    let exit_reason = match status {
-        "stopped_out" => "trailing stop was hit",
-        "expired" => "the 90-day holding limit was reached",
-        "closed" if pnl_pct > 0.0 => "profit target was reached",
-        "closed" => "signal decay triggered an exit",
-        _ => "position was closed",
-    };
-
-    let journal = format!(
-        "Entered {} long on {} at ${:.2} driven by {}. Position size: ${:.0}. \
-         Exited after {} days at ${:.2} — {}{:.1}% (${}{:.0}) because {}.",
-        name, entry_date, entry_price, drivers, position_size,
-        holding_days, exit_price,
-        if pnl_pct >= 0.0 { "+" } else { "" }, pnl_pct,
-        if pnl_dollars >= 0.0 { "+" } else { "" }, pnl_dollars,
-        exit_reason,
-    );
-
-    conn.execute(
-        "UPDATE paper_trades SET trade_journal = ?1 WHERE id = ?2",
-        rusqlite::params![journal, trade_id],
-    ).ok();
-}
+// Trade journal auto-generation on close moved to position_management.rs
+// (2026-07-15) — it now fires from the single exit authority (Phase 13.6),
+// since calibration is measure-only and no longer closes trades.

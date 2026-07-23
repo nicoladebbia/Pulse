@@ -26,29 +26,45 @@ pub struct EntityPrice {
     pub ticker: String,
     pub date: String,
     pub close: f64,
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
     pub change_1d: Option<f64>,
     pub change_7d: Option<f64>,
     pub change_30d: Option<f64>,
     pub entity_name: Option<String>,
 }
 
-/// Get latest prices for entities with ticker mappings.
+/// Get the MOST-RECENT price row per ticker (not the global latest date).
+///
+/// Previously this filtered `WHERE date = (SELECT MAX(date) FROM entity_prices)`,
+/// which dropped every ticker whose newest row was any earlier date — on a day
+/// when only ~142 of ~525 tickers refreshed, 383 tickers with a perfectly good
+/// 1-day-old price rendered as "no price." We now pick each ticker's own latest
+/// row via ROW_NUMBER, so a slightly-stale-but-valid price still shows (the
+/// frontend surfaces the date + a staleness badge). No extra Finnhub calls —
+/// this reads rows already stored.
 #[tauri::command]
 pub fn get_entity_prices(db: State<'_, DbState>, limit: Option<usize>) -> Result<Vec<EntityPrice>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let limit = limit.unwrap_or(50);
+    let limit = limit.unwrap_or(100);
 
     let mut stmt = conn
         .prepare(
-            "SELECT ep.ticker, ep.date, ep.close, ep.change_1d, ep.change_7d, ep.change_30d,
+            "WITH latest AS (
+                 SELECT ticker, date, close, open, high, low, change_1d, change_7d, change_30d,
+                        ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+                 FROM entity_prices
+             )
+             SELECT l.ticker, l.date, l.close, l.open, l.high, l.low,
+                    l.change_1d, l.change_7d, l.change_30d,
                     (SELECT e.name FROM entity_tickers et
                      JOIN entities e ON e.id = et.entity_id
-                     WHERE et.ticker = ep.ticker
+                     WHERE et.ticker = l.ticker
                      ORDER BY et.confidence DESC LIMIT 1) AS entity_name
-             FROM entity_prices ep
-             WHERE ep.date = (SELECT MAX(date) FROM entity_prices)
-             GROUP BY ep.ticker
-             ORDER BY ep.close DESC
+             FROM latest l
+             WHERE l.rn = 1
+             ORDER BY l.date DESC, l.close DESC
              LIMIT ?1"
         )
         .map_err(|e| e.to_string())?;
@@ -59,10 +75,13 @@ pub fn get_entity_prices(db: State<'_, DbState>, limit: Option<usize>) -> Result
                 ticker: row.get(0)?,
                 date: row.get(1)?,
                 close: row.get(2)?,
-                change_1d: row.get(3)?,
-                change_7d: row.get(4)?,
-                change_30d: row.get(5)?,
-                entity_name: row.get(6)?,
+                open: row.get(3)?,
+                high: row.get(4)?,
+                low: row.get(5)?,
+                change_1d: row.get(6)?,
+                change_7d: row.get(7)?,
+                change_30d: row.get(8)?,
+                entity_name: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -83,10 +102,17 @@ pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
     // Get tickers to refresh (from DB, drop lock before async)
     let tickers: Vec<(i64, String)> = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
+        // Open-position tickers always refresh first — they feed the trade
+        // detail page and exit-level display; the confidence-ranked rest fill
+        // the remaining slots (same fix as pulse-fetcher market_prices.rs).
         let mut stmt = conn.prepare(
-            "SELECT et.entity_id, et.ticker FROM entity_tickers et
-             WHERE et.is_public = 1 AND et.confidence >= 0.8
-             ORDER BY et.confidence DESC LIMIT 25"
+            "SELECT MIN(et.entity_id), et.ticker FROM entity_tickers et
+             WHERE et.is_public = 1 AND (et.confidence >= 0.8
+                 OR et.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open'))
+             GROUP BY et.ticker
+             ORDER BY (et.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open')) DESC,
+                      MAX(et.confidence) DESC
+             LIMIT 25"
         ).map_err(|e| e.to_string())?;
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(|e| e.to_string())?
@@ -431,14 +457,15 @@ pub fn get_source_health(db: State<'_, DbState>) -> Result<Vec<SourceHealth>, St
             ).unwrap_or(0)
         };
 
-        // Also check api_usage
+        // API-call count in the last 7 days. NOTE: api_usage logs one row per HTTP request
+        // regardless of whether any data came back, so this is "did we try", NOT "did we get
+        // data". It must never by itself mean a source is healthy (that was the old bug: a
+        // dead scraper that 200s an empty page every run looked "active").
         let api_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM api_usage WHERE provider = ?1 AND created_at >= datetime('now', '-7 days')",
             [api_provider],
             |row| row.get(0),
         ).unwrap_or(0);
-
-        let total = story_count.max(api_count);
 
         let last_fetch: Option<String> = conn.query_row(
             "SELECT MAX(created_at) FROM api_usage WHERE provider = ?1",
@@ -446,12 +473,39 @@ pub fn get_source_health(db: State<'_, DbState>) -> Result<Vec<SourceHealth>, St
             |row| row.get(0),
         ).unwrap_or(None);
 
-        let status = if total > 0 { "active" } else if name.contains("Patents") { "migrating" } else { "inactive" };
+        // Honest health (HIGH-1/HIGH-2). A source is only "active" if it PRODUCED DATA in the
+        // last 7 days. Sources that don't emit stories (Finnhub quotes, Alpaca execution — empty
+        // source_match) are judged by whether they're being called at all. A source that has
+        // produced stories historically but none in 7 days is "stale" (dead-but-firing: FRED,
+        // EIA, Google Patents were all still calling their APIs while producing nothing for
+        // 43-91 days). Never produced anything → "inactive".
+        let ever_produced: i64 = if source_match.is_empty() {
+            0
+        } else {
+            let q = if source_match.contains('%') {
+                "SELECT COUNT(*) FROM stories WHERE source_type = 'financial' AND source_name LIKE ?1"
+            } else {
+                "SELECT COUNT(*) FROM stories WHERE source_type = 'financial' AND source_name = ?1"
+            };
+            conn.query_row(q, [source_match], |row| row.get(0)).unwrap_or(0)
+        };
+
+        let (status, last_count) = if source_match.is_empty() {
+            // Non-story data source (Finnhub/Alpaca): active iff being called.
+            (if api_count > 0 { "active" } else { "inactive" }, api_count)
+        } else if story_count > 0 {
+            ("active", story_count)
+        } else if ever_produced > 0 {
+            // Produced before, nothing in 7 days — firing but dead.
+            ("stale", 0)
+        } else {
+            ("inactive", 0)
+        };
 
         health.push(SourceHealth {
             name: name.to_string(),
             status: status.to_string(),
-            last_count: total,
+            last_count,
             last_fetch,
             description: desc.to_string(),
         });

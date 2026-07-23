@@ -4,14 +4,15 @@
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
 		executeTrade, closePosition, getFinancialEvents, getSignalEvidence, getSourceHealth,
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getTradeJournal,
-		runBacktest, startPriceStream, stopPriceStream
+		runBacktest, startPriceStream, stopPriceStream, getTradeRationale
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics,
-		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate
+		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate, TradeRationale
 	} from '$lib/tauri/types';
 	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
+	import { parseTradeReason, fmtReasonSignals } from '$lib/trade-reason';
 
 	let signals = $state<CrossSignal[]>([]);
 	let convergence = $state<CrossSignal[]>([]);
@@ -30,10 +31,13 @@
 	let tradingConfidence = $state(0.6);
 	let tradeStatus = $state<string | null>(null);
 	let pricesRefreshing = $state(false);
+	let priceRefreshFailed = $state(false);
 	let analytics = $state<PortfolioAnalytics | null>(null);
 	let showAnalytics = $state(false);
 	let expandedTradeId = $state<number | null>(null);
 	let tradeJournals = $state<Record<number, TradeJournal>>({});
+	let aiRationales = $state<Record<number, TradeRationale>>({});
+	let aiRationaleFailed = $state<Record<number, boolean>>({});
 	let showBacktest = $state(false);
 	let backtestRunning = $state(false);
 	let backtestResult = $state<BacktestResult | null>(null);
@@ -96,6 +100,44 @@
 		return () => { cancelled = true; if (unlisten) unlisten(); };
 	});
 
+	// Lazily fetch (and DB-cache, one Haiku call ever per trade) the AI "why this
+	// trade" take for each open auto-buy position. Fire-and-forget: a failure just
+	// leaves the raw signal-convergence line showing, never blocks the page.
+	// `portfolio` gets reassigned on every live price tick (see the price-update
+	// effect above) once streaming is on, which re-runs this effect — the
+	// in-flight guard stops a tick landing mid-request from firing a duplicate
+	// call for the same trade before the first one resolves and caches.
+	const aiRationalesInFlight = new Set<number>();
+	$effect(() => {
+		const openTrades = portfolio?.open_trades ?? [];
+		for (const t of openTrades) {
+			if (aiRationales[t.id] || aiRationaleFailed[t.id] || aiRationalesInFlight.has(t.id)) continue;
+			const reason = parseTradeReason(t.signal_profile);
+			if (reason?.kind !== 'auto') continue;
+			aiRationalesInFlight.add(t.id);
+			getTradeRationale(t.id).then(r => {
+				aiRationales = { ...aiRationales, [t.id]: r };
+			}).catch(() => {
+				aiRationaleFailed = { ...aiRationaleFailed, [t.id]: true };
+			}).finally(() => {
+				aiRationalesInFlight.delete(t.id);
+			});
+		}
+	});
+
+	// The rationale prompt structures sentence 1 as the mechanical "what fired"
+	// line and sentence 2 as the actual bull-thesis reasoning — pull sentence 2
+	// specifically for the card so the "why" survives truncation, not whichever
+	// sentence boundary the model happened to land on. A static caveat is always
+	// appended in the template (not model text) so it can't be silently dropped.
+	function splitSentences(text: string): string[] {
+		return text.match(/[^.!?]+[.!?]+(?:\s+|$)/g)?.map(s => s.trim()) ?? [text.trim()];
+	}
+	function bullThesisSentence(text: string): string {
+		const sentences = splitSentences(text);
+		return sentences[1] ?? sentences[0] ?? text;
+	}
+
 	async function loadData() {
 		error = null;
 		isLoading = true;
@@ -106,7 +148,7 @@
 				getConvergenceAlerts(40).catch(() => []),
 				getSignalEvidence(40).catch(() => []),
 				getFinancialEvents(20).catch(() => []),
-				getEntityPrices(50).catch(() => []),
+				getEntityPrices(100).catch(() => []),
 			]);
 			signals = s;
 			convergence = c;
@@ -120,10 +162,11 @@
 			getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
 			// Refresh prices in background, then reload price list
 			pricesRefreshing = true;
+			priceRefreshFailed = false;
 			refreshPrices()
-				.then(() => getEntityPrices(50))
+				.then(() => getEntityPrices(100))
 				.then(p => { prices = p; })
-				.catch(() => {})
+				.catch(() => { priceRefreshFailed = true; })
 				.finally(() => { pricesRefreshing = false; });
 		} catch (e: any) {
 			error = String(e?.message ?? e);
@@ -225,6 +268,22 @@
 		return val.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 	}
 
+	/**
+	 * Freshness of a daily price row for the Market tab.
+	 * Returns a short label + whether it's stale (>1 trading day old).
+	 * "today" / "1d ago" / "Nd ago". Weekends make 2-3d normal, so we only
+	 * badge as stale at >3 calendar days.
+	 */
+	function priceAge(dateStr: string): { label: string; stale: boolean } {
+		const days = Math.floor((Date.now() - Date.parse(dateStr + 'T00:00:00Z')) / 86_400_000);
+		if (days <= 0) return { label: 'today', stale: false };
+		if (days === 1) return { label: '1d ago', stale: false };
+		return { label: `${days}d ago`, stale: days > 3 };
+	}
+
+	// Toggle: show OHLC detail row in the Market table.
+	let showOhlc = $state(false);
+
 	function fmtPnl(val: number): string {
 		return `${val >= 0 ? '+' : ''}${fmtPrice(val)}`;
 	}
@@ -266,6 +325,7 @@
 	function statusDot(status: string): string {
 		if (status === 'active') return 'bg-emerald-400';
 		if (status === 'migrating') return 'bg-amber-400';
+		if (status === 'stale') return 'bg-amber-400'; // firing but produced no data in 7d
 		return 'bg-zinc-600';
 	}
 
@@ -721,17 +781,33 @@
 				<p class="text-sm text-text-muted">Prices are fetched daily for entities with ticker mappings.</p>
 			</div>
 		{:else}
+			<div class="flex items-center justify-between mb-2 px-1">
+				<span class="text-xs text-text-muted">
+					{prices.length} tickers · most-recent close per ticker
+					{#if priceRefreshFailed}
+						<span class="text-amber-400" title="Today's Finnhub refresh failed — showing last stored prices">· refresh failed, showing stored</span>
+					{:else if pricesRefreshing}
+						<span class="text-text-muted">· refreshing…</span>
+					{/if}
+				</span>
+				<button
+					class="text-xs text-text-muted hover:text-text transition-colors"
+					onclick={() => (showOhlc = !showOhlc)}
+				>{showOhlc ? 'Hide OHLC' : 'Show OHLC'}</button>
+			</div>
 			<div class="bg-bg-card border border-border rounded-xl overflow-hidden">
-				<div class="grid grid-cols-6 px-4 py-2.5 text-[10px] text-text-muted uppercase tracking-wider border-b border-border">
+				<div class="grid grid-cols-7 px-4 py-2.5 text-[10px] text-text-muted uppercase tracking-wider border-b border-border">
 					<span class="col-span-2">Entity</span>
 					<span class="text-right">Price</span>
 					<span class="text-right">1D</span>
 					<span class="text-right">7D</span>
 					<span class="text-right">30D</span>
+					<span class="text-right">As of</span>
 				</div>
 				{#each prices as p}
-					<div class="grid grid-cols-6 px-4 py-2.5 items-center hover:bg-bg-card-hover transition-colors border-b border-border/50 last:border-0">
-						<div class="col-span-2 flex items-center gap-2">
+					{@const age = priceAge(p.date)}
+					<div class="grid grid-cols-7 px-4 py-2.5 items-center hover:bg-bg-card-hover transition-colors border-b border-border/50 last:border-0">
+						<div class="col-span-2 flex items-center gap-2 min-w-0">
 							<span class="text-sm font-mono font-semibold text-text">{p.ticker}</span>
 							{#if p.entity_name}
 								<span class="text-[10px] text-text-muted truncate">{p.entity_name}</span>
@@ -741,7 +817,20 @@
 						<span class="text-sm font-mono text-right {changeColor(p.change_1d)}">{fmtChange(p.change_1d)}</span>
 						<span class="text-sm font-mono text-right {changeColor(p.change_7d)}">{fmtChange(p.change_7d)}</span>
 						<span class="text-sm font-mono text-right {changeColor(p.change_30d)}">{fmtChange(p.change_30d)}</span>
+						<span
+							class="text-[10px] font-mono text-right {age.stale ? 'text-amber-400' : 'text-text-muted'}"
+							title={p.date}
+						>{age.label}</span>
 					</div>
+					{#if showOhlc}
+						<div class="grid grid-cols-7 px-4 pb-2 -mt-1 text-[10px] font-mono text-text-muted border-b border-border/50 last:border-0">
+							<span class="col-span-2"></span>
+							<span class="text-right">O {p.open != null ? p.open.toFixed(2) : '--'}</span>
+							<span class="text-right">H {p.high != null ? p.high.toFixed(2) : '--'}</span>
+							<span class="text-right">L {p.low != null ? p.low.toFixed(2) : '--'}</span>
+							<span class="col-span-2"></span>
+						</div>
+					{/if}
 				{/each}
 			</div>
 		{/if}
@@ -953,10 +1042,15 @@
 						{@const pnlPct = pos.unrealized_pl_pct * 100}
 						{@const isWinning = pos.unrealized_pl >= 0}
 						{@const dbTrade = portfolio.open_trades.find(t => t.ticker === pos.symbol)}
+						{@const reason = dbTrade ? parseTradeReason(dbTrade.signal_profile) : null}
 						<div class="bg-bg-card border {isWinning ? 'border-emerald-500/15' : 'border-rose-500/15'} rounded-xl px-5 py-4">
 							<div class="flex items-center justify-between mb-2">
 								<div class="flex items-center gap-3">
-									<span class="text-sm font-mono font-bold text-text">{pos.symbol}</span>
+									{#if dbTrade}
+										<a href="/signals/trade/{dbTrade.id}" class="text-sm font-mono font-bold text-text hover:text-blue-300 transition-colors" title="Full trade details">{pos.symbol} <span class="text-[10px] text-text-muted font-normal">&rarr;</span></a>
+									{:else}
+										<span class="text-sm font-mono font-bold text-text">{pos.symbol}</span>
+									{/if}
 									<span class="text-xs text-text-muted">{pos.qty.toFixed(2)} shares</span>
 								</div>
 								<div class="text-right">
@@ -972,6 +1066,33 @@
 								<span>Entry: ${pos.avg_entry_price.toFixed(2)} &rarr; Now: ${pos.current_price.toFixed(2)}</span>
 								<span>Cost: {fmtPrice(pos.avg_entry_price * pos.qty)} &rarr; {fmtPrice(pos.market_value)}</span>
 							</div>
+							{#if dbTrade}
+								<div class="mt-1.5 text-[11px] text-text-muted">
+									<span>Opened {dbTrade.entry_date.slice(0, 10)}</span>
+									{#if reason?.kind === 'auto'}
+										<span> &middot; auto-buy on signal convergence: <span class="font-mono text-text-secondary">{fmtReasonSignals(reason.signals)}</span></span>
+									{:else if reason?.kind === 'manual'}
+										<span> &middot; manual trade</span>
+									{:else if reason?.kind === 'reconciled'}
+										<span> &middot; imported from Alpaca</span>
+									{/if}
+								</div>
+								{#if reason?.kind === 'auto' && aiRationales[dbTrade.id]}
+									<p class="mt-1 text-[11px] text-indigo-300/90 leading-relaxed">
+										<span class="text-indigo-400/70 font-medium">AI take:</span> {bullThesisSentence(aiRationales[dbTrade.id].text)}
+										<span class="text-text-muted"> (unproven strategy, paper-only — not investment advice)</span>
+									</p>
+								{/if}
+								{#if reason?.kind === 'auto' && reason.stories.length > 0}
+									<ul class="mt-1 space-y-0.5">
+										{#each reason.stories as story}
+											<li class="text-[11px] text-text-secondary truncate">
+												&ldquo;{story.title}&rdquo;{#if story.source}<span class="text-text-muted"> — {story.source}</span>{/if}
+											</li>
+										{/each}
+									</ul>
+								{/if}
+							{/if}
 							<!-- P&L bar -->
 							<div class="mt-2 h-1 bg-border rounded-full overflow-hidden">
 								<div class="h-full rounded-full {isWinning ? 'bg-emerald-400' : 'bg-rose-400'}" style="width: {Math.min(Math.abs(pnlPct) * 5, 100)}%"></div>
@@ -1001,6 +1122,7 @@
 						{@const pnl = trade.pnl_pct ?? 0}
 						{@const isGreen = pnl >= 0}
 						{@const isClosed = trade.status !== 'open'}
+						{@const reason = parseTradeReason(trade.signal_profile)}
 						<div>
 							<button class="w-full text-left px-4 py-3 {isClosed ? 'hover:bg-white/[0.02]' : ''} transition-colors"
 								onclick={() => isClosed && toggleTradeJournal(trade.id)} disabled={!isClosed}>
@@ -1014,6 +1136,13 @@
 											trade.status === 'stopped_out' ? 'bg-rose-500/15 text-rose-400' :
 											'bg-zinc-500/15 text-zinc-400'
 										}">{trade.status}</span>
+										{#if reason?.kind === 'auto'}
+											<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-indigo-500/15 text-indigo-400" title="Opened automatically on signal convergence: {fmtReasonSignals(reason.signals)}">auto</span>
+										{:else if reason?.kind === 'manual'}
+											<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-zinc-500/15 text-zinc-400">manual</span>
+										{:else if reason?.kind === 'reconciled'}
+											<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-zinc-500/15 text-zinc-400" title="Imported from Alpaca during ledger reconciliation">imported</span>
+										{/if}
 									</div>
 									<div class="flex items-center gap-2">
 										{#if hasPnl}
@@ -1038,11 +1167,14 @@
 									{/if}
 								</div>
 							</button>
-							{#if expandedTradeId === trade.id && tradeJournals[trade.id]}
+							{#if expandedTradeId === trade.id}
 								<div class="px-4 pb-3 pt-1">
-									<div class="bg-bg border border-border rounded-lg p-3">
-										<p class="text-xs text-text-secondary leading-relaxed">{tradeJournals[trade.id].journal}</p>
-									</div>
+									{#if tradeJournals[trade.id]}
+										<div class="bg-bg border border-border rounded-lg p-3">
+											<p class="text-xs text-text-secondary leading-relaxed">{tradeJournals[trade.id].journal}</p>
+										</div>
+									{/if}
+									<a href="/signals/trade/{trade.id}" class="inline-block mt-2 text-[11px] text-blue-400 hover:text-blue-300 transition-colors">Full trade details &rarr;</a>
 								</div>
 							{/if}
 						</div>
@@ -1094,8 +1226,8 @@
 					<p class="text-xs text-text-muted mb-2">{src.description}</p>
 					<div class="flex items-center justify-between text-[10px]">
 						<span class="text-text-secondary font-mono">{src.last_count} items/week</span>
-						<span class="{src.status === 'active' ? 'text-emerald-400' : src.status === 'migrating' ? 'text-amber-400' : 'text-zinc-500'}">
-							{src.status === 'active' ? 'Active' : src.status === 'migrating' ? 'Migrating' : 'Inactive'}
+						<span class="{src.status === 'active' ? 'text-emerald-400' : (src.status === 'migrating' || src.status === 'stale') ? 'text-amber-400' : 'text-zinc-500'}">
+							{src.status === 'active' ? 'Active' : src.status === 'migrating' ? 'Migrating' : src.status === 'stale' ? 'No data 7d' : 'Inactive'}
 						</span>
 					</div>
 				</div>

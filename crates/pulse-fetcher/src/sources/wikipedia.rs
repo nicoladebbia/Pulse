@@ -11,15 +11,26 @@ use super::RawArticle;
 pub async fn fetch(db_path: &std::path::Path) -> anyhow::Result<Vec<RawArticle>> {
     let conn = rusqlite::Connection::open(db_path)?;
 
-    // Get entities with tickers that have recent signals (worth tracking)
+    // Get entities with tickers that have recent signals (worth tracking).
+    // 2026-07-23: this used to be an unordered LIMIT 50 — an arbitrary 2% of
+    // the ~2,500 ticker-mapped entities, picked by whatever SQLite's query
+    // planner returned first, despite the comment already claiming "recent
+    // signals" filtering that the SQL never actually did. That's most of why
+    // search_trend_delta had only 3 real signals in 90 days. Now actually
+    // orders by most-recent entity_mentions activity (indexed) and raises
+    // the cap — Wikipedia's pageviews API is ~100 req/s and this fetch runs
+    // at ~150ms/entity, so 300 entities is ~45s, well within budget.
     let entities: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT ec.canonical_name, et.ticker
+            "SELECT ec.canonical_name, et.ticker
              FROM entity_canonical ec
              JOIN entities e ON e.canonical_id = ec.id
              JOIN entity_tickers et ON et.entity_id = e.id
+             LEFT JOIN entity_mentions em ON em.entity_id = e.id
              WHERE et.ticker IS NOT NULL
-             LIMIT 50"
+             GROUP BY ec.canonical_name, et.ticker
+             ORDER BY MAX(em.mentioned_at) DESC
+             LIMIT 300"
         )?;
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .filter_map(|r| r.ok())
@@ -27,13 +38,16 @@ pub async fn fetch(db_path: &std::path::Path) -> anyhow::Result<Vec<RawArticle>>
     };
 
     if entities.is_empty() {
-        // Fallback: try entities table directly
+        // Fallback: try entities table directly (same recency ordering as above)
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT e.name, et.ticker
+            "SELECT e.name, et.ticker
              FROM entities e
              JOIN entity_tickers et ON et.entity_id = e.id
+             LEFT JOIN entity_mentions em ON em.entity_id = e.id
              WHERE et.ticker IS NOT NULL
-             LIMIT 50"
+             GROUP BY e.name, et.ticker
+             ORDER BY MAX(em.mentioned_at) DESC
+             LIMIT 300"
         )?;
         let fallback: Vec<(String, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?

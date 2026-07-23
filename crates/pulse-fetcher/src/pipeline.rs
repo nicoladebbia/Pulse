@@ -763,6 +763,18 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Position management failed (non-fatal): {}", e),
     }
 
+    // Phase 13.7: Verify the realized-P&L WRITE on every close path (non-fatal).
+    // Path-agnostic table query over resolved post-arm rows — catches a bad/NULL
+    // pnl write from the sell branch OR the 404/reconcile no-fill branch, either of
+    // which would silently corrupt the edge-report substrate. Fires a permanent
+    // breakage alarm + a one-time "first close" runtime confirmation (rule #8).
+    {
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if let Err(e) = crate::edge_report::verify_pnl_writes(db_path, &now, &notify_info) {
+            tracing::warn!("P&L-write verification failed (non-fatal): {}", e);
+        }
+    }
+
     // Phase 14: Automated calibration (non-fatal)
     progress.update_detail("Calibrating signal weights", 100.0);
     tracing::info!("Phase 14: Running signal calibration...");
@@ -797,6 +809,16 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Ok(true) => tracing::info!("Portfolio snapshot recorded"),
         Ok(false) => tracing::info!("Portfolio snapshot skipped"),
         Err(e) => tracing::warn!("Portfolio snapshot failed (non-fatal): {}", e),
+    }
+
+    // Phase 14.2: Announce ONCE when the post-arm edge sample first reaches N=20
+    // (non-fatal). No verdict, no flag flip — a human runs `--mode edge-report`.
+    // Removes the "remember to check in weeks" dependency; latched, fires once.
+    {
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        if let Err(e) = crate::edge_report::maybe_announce_edge_sample(db_path, &now, &notify_info) {
+            tracing::warn!("Edge-sample announce check failed (non-fatal): {}", e);
+        }
     }
 
     // Phase 14.5: Generate predictions (Sonnet daily, Opus Sunday) (non-fatal)
@@ -3184,8 +3206,149 @@ pub fn backfill_tickers(db_path: &Path) -> anyhow::Result<usize> {
     populate_tickers_limited(db_path, 100_000)
 }
 
+/// Rebuild the entity-canonical graph from scratch (via `--mode recanonicalize`).
+///
+/// `resolve_entities` only processes entities with a NULL `canonical_id`, so tightening the
+/// canonicalization match logic does NOT un-merge groups that were already over-merged (e.g. the
+/// 129 unrelated companies swept into canonical "Arm" by the old substring match). This standalone
+/// pass wipes the existing grouping and rebuilds it under the current (fixed) logic, then re-runs
+/// the downstream ticker + signal + cross-signal computation so the Signals tabs reflect clean
+/// groups. No Groq/LLM calls — pure DB work, safe to run against a copy first.
+pub fn run_recanonicalize(db_path: &Path) -> anyhow::Result<usize> {
+    {
+        let conn = rusqlite::Connection::open(db_path)?;
+        // Reset the poisoned grouping. entity_canonical is fully derived from entities, so
+        // clearing both and rebuilding is lossless (nothing else owns canonical rows).
+        tracing::info!("Recanonicalize: clearing existing canonical grouping...");
+        conn.execute("UPDATE entities SET canonical_id = NULL", [])?;
+        conn.execute("DELETE FROM entity_canonical", [])?;
+
+        // Purge the poisoned 0.6-confidence tickers (the old contains-match tier). These carried
+        // both a wrong ticker AND a wrong CIK (e.g. Arm Holdings got HYFM + Hydrofarm's CIK), which
+        // then force spurious ticker/CIK merges in resolve_entities. Deleting them drops those
+        // entities back into populate_tickers_limited's unmapped set (it skips ids already in
+        // entity_tickers), so they get re-resolved with the fixed word-boundary logic. A ticker
+        // whose ONLY source was a coincidentally-correct 0.6 guess is intentionally sacrificed —
+        // a lucky wrong-method match isn't worth keeping for "super correct".
+        let purged = conn.execute("DELETE FROM entity_tickers WHERE confidence = 0.6", [])?;
+        tracing::info!("Recanonicalize: purged {} poisoned 0.6-confidence tickers", purged);
+    }
+
+    // Rebuild canonical groups. resolve_entities processes up to 500 per call, so loop until
+    // it drains (returns 0). Bounded to avoid any pathological infinite loop.
+    let mut total = 0usize;
+    for _ in 0..500 {
+        let n = resolve_entities(db_path)?;
+        total += n;
+        if n == 0 {
+            break;
+        }
+    }
+    tracing::info!("Recanonicalize: resolved {} entities into canonical groups", total);
+
+    // Re-populate per-entity tickers (highest-confidence pick) across the whole table.
+    match populate_tickers_limited(db_path, 100_000) {
+        Ok(n) => tracing::info!("Recanonicalize: mapped {} entity tickers", n),
+        Err(e) => tracing::warn!("Recanonicalize ticker mapping failed (non-fatal): {}", e),
+    }
+
+    // Propagate those tickers up to the canonical groups. MUST run after ticker population —
+    // the resolve loop above ran before entity_tickers was filled, so canonical rows for
+    // newly-mapped entities are still NULL until this pass. Without it "Arm Holdings" stays
+    // stale (the exact symptom that outlived the interrupted run).
+    match refresh_canonical_tickers(db_path) {
+        Ok(n) => tracing::info!("Recanonicalize: propagated tickers to {} canonical groups", n),
+        Err(e) => tracing::warn!("Recanonicalize canonical ticker refresh failed (non-fatal): {}", e),
+    }
+
+    // Recompute entity signals + cross-signals from the clean groups so convergence is rebuilt.
+    {
+        let conn = rusqlite::Connection::open(db_path)?;
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        if let Err(e) = recompute_signals_pipeline(&conn, &today) {
+            tracing::warn!("Recanonicalize signal recompute failed (non-fatal): {}", e);
+        }
+    }
+    match compute_cross_signals(db_path) {
+        Ok(n) => tracing::info!("Recanonicalize: recomputed {} cross-signal scores", n),
+        Err(e) => tracing::warn!("Recanonicalize cross-signal computation failed (non-fatal): {}", e),
+    }
+
+    // compute_cross_signals only writes today's rows; historical cross_signals rows keep
+    // stale tickers from before this recanonicalization. The auto-buy window reads the last
+    // 1-day of rows, so a stale ticker (Arm's HYFM) would reach the money path. Re-derive
+    // every canonical-grouped row's ticker from the now-corrected entity_canonical mapping.
+    match refresh_cross_signal_tickers(db_path) {
+        Ok(n) => tracing::info!("Recanonicalize: repaired {} cross-signal tickers from canonical", n),
+        Err(e) => tracing::warn!("Recanonicalize cross-signal ticker repair failed (non-fatal): {}", e),
+    }
+
+    Ok(total)
+}
+
 fn populate_tickers(db_path: &Path) -> anyhow::Result<usize> {
     populate_tickers_limited(db_path, 200)
+}
+
+/// Propagate the best per-entity ticker up to each canonical group.
+///
+/// `resolve_entities` runs this same UPDATE at the end of each pass, but only against the
+/// `entity_tickers` rows that exist AT THAT MOMENT. During a full recanonicalize the resolve
+/// loop runs BEFORE `populate_tickers_limited` fills `entity_tickers`, so canonical rows for
+/// newly-mapped entities would stay NULL (this is exactly why "Arm Holdings" kept a stale
+/// ticker after the interrupted run). Call this AFTER ticker population to close the gap.
+/// This is the AUTHORITATIVE pick — it runs last, after all tickers are populated, so it
+/// deliberately does NOT gate on `ticker IS NULL`. The in-loop UPDATE at resolve_entities is
+/// first-write-wins across passes (a group's ticker locks in on the first pass that links any
+/// ticker, and a higher-confidence entity joining later can't replace it). Overwriting here
+/// with the full ORDER BY makes the highest-confidence linked ticker win regardless of pass
+/// order. The `id IN (...)` guard ensures the subquery always finds ≥1 linked ticker, so no
+/// canonical row is ever nulled by this.
+fn refresh_canonical_tickers(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute(
+        "UPDATE entity_canonical SET ticker = (
+            SELECT et.ticker FROM entity_tickers et
+            JOIN entities e ON e.id = et.entity_id
+            WHERE e.canonical_id = entity_canonical.id
+            ORDER BY et.confidence DESC, et.is_public DESC, et.last_verified DESC
+            LIMIT 1
+        ) WHERE id IN (
+            SELECT DISTINCT e.canonical_id FROM entities e
+            JOIN entity_tickers et ON et.entity_id = e.id
+            WHERE e.canonical_id IS NOT NULL
+        )",
+        [],
+    ).map_err(Into::into)
+}
+
+/// Re-derive `cross_signals.ticker` from the corrected `entity_canonical` mapping.
+///
+/// `compute_cross_signals` only writes rows for `computed_at = today`, so historical
+/// rows keep whatever ticker was authoritative when they were written. After a
+/// re-canonicalization corrects `entity_canonical.ticker` (e.g. Arm HYFM→ARM), every
+/// prior cross_signals row for that entity is stale — and the auto-buy window
+/// (`computed_at >= date('now','-1 day')`) reads yesterday's rows, so stale tickers
+/// reach the money path. This repairs ALL canonical-grouped rows to match their
+/// canonical, mirroring `refresh_canonical_tickers`' authority.
+///
+/// SCOPE IS DELIBERATELY canonical-only: rows whose entity has NO canonical group
+/// (`canonical_id IS NULL`) are direct-mapped from a confident entity_tickers row
+/// (e.g. CORECIVIC→CXW 0.95, UNITIL→UTL 0.98) and are NOT touched — NULLing them
+/// would wipe legitimate signals. Emits real NULL where the canonical has no ticker
+/// (so the buy query's `ticker IS NOT NULL` gate correctly rejects e.g. CIA/EY/ICE).
+fn refresh_cross_signal_tickers(db_path: &Path) -> anyhow::Result<usize> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute(
+        "UPDATE cross_signals SET ticker = (
+            SELECT ec.ticker FROM entities e
+            JOIN entity_canonical ec ON ec.id = e.canonical_id
+            WHERE e.id = cross_signals.entity_id
+        ) WHERE entity_id IN (
+            SELECT id FROM entities WHERE canonical_id IS NOT NULL
+        )",
+        [],
+    ).map_err(Into::into)
 }
 
 fn populate_tickers_limited(db_path: &Path, limit: usize) -> anyhow::Result<usize> {
@@ -3242,9 +3405,15 @@ fn populate_tickers_limited(db_path: &Path, limit: usize) -> anyhow::Result<usiz
         ).ok();
 
         if let Some((ticker, cik)) = ticker_from_metadata {
+            // Story financial_metadata.ticker is LLM-extracted at fetch time and NOT cross-checked
+            // against the entity — it can be flat wrong (story 2542 "Arm Holdings Wikipedia views"
+            // carried ticker=HYFM). It used to be stamped 1.0, OUTRANKING the authoritative SEC CIK
+            // match (0.95/0.98), so the group's ORDER BY confidence pick chose the LLM guess over a
+            // government identifier. Demoted below every SEC-derived source; only the SEC contains
+            // fallback (0.6) is weaker.
             conn.execute(
                 "INSERT OR IGNORE INTO entity_tickers (entity_id, ticker, cik, confidence)
-                 VALUES (?1, ?2, ?3, 1.0)",
+                 VALUES (?1, ?2, ?3, 0.75)",
                 rusqlite::params![entity_id, ticker, cik],
             )?;
             mapped += 1;
@@ -3276,9 +3445,12 @@ fn populate_tickers_limited(db_path: &Path, limit: usize) -> anyhow::Result<usiz
                         let cik_norm = cik_digits.trim_start_matches('0').to_string();
                         if !cik_norm.is_empty() {
                             if let Some((ticker, cik)) = cik_map.get(&cik_norm) {
+                                // CIK match = a government-registered identifier embedded in the
+                                // entity name. Strongest possible signal → TOP of the ladder (0.98),
+                                // above story-metadata (0.75) and every fuzzy name match.
                                 conn.execute(
                                     "INSERT OR IGNORE INTO entity_tickers (entity_id, ticker, cik, confidence)
-                                     VALUES (?1, ?2, ?3, 0.95)",
+                                     VALUES (?1, ?2, ?3, 0.98)",
                                     rusqlite::params![entity_id, ticker, cik],
                                 )?;
                                 mapped += 1;
@@ -3379,8 +3551,30 @@ async fn download_sec_tickers_async() -> anyhow::Result<std::collections::HashMa
     Ok(map)
 }
 
+/// Word-boundary containment: is `needle` a contiguous run of WHOLE WORDS inside `hay`?
+///
+/// Replaces raw `str::contains` in the entity/ticker resolution paths. The substring version
+/// merged any name/key containing a short token as a substring — "arm holdings" matched SEC key
+/// "hydrofarm holdings, inc" (…hydrof-ARM HOLDINGS…) → attached HYFM + Hydrofarm's CIK to the
+/// real Arm Holdings, poisoning the ticker AND forcing a CIK/ticker merge into Hydrofarm's group.
+/// Requiring whole-word alignment keeps legit hits ("apple" ⊂ "apple inc") and drops the bleed.
+/// `needle.len() < 3` returns false to avoid single-token noise (matches the ≥3 guards nearby).
+fn contains_words(hay: &str, needle: &str) -> bool {
+    if needle.len() < 3 {
+        return false;
+    }
+    let hay_tokens: Vec<&str> = hay.split_whitespace().collect();
+    let needle_tokens: Vec<&str> = needle.split_whitespace().collect();
+    if needle_tokens.is_empty() || needle_tokens.len() > hay_tokens.len() {
+        return false;
+    }
+    hay_tokens
+        .windows(needle_tokens.len())
+        .any(|w| w == needle_tokens.as_slice())
+}
+
 /// Resolve entity name to ticker using SEC data.
-/// Tries: exact match → suffix-stripped match → contains match.
+/// Tries: exact match → suffix-stripped match → word-boundary contains match.
 fn resolve_ticker_sec(
     name: &str,
     sec_map: &std::collections::HashMap<String, (String, String)>,
@@ -3399,9 +3593,10 @@ fn resolve_ticker_sec(
         return None;
     }
 
-    // 1. Exact match
+    // 1. Exact name match against SEC company list. Strong, but below a CIK match (0.98) —
+    // a name can collide, a CIK cannot. Was 1.0 (tied with story-metadata); now 0.95.
     if let Some((ticker, cik)) = sec_map.get(&name_lower) {
-        return Some((ticker.clone(), cik.clone(), 1.0));
+        return Some((ticker.clone(), cik.clone(), 0.95));
     }
 
     // 2. Strip common suffixes
@@ -3416,15 +3611,16 @@ fn resolve_ticker_sec(
         for (key, (ticker, cik)) in sec_map.iter() {
             let key_stripped = suffixes.iter().fold(key.as_str(), |s, sfx| s.trim_end_matches(sfx)).trim();
             if key_stripped == stripped {
-                return Some((ticker.clone(), cik.clone(), 0.8));
+                return Some((ticker.clone(), cik.clone(), 0.85));
             }
         }
     }
 
-    // 3. Contains match (min 5 chars to avoid false positives)
+    // 3. Word-boundary contains match (min 5 chars to avoid false positives).
+    // Was raw substring — "arm holdings" matched "hydrofarm holdings, inc" → HYFM poison.
     if name_lower.len() >= 5 {
         for (key, (ticker, cik)) in sec_map.iter() {
-            if key.contains(&name_lower) || name_lower.contains(key.as_str()) {
+            if contains_words(key, &name_lower) || contains_words(&name_lower, key) {
                 return Some((ticker.clone(), cik.clone(), 0.6));
             }
         }
@@ -3514,13 +3710,22 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
         Ok(rows.collect())
     };
 
-    // Stage 2 — source diversity (last 7 days). Distinct source_names per topic.
+    // Stage 2 — source diversity (last 30 days). Distinct source_names per topic.
+    // 30-day, NOT 7-day: news coverage is bursty, so a 7-day slice scores even
+    // well-covered entities at diversity=1 (Nvidia: 1 over 7d vs 9 over 30d,
+    // measured 2026-07-15). The convergence gate needs src_diversity>=2, and this
+    // UPDATE (written at ~3958) runs AFTER — and clobbers — the financial writer in
+    // extract_entities_from_financial_metadata, which already uses 30 days. A 7-day
+    // window here silently overwrote that broader count with 1 and starved the
+    // `positive>=2 && src_diversity>=2` convergence branch to ~32 of 2712 signals.
+    // 30d aligns both writers and the news timescale (raises it to ~133; the
+    // positive>=2 + compound>0.3 gates keep candidate volume bounded, not a firehose).
     let diversity_map: HashMap<Key, f64> = load_metric(
         "SELECT tm.topic, tm.sector, CAST(COUNT(DISTINCT s.source_name) AS REAL)
          FROM entity_mentions em
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
-         WHERE em.mentioned_at >= date(?1, '-7 days')
+         WHERE em.mentioned_at >= date(?1, '-30 days')
          GROUP BY tm.topic, tm.sector",
         &[&today],
     ).unwrap_or_default();
@@ -3824,13 +4029,21 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
          insider_vol, inst_flow, contract_val, patent_rate,
          search_delta, import_delta, reg_sentiment, lobby_delta) in &rows
     {
-        // Normalize each dimension — same scales as cross_signals.rs
+        // Normalize each dimension.
         let insider_norm = normalize_signal(*insider_vol, 1_000_000.0);
         let inst_norm = normalize_signal(*inst_flow, 15.0); // Count of distinct 13F filers holding this stock
-        // Pure acceleration ratio, gated by minimum sample. Mirrors cross_signals.rs.
+        // Pure acceleration ratio, gated by minimum sample.
         let news_norm = if *w7 >= 3 { normalize_signal(*acceleration, 2.0) } else { 0.0 };
-        // Government signal: contract value + regulatory/8-K severity composite
-        let contract_norm = normalize_signal(*contract_val, 10_000_000.0);
+        // Government signal: contract value + regulatory/8-K severity composite.
+        // 2026-07-23: scale was $10M — measured against real USASpending data,
+        // even the 10th percentile contract ($69.5M) already saturates a $10M
+        // sigmoid to 99.9%, and ALL 543 nonzero contract_value rows in the DB
+        // crossed the 0.3 threshold. Every contract from $12M to $410B was
+        // normalizing to ~1.0, giving contract_norm zero discriminative power
+        // despite government_signal carrying real 0.1848 weight. Rescaled to
+        // $200M, anchored to the real median ($220M) so the sigmoid actually
+        // spreads across the observed range (p10=$69.5M, p75=$797M, p90=$3.1B).
+        let contract_norm = normalize_signal(*contract_val, 200_000_000.0);
         let reg_norm = normalize_signal(*reg_sentiment, 3.0);
         let gov_norm = (contract_norm * 0.6 + reg_norm * 0.4).min(1.0);
         let search_norm = normalize_signal(*search_delta, 50.0);
@@ -3850,8 +4063,15 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
             .max(0.0).min(1.0);
 
         // Convergence: 3+ signals > 0.3 AND source_diversity >= 3
-        let positive = [insider_norm, inst_norm, news_norm, gov_norm,
-            search_norm, patent_norm, supply_norm, political_norm]
+        // institutional_flow and supply_chain are excluded here — both are
+        // zero-weighted in `compound` (weights[1]/weights[6], known bugs: the
+        // substring-match false-positive and the market-wide constant), so
+        // they must not be allowed to swing the convergence gate either.
+        // Measured 2026-07-23: 363/1130 real candidates had institutional_flow
+        // > 0.3, and 3 of those relied on it as the deciding vote (only 1 other
+        // real dim also > 0.3) — including META on 2026-04-27.
+        let positive = [insider_norm, news_norm, gov_norm,
+            search_norm, patent_norm, political_norm]
             .iter().filter(|&&v| v > 0.3).count();
         // Convergence: 2+ signals > 0.3 AND diversity >= 2, OR very high compound score
         let convergence = (positive >= 2 && *src_diversity >= 2) || compound >= 0.40;
@@ -4566,25 +4786,39 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
 
             // Capture the recent stories that drove this signal so the trade
             // journal can show "we bought because of these specific headlines".
-            // Limit to the 8 most recent / most-cited stories per entity.
-            let story_refs: Vec<(i64, String, String)> = {
-                let mut s = match conn.prepare(
+            // Mentions often land on an alias row of the same company ("Arm" vs
+            // "ARM HOLDINGS PLC"), so include every entity mapped to the trade's
+            // ticker. Grouping by ticker, NOT entities.canonical_id — canonical
+            // groups are polluted (AIRI's contains Fitbit; ARM's canonical is
+            // Vertex Pharma), which would attach unrelated headlines as the
+            // trade's "reason". 30-day window matches the source_diversity
+            // starvation fix. The order has already executed on Alpaca by this
+            // point, so a story-lookup failure must never skip recording the
+            // trade — every error path degrades to an empty list, never
+            // `continue`.
+            let story_refs: Vec<(i64, String, String)> = conn
+                .prepare(
                     "SELECT s.id, s.headline, s.source_name
                      FROM entity_mentions em
                      JOIN stories s ON s.id = em.story_id
-                     WHERE em.entity_id = ?1
-                       AND em.mentioned_at >= date('now', '-14 days')
+                     WHERE em.entity_id IN (
+                           SELECT entity_id FROM entity_tickers WHERE ticker = ?2
+                           UNION SELECT ?1
+                       )
+                       AND em.mentioned_at >= date('now', '-30 days')
                      ORDER BY em.mentioned_at DESC, s.importance_score DESC
                      LIMIT 8"
-                ) {
-                    Ok(stmt) => stmt,
-                    Err(_) => continue,
-                };
-                s.query_map([entity_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                )
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map(
+                        rusqlite::params![entity_id, ticker.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
                     .ok()
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default()
-            };
+                })
+                .unwrap_or_default();
 
             // Build signal_profile JSON matching calibration keys.
             // Now includes `stories[]` so the trade journal can reference the
@@ -4771,6 +5005,16 @@ pub async fn run_position_management(db_path: &Path) -> anyhow::Result<usize> {
     manage_open_positions(db_path).await
 }
 
+/// Run ONLY the auto-buy phase (Phase 13.5) in isolation — same gate, same
+/// candidate query, same Alpaca paper endpoint as the daily pipeline. Exists as a
+/// manual buy trigger: the daily run short-circuits at the "already fetched today"
+/// guard once the day's first slot succeeds, so later slots never reach Phase 13.5.
+/// This lets a fresh convergence set be acted on without a re-fetch. Still hard-gated
+/// by AUTO_TRADE_ENABLED; a no-op when disarmed. Paper-only (hardcoded endpoint).
+pub async fn run_auto_trade(db_path: &Path) -> anyhow::Result<usize> {
+    auto_trade_on_convergence(db_path).await
+}
+
 async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
     let dry_run = std::env::var("EXIT_DRY_RUN")
         .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))
@@ -4904,7 +5148,7 @@ async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
         let decayed = crate::position_management::check_signal_decay(&conn, ticker, *orig_score);
 
         let action = crate::position_management::evaluate_position(
-            &conn, *trade_id, ticker, *entry_price, entry_date, current_price, &today,
+            &conn, *trade_id, ticker, *entry_price, current_price,
         );
 
         // Decide final action: signal decay forces a full close (overrides Hold).
@@ -4921,7 +5165,7 @@ async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
                     (held_qty / 2.0, reason)
                 }
             }
-            PositionAction::TightenStop { .. } | PositionAction::Hold => {
+            PositionAction::Hold => {
                 if decayed {
                     (held_qty, format!("signal_decay (orig {:.2}, pnl {:.1}%)", orig_score, pnl_pct))
                 } else {
@@ -5025,6 +5269,15 @@ async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
                     pnl=?3, pnl_pct=?4 WHERE id=?5",
                 rusqlite::params![exit_price, now_dt, pnl_dollars, pnl_pct_final, trade_id],
             ).ok();
+            // Journal the close. This is the SINGLE exit authority (Phase 13.6),
+            // so it owns journal generation — calibration is measure-only and no
+            // longer closes trades. Without this, the Portfolio exit-reasons
+            // feature stops getting entries once auto-exits arm.
+            let reason_status = if reason.starts_with("signal_decay") { "closed" } else { "stopped_out" };
+            crate::position_management::generate_trade_journal(
+                &conn, *trade_id, ticker, entry_date, &today,
+                *entry_price, exit_price, *position_size, pnl_pct_final, pnl_dollars, reason_status,
+            );
             tracing::info!("Position mgmt: CLOSED {} @ ${:.2} ({:+.1}%, ${:+.2})",
                 ticker, exit_price, pnl_pct_final, pnl_dollars);
         } else {
@@ -5635,8 +5888,11 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
 
     if unresolved.is_empty() { return Ok(0); }
 
-    // Load existing canonical entities for matching
-    let existing_canonicals: Vec<(i64, String, Option<String>, Option<String>)> = {
+    // Load existing canonical entities for matching. MUTABLE: canonicals created during this
+    // loop are pushed back in (see the create branch) so a later entity in the SAME batch can
+    // match one an earlier entity just created. Without this, "Arm" (entity 122) and "Arm
+    // Holdings" (entity 21) split into two groups because 21 couldn't see the canonical 122 made.
+    let mut existing_canonicals: Vec<(i64, String, Option<String>, Option<String>)> = {
         let mut stmt = conn.prepare(
             "SELECT id, canonical_name, ticker, cik FROM entity_canonical"
         )?;
@@ -5666,6 +5922,9 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
         }
         n.trim().to_string()
     };
+
+    // Uses the module-scope `contains_words` (also used by resolve_ticker_sec) for the
+    // word-boundary name match below — "arm" no longer merges "hydrofarm"/"pharma".
 
     let mut resolved = 0usize;
 
@@ -5713,8 +5972,10 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
                     matched_canonical_id = Some(*cid);
                     break;
                 }
-                // Also try contains for short names (>= 5 chars)
-                if name_norm.len() >= 5 && (c_norm.contains(&name_norm) || name_norm.contains(&c_norm)) {
+                // Word-boundary containment (either direction). Requires whole-word alignment
+                // so "arm" no longer matches "hydrofarm"/"pharma"; "nvidia" still matches
+                // "nvidia corp". Min length enforced inside contains_words.
+                if contains_words(&c_norm, &name_norm) || contains_words(&name_norm, &c_norm) {
                     matched_canonical_id = Some(*cid);
                     break;
                 }
@@ -5741,6 +6002,12 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
                 "SELECT id FROM entity_canonical WHERE canonical_name = ?1",
                 [&canon_name], |row| row.get(0),
             ).ok();
+
+            // Make this new canonical visible to later entities in the SAME batch, so intra-batch
+            // duplicates ("Arm" then "Arm Holdings") collapse into it instead of each spawning a row.
+            if let Some(new_cid) = matched_canonical_id {
+                existing_canonicals.push((new_cid, canon_name.clone(), ticker.clone(), entity_cik.clone()));
+            }
         }
 
         // Link entity to canonical
@@ -5771,12 +6038,16 @@ fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
         }
     }
 
-    // Update canonical entities with best available ticker/CIK from linked entities
+    // Update canonical entities with best available ticker from linked entities.
+    // Pick the HIGHEST-CONFIDENCE ticker, not an arbitrary one — the old `LIMIT 1` with no
+    // ORDER BY grabbed a random linked ticker, so a polluted group could resolve to a junk
+    // 0.6-confidence mapping over the correct 0.95 one. Tie-break by is_public then most-recent.
     conn.execute_batch(
         "UPDATE entity_canonical SET ticker = (
             SELECT et.ticker FROM entity_tickers et
             JOIN entities e ON e.id = et.entity_id
             WHERE e.canonical_id = entity_canonical.id
+            ORDER BY et.confidence DESC, et.is_public DESC, et.last_verified DESC
             LIMIT 1
         ) WHERE ticker IS NULL AND id IN (
             SELECT DISTINCT e.canonical_id FROM entities e
@@ -5819,6 +6090,19 @@ fn notify_degraded(msg: &str) {
         .arg(format!(
             r#"display notification "{}" with title "Pulse fetch DEGRADED" sound name "Basso""#,
             msg.replace('"', "'").replace('\\', "")
+        ))
+        .status();
+}
+
+/// General title+body notification (used by the edge-report money-path hooks).
+/// `.status()` not `.spawn()` for the same launchd-delivery reason as above.
+pub fn notify_info(title: &str, body: &str) {
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            r#"display notification "{}" with title "{}" sound name "Glass""#,
+            body.replace('"', "'").replace('\\', ""),
+            title.replace('"', "'").replace('\\', "")
         ))
         .status();
 }
