@@ -7,15 +7,19 @@ use std::path::Path;
 /// 1. Evaluate open paper trades against current prices
 /// 2. Compute Brier scores for resolved predictions
 /// 3. Track which signal dimensions predict actual outcomes
-/// 4. Auto-adjust signal weights based on empirical hit rates
-/// 5. Prune dead signals (consistently < 50% hit rate)
+/// 4. Propose a reweight based on empirical hit rates — written to
+///    `pending_calibration` for manual approval, NOT applied automatically
+///    (2026-07-23, Task 3.3 — see `adjust_weights` doc comment for why)
+/// 5. Flag dead signals (consistently < 50% hit rate) for review
 ///
 /// Runs as pipeline Phase 14 (after cross-signal detection).
 
 /// Calibration weights stored in DB for persistence across runs.
 /// Zeroed dimensions (no data source) excluded from compound score.
 /// Active weights sum to 1.0.
-const DEFAULT_WEIGHTS: &[(&str, f64)] = &[
+/// Single source of truth — pipeline.rs::load_calibrated_weights derives its
+/// positional array from this instead of hand-duplicating the numbers.
+pub(crate) const DEFAULT_WEIGHTS: &[(&str, f64)] = &[
     ("insider_signal", 0.2391),
     ("institutional_flow", 0.0),    // ZEROED 2026-06-05: substring-match bug (ticker "X" = 61 funds); restore when fixed
     ("news_momentum", 0.2391),
@@ -42,7 +46,8 @@ pub async fn run_calibration(db_path: &Path) -> anyhow::Result<CalibrationReport
     // 3. Analyze signal dimension hit rates
     report.signal_analysis = analyze_signal_performance(&conn)?;
 
-    // 4. Auto-adjust weights if we have enough data
+    // 4. Propose a reweight if we have enough data — holds in pending_calibration,
+    // does not touch live weights (see adjust_weights doc comment)
     if report.signal_analysis.total_resolved >= 10 {
         report.weights_adjusted = adjust_weights(&conn, &report.signal_analysis)?;
     }
@@ -58,6 +63,8 @@ pub struct CalibrationReport {
     pub positions_evaluated: usize,
     pub brier_scores_updated: usize,
     pub signal_analysis: SignalAnalysis,
+    /// True if a reweight PROPOSAL was written to `pending_calibration` this
+    /// run — NOT that live weights changed. See `adjust_weights`.
     pub weights_adjusted: bool,
     pub confidence_calibration: Vec<(f64, f64, usize)>, // (predicted, actual, count)
 }
@@ -222,20 +229,35 @@ fn analyze_signal_performance(conn: &Connection) -> anyhow::Result<SignalAnalysi
     Ok(analysis)
 }
 
-/// Auto-adjust signal weights based on empirical performance.
+/// Compute a proposed reweight from empirical performance and hold it in
+/// `pending_calibration` for manual approval — does NOT touch
+/// `user_profile.calibrated_weights` (see `apply_pending_calibration` in
+/// src-tauri/src/commands/trading.rs for the explicit apply step).
+///
+/// 2026-07-23 (calibration-backtest-universe audit, Task 3.3): this used to
+/// INSERT OR REPLACE the live weights directly, silently, the moment
+/// total_resolved crossed 10 — no significance test, no held-out check, no
+/// human in the loop. The corrected 41-day historical backfill (Finding C)
+/// found only ~4-5 independent resolved episodes even with clean signal
+/// computation, and the live paper_trades sample is smaller still — nowhere
+/// near enough to trust an automatic reweight. Proposals are logged loudly
+/// and held until Nicola explicitly applies them.
 fn adjust_weights(conn: &Connection, analysis: &SignalAnalysis) -> anyhow::Result<bool> {
     if analysis.dimension_hit_rates.is_empty() {
         return Ok(false);
     }
 
-    // Store calibrated weights as a JSON config in the DB
+    // Compute the full proposed weight vector (same math as before)
     let mut weights: Vec<(String, f64)> = DEFAULT_WEIGHTS
         .iter()
         .map(|(k, v)| (k.to_string(), *v))
         .collect();
 
+    // dimension -> (hit_rate, sample_size), for logging into pending_calibration
+    let mut applied_dims: Vec<(&str, f64, usize)> = Vec::new();
+
     for (dim, hit_rate, sample_size) in &analysis.dimension_hit_rates {
-        // Only adjust if we have enough data
+        // Only propose an adjustment if we have enough data
         if *sample_size < 5 {
             continue;
         }
@@ -261,6 +283,12 @@ fn adjust_weights(conn: &Connection, analysis: &SignalAnalysis) -> anyhow::Resul
                 *v *= adjustment;
             }
         }
+        applied_dims.push((weight_key, *hit_rate, *sample_size));
+    }
+
+    if applied_dims.is_empty() {
+        tracing::info!("Calibration: no dimension had >=5 resolved samples — no proposal generated");
+        return Ok(false);
     }
 
     // Normalize weights to sum to 1.0
@@ -271,14 +299,39 @@ fn adjust_weights(conn: &Connection, analysis: &SignalAnalysis) -> anyhow::Resul
         }
     }
 
-    // Store calibrated weights
-    let weights_json = serde_json::to_string(&weights)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO user_profile (key, value) VALUES ('calibrated_weights', ?1)",
-        [&weights_json],
-    )?;
+    let batch_id = uuid_like_batch_id();
+    let computed_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let old_by_key: std::collections::HashMap<&str, f64> =
+        DEFAULT_WEIGHTS.iter().map(|(k, v)| (*k, *v)).collect();
 
-    tracing::info!("Calibration: adjusted signal weights based on {} resolved trades", analysis.total_resolved);
+    for (key, new_weight) in &weights {
+        let old_weight = *old_by_key.get(key.as_str()).unwrap_or(&0.0);
+        let (hit_rate, sample_size) = applied_dims
+            .iter()
+            .find(|(k, _, _)| *k == key.as_str())
+            .map(|(_, hr, n)| (Some(*hr), Some(*n as i64)))
+            .unwrap_or((None, None));
+        conn.execute(
+            "INSERT INTO pending_calibration
+                (batch_id, computed_at, dimension, old_weight, new_weight, hit_rate, sample_size, total_resolved, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
+            rusqlite::params![
+                batch_id,
+                computed_at,
+                key,
+                old_weight,
+                new_weight,
+                hit_rate,
+                sample_size,
+                analysis.total_resolved as i64,
+            ],
+        )?;
+    }
+
+    tracing::warn!(
+        "Calibration: PROPOSAL {} computed from {} resolved trades — held for manual approval, NOT applied. Review with get_pending_calibration, apply with apply_pending_calibration.",
+        batch_id, analysis.total_resolved
+    );
     for (dim, hit_rate, n) in &analysis.dimension_hit_rates {
         tracing::info!("  {} hit rate: {:.0}% (n={})", dim, hit_rate * 100.0, n);
     }
@@ -287,6 +340,15 @@ fn adjust_weights(conn: &Connection, analysis: &SignalAnalysis) -> anyhow::Resul
     }
 
     Ok(true)
+}
+
+/// Cheap, dependency-free batch id — not a real UUID, just unique enough to
+/// group one calibration run's dimension rows together for review/apply.
+fn uuid_like_batch_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("cal-{}-{}", now.as_secs(), now.subsec_nanos())
 }
 
 /// Compute confidence calibration curve.

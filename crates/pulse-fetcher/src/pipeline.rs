@@ -709,10 +709,10 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 12.5: Recompute entity signals before cross-signal detection
     progress.update_detail("Recomputing entity signals", 100.0);
     tracing::info!("Phase 12.5: Recomputing entity signals...");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     {
         let conn = rusqlite::Connection::open(db_path)?;
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        match recompute_signals_pipeline(&conn, &today) {
+        match recompute_signals_pipeline(&conn, &today, 90) {
             Ok(count) => {
                 if count > 0 {
                     tracing::info!("Recomputed {} entity signals", count);
@@ -725,7 +725,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 13: Cross-signal detection (non-fatal)
     progress.update_detail("Computing cross-signal scores", 100.0);
     tracing::info!("Phase 13: Computing cross-signal scores...");
-    match compute_cross_signals(db_path) {
+    match compute_cross_signals(db_path, &today) {
         Ok(count) => {
             if count > 0 {
                 tracing::info!("Computed {} cross-signal scores", count);
@@ -792,7 +792,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                     report.signal_analysis.total_resolved);
             }
             if report.weights_adjusted {
-                tracing::info!("Calibration: signal weights auto-adjusted");
+                tracing::warn!("Calibration: reweight PROPOSED and held in pending_calibration — not applied. Review + apply manually.");
             }
             if !report.signal_analysis.dead_signals.is_empty() {
                 tracing::warn!("Calibration: dead signals detected: {}",
@@ -3206,6 +3206,102 @@ pub fn backfill_tickers(db_path: &Path) -> anyhow::Result<usize> {
     populate_tickers_limited(db_path, 100_000)
 }
 
+/// Historical signal backfill (via `--mode backfill-signals`). Loops `[start, end]`
+/// ascending, recomputing `signals` + `cross_signals` as-of each historical date using
+/// the resolved calibration-backtest-universe plan's window/hold shrink (window_days=30
+/// for this pass, though the parameter is general). Filtering is by ingestion date
+/// (`entity_mentions.mentioned_at`, when the pipeline first extracted the entity) — NOT
+/// `stories.published_at`, which for financial sources holds heterogeneous, unreliable
+/// dates (USASpending contract-start dates back to 1978, FEC filing periods extending to
+/// Dec 2026) and can't be used as a clean content-date filter. Ingestion date is also the
+/// theoretically correct lookahead-safety boundary: it's exactly when the algorithm could
+/// have known about the fact, regardless of how old the underlying event was. Every
+/// windowed stage now bounds ABOVE by `<= ?1` (as_of) in addition to the existing lower
+/// bound — without it, a backfilled as_of in the past still read every mention through
+/// today, leaking ~2 months of future data into every historical signal (caught by
+/// advisor review 2026-07-23, before any calibration/backtest numbers were trusted).
+///
+/// Refuses to run against what looks like the live production DB path unless
+/// `i_know_this_is_a_copy` is set — this DELETEs and rewrites `cross_signals` rows across
+/// the given date range, which would corrupt live trading data.
+pub fn run_backfill_signals(
+    db_path: &Path,
+    start: &str,
+    end: &str,
+    window_days: i64,
+    i_know_this_is_a_copy: bool,
+) -> anyhow::Result<usize> {
+    let production_path = dirs::data_dir().map(|d| d.join("com.pulse.app").join("pulse.db"));
+    let looks_like_production = production_path
+        .as_ref()
+        .map(|p| {
+            if p == db_path {
+                return true;
+            }
+            // Fall back to canonicalized comparison for relative/symlinked paths that
+            // point at the same file. Only trust this when BOTH sides canonicalize
+            // successfully — if either fails (e.g. db_path doesn't exist yet), treat
+            // as NOT production rather than let two `None`s look like a match.
+            match (std::fs::canonicalize(p), std::fs::canonicalize(db_path)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        })
+        .unwrap_or(false);
+    if looks_like_production && !i_know_this_is_a_copy {
+        anyhow::bail!(
+            "Refusing to run backfill-signals against what looks like the live production \
+             DB ({}). This DELETEs and rewrites cross_signals rows in the given date range. \
+             Run it against a scratch copy made with `sqlite3 <live db> \".backup <copy>\"` \
+             (never `cp` — the live fetcher may be mid-write), or pass \
+             --i-know-this-is-a-copy if you're certain this path is safe.",
+            db_path.display()
+        );
+    }
+
+    let start_date = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("invalid --start '{}': {}", start, e))?;
+    let end_date = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("invalid --end '{}': {}", end, e))?;
+    if start_date > end_date {
+        anyhow::bail!("--start ({}) must be <= --end ({})", start, end);
+    }
+
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    // Wipe stale cross_signals rows in-range FIRST, before the loop writes anything.
+    // compute_cross_signals uses INSERT OR REPLACE keyed on (entity_id, date(computed_at))
+    // and SKIPS writing any entity that drops below threshold — so without this wipe, an
+    // entity whose corrected score no longer clears convergence keeps its old inflated
+    // stale row, and those surviving stale (inflated) rows would dominate candidate
+    // selection instead of being replaced by the corrected (lower/absent) values.
+    let wiped = conn.execute(
+        "DELETE FROM cross_signals WHERE date(computed_at) BETWEEN ?1 AND ?2",
+        rusqlite::params![start, end],
+    )?;
+    tracing::info!("Backfill-signals: wiped {} stale cross_signals rows in [{}, {}]", wiped, start, end);
+
+    let total_days = (end_date - start_date).num_days() + 1;
+    let mut date = start_date;
+    let mut processed = 0usize;
+    while date <= end_date {
+        let date_str = date.format("%Y-%m-%d").to_string();
+        match recompute_signals_pipeline(&conn, &date_str, window_days) {
+            Ok(n) => tracing::info!("Backfill-signals {}: recomputed {} entity signals", date_str, n),
+            Err(e) => tracing::warn!("Backfill-signals {}: signal recompute failed (non-fatal): {}", date_str, e),
+        }
+        match compute_cross_signals(db_path, &date_str) {
+            Ok(n) => tracing::info!("Backfill-signals {}: computed {} cross-signal scores", date_str, n),
+            Err(e) => tracing::warn!("Backfill-signals {}: cross-signal computation failed (non-fatal): {}", date_str, e),
+        }
+        processed += 1;
+        tracing::info!("Backfill-signals progress: {}/{} days", processed, total_days);
+        date = date.succ_opt().ok_or_else(|| anyhow::anyhow!("date overflow while backfilling"))?;
+    }
+
+    Ok(processed)
+}
+
 /// Rebuild the entity-canonical graph from scratch (via `--mode recanonicalize`).
 ///
 /// `resolve_entities` only processes entities with a NULL `canonical_id`, so tightening the
@@ -3262,14 +3358,14 @@ pub fn run_recanonicalize(db_path: &Path) -> anyhow::Result<usize> {
     }
 
     // Recompute entity signals + cross-signals from the clean groups so convergence is rebuilt.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     {
         let conn = rusqlite::Connection::open(db_path)?;
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        if let Err(e) = recompute_signals_pipeline(&conn, &today) {
+        if let Err(e) = recompute_signals_pipeline(&conn, &today, 90) {
             tracing::warn!("Recanonicalize signal recompute failed (non-fatal): {}", e);
         }
     }
-    match compute_cross_signals(db_path) {
+    match compute_cross_signals(db_path, &today) {
         Ok(n) => tracing::info!("Recanonicalize: recomputed {} cross-signal scores", n),
         Err(e) => tracing::warn!("Recanonicalize cross-signal computation failed (non-fatal): {}", e),
     }
@@ -3636,8 +3732,17 @@ fn resolve_ticker_sec(
 /// Performance: rewritten 2026-05-10 from per-topic subqueries (O(topics × stories))
 /// to per-metric GROUP BY (O(stories) per metric). Was hanging at >25min on 6566
 /// topics × 9 subqueries × full canonical scan. Now ~9 single-pass queries.
-fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyhow::Result<usize> {
+/// `window_days` is the lookback used for the "90-day" dimensions (topic
+/// momentum/dormant classification, USASpending contract value, lobbying
+/// spend) — required, not defaulted, so every call site must explicitly
+/// choose. Live callers pass 90 (unchanged production behavior); the
+/// historical backfill driver passes 30, per the resolved window/hold
+/// shrink decision (2026-07-23 calibration-backtest-universe plan).
+/// institutional_flow's 90-day window (Stage 10) is intentionally left at a
+/// hardcoded 90 — it's zeroed in DEFAULT_WEIGHTS and out of scope for backfill.
+fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str, window_days: i64) -> anyhow::Result<usize> {
     use std::collections::HashMap;
+    let window_clause = format!("-{} days", window_days);
 
     // Check if entity_canonical table exists for canonical grouping
     let has_canonical: bool = conn.query_row(
@@ -3676,16 +3781,16 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
         "SELECT tm.topic, tm.sector,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END) AS w7,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-30 days') THEN 1 ELSE 0 END) AS w30,
-            SUM(CASE WHEN em.mentioned_at >= date(?1, '-90 days') THEN 1 ELSE 0 END) AS w90,
+            SUM(CASE WHEN em.mentioned_at >= date(?1, ?2) THEN 1 ELSE 0 END) AS w90,
             COUNT(DISTINCT em.mentioned_at) AS days_active
          FROM entity_mentions em
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
-         WHERE em.mentioned_at >= date(?1, '-90 days')
+         WHERE em.mentioned_at >= date(?1, ?2) AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector"
     )?;
 
     let window_rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = stmt
-        .query_map([today], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?
+        .query_map(rusqlite::params![today, window_clause], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -3725,7 +3830,7 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
          FROM entity_mentions em
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
-         WHERE em.mentioned_at >= date(?1, '-30 days')
+         WHERE em.mentioned_at >= date(?1, '-30 days') AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector",
         &[&today],
     ).unwrap_or_default();
@@ -3743,7 +3848,7 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
          WHERE s.source_type = 'financial'
-           AND em.mentioned_at >= date(?1, '-30 days')
+           AND em.mentioned_at >= date(?1, '-30 days') AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector",
         &[&today],
     ).unwrap_or_default();
@@ -3760,9 +3865,9 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
          WHERE s.source_type = 'financial'
-           AND em.mentioned_at >= date(?1, '-90 days')
+           AND em.mentioned_at >= date(?1, ?2) AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector",
-        &[&today],
+        &[&today as &dyn rusqlite::ToSql, &window_clause as &dyn rusqlite::ToSql],
     ).unwrap_or_default();
 
     // Stage 5 — lobbying spend (LDA / Senate, last 90d).
@@ -3777,9 +3882,9 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
          WHERE s.source_type = 'financial'
-           AND em.mentioned_at >= date(?1, '-90 days')
+           AND em.mentioned_at >= date(?1, ?2) AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector",
-        &[&today],
+        &[&today as &dyn rusqlite::ToSql, &window_clause as &dyn rusqlite::ToSql],
     ).unwrap_or_default();
 
     // Stage 6 — Federal Register mentions (last 30d).
@@ -3789,7 +3894,7 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
          WHERE s.source_name LIKE '%Federal Register%'
-           AND em.mentioned_at >= date(?1, '-30 days')
+           AND em.mentioned_at >= date(?1, '-30 days') AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector",
         &[&today],
     ).unwrap_or_default();
@@ -3801,7 +3906,7 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
          WHERE (s.source_name = 'USPTO' OR s.source_name = 'Google Patents')
-           AND em.mentioned_at >= date(?1, '-30 days')
+           AND em.mentioned_at >= date(?1, '-30 days') AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector",
         &[&today],
     ).unwrap_or_default();
@@ -3818,7 +3923,7 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
          WHERE s.source_name LIKE '%EDGAR 8-K%'
-           AND em.mentioned_at >= date(?1, '-14 days')
+           AND em.mentioned_at >= date(?1, '-14 days') AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector",
         &[&today],
     ).unwrap_or_default();
@@ -3835,7 +3940,7 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
          JOIN stories s ON s.id = em.story_id
          WHERE s.source_type = 'financial'
-           AND em.mentioned_at >= date(?1, '-7 days')
+           AND em.mentioned_at >= date(?1, '-7 days') AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector",
         &[&today],
     ).unwrap_or_default();
@@ -3849,7 +3954,7 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
                AND s.financial_metadata IS NOT NULL
                AND json_valid(s.financial_metadata)
                AND json_extract(s.financial_metadata, '$.holdings') IS NOT NULL
-               AND s.published_at >= date(?1, '-90 days')"
+               AND s.published_at >= date(?1, '-90 days') AND s.published_at <= ?1"
         )?;
 
         let metadata_rows: Vec<String> = stmt.query_map([today], |row| row.get::<_, String>(0))?
@@ -3905,6 +4010,11 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
     };
 
     // Stage 11 — sector-level FRED indicator (single value, applied to all rows).
+    // 2026-07-23: was hardcoded to `datetime('now', '-7 days')`, ignoring the
+    // `today` param every other stage in this function uses — a historical
+    // backfill run would always pull TODAY's FRED value regardless of the date
+    // being recomputed. Bound to `today` so a backfill sees the value as of
+    // that date, not the live value.
     let import_delta: f64 = conn.query_row(
         "SELECT COALESCE(AVG(ABS(
             CAST(json_extract(s.financial_metadata, '$.change_pct') AS REAL)
@@ -3913,8 +4023,8 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
          WHERE s.source_name = 'FRED'
            AND json_valid(s.financial_metadata)
            AND json_extract(s.financial_metadata, '$.series_id') IN ('INDPRO', 'PPIACO', 'DCOILWTICO')
-           AND s.created_at >= datetime('now', '-7 days')",
-        [],
+           AND s.created_at >= datetime(?1, '-7 days')",
+        rusqlite::params![today],
         |row| row.get(0),
     ).unwrap_or(0.0);
 
@@ -3960,7 +4070,13 @@ fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str) -> anyho
         let inst_flow = inst_flow_map.get(&k).copied().unwrap_or(0.0);
         let search_delta = search_map.get(&k).copied().unwrap_or(0.0);
 
-        // Composite regulatory_sentiment: Fed Reg count + 8-K event boost
+        // Composite regulatory_sentiment: Fed Reg count + 8-K event boost.
+        // The *3.0 boost is a manually-set constant (Task 3.4,
+        // calibration-backtest-universe audit, 2026-07-23) — deliberately NOT
+        // part of automated calibration. The corrected historical backfill
+        // found only ~4-5 independent resolved episodes; fitting a free
+        // parameter here on that sample would overfit, not improve accuracy.
+        // Revisit once forward paper-trading data accumulates enough volume.
         let reg_composite = reg_count + (event_boost * 3.0);
 
         tx.execute(
@@ -3990,9 +4106,15 @@ fn normalize_signal(value: f64, scale: f64) -> f64 {
 /// Compute cross-signal scores for all entities.
 /// Unified with src-tauri/src/services/cross_signals.rs — same 8 dimensions,
 /// same weights, same convergence threshold (3+ signals > 0.3, diversity >= 3).
-fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
+/// `as_of` stamps the `computed_at` column — live callers pass today's date
+/// (no behavior change), a historical backfill driver passes a past date.
+/// NOTE: this function reads whatever is CURRENTLY in the upsert-only `signals`
+/// table — it has no history layer, so a backfill run must call
+/// `recompute_signals_pipeline(conn, as_of)` immediately before this for the
+/// same `as_of`, per date, in ascending order.
+fn compute_cross_signals(db_path: &Path, as_of: &str) -> anyhow::Result<usize> {
     let conn = rusqlite::Connection::open(db_path)?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = as_of;
 
     // Load calibrated weights if available, else use defaults
     let weights = load_calibrated_weights(&conn);
@@ -4045,6 +4167,11 @@ fn compute_cross_signals(db_path: &Path) -> anyhow::Result<usize> {
         // spreads across the observed range (p10=$69.5M, p75=$797M, p90=$3.1B).
         let contract_norm = normalize_signal(*contract_val, 200_000_000.0);
         let reg_norm = normalize_signal(*reg_sentiment, 3.0);
+        // The 0.6/0.4 blend is a manually-set constant (Task 3.4,
+        // calibration-backtest-universe audit, 2026-07-23) — NOT part of
+        // automated calibration, same reasoning as reg_composite's *3.0 above:
+        // more free parameters fit to a ~4-5-episode sample is overfitting,
+        // not signal. Revisit once forward paper-trading data accumulates.
         let gov_norm = (contract_norm * 0.6 + reg_norm * 0.4).min(1.0);
         let search_norm = normalize_signal(*search_delta, 50.0);
         let patent_norm = normalize_signal(*patent_rate, 5.0);
@@ -4145,7 +4272,26 @@ fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
     // (ticker "X" matched 61 funds) — both were injecting noise / dilution. Their
     // 0.08 is redistributed proportionally across the 6 live signals so weights
     // still sum to 1.0. Restore when those signals are fixed (see findings).
-    let defaults = [0.2391, 0.0, 0.2391, 0.1848, 0.0543, 0.0435, 0.0, 0.2391];
+    //
+    // 2026-07-23: derived from calibration::DEFAULT_WEIGHTS (single source of
+    // truth) instead of a second hand-typed copy of the same 8 numbers — the
+    // two had already drifted apart once (calibration-backtest-universe audit).
+    let default_weight = |key: &str| -> f64 {
+        crate::calibration::DEFAULT_WEIGHTS.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
+    };
+    let defaults = [
+        default_weight("insider_signal"),
+        default_weight("institutional_flow"),
+        default_weight("news_momentum"),
+        default_weight("government_signal"),
+        default_weight("search_trend"),
+        default_weight("patent_signal"),
+        default_weight("supply_chain"),
+        default_weight("political_signal"),
+    ];
 
     let json: Option<String> = conn.query_row(
         "SELECT value FROM user_profile WHERE key = 'calibrated_weights'",

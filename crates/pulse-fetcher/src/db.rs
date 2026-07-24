@@ -21,6 +21,8 @@ const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.
 const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_fts_porter.sql");
 const MIGRATION_025: &str = include_str!("../../../migrations/025_half_close_marker.sql");
 const MIGRATION_026: &str = include_str!("../../../migrations/026_drop_stillborn_trend_tables.sql");
+const MIGRATION_027: &str = include_str!("../../../migrations/027_ai_trade_rationale.sql");
+const MIGRATION_028: &str = include_str!("../../../migrations/028_pending_calibration.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -532,6 +534,28 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_026)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (26)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 27: Cache an AI-generated plain-English trade rationale
+    // (ai_rationale/ai_rationale_at on paper_trades). Both app + fetcher run it.
+    // NOTE: was applied out-of-band on the live DB before this wiring existed —
+    // this INSERT is a no-op there (guarded by `!applied.contains`) but fixes
+    // the gap for any fresh DB built from migrations alone.
+    if !applied.contains(&27) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_027)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (27)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 28: pending_calibration table — auto-calibration proposals
+    // held for manual approval instead of silently overwriting live weights
+    // (calibration-backtest-universe audit, Task 3.3). Both app + fetcher run it.
+    if !applied.contains(&28) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_028)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (28)", [])?;
         tx.commit()?;
     }
 

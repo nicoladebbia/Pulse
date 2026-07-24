@@ -318,6 +318,38 @@ async fn backfill_candles_alpaca(
     Ok(stored)
 }
 
+/// Ad-hoc candle backfill for a specific ticker list, independent of the daily
+/// pipeline's 200/30-per-day caps and open-position pinning (see `fetch_prices`).
+/// Used by `--mode backfill-prices` to fill price coverage for entities that
+/// never won a daily-fetch slot — e.g. calibration-backtest-universe Task 3.0
+/// found signal candidates (ORCL/TME/NVRI/GSCE/ACN) with no price rows near
+/// their open/resolve dates because the live fetcher had never reached them.
+pub async fn backfill_candles_for_tickers(
+    db_path: &std::path::Path,
+    tickers: &[String],
+    days_back: i64,
+) -> anyhow::Result<usize> {
+    let api_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
+    let conn = Connection::open(db_path)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let mut total = 0;
+    for ticker in tickers {
+        match backfill_candles(&client, &api_key, &conn, ticker, days_back).await {
+            Ok(n) => {
+                tracing::info!("backfill-prices {}: stored {} candles", ticker, n);
+                total += n;
+            }
+            Err(e) => tracing::warn!("backfill-prices {}: failed: {}", ticker, e),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    Ok(total)
+}
+
 /// Legacy Finnhub candle backfill — premium-only on free keys.
 async fn backfill_candles_finnhub(
     client: &reqwest::Client,

@@ -964,3 +964,109 @@ pub async fn get_stream_status(
 ) -> Result<StreamStatus, String> {
     Ok(live_prices::get_status(state.inner().clone()).await)
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PendingCalibrationRow {
+    pub id: i64,
+    pub batch_id: String,
+    pub computed_at: String,
+    pub dimension: String,
+    pub old_weight: f64,
+    pub new_weight: f64,
+    pub hit_rate: Option<f64>,
+    pub sample_size: Option<i64>,
+    pub total_resolved: i64,
+    pub status: String,
+}
+
+/// List calibration proposals (default: only 'pending', newest batch first).
+/// Task 3.3 — calibration.rs::adjust_weights writes here instead of touching
+/// live weights directly; this is the review surface before an explicit apply.
+#[tauri::command]
+pub fn get_pending_calibration(
+    db: State<'_, DbState>,
+    status: Option<String>,
+) -> Result<Vec<PendingCalibrationRow>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let status = status.unwrap_or_else(|| "pending".to_string());
+    let mut stmt = conn.prepare(
+        "SELECT id, batch_id, computed_at, dimension, old_weight, new_weight,
+                hit_rate, sample_size, total_resolved, status
+         FROM pending_calibration
+         WHERE status = ?1
+         ORDER BY computed_at DESC, dimension ASC"
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([&status], |row| {
+        Ok(PendingCalibrationRow {
+            id: row.get(0)?,
+            batch_id: row.get(1)?,
+            computed_at: row.get(2)?,
+            dimension: row.get(3)?,
+            old_weight: row.get(4)?,
+            new_weight: row.get(5)?,
+            hit_rate: row.get(6)?,
+            sample_size: row.get(7)?,
+            total_resolved: row.get(8)?,
+            status: row.get(9)?,
+        })
+    }).map_err(|e| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+    Ok(rows)
+}
+
+/// Apply a pending calibration batch to live weights (explicit, manual —
+/// Nicola triggers this; nothing here fires automatically). Writes the
+/// batch's (dimension, new_weight) pairs to `user_profile.calibrated_weights`
+/// as the same JSON shape `pipeline.rs::load_calibrated_weights` reads, then
+/// marks every row in the batch 'applied'. Passing `batch_id: None` applies
+/// the most recent pending batch.
+#[tauri::command]
+pub fn apply_pending_calibration(
+    db: State<'_, DbState>,
+    batch_id: Option<String>,
+) -> Result<usize, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let batch_id = match batch_id {
+        Some(b) => b,
+        None => conn
+            .query_row(
+                "SELECT batch_id FROM pending_calibration WHERE status = 'pending' ORDER BY computed_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| "No pending calibration proposal to apply".to_string())?,
+    };
+
+    let rows: Vec<(String, f64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT dimension, new_weight FROM pending_calibration WHERE batch_id = ?1 AND status = 'pending'"
+        ).map_err(|e| e.to_string())?;
+        stmt.query_map([&batch_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    if rows.is_empty() {
+        return Err(format!("No pending rows found for batch '{}'", batch_id));
+    }
+
+    let weights_json = serde_json::to_string(&rows).map_err(|e| e.to_string())?;
+    let applied_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+
+    conn.execute(
+        "INSERT OR REPLACE INTO user_profile (key, value) VALUES ('calibrated_weights', ?1)",
+        [&weights_json],
+    ).map_err(|e| e.to_string())?;
+
+    let updated = conn.execute(
+        "UPDATE pending_calibration SET status = 'applied', applied_at = ?1 WHERE batch_id = ?2 AND status = 'pending'",
+        rusqlite::params![applied_at, batch_id],
+    ).map_err(|e| e.to_string())?;
+
+    tracing::warn!("Calibration: batch {} APPLIED to live weights ({} dimensions)", batch_id, updated);
+
+    Ok(updated)
+}
