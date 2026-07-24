@@ -4,12 +4,14 @@
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
 		executeTrade, closePosition, getFinancialEvents, getSignalEvidence, getSourceHealth,
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getTradeJournal,
-		runBacktest, startPriceStream, stopPriceStream, getTradeRationale
+		runBacktest, startPriceStream, stopPriceStream, getTradeRationale,
+		getPendingCalibration, applyPendingCalibration, rejectPendingCalibration, getCalibrationGateStatus
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics,
-		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate, TradeRationale
+		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate, TradeRationale,
+		PendingCalibrationRow, CalibrationGateStatus
 	} from '$lib/tauri/types';
 	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
 	import { parseTradeReason, fmtReasonSignals } from '$lib/trade-reason';
@@ -51,6 +53,12 @@
 	let btMaxHold = $state(90);
 	let btMaxPositions = $state(10);
 	let btPositionSize = $state(5);
+	let showCalibration = $state(false);
+	let pendingCalibration = $state<PendingCalibrationRow[]>([]);
+	let calibrationGate = $state<CalibrationGateStatus | null>(null);
+	let calibrationActing = $state<string | null>(null);
+	let calibrationError = $state<string | null>(null);
+	let calibrationStatus = $state<string | null>(null);
 
 	$effect(() => {
 		if (loaded) return;
@@ -160,6 +168,8 @@
 			getPortfolioAnalytics().then(a => { analytics = a; }).catch(() => {});
 			getSourceHealth().then(sh => { sources = sh; }).catch(() => {});
 			getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
+			getPendingCalibration().then(rows => { pendingCalibration = rows; }).catch(() => {});
+			getCalibrationGateStatus().then(g => { calibrationGate = g; }).catch(() => {});
 			// Refresh prices in background, then reload price list
 			pricesRefreshing = true;
 			priceRefreshFailed = false;
@@ -240,6 +250,42 @@
 			backtestError = String(e?.message ?? e);
 		} finally {
 			backtestRunning = false;
+		}
+	}
+
+	async function reloadPendingCalibration() {
+		try { pendingCalibration = await getPendingCalibration(); } catch { /* keep stale list rather than blank the page */ }
+	}
+
+	async function handleApplyCalibration(batchId: string) {
+		if (!confirm(`Apply this calibration batch to live trading weights? This changes how new trades are scored.`)) return;
+		calibrationActing = batchId;
+		calibrationError = null;
+		calibrationStatus = null;
+		try {
+			const n = await applyPendingCalibration(batchId);
+			calibrationStatus = `Applied ${n} weight${n === 1 ? '' : 's'} to live trading.`;
+			await reloadPendingCalibration();
+		} catch (e: any) {
+			calibrationError = String(e?.message ?? e);
+		} finally {
+			calibrationActing = null;
+		}
+	}
+
+	async function handleRejectCalibration(batchId: string) {
+		if (!confirm(`Reject this calibration batch? Live weights stay unchanged.`)) return;
+		calibrationActing = batchId;
+		calibrationError = null;
+		calibrationStatus = null;
+		try {
+			await rejectPendingCalibration(batchId);
+			calibrationStatus = 'Batch rejected — live weights untouched.';
+			await reloadPendingCalibration();
+		} catch (e: any) {
+			calibrationError = String(e?.message ?? e);
+		} finally {
+			calibrationActing = null;
 		}
 	}
 
@@ -440,6 +486,18 @@
 		if (e.key === 'r') loadData();
 		if (e.key === 'a') { activeTab = 'portfolio'; showAnalytics = !showAnalytics; }
 		if (e.key === 'b') { activeTab = 'portfolio'; showBacktest = !showBacktest; }
+		if (e.key === 'c') { activeTab = 'portfolio'; showCalibration = !showCalibration; }
+	}
+
+	function calibrationBatches(rows: PendingCalibrationRow[]): { batch_id: string; computed_at: string; total_resolved: number; dims: PendingCalibrationRow[] }[] {
+		const byBatch = new Map<string, PendingCalibrationRow[]>();
+		for (const r of rows) {
+			if (!byBatch.has(r.batch_id)) byBatch.set(r.batch_id, []);
+			byBatch.get(r.batch_id)!.push(r);
+		}
+		return Array.from(byBatch.entries())
+			.map(([batch_id, dims]) => ({ batch_id, computed_at: dims[0].computed_at, total_resolved: dims[0].total_resolved, dims }))
+			.sort((a, b) => b.computed_at.localeCompare(a.computed_at));
 	}
 </script>
 
@@ -1030,6 +1088,62 @@
 						{:else}
 							<p class="text-xs text-text-muted text-center py-3">No signals matched criteria.</p>
 						{/if}
+					</div>
+				{/if}
+			{/if}
+
+			<!-- Calibration Review -->
+			<button onclick={() => showCalibration = !showCalibration}
+				class="w-full text-left mb-5 flex items-center justify-between px-4 py-2.5 bg-bg-card border border-border rounded-xl hover:border-ai/30 transition-colors">
+				<span class="text-xs font-semibold text-text-muted uppercase tracking-wider">Calibration Review {pendingCalibration.length > 0 ? `(${calibrationBatches(pendingCalibration).length} pending)` : ''}</span>
+				<span class="text-xs text-text-muted">{showCalibration ? '▾' : '▸'} <kbd class="text-[10px] px-1 py-0.5 bg-bg rounded border border-border ml-1">c</kbd></span>
+			</button>
+
+			{#if showCalibration}
+				{#if calibrationStatus}<div class="bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-3 mb-3"><p class="text-xs text-emerald-400">{calibrationStatus}</p></div>{/if}
+				{#if calibrationError}<div class="bg-rose-500/10 border border-rose-500/20 rounded-xl p-3 mb-3"><p class="text-xs text-rose-400">{calibrationError}</p></div>{/if}
+
+				{#if pendingCalibration.length === 0}
+					<div class="bg-bg-card border border-border rounded-xl p-4 mb-5">
+						<p class="text-xs text-text-muted">
+							No pending calibration proposals.
+							{#if calibrationGate}
+								Weight recalibration proposes once {calibrationGate.threshold} live trades have resolved
+								(closed, stopped out, or expired) — currently {calibrationGate.total_resolved} of {calibrationGate.threshold}.
+							{/if}
+						</p>
+					</div>
+				{:else}
+					<div class="space-y-3 mb-5">
+						{#each calibrationBatches(pendingCalibration) as batch}
+							<div class="bg-bg-card border border-amber-500/25 rounded-xl p-4">
+								<div class="flex items-center justify-between mb-3">
+									<span class="text-xs font-mono text-text-muted">{batch.computed_at} · n={batch.total_resolved} resolved trades</span>
+									<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-amber-500/15 text-amber-400 uppercase tracking-wider">Pending</span>
+								</div>
+								<div class="space-y-1.5 mb-3">
+									{#each batch.dims as d}
+										{@const delta = d.new_weight - d.old_weight}
+										<div class="flex items-center justify-between text-xs">
+											<span class="text-text capitalize w-28">{d.dimension}</span>
+											<span class="font-mono text-text-muted">{d.old_weight.toFixed(3)} → {d.new_weight.toFixed(3)}</span>
+											<span class="font-mono w-16 text-right {delta > 0 ? 'text-emerald-400' : delta < 0 ? 'text-rose-400' : 'text-text-muted'}">{delta >= 0 ? '+' : ''}{delta.toFixed(3)}</span>
+											<span class="text-[10px] text-text-muted w-24 text-right">{d.hit_rate != null ? `${(d.hit_rate * 100).toFixed(0)}% hit` : '—'}{d.sample_size != null ? ` (n=${d.sample_size})` : ''}</span>
+										</div>
+									{/each}
+								</div>
+								<div class="flex gap-2">
+									<button onclick={() => handleApplyCalibration(batch.batch_id)} disabled={calibrationActing === batch.batch_id}
+										class="px-3 py-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/25 rounded-lg text-xs font-medium hover:bg-emerald-500/20 transition-colors disabled:opacity-50">
+										{calibrationActing === batch.batch_id ? 'Applying...' : 'Apply to live weights'}
+									</button>
+									<button onclick={() => handleRejectCalibration(batch.batch_id)} disabled={calibrationActing === batch.batch_id}
+										class="px-3 py-1.5 bg-rose-500/10 text-rose-400 border border-rose-500/25 rounded-lg text-xs font-medium hover:bg-rose-500/20 transition-colors disabled:opacity-50">
+										Reject
+									</button>
+								</div>
+							</div>
+						{/each}
 					</div>
 				{/if}
 			{/if}

@@ -1,5 +1,5 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus } from './types';
 
 export async function getTodayBriefing(): Promise<BriefingWithStories | null> {
 	return invoke('get_today_briefing');
@@ -193,6 +193,24 @@ export async function getTradeDetail(tradeId: number): Promise<TradeDetail> {
 
 export async function getTradeRationale(tradeId: number, regenerate = false): Promise<TradeRationale> {
 	return invoke('get_trade_rationale', { tradeId, regenerate });
+}
+
+// === Weight Calibration Review ===
+
+export async function getPendingCalibration(status?: string): Promise<PendingCalibrationRow[]> {
+	return invoke('get_pending_calibration', { status: status ?? null });
+}
+
+export async function applyPendingCalibration(batchId?: string): Promise<number> {
+	return invoke('apply_pending_calibration', { batchId: batchId ?? null });
+}
+
+export async function rejectPendingCalibration(batchId?: string): Promise<number> {
+	return invoke('reject_pending_calibration', { batchId: batchId ?? null });
+}
+
+export async function getCalibrationGateStatus(): Promise<CalibrationGateStatus> {
+	return invoke('get_calibration_gate_status');
 }
 
 export async function runBacktest(config: BacktestConfig): Promise<BacktestResult> {

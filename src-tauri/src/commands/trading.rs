@@ -1070,3 +1070,62 @@ pub fn apply_pending_calibration(
 
     Ok(updated)
 }
+
+/// Reject a pending calibration batch without touching live weights (explicit,
+/// manual — the review counterpart to apply). Passing `batch_id: None` rejects
+/// the most recent pending batch.
+#[tauri::command]
+pub fn reject_pending_calibration(
+    db: State<'_, DbState>,
+    batch_id: Option<String>,
+) -> Result<usize, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let batch_id = match batch_id {
+        Some(b) => b,
+        None => conn
+            .query_row(
+                "SELECT batch_id FROM pending_calibration WHERE status = 'pending' ORDER BY computed_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| "No pending calibration proposal to reject".to_string())?,
+    };
+
+    let applied_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let updated = conn.execute(
+        "UPDATE pending_calibration SET status = 'rejected', applied_at = ?1 WHERE batch_id = ?2 AND status = 'pending'",
+        rusqlite::params![applied_at, batch_id],
+    ).map_err(|e| e.to_string())?;
+
+    if updated == 0 {
+        return Err(format!("No pending rows found for batch '{}'", batch_id));
+    }
+
+    tracing::warn!("Calibration: batch {} REJECTED, live weights untouched ({} dimensions)", batch_id, updated);
+
+    Ok(updated)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CalibrationGateStatus {
+    pub total_resolved: i64,
+    pub threshold: i64,
+}
+
+/// How close the live paper-trading loop is to the calibration gate
+/// (calibration.rs proposes a reweight once total_resolved >= threshold).
+/// Same WHERE clause as calibration.rs::analyze_signal_performance so this
+/// count always matches what actually gates a proposal. `threshold: 10` is
+/// duplicated from calibration.rs's `>= 10` check — keep both in sync if
+/// that changes, or this display silently drifts from the real gate.
+#[tauri::command]
+pub fn get_calibration_gate_status(db: State<'_, DbState>) -> Result<CalibrationGateStatus, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let total_resolved: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM paper_trades WHERE status IN ('closed', 'stopped_out', 'expired') AND pnl_pct IS NOT NULL",
+        [],
+        |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    Ok(CalibrationGateStatus { total_resolved, threshold: 10 })
+}

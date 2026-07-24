@@ -47,7 +47,9 @@ pub async fn run_calibration(db_path: &Path) -> anyhow::Result<CalibrationReport
     report.signal_analysis = analyze_signal_performance(&conn)?;
 
     // 4. Propose a reweight if we have enough data — holds in pending_calibration,
-    // does not touch live weights (see adjust_weights doc comment)
+    // does not touch live weights (see adjust_weights doc comment). Threshold
+    // duplicated in src-tauri/src/commands/trading.rs::get_calibration_gate_status
+    // for the UI's progress display — keep both in sync if this changes.
     if report.signal_analysis.total_resolved >= 10 {
         report.weights_adjusted = adjust_weights(&conn, &report.signal_analysis)?;
     }
