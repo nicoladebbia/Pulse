@@ -4494,7 +4494,16 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
                 }
                 if let Some(name) = meta.get("agency").and_then(|v| v.as_str()) {
                     if !name.is_empty() {
-                        ents.push((name, "company", 0.0));
+                        // Was typed "company" — a federal agency (e.g. "Department of
+                        // Transportation") is never ticker-eligible or tradeable, but that type
+                        // let it INTO populate_tickers_limited's eligible set and let it
+                        // accumulate a compound_score across every contract it appears in
+                        // (an agency shows up in hundreds of unrelated awards), producing fake
+                        // convergence unrelated to any single company. "regulatory_action"
+                        // (already used for Federal Register agencies) is excluded from
+                        // ticker-mapping and semantically correct. (calibration-backtest-universe
+                        // Task 5, 2026-07-24 — found via the 290-NULL-ticker candidate audit.)
+                        ents.push((name, "regulatory_action", 0.0));
                     }
                 }
                 ents
@@ -4520,14 +4529,26 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
             }
             s if s.contains("LDA") || s.contains("Senate") => {
                 let mut ents = Vec::new();
+                // Types were swapped: `client` (the real company paying for lobbying, e.g.
+                // "MOHAWK INDUSTRIES, INC.") was typed "lobbying_disclosure" — which
+                // populate_tickers_limited's eligible-type filter EXCLUDES, so a genuine
+                // public company could never get a ticker attempt. `registrant` (the law
+                // firm/lobbying shop actually filing, e.g. "ALSTON & BIRD LLP") was typed
+                // "company" — ticker-eligible despite never being a tradeable entity, and it
+                // accumulates fake convergence by aggregating across every unrelated client
+                // it files for (one firm, dozens of clients' filings). Swapping the labels
+                // makes the real company ticker-eligible and keeps the intermediary out of
+                // the ticker-mapping and now-more-obviously-not-a-company bucket. (See
+                // USASpending block above for the sibling bug/fix.
+                // calibration-backtest-universe Task 5, 2026-07-24.)
                 if let Some(name) = meta.get("client").and_then(|v| v.as_str()) {
                     if !name.is_empty() {
-                        ents.push((name, "lobbying_disclosure", 0.0));
+                        ents.push((name, "company", 0.0));
                     }
                 }
                 if let Some(name) = meta.get("registrant").and_then(|v| v.as_str()) {
                     if !name.is_empty() {
-                        ents.push((name, "company", 0.0));
+                        ents.push((name, "lobbying_disclosure", 0.0));
                     }
                 }
                 ents
@@ -4665,6 +4686,7 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     };
     let alpaca_secret = std::env::var("ALPACA_SECRET_KEY")
         .map_err(|_| anyhow::anyhow!("ALPACA_SECRET_KEY not set"))?;
+    let finnhub_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
 
     let conn = rusqlite::Connection::open(db_path)?;
 
@@ -4780,6 +4802,15 @@ async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
                 "Auto-trade: vetoing {} ({}) — heavy insider selling (net ${:.0})",
                 name, ticker, insider_raw
             );
+            continue;
+        }
+
+        // Universe quality gate: $300M market cap / $1 min price / Alpaca-tradable.
+        // Cached 7 days. Fails closed on missing data — see check_ticker_universe_eligibility.
+        if !crate::market_prices::check_ticker_universe_eligibility(
+            &client, &conn, &finnhub_key, &alpaca_key, &alpaca_secret, ticker,
+        ).await {
+            tracing::warn!("Auto-trade: skipping {} ({}) — failed universe quality gate", name, ticker);
             continue;
         }
 

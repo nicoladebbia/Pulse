@@ -350,6 +350,166 @@ pub async fn backfill_candles_for_tickers(
     Ok(total)
 }
 
+#[derive(Debug, Deserialize)]
+struct FinnhubProfile {
+    #[serde(rename = "marketCapitalization", default)]
+    market_cap: f64, // in millions USD; Finnhub returns 0/missing for no profile (e.g. non-equities)
+}
+
+/// Universe quality gate: reject sub-$300M market cap / sub-$1 price tickers, and
+/// require Alpaca to confirm the symbol is actually tradable, before a signal can
+/// enter the auto-trade buy path. Cached in `ticker_eligibility_cache` (7-day TTL)
+/// so the live auto-trade loop doesn't re-hit Finnhub/Alpaca every cycle for the
+/// same name. Fails CLOSED — any missing data point (no Finnhub profile, no
+/// price, Alpaca error) rejects the ticker rather than passing it through.
+///
+/// Built after the calibration-backtest-universe Task 3.0 audit found the
+/// client/registrant entity-type swap bug (see `pipeline.rs`'s
+/// `extract_entities_from_financial_metadata`): fixing that bug makes lobbying
+/// "client" names newly ticker-eligible, which includes trade associations and
+/// nonprofits (e.g. "SPORTS BETTING ALLIANCE") that could fuzzy-match a real
+/// ticker. This gate is the safety net — Task 5.1 (market cap/price) + Task 5.2
+/// (Alpaca tradability), 2026-07-24.
+pub async fn check_ticker_universe_eligibility(
+    client: &reqwest::Client,
+    conn: &Connection,
+    finnhub_key: &str,
+    alpaca_key: &str,
+    alpaca_secret: &str,
+    ticker: &str,
+) -> bool {
+    const MIN_MARKET_CAP_MILLIONS: f64 = 300.0;
+    const MIN_PRICE: f64 = 1.0;
+
+    if let Ok(eligible) = conn.query_row(
+        "SELECT eligible FROM ticker_eligibility_cache
+         WHERE ticker = ?1 AND checked_at >= datetime('now', '-7 days')",
+        [ticker],
+        |row| row.get::<_, i64>(0),
+    ) {
+        return eligible == 1;
+    }
+
+    let mut market_cap: Option<f64> = None;
+    let mut last_price: Option<f64> = None;
+    let mut alpaca_tradable = false;
+    let mut alpaca_status = String::new();
+    // Tracks whether each upstream call actually succeeded, so a rejection can be
+    // logged as "data says ineligible" vs "couldn't reach Finnhub/Alpaca" — these
+    // look identical downstream (both leave the Option unset / bool false) but are
+    // operationally very different: the latter fails EVERY candidate closed and,
+    // unlogged distinctly, is indistinguishable from a quiet zero-trades day.
+    let mut finnhub_profile_ok = false;
+    let mut finnhub_quote_ok = false;
+    let mut alpaca_ok = false;
+
+    if !finnhub_key.is_empty() {
+        match client
+            .get(format!("https://finnhub.io/api/v1/stock/profile2?symbol={}&token={}", ticker, finnhub_key))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                finnhub_profile_ok = true;
+                if let Ok(profile) = resp.json::<FinnhubProfile>().await {
+                    if profile.market_cap > 0.0 {
+                        market_cap = Some(profile.market_cap);
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::warn!("Universe gate: Finnhub profile2 for {} returned status {}", ticker, resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("Universe gate: Finnhub profile2 request failed for {}: {}", ticker, e);
+            }
+        }
+        match client
+            .get(format!("https://finnhub.io/api/v1/quote?symbol={}&token={}", ticker, finnhub_key))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                finnhub_quote_ok = true;
+                if let Ok(quote) = resp.json::<FinnhubQuote>().await {
+                    if quote.c > 0.0 {
+                        last_price = Some(quote.c);
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::warn!("Universe gate: Finnhub quote for {} returned status {}", ticker, resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("Universe gate: Finnhub quote request failed for {}: {}", ticker, e);
+            }
+        }
+    } else {
+        tracing::warn!("Universe gate: FINNHUB_API_KEY unset — {} will fail closed", ticker);
+    }
+
+    if !alpaca_key.is_empty() && !alpaca_secret.is_empty() {
+        match client
+            .get(format!("https://paper-api.alpaca.markets/v2/assets/{}", ticker))
+            .header("APCA-API-KEY-ID", alpaca_key)
+            .header("APCA-API-SECRET-KEY", alpaca_secret)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                alpaca_ok = true;
+                if let Ok(asset) = resp.json::<serde_json::Value>().await {
+                    alpaca_tradable = asset.get("tradable").and_then(|v| v.as_bool()).unwrap_or(false);
+                    alpaca_status = asset.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                }
+            }
+            Ok(resp) => {
+                tracing::warn!("Universe gate: Alpaca assets for {} returned status {}", ticker, resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("Universe gate: Alpaca assets request failed for {}: {}", ticker, e);
+            }
+        }
+    } else {
+        tracing::warn!("Universe gate: Alpaca keys unset — {} will fail closed", ticker);
+    }
+
+    if !finnhub_profile_ok || !finnhub_quote_ok || !alpaca_ok {
+        tracing::warn!(
+            "Universe gate: {} — one or more upstream checks unreachable (finnhub_profile_ok={}, finnhub_quote_ok={}, alpaca_ok={}); rejection below may be an outage, not a real ineligibility",
+            ticker, finnhub_profile_ok, finnhub_quote_ok, alpaca_ok
+        );
+    }
+
+    let eligible = market_cap.map(|m| m >= MIN_MARKET_CAP_MILLIONS).unwrap_or(false)
+        && last_price.map(|p| p >= MIN_PRICE).unwrap_or(false)
+        && alpaca_tradable
+        && alpaca_status == "active";
+
+    let _ = conn.execute(
+        "INSERT INTO ticker_eligibility_cache
+             (ticker, market_cap_millions, last_price, alpaca_tradable, alpaca_status, eligible, checked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+         ON CONFLICT(ticker) DO UPDATE SET
+             market_cap_millions = excluded.market_cap_millions,
+             last_price = excluded.last_price,
+             alpaca_tradable = excluded.alpaca_tradable,
+             alpaca_status = excluded.alpaca_status,
+             eligible = excluded.eligible,
+             checked_at = excluded.checked_at",
+        rusqlite::params![ticker, market_cap, last_price, alpaca_tradable as i64, alpaca_status, eligible as i64],
+    );
+
+    if !eligible {
+        tracing::info!(
+            "Universe gate: {} REJECTED (market_cap={:?}M, price={:?}, alpaca_tradable={}, alpaca_status={:?})",
+            ticker, market_cap, last_price, alpaca_tradable, alpaca_status
+        );
+    }
+
+    eligible
+}
+
 /// Legacy Finnhub candle backfill — premium-only on free keys.
 async fn backfill_candles_finnhub(
     client: &reqwest::Client,
@@ -493,3 +653,4 @@ pub async fn fetch_historical(
     crate::db::log_api_usage(&conn, "finnhub", "candle", "fetch_historical", 0, 0);
     Ok(stored)
 }
+

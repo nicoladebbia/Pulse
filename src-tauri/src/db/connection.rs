@@ -32,6 +32,8 @@ pub const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_ft
 pub const MIGRATION_025: &str = include_str!("../../../migrations/025_half_close_marker.sql");
 pub const MIGRATION_026: &str = include_str!("../../../migrations/026_drop_stillborn_trend_tables.sql");
 pub const MIGRATION_027: &str = include_str!("../../../migrations/027_ai_trade_rationale.sql");
+pub const MIGRATION_028: &str = include_str!("../../../migrations/028_pending_calibration.sql");
+pub const MIGRATION_029: &str = include_str!("../../../migrations/029_ticker_eligibility_cache.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -612,6 +614,25 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_027)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (27)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 28: pending_calibration table — auto-calibration proposals held for
+    // manual approval instead of silently overwriting live weights
+    // (calibration-backtest-universe audit, Task 3.3).
+    if !applied.contains(&28) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_028)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (28)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 29: ticker_eligibility_cache — $300M market-cap / $1 min-price /
+    // Alpaca-tradability gate cache (calibration-backtest-universe Task 5.1/5.2).
+    if !applied.contains(&29) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_029)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (29)", [])?;
         tx.commit()?;
     }
 

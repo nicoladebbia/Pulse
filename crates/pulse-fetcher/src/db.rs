@@ -23,6 +23,7 @@ const MIGRATION_025: &str = include_str!("../../../migrations/025_half_close_mar
 const MIGRATION_026: &str = include_str!("../../../migrations/026_drop_stillborn_trend_tables.sql");
 const MIGRATION_027: &str = include_str!("../../../migrations/027_ai_trade_rationale.sql");
 const MIGRATION_028: &str = include_str!("../../../migrations/028_pending_calibration.sql");
+const MIGRATION_029: &str = include_str!("../../../migrations/029_ticker_eligibility_cache.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -556,6 +557,16 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_028)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (28)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 29: ticker_eligibility_cache — $300M market-cap / $1 min-price /
+    // Alpaca-tradability gate cache (calibration-backtest-universe Task 5.1/5.2).
+    // Both app + fetcher run it.
+    if !applied.contains(&29) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_029)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (29)", [])?;
         tx.commit()?;
     }
 
