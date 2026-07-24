@@ -12,6 +12,10 @@ crate-type = ["lib", "cdylib", "staticlib"]
 name = "pulse-eval"
 path = "src/bin/eval.rs"
 
+[[bin]]
+name = "pulse-backtest"
+path = "src/bin/backtest_runner.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

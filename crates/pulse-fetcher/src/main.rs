@@ -29,6 +29,34 @@ struct Args {
     /// Force re-fetch even if today's briefing already exists
     #[arg(long, default_value_t = false)]
     force: bool,
+
+    /// backfill-signals mode: start date (YYYY-MM-DD), inclusive
+    #[arg(long)]
+    start: Option<String>,
+
+    /// backfill-signals mode: end date (YYYY-MM-DD), inclusive
+    #[arg(long)]
+    end: Option<String>,
+
+    /// backfill-signals mode: lookback window in days for the gov/political/momentum
+    /// dimensions (see pipeline::recompute_signals_pipeline's window_days param)
+    #[arg(long, default_value_t = 30)]
+    window_days: i64,
+
+    /// backfill-signals mode: explicit acknowledgment that --db-path is NOT the live
+    /// production DB. Required to run against any path that resolves to the real
+    /// Application Support location; the mode refuses otherwise.
+    #[arg(long, default_value_t = false)]
+    i_know_this_is_a_copy: bool,
+
+    /// backfill-prices mode: comma-separated ticker list to backfill candle history for.
+    #[arg(long)]
+    tickers: Option<String>,
+
+    /// backfill-prices mode: how many days back to fetch candles for (Alpaca caps at
+    /// ~60 bars per call).
+    #[arg(long, default_value_t = 60)]
+    days_back: i64,
 }
 
 #[tokio::main]
@@ -209,6 +237,42 @@ async fn main() -> anyhow::Result<()> {
                     r.positions_evaluated, r.brier_scores_updated, r.signal_analysis.total_resolved
                 ),
                 Err(e) => tracing::error!("Calibration failed: {}", e),
+            }
+        }
+        "backfill-signals" => {
+            // Historical signal recompute for the corrected-backtest exercise
+            // (calibration-backtest-universe plan, Phase 2). Refuses to run against
+            // the live production DB path unless --i-know-this-is-a-copy is passed —
+            // this wipes and rewrites cross_signals rows in the given date range.
+            let start = args.start.as_deref().unwrap_or_else(|| {
+                tracing::error!("backfill-signals requires --start YYYY-MM-DD");
+                std::process::exit(1);
+            });
+            let end = args.end.as_deref().unwrap_or_else(|| {
+                tracing::error!("backfill-signals requires --end YYYY-MM-DD");
+                std::process::exit(1);
+            });
+            match pipeline::run_backfill_signals(&db_path, start, end, args.window_days, args.i_know_this_is_a_copy) {
+                Ok(n) => tracing::info!("Backfill-signals complete: {} days processed", n),
+                Err(e) => {
+                    tracing::error!("Backfill-signals failed: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+        "backfill-prices" => {
+            // Ad-hoc candle backfill for specific tickers, bypassing the daily
+            // pipeline's 200/30-per-day caps (see market_prices::backfill_candles_for_tickers).
+            let tickers: Vec<String> = args.tickers.as_deref().unwrap_or_else(|| {
+                tracing::error!("backfill-prices requires --tickers TICK1,TICK2,...");
+                std::process::exit(1);
+            }).split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect();
+            match market_prices::backfill_candles_for_tickers(&db_path, &tickers, args.days_back).await {
+                Ok(n) => tracing::info!("Backfill-prices complete: {} candles stored across {} tickers", n, tickers.len()),
+                Err(e) => {
+                    tracing::error!("Backfill-prices failed: {}", e);
+                    return Err(e);
+                }
             }
         }
         "edge-report" => {

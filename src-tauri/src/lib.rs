@@ -121,6 +121,10 @@ pub fn run() {
             commands::trading::start_price_stream,
             commands::trading::stop_price_stream,
             commands::trading::get_stream_status,
+            commands::trading::get_pending_calibration,
+            commands::trading::apply_pending_calibration,
+            commands::trading::reject_pending_calibration,
+            commands::trading::get_calibration_gate_status,
         ])
         .build(tauri::generate_context!())
         .expect("error building Pulse")

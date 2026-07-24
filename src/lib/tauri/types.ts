@@ -420,6 +420,27 @@ export interface FinancialApiQuota {
 	last_call_at: string | null;
 }
 
+// === Weight Calibration Review (pending_calibration — distinct from CalibrationStats above,
+// which is prediction accuracy, not trading-weight calibration) ===
+
+export interface PendingCalibrationRow {
+	id: number;
+	batch_id: string;
+	computed_at: string;
+	dimension: string;
+	old_weight: number;
+	new_weight: number;
+	hit_rate: number | null;
+	sample_size: number | null;
+	total_resolved: number;
+	status: string;
+}
+
+export interface CalibrationGateStatus {
+	total_resolved: number;
+	threshold: number;
+}
+
 // === Paper Trading Types ===
 
 export interface Portfolio {

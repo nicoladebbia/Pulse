@@ -562,10 +562,15 @@ fn load_prices(
     // Build `?,?,?` placeholders. We cap batch size so we don't blow past
     // SQLITE_MAX_VARIABLE_NUMBER on pathological runs. 500 tickers is plenty.
     let mut out: HashMap<String, HashMap<String, (f64, f64, f64)>> = HashMap::new();
+    // COALESCE high/low to close: the daily quote-only fetch writes close-only rows,
+    // and the Alpaca candle backfill uses INSERT OR IGNORE (won't overwrite them) —
+    // without this, row.get::<_,f64> on a NULL high/low errors and the whole day
+    // silently vanishes from `prices`, which the entry logic then reads as "no bar
+    // today" for a date that actually has a valid close.
     for chunk in tickers.chunks(500) {
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT ticker, date, close, high, low FROM entity_prices
+            "SELECT ticker, date, close, COALESCE(high, close), COALESCE(low, close) FROM entity_prices
              WHERE ticker IN ({}) AND date >= ? AND date <= ?
              ORDER BY date ASC",
             placeholders
