@@ -3,7 +3,7 @@
 	import ChatMessage from '$lib/components/chat/ChatMessage.svelte';
 	import ChatThinking from '$lib/components/chat/ChatThinking.svelte';
 	import ChatInsights from '$lib/components/chat/ChatInsights.svelte';
-	import { getChatContext } from '$lib/tauri/commands';
+	import { getChatContext, safeInvoke, safeCall } from '$lib/tauri/commands';
 	import { isTauri } from '$lib/tauri/mock';
 	import type { ChatContext } from '$lib/tauri/types';
 
@@ -18,9 +18,8 @@
 		if (contextLoaded) return;
 		contextLoaded = true;
 		if (isTauri()) {
-			getChatContext().then(ctx => { chatContext = ctx; }).catch(() => {});
-			const ipc = (window as any).__TAURI_INTERNALS__;
-			ipc?.invoke('get_feedback_stats').then((s: any) => { feedbackStats = s; }).catch(() => {});
+			safeCall(getChatContext).then(ctx => { chatContext = ctx; });
+			safeInvoke<any>('get_feedback_stats').then(s => { feedbackStats = s; });
 		}
 	});
 
