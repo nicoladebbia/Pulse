@@ -41,6 +41,7 @@
 		<button
 			class="absolute right-2.5 bottom-2.5 text-text-muted hover:text-ai transition-colors
 				disabled:opacity-30"
+			aria-label="Send message"
 			disabled={!query.trim() || $isStreaming}
 			onclick={handleSubmit}
 		>

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { FreedomStory } from '$lib/tauri/types';
+	import { openExternal } from '$lib/tauri/shell';
 
 	let { freedom, label, color, stories }: {
 		freedom: string;
@@ -24,12 +25,6 @@
 		if (hours < 1) return 'Just now';
 		if (hours < 24) return `${hours}h ago`;
 		return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-	}
-
-	function openSource(url: string) {
-		const ipc = (window as any).__TAURI_INTERNALS__;
-		if (ipc) ipc.invoke('plugin:shell|open', { path: url });
-		else window.open(url, '_blank');
 	}
 </script>
 
@@ -101,7 +96,7 @@
 
 					<button
 						class="text-[10px] uppercase tracking-wider text-text-muted hover:text-text transition-colors"
-						onclick={() => openSource(heroStory.original_url)}
+						onclick={() => openExternal(heroStory.original_url)}
 					>
 						Read original source →
 					</button>
@@ -167,7 +162,7 @@
 
 							<button
 								class="text-[10px] uppercase tracking-wider text-text-muted hover:text-text transition-colors"
-								onclick={() => openSource(story.original_url)}
+								onclick={() => openExternal(story.original_url)}
 							>
 								Read original source →
 							</button>

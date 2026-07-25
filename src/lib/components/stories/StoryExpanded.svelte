@@ -3,6 +3,7 @@
 	import RelevanceBadge from './RelevanceBadge.svelte';
 	import type { Story, ChatStreamEvent, StoryEntityContext } from '$lib/tauri/types';
 	import { chatSendStream } from '$lib/tauri/commands';
+	import { openExternal } from '$lib/tauri/shell';
 	import { isTauri, simulateChatStream } from '$lib/tauri/mock';
 
 	let { story, onClose }: { story: Story; onClose: () => void } = $props();
@@ -34,15 +35,6 @@
 	});
 	let followUpQuery = $state('');
 	let conversationEl = $state<HTMLElement | null>(null);
-
-	function openSource() {
-		const ipc = (window as any).__TAURI_INTERNALS__;
-		if (ipc) {
-			ipc.invoke('plugin:shell|open', { path: story.original_url });
-		} else {
-			window.open(story.original_url, '_blank');
-		}
-	}
 
 	async function askQuestion(question: string) {
 		if (isAsking || !question.trim()) return;
@@ -250,7 +242,7 @@
 	<div class="flex items-center justify-between pb-6 border-b border-border">
 		<button
 			class="text-sm text-ai hover:underline transition-colors"
-			onclick={openSource}
+			onclick={() => openExternal(story.original_url)}
 		>
 			Read original source →
 		</button>
