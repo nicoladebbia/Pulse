@@ -2,28 +2,6 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
-/// Pricing per 1M tokens (input/output) as of 2026-08
-const PRICING: &[(&str, &str, f64, f64)] = &[
-    // (provider, model_prefix, input_per_1m, output_per_1m)
-    ("anthropic", "claude-haiku", 1.0, 5.0),
-    ("anthropic", "claude-sonnet", 3.0, 15.0),
-    ("anthropic", "claude-opus", 5.0, 25.0),
-    ("groq", "llama-3.1-8b", 0.05, 0.08),
-    ("groq", "llama-3.3-70b", 0.59, 0.79),
-    ("groq", "llama-4-scout", 0.11, 0.34),
-    ("voyage", "voyage-3-lite", 0.01, 0.0), // embeddings: input only
-    ("tavily", "search", 0.0, 0.0),          // free tier
-    // Financial data APIs (all free)
-    ("fred", "economic", 0.0, 0.0),
-    ("finnhub", "quote", 0.0, 0.0),
-    ("fec", "campaign", 0.0, 0.0),
-    ("eia", "energy", 0.0, 0.0),
-    ("sec_edgar", "filing", 0.0, 0.0),
-    ("usaspending", "contract", 0.0, 0.0),
-    ("federal_register", "rule", 0.0, 0.0),
-    ("alpaca", "trading", 0.0, 0.0),
-];
-
 /// Rate limits for all tracked external APIs.
 /// (provider, calls_per_minute, calls_per_hour, calls_per_day, description)
 /// Use -1 for "no limit" on any dimension.
@@ -49,13 +27,10 @@ pub const FINANCIAL_RATE_LIMITS: &[(&str, i64, i64, i64, &str)] = &[
     ("wikipedia",          -1,   -1,   -1,     "Wikipedia"),
 ];
 
+/// Prices come from the shared pulse-pricing crate, which reads pricing.json
+/// (next to pulse.db) on every call — edit that file to update prices live.
 pub fn estimate_cost(provider: &str, model: &str, input_tokens: i64, output_tokens: i64) -> f64 {
-    for &(p, m, in_price, out_price) in PRICING {
-        if provider == p && model.contains(m) {
-            return (input_tokens as f64 * in_price + output_tokens as f64 * out_price) / 1_000_000.0;
-        }
-    }
-    0.0
+    pulse_pricing::estimate_cost(provider, model, input_tokens, output_tokens)
 }
 
 /// Log an API call's token usage.
