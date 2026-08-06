@@ -2,15 +2,16 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
-/// Pricing per 1M tokens (input/output) as of 2025
+/// Pricing per 1M tokens (input/output) as of 2026-08
 const PRICING: &[(&str, &str, f64, f64)] = &[
     // (provider, model_prefix, input_per_1m, output_per_1m)
-    ("anthropic", "claude-haiku", 0.25, 1.25),
+    ("anthropic", "claude-haiku", 1.0, 5.0),
     ("anthropic", "claude-sonnet", 3.0, 15.0),
-    ("anthropic", "claude-opus", 15.0, 75.0),
+    ("anthropic", "claude-opus", 5.0, 25.0),
     ("groq", "llama-3.1-8b", 0.05, 0.08),
     ("groq", "llama-3.3-70b", 0.59, 0.79),
-    ("voyage", "voyage-3-lite", 0.02, 0.0), // embeddings: input only
+    ("groq", "llama-4-scout", 0.11, 0.34),
+    ("voyage", "voyage-3-lite", 0.01, 0.0), // embeddings: input only
     ("tavily", "search", 0.0, 0.0),          // free tier
     // Financial data APIs (all free)
     ("fred", "economic", 0.0, 0.0),

@@ -106,7 +106,7 @@ Requires macOS, a Rust toolchain, and Node + [pnpm](https://pnpm.io/).
 
 ```bash
 pnpm install                  # frontend deps
-cp .env.example .env          # then fill in ANTHROPIC_API_KEY, VOYAGE_API_KEY, CURRENTS_API_KEY
+cp .env.example .env          # then fill in ANTHROPIC_API_KEY, VOYAGE_API_KEY, GROQ_API_KEY
 
 pnpm tauri dev                # run the desktop app (frontend + Rust backend)
 pnpm tauri build             # production app build

@@ -445,6 +445,90 @@ impl GroqClient {
         anyhow::bail!("Groq API: max retries exceeded (last error: {})", last_err.unwrap_or_else(|| "rate limiting".into()))
     }
 
+    /// Call Claude (Anthropic API) for the analyze stage. Separate from `call()`
+    /// because Anthropic's Messages API differs from Groq's OpenAI-compatible one
+    /// (headers, body shape, usage field names). Logs real token counts under
+    /// provider "anthropic". Retries on 429/5xx/network; bails on 4xx.
+    async fn call_anthropic(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
+
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+            "system": system,
+            "messages": [{"role": "user", "content": user_msg}]
+        });
+
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(15 * attempt as u64)).await;
+            }
+            let resp = match self.http
+                .post("https://api.anthropic.com/v1/messages")
+                // self.http's 60s default was tuned for Groq; an 8000-max_token
+                // generation over a 140-story payload can exceed it. Per-request
+                // override so a slow-but-fine Haiku call isn't billed then discarded.
+                .timeout(std::time::Duration::from_secs(180))
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Anthropic connection error (attempt {}): {}", attempt + 1, e);
+                    last_err = Some(format!("{}", e));
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            let code = status.as_u16();
+            if code == 429 || (500..600).contains(&code) {
+                let text = resp.text().await.unwrap_or_default();
+                tracing::warn!("Anthropic transient error {} (attempt {}): {}", status, attempt + 1, text.chars().take(120).collect::<String>());
+                last_err = Some(format!("HTTP {}: {}", status, text));
+                continue;
+            }
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Anthropic API error {}: {}", status, text);
+            }
+
+            let response: serde_json::Value = resp.json().await
+                .map_err(|e| anyhow::anyhow!("Anthropic response parse error: {}", e))?;
+
+            if let Some(ref path) = self.db_path {
+                if let Ok(conn) = rusqlite::Connection::open(path) {
+                    crate::db::log_api_usage(
+                        &conn, "anthropic", model, endpoint,
+                        response["usage"]["input_tokens"].as_i64().unwrap_or(0),
+                        response["usage"]["output_tokens"].as_i64().unwrap_or(0),
+                    );
+                }
+            }
+
+            // Distinguish truncation from model non-compliance: a max_tokens stop
+            // means the JSON is syntactically cut off — bail with a clear reason
+            // instead of letting the downstream parse-fail log blame the model.
+            if response["stop_reason"].as_str() == Some("max_tokens") {
+                anyhow::bail!("Anthropic hit max_tokens ({}) for {} — output truncated", max_tokens, endpoint);
+            }
+            let text = response["content"][0]["text"].as_str().unwrap_or("").to_string();
+            if text.is_empty() {
+                anyhow::bail!("Anthropic returned empty content for {}", endpoint);
+            }
+            return Ok(text);
+        }
+
+        anyhow::bail!("Anthropic API: max retries exceeded (last error: {})", last_err.unwrap_or_else(|| "unknown".into()))
+    }
+
     pub async fn translate(&self, title: &str, snippet: &str) -> anyhow::Result<(String, String)> {
         let system = "You are a translator. Translate Italian news to English. Return valid JSON only.";
         let user_msg = format!(
@@ -544,15 +628,27 @@ impl GroqClient {
             stories.len()
         ));
 
-        // analyze is PINNED to 70B (not the scout env default). This is the single
+        // analyze runs on Claude Haiku 4.5 (Anthropic), falling back to Groq 70B if
+        // the Anthropic call fails or the key is absent. History: this is the single
         // largest structured-output call in the pipeline — 140 stories → 140
-        // relevance_scores + connections + trends + per-sector curation arrays. Measured
-        // A/B (2026-06-25): scout failed it twice on the same payload — once with a Groq
-        // 400 json_validate_failed (stray escape), once with a 200 whose body our serde
-        // rejected ("invalid type: map, expected usize" in the curation field). 70B passed
-        // the identical payload first try. pre_curate stays on the cheap scout (simpler
-        // index-list output it handles fine); only this call needs the stronger model.
-        let text = self.call(STRONG_MODEL_DEFAULT, "analyze", system, &user_msg, 8000).await?;
+        // relevance_scores + connections + trends + per-sector curation arrays. Scout
+        // failed it twice (json_validate_failed / serde reject); 70B passed but still
+        // produces dup-key and missing-field bodies (see the salvage below). Haiku 4.5
+        // is the upgrade for exactly that non-compliance (~+$1.3/mo at 2026-08 volume),
+        // and as a bonus is immune to the Groq VPN/IP 403 block. Set
+        // PULSE_ANALYZE_PROVIDER=groq to force the old path for A/B.
+        let force_groq = std::env::var("PULSE_ANALYZE_PROVIDER").map(|v| v.eq_ignore_ascii_case("groq")).unwrap_or(false);
+        let text = if !force_groq && std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            match self.call_anthropic("claude-haiku-4-5", "analyze", system, &user_msg, 8000).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("analyze via Anthropic failed ({}), falling back to Groq 70B", e);
+                    self.call(STRONG_MODEL_DEFAULT, "analyze", system, &user_msg, 8000).await?
+                }
+            }
+        } else {
+            self.call(STRONG_MODEL_DEFAULT, "analyze", system, &user_msg, 8000).await?
+        };
         let json_str = extract_json(&text);
         // Salvage the common serde-on-200 failure: Groq returns HTTP 200 whose body
         // has DUPLICATE keys (e.g. `"relevance"` twice in one object). serde's derived
