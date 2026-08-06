@@ -639,7 +639,10 @@ impl GroqClient {
         // PULSE_ANALYZE_PROVIDER=groq to force the old path for A/B.
         let force_groq = std::env::var("PULSE_ANALYZE_PROVIDER").map(|v| v.eq_ignore_ascii_case("groq")).unwrap_or(false);
         let text = if !force_groq && std::env::var("ANTHROPIC_API_KEY").is_ok() {
-            match self.call_anthropic("claude-haiku-4-5", "analyze", system, &user_msg, 8000).await {
+            // 16000, not the Groq path's 8000: Haiku's relevance `reason` strings run
+            // longer than 70B's and a 125-story payload measured ~8k output — the 8000
+            // cap truncated a live run (2026-08-06). Haiku bills only tokens produced.
+            match self.call_anthropic("claude-haiku-4-5", "analyze", system, &user_msg, 16000).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("analyze via Anthropic failed ({}), falling back to Groq 70B", e);
@@ -930,6 +933,14 @@ fn build_analysis_result(parsed: AnalysisResponse, stories: &[SummarizedStory]) 
             // Reject same-sector pairs: this is the honesty fix for "cross-sector connections".
             if curated_stories[a].article.sector == curated_stories[b].article.sector {
                 same_sector_dropped += 1;
+                // Log the model's raw claim so scheduled runs reveal WHETHER the model
+                // mislabels sectors or the remap does: input ids vs the sectors we resolved.
+                tracing::info!(
+                    "  dropped same-sector pair: model story_ids={:?} → [{}] {} ↔ [{}] {}",
+                    c.story_ids,
+                    curated_stories[a].article.sector, curated_stories[a].headline.chars().take(50).collect::<String>(),
+                    curated_stories[b].article.sector, curated_stories[b].headline.chars().take(50).collect::<String>()
+                );
                 return None;
             }
             Some(Connection {
