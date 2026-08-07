@@ -114,7 +114,12 @@ pub async fn enrich(mut articles: Vec<RawArticle>) -> Vec<RawArticle> {
         articles
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.source_type == "news" && !a.url.is_empty())
+            .filter(|(_, a)| {
+                a.source_type == "news"
+                    && !a.url.is_empty()
+                    // Already grounded at parse time (RSS content:encoded).
+                    && !a.content_snippet.contains("\n\nArticle text: ")
+            })
             .map(|(i, a)| {
                 let client = client.clone();
                 let url = a.url.clone();

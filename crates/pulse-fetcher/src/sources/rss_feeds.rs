@@ -224,14 +224,29 @@ async fn fetch_single(
             })
             .unwrap_or_default();
 
+        // Many feeds ship the FULL article in <content:encoded>. Extract its
+        // readable text and append with the same "Article text:" marker
+        // article_text::enrich uses — the summarizer gets grounded input for
+        // free (no HTTP fetch, no bot-blocking) and enrich skips these articles.
+        let full_text = entry
+            .content
+            .as_ref()
+            .and_then(|c| c.body.as_deref())
+            .map(crate::article_text::extract_paragraphs)
+            .unwrap_or_default();
+
         if !title.is_empty() && !link.is_empty() {
+            let mut content_snippet: String = snippet.chars().take(500).collect();
+            if !full_text.is_empty() {
+                content_snippet = format!("{}\n\nArticle text: {}", content_snippet, full_text);
+            }
             articles.push(RawArticle {
                 title,
                 url: link,
                 source_name: name.to_string(),
                 source_url: url.to_string(),
                 published_at: pub_date.map(|dt| dt.to_rfc3339()),
-                content_snippet: snippet.chars().take(500).collect(),
+                content_snippet,
                 sector: sector.to_string(),
                 feed_id: format!("rss_{}", name.to_lowercase().replace(' ', "_")),
                 language: lang.to_string(),

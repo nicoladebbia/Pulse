@@ -688,11 +688,53 @@ impl GroqClient {
                 })?,
         };
 
+        let mut parsed = parsed;
         if parsed.relevance_scores.len() < stories.len() {
             tracing::warn!(
-                "Analysis returned {}/{} relevance_scores — some stories will lack relevance data",
+                "Analysis returned {}/{} relevance_scores — retrying the missing ones",
                 parsed.relevance_scores.len(), stories.len()
             );
+            // One targeted retry: score ONLY the skipped stories. Haiku reliably
+            // handles a small single-task batch even when it dropped entries from
+            // the giant 4-task call. Best-effort — a failure keeps the shortfall.
+            let scored: std::collections::HashSet<usize> =
+                parsed.relevance_scores.iter().map(|r| r.story_id).collect();
+            let missing: Vec<usize> =
+                (0..stories.len()).filter(|i| !scored.contains(i)).collect();
+            let mut retry_msg = String::from(
+                "Score each story 1-10 for personal relevance to a tech founder in Miami Beach \
+                 who builds AI/ML apps, Shopify tools, and iOS apps; Italian heritage, follows Serie A.\n\
+                 Return ONLY JSON: {\"relevance_scores\": [{\"story_id\": <id>, \"relevance\": <1-10>, \"reason\": \"...\"}]}\n\
+                 Use the EXACT story_id values shown. Score every story listed.\n",
+            );
+            for &i in &missing {
+                retry_msg.push_str(&format!(
+                    "\n[{}] [{}] {}\n{}\n",
+                    i, stories[i].article.sector, stories[i].headline, stories[i].summary
+                ));
+            }
+            #[derive(Deserialize)]
+            struct RetryScores { relevance_scores: Vec<AnalysisRelevance> }
+            let retry_text = match self
+                .call_anthropic("claude-haiku-4-5", "relevance_retry", "You score news stories for personal relevance. Return valid JSON only.", &retry_msg, 4000)
+                .await
+            {
+                Ok(t) => Ok(t),
+                Err(_) => self.call(STRONG_MODEL_DEFAULT, "relevance_retry", "You score news stories for personal relevance. Return valid JSON only.", &retry_msg, 4000).await,
+            };
+            match retry_text {
+                Ok(t) => match serde_json::from_str::<RetryScores>(&extract_json(&t)) {
+                    Ok(r) => {
+                        let added = r.relevance_scores.into_iter()
+                            .filter(|s| missing.contains(&s.story_id))
+                            .collect::<Vec<_>>();
+                        tracing::info!("Relevance retry recovered {}/{} missing scores", added.len(), missing.len());
+                        parsed.relevance_scores.extend(added);
+                    }
+                    Err(e) => tracing::warn!("Relevance retry parse failed (non-fatal): {}", e),
+                },
+                Err(e) => tracing::warn!("Relevance retry call failed (non-fatal): {}", e),
+            }
         }
 
         // Validate and log per-sector curation
@@ -711,6 +753,52 @@ impl GroqClient {
         // unit-tested without a live Groq call (see tests below).
         Ok(build_analysis_result(parsed, stories))
     }
+    /// Dedicated cross-sector connections pass over the CURATED stories.
+    /// The 4-task analyze prompt reliably under-delivers connections (models
+    /// pad with same-sector pairs or skip the task); a single-task call over
+    /// the final curated list complies far better. Indices in the input ARE
+    /// curated positions, so no URL remap is needed — just bounds+sector checks.
+    /// Best-effort: callers keep analyze()'s connections on Err.
+    pub async fn find_connections(&self, curated: &[SummarizedStory]) -> anyhow::Result<Vec<Connection>> {
+        let system = "You find cross-sector connections between news stories for an intelligence briefing. Return valid JSON only.";
+        let mut user_msg = String::from(
+            "Below are today's curated stories, each tagged [index] [sector].\n\
+             Find 3-6 connections. Each connection links exactly 2 stories whose [sector] tags DIFFER \
+             (ai↔tech, ai↔italy, miami↔tech, ...). Same-sector pairs are invalid and will be discarded.\n\
+             Look for: shared companies, shared policy/regulation, shared money flows, shared people, shared supply chains.\n\
+             The insight must say something neither story says alone.\n\
+             Return ONLY JSON: {\"connections\": [{\"story_ids\": [3, 87], \"connection\": \"...\", \"insight\": \"...\"}]}\n\
+             FINAL CHECK: for each pair, confirm the two [sector] tags differ — replace any same-sector pair.\n",
+        );
+        for (i, s) in curated.iter().enumerate() {
+            user_msg.push_str(&format!("\n[{}] [{}] {}", i, s.article.sector, s.headline));
+        }
+
+        #[derive(Deserialize)]
+        struct ConnectionsOnly { connections: Vec<AnalysisConnection> }
+        let text = match self.call_anthropic("claude-haiku-4-5", "connections", system, &user_msg, 2000).await {
+            Ok(t) => Ok(t),
+            Err(_) => self.call(STRONG_MODEL_DEFAULT, "connections", system, &user_msg, 2000).await,
+        }?;
+        let parsed: ConnectionsOnly = serde_json::from_str(&extract_json(&text))?;
+
+        let mut dropped = 0usize;
+        let connections: Vec<Connection> = parsed.connections.into_iter()
+            .filter_map(|c| {
+                if c.story_ids.len() < 2 { return None; }
+                let (a, b) = (c.story_ids[0], c.story_ids[1]);
+                if a >= curated.len() || b >= curated.len() || a == b { return None; }
+                if curated[a].article.sector == curated[b].article.sector {
+                    dropped += 1;
+                    return None;
+                }
+                Some(Connection { story_idx_a: a, story_idx_b: b, connection: c.connection, insight: c.insight })
+            })
+            .collect();
+        tracing::info!("Dedicated connections pass: {} cross-sector kept, {} same-sector dropped", connections.len(), dropped);
+        Ok(connections)
+    }
+
     /// Pre-curate raw articles before summarization. Uses 70B to pick the most
     /// newsworthy articles from the raw pool, then applies a sector-balanced hard
     /// cap (max_keep), so we only pay to summarize stories that can actually make
@@ -1203,3 +1291,4 @@ mod tests {
         assert_eq!(sectors, ["ai", "italy"]);
     }
 }
+
