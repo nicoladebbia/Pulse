@@ -1,3 +1,4 @@
+mod article_text;
 mod pipeline;
 mod sources;
 mod claude;

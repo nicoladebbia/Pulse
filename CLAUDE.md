@@ -19,10 +19,10 @@ cargo build -p pulse-fetcher    # Build fetcher only
 ```
 
 ## Key Decisions
-- Groq for the fetch pipeline: llama-3.1-8b-instant for short/exec summaries, llama-3.3-70b-versatile for story summaries + cross-sector analysis (NOT Anthropic — the `claude/` module name is legacy). Anthropic is only used by the in-app chat command.
+- Fetch pipeline models: llama-3.1-8b-instant (Groq) for story/exec summaries, llama-3.3-70b-versatile (Groq) for pre-curation + freedoms analysis, Claude Haiku 4.5 (Anthropic) for the daily cross-sector `analyze` (falls back to Groq 70B on error; `PULSE_ANALYZE_PROVIDER=groq` forces the old path). Anthropic also powers in-app chat, contextual prefixes, entity extraction, and predictions. The `claude/` module name predates the Groq migration.
 - SQLite + sqlite-vec for storage and vector search
 - Voyage-3-lite for embeddings (512 dims)
-- All news sources are free APIs (Google News RSS, HN, direct RSS, Currents)
+- All news sources are free APIs (Google News RSS, HN, direct RSS)
 - Magazine layout, dark mode only, vim-style keyboard shortcuts
 
 ## Crash Prevention Rules
@@ -33,4 +33,4 @@ cargo build -p pulse-fetcher    # Build fetcher only
 - **Test nullable DB columns** — use `Option<T>` for any column that can be NULL, even if a WHERE clause filters NULLs.
 
 ## Environment Variables
-Required in `.env`: ANTHROPIC_API_KEY, VOYAGE_API_KEY, CURRENTS_API_KEY
+Required in `.env`: ANTHROPIC_API_KEY, VOYAGE_API_KEY, GROQ_API_KEY

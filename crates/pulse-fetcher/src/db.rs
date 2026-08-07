@@ -587,15 +587,9 @@ pub fn log_api_usage(
     input_tokens: i64,
     output_tokens: i64,
 ) {
-    let cost = match (provider, model) {
-        ("groq", m) if m.contains("8b") => (input_tokens as f64 * 0.05 + output_tokens as f64 * 0.08) / 1_000_000.0,
-        ("groq", m) if m.contains("scout") => (input_tokens as f64 * 0.11 + output_tokens as f64 * 0.34) / 1_000_000.0,
-        ("groq", _) => (input_tokens as f64 * 0.59 + output_tokens as f64 * 0.79) / 1_000_000.0,
-        ("anthropic", m) if m.contains("haiku") => (input_tokens as f64 * 0.25 + output_tokens as f64 * 1.25) / 1_000_000.0,
-        ("anthropic", m) if m.contains("sonnet") => (input_tokens as f64 * 3.0 + output_tokens as f64 * 15.0) / 1_000_000.0,
-        ("voyage", _) => (input_tokens as f64 * 0.02) / 1_000_000.0,
-        _ => 0.0,
-    };
+    // Prices come from the shared pulse-pricing crate, which reads pricing.json
+    // (next to pulse.db) on every call — edit that file to update prices live.
+    let cost = pulse_pricing::estimate_cost(provider, model, input_tokens, output_tokens);
 
     conn.execute(
         "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd)

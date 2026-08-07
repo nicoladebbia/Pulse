@@ -2958,6 +2958,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "futures-util",
+ "pulse-pricing",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -2983,6 +2984,7 @@ dependencies = [
  "dotenvy",
  "feed-rs",
  "futures",
+ "pulse-pricing",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -2995,6 +2997,16 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "pulse-pricing"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

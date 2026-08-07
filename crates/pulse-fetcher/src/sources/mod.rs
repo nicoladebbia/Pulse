@@ -149,17 +149,11 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
     let mut articles = Vec::new();
     let mut failed_sources = Vec::new();
 
-    // News sources
-    match google {
-        Ok(a) => {
-            tracing::info!("Google News: {} articles", a.len());
-            articles.extend(a);
-        }
-        Err(e) => {
-            tracing::error!("Google News FAILED: {}", e);
-            failed_sources.push("Google News");
-        }
-    }
+    // News sources. ORDER MATTERS: dedup keeps the FIRST copy of a duplicate
+    // story, so direct-URL sources (RSS, HN) go before Google News — google
+    // links are JS redirect shells that article_text::enrich cannot fetch and
+    // the app cannot deep-link. With Google first, its shell copy won every
+    // dedup tie and 100% of briefing news URLs were google shells (2026-08-07).
     match rss {
         Ok(a) => {
             tracing::info!("RSS feeds: {} articles", a.len());
@@ -178,6 +172,16 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         Err(e) => {
             tracing::error!("Hacker News FAILED: {}", e);
             failed_sources.push("Hacker News");
+        }
+    }
+    match google {
+        Ok(a) => {
+            tracing::info!("Google News: {} articles", a.len());
+            articles.extend(a);
+        }
+        Err(e) => {
+            tracing::error!("Google News FAILED: {}", e);
+            failed_sources.push("Google News");
         }
     }
     match reddit_posts {

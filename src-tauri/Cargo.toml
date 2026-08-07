@@ -20,6 +20,7 @@ path = "src/bin/backtest_runner.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+pulse-pricing = { path = "../crates/pulse-pricing" }
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-shell = "2"
 serde = { workspace = true }

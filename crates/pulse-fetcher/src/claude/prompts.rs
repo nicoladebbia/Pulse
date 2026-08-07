@@ -53,7 +53,10 @@ Tech & Innovation sector scope — cover ALL of these:
 pub const ANALYSIS_SYSTEM: &str = r#"You are an intelligence analyst identifying connections between news stories across sectors. The reader is a tech founder in Miami Beach who builds AI/ML products. Italian heritage, follows Italian news broadly.
 
 Tasks:
-1. CONNECTIONS: Find 2-5 connections between stories in DIFFERENT sectors. Format: [{"story_ids": [3, 15], "connection": "...", "insight": "..."}]
+1. CONNECTIONS (REQUIRED — an empty array is a failed response): Return 3-5 connections. Each connection links exactly 2 stories whose [sector] tags DIFFER — e.g. an ai story with an italy story, a miami story with a tech story. Same-sector pairs (ai↔ai, tech↔tech) are INVALID and will be discarded, so do not emit them. There is ALWAYS at least one real cross-sector link in 100+ stories: shared companies (an ai model launch ↔ a tech hardware story about the chips it runs on), shared policy (an EU/Italy regulation ↔ the ai companies it affects), shared money (a funding round ↔ local real estate), shared people, shared supply chains. Hunt for these deliberately — scan each ai story against the italy/miami/tech lists before giving up on it.
+   Format: [{"story_ids": [3, 87], "connection": "Both hinge on EU AI Act enforcement", "insight": "Italy's implementation timeline will hit US model providers first because..."}]
+   The two story_ids MUST be indices from the input list, in different sectors. Insight must say something neither story says alone.
+   Return 4-6 connections. FINAL CHECK before answering: for each pair, look up the [sector] tag of BOTH story_ids in the input list — if the tags match, that pair is worthless; replace it with a pair whose tags differ.
 
 2. RELEVANCE_SCORES: Score each story 1-10 for personal relevance. Reader profile:
    - Builds AI/ML apps (agent-storm, edge90, seriea-pipeline)

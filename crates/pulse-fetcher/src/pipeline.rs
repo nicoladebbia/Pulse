@@ -353,6 +353,12 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 2.5: Pre-curate — pick the best ~90 NEWS articles BEFORE expensive summarization
     // (Financial articles skip this — they're already structured data)
+    // Degradation flags for the post-run health alert: every fallback below is
+    // deliberately non-fatal, which is exactly why each one must be COUNTED — the
+    // Scout decommission (2026-07-17) ran the dumb pre-curation fallback for 3
+    // weeks with nothing but a log line nobody reads.
+    let mut pre_curate_fell_back = false;
+    let mut analysis_degraded = false;
     let articles_to_summarize = if news_articles.len() > 100 {
         tracing::info!("Pre-curating: selecting best articles from {} candidates...", news_articles.len());
         let api_key = std::env::var("GROQ_API_KEY")
@@ -369,6 +375,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::warn!("Pre-curation failed (non-fatal): {}", e);
+                pre_curate_fell_back = true;
                 // Sector-balanced cap: ensure each sector is represented
                 let mut fallback = if news_articles.len() > 150 {
                     tracing::info!("Sector-balanced cap from {} to ~150 articles", news_articles.len());
@@ -409,6 +416,10 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 3: Summarize pre-curated NEWS articles (not financial — they're already structured)
     progress.start_stage(3);
+    // Ground summaries in real article text (best-effort — fetch failures keep
+    // the snippet). Without this, models fabricate specifics from title+snippet.
+    tracing::info!("Phase 3: Fetching article bodies for {} stories...", articles_to_summarize.len());
+    let articles_to_summarize = crate::article_text::enrich(articles_to_summarize).await;
     tracing::info!("Phase 3: Summarizing {} stories...", articles_to_summarize.len());
     let summaries = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress), db_path).await?;
     let sum_count = summaries.len() as i64;
@@ -466,6 +477,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Ok(a) => a,
         Err(e) => {
             tracing::error!("Cross-sector analysis failed ({}) — persisting news WITHOUT cross-sector enrichment (degraded briefing).", e);
+            analysis_degraded = true;
             crate::claude::degraded_analysis(&summaries)
         }
     };
@@ -912,6 +924,37 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         tracing::info!("║ Total stories in DB: {:>6}              ║", total_stories);
         tracing::info!("║ Duration:            {:>5.1}s              ║", duration.as_secs_f64());
         tracing::info!("╚══════════════════════════════════════════╝");
+
+        // Silent-degradation alert: a run can end Ok while quietly worse than
+        // yesterday's — every check below corresponds to a fallback that once
+        // masked a real outage for days/weeks. One notification, all findings.
+        let mut degradations: Vec<String> = Vec::new();
+        if pre_curate_fell_back {
+            degradations.push("pre-curation fell back to sector cap (LLM call failed)".into());
+        }
+        if analysis_degraded {
+            degradations.push("analyze failed entirely — no relevance/connections/trends".into());
+        }
+        if !analysis_degraded && analysis.connections.is_empty() {
+            degradations.push("0 cross-sector connections in today's briefing".into());
+        }
+        if !analysis_degraded {
+            // analyze succeeded — but on which provider? No anthropic row today
+            // means the Haiku path silently fell back to Groq 70B.
+            let anthropic_analyze_today: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM api_usage WHERE provider='anthropic' AND endpoint='analyze'
+                 AND DATE(created_at) = DATE('now')",
+                [], |r| r.get(0),
+            ).unwrap_or(0);
+            if anthropic_analyze_today == 0 {
+                degradations.push("analyze ran on Groq fallback, not Claude Haiku".into());
+            }
+        }
+        if !degradations.is_empty() {
+            let msg = format!("Briefing OK but degraded: {}", degradations.join("; "));
+            tracing::warn!("{}", msg);
+            notify_degraded(&msg);
+        }
     }
 
     Ok(())
@@ -2705,7 +2748,9 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         unique
     };
 
-    // Phase 3: Summarize
+    // Phase 3: Summarize (grounded in fetched article bodies, best-effort)
+    tracing::info!("Freedoms: Fetching article bodies for {} stories...", to_summarize.len());
+    let to_summarize = crate::article_text::enrich(to_summarize).await;
     tracing::info!("Freedoms: Summarizing {} stories...", to_summarize.len());
     let summaries = crate::claude::summarize_stories(&to_summarize, None, db_path).await?;
     tracing::info!("Freedoms: {} summaries", summaries.len());

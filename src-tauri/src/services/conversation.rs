@@ -710,11 +710,26 @@ impl ClaudeConversation {
 #[derive(Deserialize)]
 struct ClaudeResponse {
     content: Vec<ClaudeContentBlock>,
+    usage: Option<ClaudeUsage>,
 }
 
 #[derive(Deserialize)]
 struct ClaudeContentBlock {
     text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeUsage {
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+/// Real token counts from the Anthropic response — replaces the old len()/4
+/// estimates in the chat commands' usage logging.
+#[derive(Debug, Clone, Copy)]
+pub struct LlmUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
 }
 
 #[async_trait]
@@ -724,7 +739,7 @@ impl ConversationLLM for ClaudeConversation {
         system: &str,
         messages: &[(String, String)],
     ) -> Result<String> {
-        self.send_message_with_model(system, messages, CONVERSATION_MODEL_FAST, 1200).await
+        Ok(self.send_message_with_model(system, messages, CONVERSATION_MODEL_FAST, 1200).await?.0)
     }
 }
 
@@ -735,7 +750,7 @@ impl ClaudeConversation {
         messages: &[(String, String)],
         model: &str,
         max_tokens: u32,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<LlmUsage>)> {
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|(role, content)| {
@@ -775,19 +790,24 @@ impl ClaudeConversation {
             .await
             .context("failed to parse Claude API response")?;
 
+        let usage = parsed.usage.as_ref().map(|u| LlmUsage {
+            input_tokens: u.input_tokens.unwrap_or(0),
+            output_tokens: u.output_tokens.unwrap_or(0),
+        });
         let text = parsed
             .content
             .into_iter()
             .find_map(|block| block.text)
             .unwrap_or_default();
 
-        Ok(text)
+        Ok((text, usage))
     }
 }
 
 impl ClaudeConversation {
     /// Stream a Claude response, calling `on_chunk` for each text delta.
-    /// Returns the fully accumulated response text.
+    /// Returns the fully accumulated response text plus real token usage
+    /// (input from `message_start`, output from the final `message_delta`).
     pub async fn send_message_stream<F>(
         &self,
         system: &str,
@@ -795,7 +815,7 @@ impl ClaudeConversation {
         model: &str,
         max_tokens: u32,
         on_chunk: F,
-    ) -> Result<String>
+    ) -> Result<(String, Option<LlmUsage>)>
     where
         F: Fn(&str) + Send,
     {
@@ -834,6 +854,8 @@ impl ClaudeConversation {
         let mut stream = resp.bytes_stream();
         let mut accumulated = String::new();
         let mut buffer = String::new();
+        let mut input_tokens: Option<i64> = None;
+        let mut output_tokens: Option<i64> = None;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("stream read error")?;
@@ -855,6 +877,15 @@ impl ClaudeConversation {
                                     accumulated.push_str(text);
                                     on_chunk(text);
                                 }
+                            } else if parsed["type"] == "message_start" {
+                                if let Some(n) = parsed["message"]["usage"]["input_tokens"].as_i64() {
+                                    input_tokens = Some(n);
+                                }
+                            } else if parsed["type"] == "message_delta" {
+                                // Cumulative — the last one wins.
+                                if let Some(n) = parsed["usage"]["output_tokens"].as_i64() {
+                                    output_tokens = Some(n);
+                                }
                             }
                         }
                     }
@@ -862,7 +893,11 @@ impl ClaudeConversation {
             }
         }
 
-        Ok(accumulated)
+        let usage = match (input_tokens, output_tokens) {
+            (Some(i), o) => Some(LlmUsage { input_tokens: i, output_tokens: o.unwrap_or(0) }),
+            _ => None,
+        };
+        Ok((accumulated, usage))
     }
 }
 
