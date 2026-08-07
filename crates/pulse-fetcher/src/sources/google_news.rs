@@ -171,7 +171,18 @@ async fn fetch_feed(
     let mut articles = Vec::new();
 
     for entry in feed.entries.iter().take(25) {
-        let title = entry.title.as_ref().map(|t| t.content.clone()).unwrap_or_default();
+        let raw_title = entry.title.as_ref().map(|t| t.content.clone()).unwrap_or_default();
+        // Google News titles are "Headline - Publisher". Strip the suffix so
+        // (a) cross-source dedup's word-set hash matches the same story from a
+        // direct RSS feed (publisher words otherwise poison the hash), and
+        // (b) the summarizer sees a clean headline. Only strip a short tail —
+        // long tails after " - " are usually part of the actual headline.
+        let (title, publisher) = match raw_title.rsplit_once(" - ") {
+            Some((head, tail)) if tail.len() <= 40 && !head.is_empty() => {
+                (head.trim().to_string(), Some(tail.trim().to_string()))
+            }
+            _ => (raw_title, None),
+        };
         let link = entry
             .links
             .first()
@@ -191,7 +202,7 @@ async fn fetch_feed(
             articles.push(RawArticle {
                 title,
                 url: link,
-                source_name: name.to_string(),
+                source_name: publisher.unwrap_or_else(|| name.to_string()),
                 source_url: url.to_string(),
                 published_at: published,
                 content_snippet: snippet,
