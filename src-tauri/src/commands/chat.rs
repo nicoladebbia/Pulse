@@ -358,9 +358,19 @@ pub async fn chat_send(
         _ => (conversation::CONVERSATION_MODEL_FAST, 1200u32),
     };
 
-    let raw_response = llm.send_message_with_model(&system_prompt, &messages_for_llm, chat_model, chat_max_tokens)
+    let (raw_response, llm_usage) = llm.send_message_with_model(&system_prompt, &messages_for_llm, chat_model, chat_max_tokens)
         .await
         .map_err(|e| format!("Claude error: {}", e))?;
+
+    // Log REAL token usage from the API response (len()/4 estimate as fallback).
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let (input, output) = match llm_usage {
+            Some(u) => (u.input_tokens, u.output_tokens),
+            None => ((system_prompt.len() + message.len()) as i64 / 4, raw_response.len() as i64 / 4),
+        };
+        api_usage::log_usage(&conn, "anthropic", chat_model, "chat", input, output).ok();
+    }
 
     // 8. Parse response
     let source_ids = conversation::extract_story_references(&raw_response);
@@ -906,7 +916,7 @@ pub async fn chat_send_stream(
 
     let on_event_clone = on_event.clone();
     let abort_clone = abort_flag.0.clone();
-    let raw_response = llm.send_message_stream(
+    let (raw_response, llm_usage) = llm.send_message_stream(
         &system_prompt,
         &messages_for_llm,
         chat_model,
@@ -1006,15 +1016,16 @@ pub async fn chat_send_stream(
         }
     }
 
-    // Log token usage (best-effort estimate) and compute cost
+    // Log REAL token usage from the stream's message_start/message_delta events
+    // (len()/4 estimate only as fallback for e.g. an aborted stream).
     let estimated_cost = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let input_est = (system_prompt.len() + message.len()) as i64 / 4;
-        let output_est = clean_message.len() as i64 / 4;
-        let model_label = if chat_model.contains("haiku") { "claude-haiku" } else { "claude-sonnet" };
-        api_usage::log_usage(&conn, "anthropic", model_label, "chat", input_est, output_est).ok();
-        // Estimate cost using pricing table
-        let cost = api_usage::estimate_cost("anthropic", model_label, input_est, output_est);
+        let (input, output) = match llm_usage {
+            Some(u) => (u.input_tokens, u.output_tokens),
+            None => ((system_prompt.len() + message.len()) as i64 / 4, clean_message.len() as i64 / 4),
+        };
+        api_usage::log_usage(&conn, "anthropic", chat_model, "chat", input, output).ok();
+        let cost = api_usage::estimate_cost("anthropic", chat_model, input, output);
         // Add ~$0.002 for rewrite + embedding + rerank overhead
         cost + 0.002
     };
