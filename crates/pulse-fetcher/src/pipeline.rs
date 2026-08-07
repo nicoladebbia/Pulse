@@ -420,7 +420,13 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // the snippet). Without this, models fabricate specifics from title+snippet.
     tracing::info!("Phase 3: Fetching article bodies for {} stories...", articles_to_summarize.len());
     let articles_to_summarize = crate::article_text::enrich(articles_to_summarize).await;
-    tracing::info!("Phase 3: Summarizing {} stories...", articles_to_summarize.len());
+    // Grounding coverage feeds the post-run health alert: 0 grounded articles
+    // means summaries are back to snippet-only fabrication territory.
+    let grounded_count = articles_to_summarize.iter()
+        .filter(|a| a.content_snippet.contains("\n\nArticle text: "))
+        .count();
+    tracing::info!("Phase 3: Summarizing {} stories ({} grounded in article text)...",
+        articles_to_summarize.len(), grounded_count);
     let summaries = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress), db_path).await?;
     let sum_count = summaries.len() as i64;
     let sum_failed = articles_to_summarize.len() as i64 - sum_count;
@@ -481,6 +487,24 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
             crate::claude::degraded_analysis(&summaries)
         }
     };
+
+    // Dedicated connections pass: the 4-task analyze prompt under-delivers
+    // connections (measured 0-2/run). A single-task call over the curated list
+    // complies much better. Run whenever analyze produced <3; keep the longer list.
+    if !analysis_degraded && analysis.connections.len() < 3 {
+        if let Ok(api_key) = std::env::var("GROQ_API_KEY") {
+            if let Ok(client) = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf())) {
+                match client.find_connections(&analysis.curated_stories).await {
+                    Ok(conns) if conns.len() > analysis.connections.len() => {
+                        tracing::info!("Connections upgraded {} -> {} via dedicated pass", analysis.connections.len(), conns.len());
+                        analysis.connections = conns;
+                    }
+                    Ok(conns) => tracing::info!("Dedicated pass found {} connections — keeping analyze's {}", conns.len(), analysis.connections.len()),
+                    Err(e) => tracing::warn!("Dedicated connections pass failed (non-fatal): {}", e),
+                }
+            }
+        }
+    }
 
     // Log sector distribution in curated stories
     {
@@ -937,6 +961,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         }
         if !analysis_degraded && analysis.connections.is_empty() {
             degradations.push("0 cross-sector connections in today's briefing".into());
+        }
+        if grounded_count == 0 {
+            degradations.push("0 stories grounded in article text (all snippet-only)".into());
         }
         if !analysis_degraded {
             // analyze succeeded — but on which provider? No anthropic row today

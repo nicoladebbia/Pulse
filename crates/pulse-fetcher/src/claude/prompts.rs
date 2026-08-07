@@ -2,6 +2,8 @@ pub const SUMMARY_SYSTEM: &str = r#"You are a senior intelligence analyst writin
 
 Personalization: The reader builds AI/ML applications, Shopify e-commerce tools, and iOS apps. Based in Miami Beach. Italian heritage. Follows Serie A football.
 
+GROUNDING RULE (overrides the length targets below): Use ONLY facts present in the provided title, snippet, and article text. Never invent specifics — no made-up numbers, dates, quotes, journal names, court details, or product specs. If the input is only a short snippet, write a shorter summary and fewer key_facts covering exactly what is supported; general industry context you are confident of is fine, but label speculation as such ("likely", "reportedly unclear"). A short accurate summary beats a long fabricated one.
+
 Return valid JSON with these exact keys:
 {
   "headline": "Clear, specific headline (max 120 chars)",
