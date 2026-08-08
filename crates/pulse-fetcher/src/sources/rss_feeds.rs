@@ -215,13 +215,11 @@ async fn fetch_single(
             .first()
             .map(|l| l.href.clone())
             .unwrap_or_default();
+        // Feed summaries are frequently raw HTML — strip to text before use.
         let snippet = entry
             .summary
             .as_ref()
-            .map(|s| s.content.clone())
-            .or_else(|| {
-                entry.content.as_ref().and_then(|c| c.body.clone())
-            })
+            .map(|s| crate::article_text::strip_tags(&s.content))
             .unwrap_or_default();
 
         // Many feeds ship the FULL article in <content:encoded>. Extract its
@@ -236,7 +234,13 @@ async fn fetch_single(
             .unwrap_or_default();
 
         if !title.is_empty() && !link.is_empty() {
-            let mut content_snippet: String = snippet.chars().take(500).collect();
+            // When there is no <description>, the body text serves as both
+            // snippet and grounding — never paste raw HTML into the snippet.
+            let mut content_snippet: String = if snippet.is_empty() {
+                full_text.chars().take(500).collect()
+            } else {
+                snippet.chars().take(500).collect()
+            };
             if !full_text.is_empty() {
                 content_snippet = format!("{}\n\nArticle text: {}", content_snippet, full_text);
             }

@@ -49,10 +49,10 @@ pub async fn groq_reachable() -> bool {
     }
 }
 
-/// The "strong" model used for the reasoning steps (cross-sector analysis +
-/// pre-curation). Overridable via PULSE_STRONG_MODEL for cost A/B testing —
-/// e.g. `meta-llama/llama-4-scout-17b-16e-instruct` is ~5x cheaper on input.
-/// Defaults to llama-3.3-70b-versatile. Returned owned so callers pass &str.
+/// The "strong" Groq model for pre-curation. Overridable via PULSE_STRONG_MODEL
+/// for A/B testing, but ONLY with a model confirmed live on Groq's /models list —
+/// the Llama-4 Scout override 404'd silently for 3 weeks after Groq
+/// decommissioned it (~2026-07-17). Defaults to llama-3.3-70b-versatile.
 fn strong_model() -> String {
     std::env::var("PULSE_STRONG_MODEL").unwrap_or_else(|_| STRONG_MODEL_DEFAULT.to_string())
 }
@@ -149,11 +149,6 @@ struct SummaryResponse {
     event_type: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct TranslationResponse {
-    title_en: String,
-    snippet_en: String,
-}
 
 #[derive(Deserialize, Default)]
 struct AnalysisResponse {
@@ -529,18 +524,6 @@ impl GroqClient {
         anyhow::bail!("Anthropic API: max retries exceeded (last error: {})", last_err.unwrap_or_else(|| "unknown".into()))
     }
 
-    pub async fn translate(&self, title: &str, snippet: &str) -> anyhow::Result<(String, String)> {
-        let system = "You are a translator. Translate Italian news to English. Return valid JSON only.";
-        let user_msg = format!(
-            "Translate to English. Return JSON: {{\"title_en\": \"...\", \"snippet_en\": \"...\"}}\n\nTitle: {}\nContent: {}",
-            title, snippet
-        );
-
-        let text = self.call(FAST_MODEL, "translate", system, &user_msg, 500).await?;
-        let parsed: TranslationResponse = serde_json::from_str(&extract_json(&text))?;
-        Ok((parsed.title_en, parsed.snippet_en))
-    }
-
     pub async fn summarize_story(&self, article: &RawArticle) -> anyhow::Result<SummarizedStory> {
         let system = super::prompts::SUMMARY_SYSTEM;
         let user_msg = format!(
@@ -697,10 +680,7 @@ impl GroqClient {
             // One targeted retry: score ONLY the skipped stories. Haiku reliably
             // handles a small single-task batch even when it dropped entries from
             // the giant 4-task call. Best-effort — a failure keeps the shortfall.
-            let scored: std::collections::HashSet<usize> =
-                parsed.relevance_scores.iter().map(|r| r.story_id).collect();
-            let missing: Vec<usize> =
-                (0..stories.len()).filter(|i| !scored.contains(i)).collect();
+            let missing = missing_relevance_ids(&parsed.relevance_scores, stories.len());
             let mut retry_msg = String::from(
                 "Score each story 1-10 for personal relevance to a tech founder in Miami Beach \
                  who builds AI/ML apps, Shopify tools, and iOS apps; Italian heritage, follows Serie A.\n\
@@ -725,11 +705,8 @@ impl GroqClient {
             match retry_text {
                 Ok(t) => match serde_json::from_str::<RetryScores>(&extract_json(&t)) {
                     Ok(r) => {
-                        let added = r.relevance_scores.into_iter()
-                            .filter(|s| missing.contains(&s.story_id))
-                            .collect::<Vec<_>>();
-                        tracing::info!("Relevance retry recovered {}/{} missing scores", added.len(), missing.len());
-                        parsed.relevance_scores.extend(added);
+                        let recovered = merge_retry_scores(&mut parsed.relevance_scores, r.relevance_scores, &missing);
+                        tracing::info!("Relevance retry recovered {}/{} missing scores", recovered, missing.len());
                     }
                     Err(e) => tracing::warn!("Relevance retry parse failed (non-fatal): {}", e),
                 },
@@ -967,6 +944,36 @@ fn extract_json_array(text: &str) -> String {
 ///     URL, the stable identity). Before this, an input index like 15 was read as
 ///     curated position 15 — landing inside the sector-grouped block and producing the
 ///     same-sector "cross-sector" connections seen in the DB (ai↔ai, miami↔miami).
+/// Input-story ids the model's relevance_scores skipped. Ids outside
+/// `0..total` are model garbage and do NOT mark a story as scored.
+fn missing_relevance_ids(scored: &[AnalysisRelevance], total: usize) -> Vec<usize> {
+    let have: std::collections::HashSet<usize> = scored
+        .iter()
+        .map(|r| r.story_id)
+        .filter(|&id| id < total)
+        .collect();
+    (0..total).filter(|i| !have.contains(i)).collect()
+}
+
+/// Merge retry scores into the main list: accept only ids we actually asked
+/// for (the missing set), at most once each. Returns how many were recovered.
+fn merge_retry_scores(
+    scores: &mut Vec<AnalysisRelevance>,
+    retry: Vec<AnalysisRelevance>,
+    missing: &[usize],
+) -> usize {
+    let wanted: std::collections::HashSet<usize> = missing.iter().copied().collect();
+    let mut taken: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut recovered = 0usize;
+    for s in retry {
+        if wanted.contains(&s.story_id) && taken.insert(s.story_id) {
+            scores.push(s);
+            recovered += 1;
+        }
+    }
+    recovered
+}
+
 fn build_analysis_result(parsed: AnalysisResponse, stories: &[SummarizedStory]) -> AnalysisResult {
     let mut curated_input_indices: Vec<usize> = Vec::new();
     curated_input_indices.extend(&parsed.curation.ai);
@@ -1087,6 +1094,36 @@ fn extract_json(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rel(id: usize, score: i32) -> AnalysisRelevance {
+        AnalysisRelevance { story_id: id, relevance: score, reason: "r".into() }
+    }
+
+    /// Mid-sequence gaps + out-of-range garbage ids: garbage must not mark a
+    /// story as scored, and gaps anywhere (not just the tail) must be found.
+    #[test]
+    fn missing_ids_finds_gaps_and_ignores_garbage() {
+        let scored = vec![rel(0, 5), rel(2, 6), rel(999, 9), rel(4, 7)];
+        assert_eq!(missing_relevance_ids(&scored, 5), vec![1, 3]);
+        assert_eq!(missing_relevance_ids(&[], 3), vec![0, 1, 2]);
+        assert_eq!(missing_relevance_ids(&[rel(0, 5), rel(1, 5), rel(2, 5)], 3), Vec::<usize>::new());
+    }
+
+    /// Merge must reject unrequested ids, garbage ids, and duplicates — the
+    /// retry model echoing already-scored stories must not double-score them.
+    #[test]
+    fn merge_accepts_only_requested_ids_once() {
+        let mut scores = vec![rel(0, 5), rel(2, 6)];
+        let missing = vec![1, 3];
+        let retry = vec![rel(1, 4), rel(1, 8), rel(2, 9), rel(999, 1), rel(3, 7)];
+        let recovered = merge_retry_scores(&mut scores, retry, &missing);
+        assert_eq!(recovered, 2);
+        assert_eq!(scores.len(), 4);
+        assert!(scores.iter().filter(|s| s.story_id == 1).count() == 1);
+        assert!(scores.iter().filter(|s| s.story_id == 2).count() == 1); // not double-scored
+        assert!(!scores.iter().any(|s| s.story_id == 999));
+    }
+
 
     /// The salvage path in `analyze()`: a Groq HTTP-200 body with a DUPLICATE key
     /// (`"relevance"` twice in one object) must not throw away the whole briefing.
@@ -1291,4 +1328,5 @@ mod tests {
         assert_eq!(sectors, ["ai", "italy"]);
     }
 }
+
 

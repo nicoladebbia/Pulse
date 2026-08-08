@@ -48,39 +48,6 @@ pub struct TrendDetection {
     pub trajectory: String,
 }
 
-pub async fn translate_italian(articles: &[RawArticle], db_path: &std::path::Path) -> anyhow::Result<Vec<RawArticle>> {
-    let italian: Vec<_> = articles.iter().filter(|a| a.language == "it").collect();
-    if italian.is_empty() {
-        return Ok(articles.to_vec());
-    }
-
-    tracing::info!("Translating {} Italian articles...", italian.len());
-    let api_key = std::env::var("GROQ_API_KEY")
-        .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
-
-    let client = client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
-    let mut result = articles.to_vec();
-
-    let mut translated_count = 0;
-    for article in &mut result {
-        if article.language == "it" {
-            match client.translate(&article.title, &article.content_snippet).await {
-                Ok((title, snippet)) => {
-                    article.title = title;
-                    article.content_snippet = snippet;
-                    article.language = "en".to_string();
-                    translated_count += 1;
-                }
-                Err(e) => tracing::warn!("Translation failed: {}", e),
-            }
-            // Throttle to stay under Gemini free tier (15 RPM)
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    }
-    tracing::info!("Translated {}/{} Italian articles", translated_count, italian.len());
-
-    Ok(result)
-}
 
 pub async fn summarize_stories(articles: &[RawArticle], progress: Option<&crate::pipeline::ProgressWriter>, db_path: &std::path::Path) -> anyhow::Result<Vec<SummarizedStory>> {
     let api_key = std::env::var("GROQ_API_KEY")
