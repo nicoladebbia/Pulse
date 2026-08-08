@@ -14,6 +14,8 @@ src-tauri/binaries/
 .codesight/
 .plans/
 
-# Local agent tooling caches (Claude Code, Serena)
-.claude/
+# Local agent tooling caches (Claude Code, Serena) — but skills are project
+# knowledge, not cache, so they stay tracked.
+.claude/*
+!.claude/skills/
 .serena/
