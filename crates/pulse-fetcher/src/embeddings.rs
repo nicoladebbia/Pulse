@@ -83,9 +83,18 @@ pub async fn generate(
             (batch_idx as f64 / total_batches as f64) * 100.0,
         );
         if batch_idx > 0 {
-            // Rate limit: free tier = 3 RPM, so wait 21s between batches
-            tracing::info!("Rate limit pause before batch {}...", batch_idx + 1);
-            tokio::time::sleep(std::time::Duration::from_secs(21)).await;
+            // Rate limit pacing. Default 21s matches the free tier's 3 RPM —
+            // the pauses are 3-5 min of pure sleep per run. After upgrading the
+            // Voyage account, set PULSE_VOYAGE_RPM in the launchd plist/.env
+            // (e.g. 60 → 2s pauses); no rebuild needed.
+            let rpm: u64 = std::env::var("PULSE_VOYAGE_RPM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&r| r > 0)
+                .unwrap_or(3);
+            let pause = (60 / rpm) + 1;
+            tracing::info!("Rate limit pause {}s before batch {} ({} RPM)...", pause, batch_idx + 1, rpm);
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
         }
 
         let batch_texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
