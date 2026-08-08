@@ -19,9 +19,35 @@ const BODY_CAP: usize = 1600;
 const MIN_PARAGRAPH_CHARS: usize = 80;
 const FETCH_CONCURRENCY: usize = 8;
 
+/// Strip all tags and decode common entities — the fallback when HTML has no
+/// usable <p> structure (e.g. content:encoded that is plain text or <div>-soup).
+pub fn strip_tags(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    let text = text
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Extract readable paragraph text from raw HTML: the contents of <p>…</p>
 /// blocks, tags stripped, entities minimally decoded, boilerplate-length
-/// filtered, joined until BODY_CAP. Pure function — unit-tested below.
+/// filtered, joined until BODY_CAP. Falls back to whole-document tag stripping
+/// when no <p> structure exists (plain-text or <div>-only content). Pure
+/// function — unit-tested below.
 pub fn extract_paragraphs(html: &str) -> String {
     let mut out = String::new();
     let lower = html.to_lowercase();
@@ -71,6 +97,16 @@ pub fn extract_paragraphs(html: &str) -> String {
                 break;
             }
         }
+    }
+    if out.is_empty() {
+        // No <p> structure — fall back to whole-document stripping, but only
+        // when that yields substantial text (a nav-only shell stays empty).
+        let mut stripped = strip_tags(html);
+        if stripped.len() >= MIN_PARAGRAPH_CHARS * 2 {
+            stripped.truncate(BODY_CAP);
+            return stripped;
+        }
+        return String::new();
     }
     out
 }
@@ -178,6 +214,16 @@ mod tests {
     #[test]
     fn empty_on_paragraphless_html() {
         assert_eq!(extract_paragraphs("<div>short</div>"), "");
+    }
+
+    /// Content with no <p> structure but substantial text (common in
+    /// content:encoded) must fall back to whole-document stripping.
+    #[test]
+    fn falls_back_to_strip_tags_for_div_only_content() {
+        let body = format!("<div>{}</div>", "The commission voted to approve the measure after months of debate. ".repeat(5));
+        let text = extract_paragraphs(&body);
+        assert!(text.contains("commission voted to approve"));
+        assert!(!text.contains('<'));
     }
 }
 

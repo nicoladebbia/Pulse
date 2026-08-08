@@ -2778,7 +2778,11 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     // Phase 3: Summarize (grounded in fetched article bodies, best-effort)
     tracing::info!("Freedoms: Fetching article bodies for {} stories...", to_summarize.len());
     let to_summarize = crate::article_text::enrich(to_summarize).await;
-    tracing::info!("Freedoms: Summarizing {} stories...", to_summarize.len());
+    let grounded = to_summarize.iter()
+        .filter(|a| a.content_snippet.contains("\n\nArticle text: "))
+        .count();
+    tracing::info!("Freedoms: Summarizing {} stories ({} grounded in article text)...",
+        to_summarize.len(), grounded);
     let summaries = crate::claude::summarize_stories(&to_summarize, None, db_path).await?;
     tracing::info!("Freedoms: {} summaries", summaries.len());
 
