@@ -141,6 +141,13 @@ async fn main() -> anyhow::Result<()> {
             // With 4 daily slots (7am/12pm/6pm/10pm) one usually catches a clean window.
             if !crate::claude::client::groq_reachable().await {
                 tracing::info!("Groq unreachable (blocked source IP) — skipping this slot silently, a later slot will retry.");
+                // Silent-skip staleness alarm: a single skipped slot is expected, but
+                // skips can repeat for DAYS with zero user-visible signal (paid
+                // 2026-08-07→09: six consecutive preflight skips, no briefing for 2
+                // days, nobody told). If the newest briefing is >36h old at skip
+                // time, fire ONE notification per calendar day (stamp file dedupes
+                // across the 4 slots).
+                notify_if_stale(&db_path);
                 return Ok(());
             }
 
@@ -318,6 +325,45 @@ fn notify_failure(summary: &str) {
             summary.replace('"', "'").replace('\\', "")
         ))
         .status();
+}
+
+/// Preflight silent-skip staleness alarm. Skipping one blocked slot is expected;
+/// skipping every slot for days is an outage the user must hear about. If the
+/// newest briefing (any type) is older than 36h when a skip happens, notify —
+/// at most once per calendar day via a stamp file next to the DB. Best-effort
+/// throughout: a broken DB read must never turn a clean skip into a crash.
+fn notify_if_stale(db_path: &std::path::Path) {
+    const STALE_HOURS: i64 = 36;
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return;
+    };
+    let last: Option<String> = conn
+        .query_row("SELECT MAX(created_at) FROM briefings", [], |row| row.get(0))
+        .ok()
+        .flatten();
+    let Some(last) = last else { return };
+    let Ok(last_ts) = chrono::NaiveDateTime::parse_from_str(&last, "%Y-%m-%d %H:%M:%S") else {
+        return;
+    };
+    let age_hours = (chrono::Utc::now().naive_utc() - last_ts).num_hours();
+    if age_hours < STALE_HOURS {
+        return;
+    }
+    // Once per day across the 4 slots: stamp file holds the last alert date.
+    let stamp = db_path.with_file_name("stale-alert-date.txt");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    if std::fs::read_to_string(&stamp).map(|s| s.trim() == today).unwrap_or(false) {
+        return;
+    }
+    let _ = std::fs::write(&stamp, &today);
+    tracing::warn!("No briefing for {}h — firing staleness alert", age_hours);
+    notify_failure(&format!(
+        "No briefing for {}h — fetch slots keep getting skipped (Groq 403-blocked from this network). Check VPN/network.",
+        age_hours
+    ));
 }
 
 async fn backfill_embeddings(db_path: &std::path::Path) -> anyhow::Result<()> {

@@ -29,24 +29,38 @@ pub async fn groq_reachable() -> bool {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        // Local client-build failure says nothing about the blocklist — fail open.
+        Err(_) => return true,
     };
-    match http.get(MODELS_URL).send().await {
-        Ok(resp) => {
-            let code = resp.status().as_u16();
-            if code == 403 {
-                tracing::warn!("Groq preflight: HTTP 403 — source IP blocked (VPN/network). Skipping run.");
-                false
-            } else {
+    // Only an HTTP 403 is evidence of Groq's IP blocklist — that's what this
+    // probe exists to detect, and only that should skip the slot. A TRANSPORT
+    // error (DNS, connect, TLS) proves nothing about the blocklist, and
+    // fail-closed on it caused the 2026-08-07→09 outage: launchd-context runs
+    // hit "error sending request" for six consecutive slots and skipped
+    // SILENTLY while the shell reached Groq fine. Fail OPEN on transport
+    // errors (after one retry): if the network is genuinely dead the pipeline
+    // fails fast and LOUDLY via notify_failure instead of vanishing.
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        match http.get(MODELS_URL).send().await {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                if code == 403 {
+                    tracing::warn!("Groq preflight: HTTP 403 — source IP blocked (VPN/network). Skipping run.");
+                    return false;
+                }
                 tracing::info!("Groq preflight: HTTP {} — reachable.", code);
-                true
+                return true;
+            }
+            Err(e) => {
+                tracing::warn!("Groq preflight: probe transport error (attempt {}): {}", attempt + 1, e);
             }
         }
-        Err(e) => {
-            tracing::warn!("Groq preflight: probe failed ({}) — treating as unreachable, skipping run.", e);
-            false
-        }
     }
+    tracing::warn!("Groq preflight: probe never connected — proceeding anyway (transport error is not a 403; a dead network will fail loudly in the pipeline).");
+    true
 }
 
 /// The "strong" Groq model for pre-curation. Overridable via PULSE_STRONG_MODEL
