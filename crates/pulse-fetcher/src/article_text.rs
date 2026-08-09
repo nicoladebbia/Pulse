@@ -19,6 +19,20 @@ const BODY_CAP: usize = 1600;
 const MIN_PARAGRAPH_CHARS: usize = 80;
 const FETCH_CONCURRENCY: usize = 8;
 
+/// Truncate at a char boundary at or below `max_bytes`. `String::truncate`
+/// PANICS mid-UTF-8-char — this killed two real runs on non-ASCII articles
+/// (ANSA Italian text landed a multi-byte char across byte 1600).
+fn truncate_at_char_boundary(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 /// Strip all tags and decode common entities — the fallback when HTML has no
 /// usable <p> structure (e.g. content:encoded that is plain text or <div>-soup).
 pub fn strip_tags(html: &str) -> String {
@@ -93,7 +107,7 @@ pub fn extract_paragraphs(html: &str) -> String {
             }
             out.push_str(&text);
             if out.len() >= BODY_CAP {
-                out.truncate(BODY_CAP);
+                truncate_at_char_boundary(&mut out, BODY_CAP);
                 break;
             }
         }
@@ -103,7 +117,7 @@ pub fn extract_paragraphs(html: &str) -> String {
         // when that yields substantial text (a nav-only shell stays empty).
         let mut stripped = strip_tags(html);
         if stripped.len() >= MIN_PARAGRAPH_CHARS * 2 {
-            stripped.truncate(BODY_CAP);
+            truncate_at_char_boundary(&mut stripped, BODY_CAP);
             return stripped;
         }
         return String::new();
@@ -201,6 +215,24 @@ mod tests {
         assert!(!text.contains("Menu"));
         assert!(!text.contains("Cookie policy"));
         assert!(!text.contains("code block"));
+    }
+
+    /// Regression: non-ASCII bodies whose BODY_CAP byte falls mid-char must
+    /// not panic (String::truncate asserts is_char_boundary). Repro of the
+    /// 2026-08-07/08 production crashes on Italian articles.
+    #[test]
+    fn caps_multibyte_text_without_panicking() {
+        // Deterministic mid-char split: 1591 ASCII bytes then 2-byte 'è's, so
+        // 'è' chars occupy odd byte offsets 1591-1592, 1593-1594, … and byte
+        // BODY_CAP (1600) lands INSIDE one. String::truncate panics there.
+        let body = format!("{}{}", "a".repeat(BODY_CAP - 9), "è".repeat(10));
+        let text = extract_paragraphs(&format!("<p>{}</p>", body));
+        assert!(text.len() <= BODY_CAP);
+        assert!(!text.is_empty());
+        // Fallback path too (no <p> structure).
+        let text2 = extract_paragraphs(&format!("<div>{}</div>", body));
+        assert!(text2.len() <= BODY_CAP);
+        assert!(!text2.is_empty());
     }
 
     #[test]
