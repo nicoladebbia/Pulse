@@ -29,6 +29,7 @@
 		error = null;
 		if (!isTauri()) {
 			briefings = mockArchiveBriefings;
+			openFromQueryParam();
 			loading = false;
 			return;
 		}
@@ -37,8 +38,23 @@
 			error = 'Failed to load archive';
 		} else {
 			briefings = result;
+			openFromQueryParam();
 		}
 		loading = false;
+	}
+
+	// Deep-link support: /archive?date=today (or ?date=YYYY-MM-DD) opens that
+	// day's briefing directly instead of landing on the day-picker list.
+	function openFromQueryParam() {
+		const param = new URLSearchParams(window.location.search).get('date');
+		if (!param) return;
+		// Local date, not toISOString() (UTC) — after 8 PM Miami the UTC date is
+		// already tomorrow and the lookup would silently miss today's briefing.
+		const now = new Date();
+		const localToday = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+		const date = param === 'today' ? localToday : param;
+		const target = briefings.find(b => b.date === date && b.briefing_type !== 'freedoms');
+		if (target) selectDaily(target.id);
 	}
 
 	async function selectDaily(briefingId: number) {

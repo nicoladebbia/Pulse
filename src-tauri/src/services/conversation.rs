@@ -334,7 +334,7 @@ MARKERS (UI extracts these):
 - Predictions: [prediction: "SPECIFIC OUTCOME by DATE" | confidence: 0.X | timeframe: "BY YYYY-MM-DD"]
   Each prediction must be falsifiable. State "Fails if: [condition]" after each one.
 
-Suggest 2-4 follow-ups."#);
+Suggest 2-4 follow-ups as [followup: ...] markers, each on its own line at the very END of your response. Do NOT write a visible "Suggested follow-ups" heading, section, or numbered list around them — the UI extracts the markers and renders them as buttons."#);
 
     prompt
 }
@@ -659,6 +659,45 @@ pub fn clean_response(response: &str) -> String {
             break;
         }
     }
+
+    // Marker removal can leave husks behind when the model wrapped markers in a
+    // visible list (e.g. "## Suggested Follow-ups\n1. [followup: ...]" becomes
+    // "## Suggested Follow-ups\n1."). Drop list items that are now empty, then
+    // drop any follow-up heading whose section no longer has content.
+    let lines: Vec<&str> = result.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        let empty_numbered = t.len() >= 2
+            && t.ends_with('.')
+            && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit());
+        if empty_numbered || t == "-" || t == "*" {
+            continue;
+        }
+        let is_followup_heading = {
+            let lower = t.to_lowercase();
+            (t.starts_with('#') || t.starts_with("**") || t.ends_with(':'))
+                && (lower.contains("follow-up") || lower.contains("followup") || lower.contains("follow up"))
+        };
+        if is_followup_heading {
+            // Keep only if something substantive remains in this section.
+            let has_content = lines[i + 1..]
+                .iter()
+                .take_while(|l| !l.trim().starts_with('#'))
+                .any(|l| {
+                    let lt = l.trim();
+                    let lt_empty_item = lt.len() >= 2
+                        && lt.ends_with('.')
+                        && lt[..lt.len() - 1].chars().all(|c| c.is_ascii_digit());
+                    !lt.is_empty() && !lt_empty_item && lt != "-" && lt != "*"
+                });
+            if !has_content {
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    result = kept.join("\n");
 
     // Clean up double spaces and trim
     while result.contains("  ") {
@@ -1140,6 +1179,28 @@ mod tests {
         assert!(!cleaned.contains("[prediction:"));
         assert!(cleaned.contains("relates to AI"));
         assert!(cleaned.contains("here."));
+    }
+
+    #[test]
+    fn test_clean_response_removes_followup_section_husk() {
+        // The model often wraps followup markers in a visible numbered section.
+        // After marker removal the list husk ("1." "2." ...) and the now-empty
+        // heading must not survive — this was the empty "Suggested Follow-ups
+        // 1. 2. 3. 4." rendering bug.
+        let response = "## Analysis\nSome real content.\n\n## Suggested Follow-ups\n1. [followup: \"What next?\" | type: \"deeper\"]\n2. [followup: \"Compare to Italy?\" | type: \"compare\"]\n3. [followup: \"When?\" | type: \"timeline\"]\n4. [followup: \"Odds?\" | type: \"predict\"]";
+        let cleaned = clean_response(response);
+        assert!(!cleaned.contains("[followup:"));
+        assert!(!cleaned.to_lowercase().contains("follow-up"), "empty heading must be dropped: {}", cleaned);
+        assert!(!cleaned.lines().any(|l| {
+            let t = l.trim();
+            t.len() >= 2 && t.ends_with('.') && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit())
+        }), "empty numbered husks must be dropped: {}", cleaned);
+        assert!(cleaned.contains("Some real content."));
+        // A followup heading with real content underneath survives.
+        let with_content = "## Suggested Follow-ups\nThese threads are worth pursuing because of X.";
+        let cleaned2 = clean_response(with_content);
+        assert!(cleaned2.contains("Suggested Follow-ups"));
+        assert!(cleaned2.contains("worth pursuing"));
     }
 
     // -----------------------------------------------------------------------

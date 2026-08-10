@@ -175,7 +175,7 @@
 					{/each}
 				</div>
 				{#if remainingCount > 0}
-					<a href="/archive" class="block text-center text-sm text-ai hover:underline mt-3 py-2">
+					<a href="/archive?date=today" class="block text-center text-sm text-ai hover:underline mt-3 py-2">
 						View all {$currentBriefing.briefing.story_count} stories in Archive
 					</a>
 				{/if}

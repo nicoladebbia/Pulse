@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import { isTauri } from '$lib/tauri/mock';
 	import { getPaperTrades, getAutoTradeStatus, autoBacktestIfDue, type AutoBacktestStatus, type AutoTradeStatus } from '$lib/tauri/commands';
 	import type { PaperTrade } from '$lib/tauri/types';
@@ -10,8 +9,16 @@
 	let backtestStatus = $state<AutoBacktestStatus | null>(null);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
+	let loadStarted = false;
 
-	onMount(async () => {
+	// onMount never fires with this app's ssr=false + prerender=true config — see +layout.svelte.
+	$effect(() => {
+		if (loadStarted) return;
+		loadStarted = true;
+		loadJournal();
+	});
+
+	async function loadJournal() {
 		if (!isTauri()) {
 			loading = false;
 			return;
@@ -37,7 +44,7 @@
 		} finally {
 			loading = false;
 		}
-	});
+	}
 
 	interface SignalProfile {
 		insider?: number;
