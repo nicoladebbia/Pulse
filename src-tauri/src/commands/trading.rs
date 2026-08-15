@@ -255,9 +255,13 @@ pub fn get_backtest_history(db: State<'_, DbState>) -> Result<Vec<BacktestResult
 /// Uses an expanding window: every day it runs, it tests on ALL data from the
 /// first cross_signals row to today. So day 91 has 91 days, day 92 has 92, etc.
 ///
-/// Default parameters mirror the production trading path (compound score > 0.3,
-/// 5% position sizing, 90-day max hold) so the daily report measures what the
-/// auto-trader WOULD have done, had it been on.
+/// The entry side mirrors the production trading path (compound score > 0.3,
+/// 5% position sizing). The EXIT side does not, and cannot: the simulator only
+/// knows fixed percentages, while the live engine exits on a 3x ATR trailing
+/// stop from the high-water mark and closes half the position at a 3x ATR
+/// profit target. Neither is expressible here. Read this report as "did the
+/// entry signal pick names that moved", not "this is what the auto-trader
+/// would have returned".
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AutoBacktestStatus {
     pub ran_today: bool,
@@ -335,9 +339,23 @@ pub fn auto_backtest_if_due(db: State<'_, DbState>) -> Result<AutoBacktestStatus
         start_date,
         end_date,
         min_score: 0.30,        // matches auto_trade_on_convergence threshold
-        stop_loss_pct: -10.0,   // realistic safety stop
+        // -10% and +15% are an APPROXIMATION of a two-part exit the simulator
+        // cannot express, not a match to any live constant. Live, the binding
+        // exit is a 3x ATR trailing stop off the high-water mark; the -15% hard
+        // stop is only the floor beneath it, and for most tickers the trail
+        // fires well before -15% ever prints. -10% sits closer to where the
+        // trail actually bites than the floor would, so it stays. The +15%
+        // take-profit stands in for the 50%-of-position close at the 3x ATR
+        // profit target — the simulator has no partial exits, so it closes all.
+        stop_loss_pct: -10.0,
         take_profit_pct: 15.0,
-        max_hold_days: 90,      // matches position_management hard expiry
+        // The live engine has NO calendar expiry — the 90-day hard expiry this
+        // used to cite was deleted from position_management on 2026-07-15. 90
+        // is kept because max_hold_days also extends the price window the walk
+        // loads (start_date .. end_date + max_hold_days), so it must stay large
+        // enough to let late trades resolve. Positions it force-closes at the
+        // limit are counted separately from genuine strategy exits.
+        max_hold_days: 90,
         max_positions: 10,
         position_size_pct: 5.0, // matches the high-score tier in position_sizing
     };
@@ -345,9 +363,19 @@ pub fn auto_backtest_if_due(db: State<'_, DbState>) -> Result<AutoBacktestStatus
     let result = backtester::run_backtest(&conn, config)
         .map_err(|e| format!("auto-backtest failed: {}", e))?;
 
+    // Say what the hit rate is a hit rate OF. It is computed over closed exits
+    // only, and on this data most of the walk's positions are still open when
+    // the price history runs out — a bare "36% hit rate" invites reading it as a
+    // verdict on a much larger sample than it is.
+    let still_open = if result.open_at_end > 0 {
+        format!(" ({} still open at data end)", result.open_at_end)
+    } else {
+        String::new()
+    };
     let summary = format!(
-        "Auto-backtest ran: {} trades, {:.1}% hit rate, {:+.2}% return, Sharpe {:.2}, max DD {:.1}%",
+        "Auto-backtest ran: {} closed trades{}, {:.1}% hit rate, {:+.2}% return, Sharpe {:.2}, max DD {:.1}%",
         result.trades_taken,
+        still_open,
         result.hit_rate,
         result.total_return_pct,
         result.sharpe_ratio,
