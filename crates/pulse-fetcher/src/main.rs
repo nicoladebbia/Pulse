@@ -149,6 +149,18 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Test notifications fired");
         }
         "backfill-embeddings" => {
+            // Hour gate FIRST — before the lock, before any DB read. launchd wakes this
+            // mode EVERY hour because an hourly interval is the only calendar shape that
+            // fires at all (see BACKFILL_HOURS); 22 of those 24 wakeups must cost nothing
+            // and must never touch the lock the daily fetch may be holding.
+            let hour = {
+                use chrono::Timelike;
+                chrono::Local::now().hour()
+            };
+            if !args.force && !is_backfill_hour(hour) {
+                tracing::debug!("Hour {} is not a backfill slot {:?} — exiting.", hour, BACKFILL_HOURS);
+                return Ok(());
+            }
             // Shares the daily fetch's lock: this mode is now SCHEDULED, so it must never
             // run alongside a daily fetch that is writing the same tables and racing the
             // same Voyage rate limit. A collision costs nothing — whichever loses exits.
@@ -603,6 +615,31 @@ async fn backfill_embeddings(
     Ok(())
 }
 
+/// Local hours at which the scheduled embedding backfill is allowed to do work.
+///
+/// This lives in the BINARY, not the plist, because launchd will not honour it. Measured on
+/// this machine (macOS 25.5, `gui/501` domain) on 2026-08-15: a LaunchAgent whose
+/// `StartCalendarInterval` names an `Hour` never fires. Four controlled probes, identical
+/// except for the calendar spec, one boundary each:
+///
+///   array of dicts, Hour+Minute ....... runs = 0
+///   single dict,    Hour+Minute ....... runs = 0
+///   single dict,    Hour+Minute in UTC. runs = 0   (rules out a timezone reading)
+///   single dict,    Minute only ....... runs = 1   FIRED
+///
+/// All four were confirmed loaded with armed triggers via `launchctl print`, and the three
+/// that failed were still at `runs = 0` eight minutes past their boundary, which rules out
+/// deferral or coalescing. `com.pulse.daily-fetch` uses a Minute-only interval and has
+/// fired every hour for twenty consecutive runs. The root cause in launchd is not known and
+/// does not need to be: the plist now uses the shape that demonstrably fires — hourly — and
+/// this gate decides which of those wakeups actually does anything.
+const BACKFILL_HOURS: [u32; 2] = [2, 14];
+
+/// Whether `hour` (0-23, local) is one of the backfill slots.
+fn is_backfill_hour(hour: u32) -> bool {
+    BACKFILL_HOURS.contains(&hour)
+}
+
 /// How many NEWS stories today's daily briefing already has.
 ///
 /// This is the project's definition of "the day is done", and it is deliberately NOT
@@ -875,6 +912,41 @@ fn recompute_signals(conn: &rusqlite::Connection, today: &str) -> anyhow::Result
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod hour_gate_tests {
+    use super::*;
+
+    /// The gate exists because launchd will not honour an `Hour` in the plist, so the
+    /// binary is woken every hour and must reject 22 of those wakeups. Assert the whole
+    /// 24-hour space, not just the two slots — a gate that accepts everything would pass a
+    /// test that only checked hours 2 and 14.
+    #[test]
+    fn accepts_exactly_the_two_slots() {
+        let accepted: Vec<u32> = (0..24).filter(|h| is_backfill_hour(*h)).collect();
+        assert_eq!(accepted, vec![2, 14], "gate must open at 02:00 and 14:00 and nowhere else");
+    }
+
+    /// The failure this guards against is an hourly wakeup starting a 90-minute backfill
+    /// that holds the flock against the daily fetch. Name the hours that must be refused.
+    #[test]
+    fn refuses_the_daily_fetch_window() {
+        for h in [0, 1, 3, 7, 8, 9, 12, 13, 15, 20, 23] {
+            assert!(!is_backfill_hour(h), "hour {h} must not start a backfill");
+        }
+    }
+
+    /// Hours come from `chrono::Local::now().hour()`, which is 0-23. A slot outside that
+    /// range would be unreachable — the gate would never open and the backfill would go
+    /// back to never running, which is the exact bug being fixed here.
+    #[test]
+    fn every_slot_is_a_reachable_local_hour() {
+        for h in BACKFILL_HOURS {
+            assert!(h < 24, "slot {h} is not a reachable hour — gate could never open");
+            assert!(is_backfill_hour(h), "slot {h} must be accepted by its own gate");
+        }
+    }
 }
 
 #[cfg(test)]

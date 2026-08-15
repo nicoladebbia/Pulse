@@ -27,17 +27,28 @@
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 
-    <!-- 02:00 and 14:00. Two safeguards make a long-running backfill harmless:
-         (1) it takes the SAME flock as the daily fetch, so the two can never overlap;
-         (2) it exits immediately unless today's briefing already has news — once that is
-             true every hourly daily slot skips in <1s anyway, so holding the lock is free.
-         Without (2) a 90-minute backfill could block the exact hourly slot that catches a
-         clean Groq window on a blocked day. -->
+    <!-- Wakes EVERY hour at :30. The hour selection (02:00 and 14:00) is enforced by the
+         binary, in BACKFILL_HOURS, NOT here — measured on this machine 2026-08-15, a
+         LaunchAgent naming an `Hour` in StartCalendarInterval never fires, while a
+         Minute-only interval fires reliably (com.pulse.daily-fetch has done so 20 runs
+         running). Four probes identical but for the calendar spec confirmed it, including a
+         UTC-hour probe that ruled out a timezone reading. So: schedule the shape that
+         works, gate the hour in code.
+
+         :30 not :00 — the daily fetch owns :00, and although the flock makes a collision
+         harmless, there is no reason to race it every hour.
+
+         Three safeguards make a 90-minute backfill harmless:
+         (1) the hour gate exits in <1s on the 22 wakeups that are not a slot, before it
+             touches the lock or the DB at all;
+         (2) it takes the SAME flock as the daily fetch, so the two can never overlap;
+         (3) it exits unless today's briefing already has news — once that is true every
+             hourly daily slot skips in <1s anyway, so holding the lock is free. Without
+             this a backfill could block the exact slot that catches a clean Groq window. -->
     <key>StartCalendarInterval</key>
-    <array>
-        <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>0</integer></dict>
-    </array>
+    <dict>
+        <key>Minute</key><integer>30</integer>
+    </dict>
 
     <key>WorkingDirectory</key>
     <string>/Users/nicoladebbia/Projects/Pulse</string>
