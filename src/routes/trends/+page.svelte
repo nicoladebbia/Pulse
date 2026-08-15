@@ -29,15 +29,25 @@
 		let cancelled = false;
 		let unlisten: (() => void) | null = null;
 		(async () => {
-			const { listen } = await import('@tauri-apps/api/event');
-			if (cancelled) return;
-			unlisten = await listen('trends-recomputed', async () => {
-				refreshing = true;
-				try {
-					threads = await getTrends();
-				} catch { /* keep showing current data */ }
-				refreshing = false;
-			});
+			// The IIFE is floating, so a rejection from either await escapes as an
+			// unhandled rejection and takes the webview with it. The identical block in
+			// signals/+page.svelte has this try for the same reason.
+			try {
+				const { listen } = await import('@tauri-apps/api/event');
+				if (cancelled) return;
+				const un = await listen('trends-recomputed', async () => {
+					refreshing = true;
+					try {
+						threads = await getTrends();
+					} catch { /* keep showing current data */ }
+					refreshing = false;
+				});
+				if (cancelled) { un(); return; }
+				unlisten = un;
+			} catch {
+				// No live refresh, but the page still shows what it loaded. Stale trends
+				// beat a crashed page.
+			}
 		})();
 		return () => { cancelled = true; if (unlisten) unlisten(); };
 	});
