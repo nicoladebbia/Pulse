@@ -1099,11 +1099,7 @@ pub fn get_chat_context(db: State<'_, DbState>) -> Result<ChatContext, String> {
         |row| row.get(0),
     ).ok();
     if let Some(headline) = hero {
-        let short = if headline.len() > 60 {
-            format!("{}...", &headline[..57])
-        } else {
-            headline
-        };
+        let short = truncate_ellipsis(&headline, 60);
         suggestions.push(ChatSuggestion {
             text: format!("Tell me more about {}", short),
             category: "story".into(),
@@ -1114,11 +1110,7 @@ pub fn get_chat_context(db: State<'_, DbState>) -> Result<ChatContext, String> {
     if let Ok(preds) = predictions::get_active_predictions(&conn) {
         let preds: Vec<_> = preds.into_iter().take(2).collect();
         for pred in preds {
-            let short = if pred.title.len() > 40 {
-                format!("{}...", &pred.title[..37])
-            } else {
-                pred.title.clone()
-            };
+            let short = truncate_ellipsis(&pred.title, 40);
             suggestions.push(ChatSuggestion {
                 text: format!("Update on the prediction: {}", short),
                 category: "prediction".into(),
@@ -1263,6 +1255,32 @@ const STOPWORDS: &[&str] = &[
     "does", "doing", "going", "happening", "tell", "know",
 ];
 
+/// Shorten to at most `max` characters, ending in an ellipsis when cut.
+///
+/// This exists because `&s[..n]` is a **byte** index: Rust panics unconditionally
+/// when `n` lands inside a multi-byte character, and a Tauri command's
+/// `Result<_, String>` cannot catch that — the panic kills the app. The corpus is
+/// full of the characters that trigger it: em-dashes in the financial digests,
+/// `€` throughout the Italy sector, `₹` and `→` in headlines. Ten stories in the
+/// live database sat on exactly the boundary these call sites used.
+///
+/// The budget is characters, not bytes, so an accented headline is no longer cut
+/// shorter than an ASCII one of the same visible length. Same bug class the
+/// fetcher was fixed for in `efa92f3`; that fix never reached this file.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    format!("{}...", s.chars().take(keep).collect::<String>())
+}
+
+/// Shorten to at most `max` characters with no ellipsis, for text being handed to
+/// a model rather than shown to a person. Same panic hazard as [`truncate_ellipsis`].
+fn truncate_plain(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 /// Extract meaningful lowercased keywords from text (3+ chars, no stopwords).
 fn extract_keywords(text: &str) -> Vec<String> {
     text.split_whitespace()
@@ -1324,7 +1342,7 @@ async fn generate_thread_title(api_key: &str, question: &str, answer: &str) -> S
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 30,
         "system": "Generate a 3-5 word title for this conversation. No quotes, no punctuation, just the topic. Examples: 'OpenAI GPT-5 Analysis', 'Miami Tech Funding', 'EU AI Regulation Impact'",
-        "messages": [{"role": "user", "content": format!("Q: {}\nA: {}", &question[..question.len().min(200)], &answer[..answer.len().min(300)])}]
+        "messages": [{"role": "user", "content": format!("Q: {}\nA: {}", truncate_plain(question, 200), truncate_plain(answer, 300))}]
     });
 
     let resp = client
@@ -1449,6 +1467,64 @@ pub fn get_feedback_stats(db: State<'_, DbState>) -> Result<serde_json::Value, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real headlines from the live corpus whose byte 57 falls *inside* a
+    /// multi-byte character. Under the old `&headline[..57]` each of these
+    /// killed the app, and a `Result` return type could not catch it — Rust
+    /// string-slice panics are unconditional.
+    const BOUNDARY_HEADLINES: [&str; 3] = [
+        "Westwind Capital reports $414M portfolio (50 holdings) — top: NEE, DUK",
+        "Ferrari Unveils First-Ever Electric Model, Priced Up to ₹6 Crore",
+        "Tower Semiconductor Wikipedia views spike 20% (170/day → 205/day)",
+    ];
+
+    #[test]
+    fn the_hazard_is_real_at_the_exact_index_these_call_sites_used() {
+        // Not a test of our code — a test that the bug being fixed exists. If this
+        // ever stops holding, the fixtures above have drifted and the tests below
+        // are no longer exercising the boundary case.
+        let hit = BOUNDARY_HEADLINES
+            .iter()
+            .filter(|h| std::str::from_utf8(&h.as_bytes()[..57]).is_err())
+            .count();
+        assert_eq!(hit, 3, "fixtures must sit on a multi-byte boundary at byte 57");
+    }
+
+    #[test]
+    fn truncate_ellipsis_survives_a_multibyte_cut() {
+        for h in BOUNDARY_HEADLINES {
+            let out = truncate_ellipsis(h, 60);
+            assert!(out.chars().count() <= 60, "over budget: {out}");
+            assert!(out.ends_with("..."));
+        }
+    }
+
+    #[test]
+    fn truncate_ellipsis_leaves_short_input_alone() {
+        assert_eq!(truncate_ellipsis("short", 60), "short");
+        // Exactly at the budget is not truncation.
+        let exact: String = "é".repeat(60);
+        assert_eq!(truncate_ellipsis(&exact, 60), exact);
+    }
+
+    #[test]
+    fn truncate_ellipsis_counts_characters_not_bytes() {
+        // 40 euro signs are 120 bytes but only 40 chars — under a 60-char budget
+        // this must NOT be truncated, where a byte-length check would have cut it.
+        let euros: String = "€".repeat(40);
+        assert_eq!(truncate_ellipsis(&euros, 60), euros);
+    }
+
+    #[test]
+    fn truncate_plain_survives_a_multibyte_cut() {
+        for h in BOUNDARY_HEADLINES {
+            let out = truncate_plain(h, 57);
+            assert!(out.chars().count() <= 57);
+        }
+        // The thread-title call site truncates to 200/300; a string shorter than
+        // the budget must come back whole.
+        assert_eq!(truncate_plain("¿qué?", 200), "¿qué?");
+    }
 
     #[test]
     fn test_extract_keywords() {
