@@ -10,3 +10,4 @@ pub mod predictions;
 pub mod usage;
 pub mod cross_signals;
 pub mod trading;
+pub mod engagement;

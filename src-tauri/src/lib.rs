@@ -125,6 +125,8 @@ pub fn run() {
             commands::trading::apply_pending_calibration,
             commands::trading::reject_pending_calibration,
             commands::trading::get_calibration_gate_status,
+            commands::engagement::record_engagement,
+            commands::engagement::get_engagement_summary,
         ])
         .build(tauri::generate_context!())
         .expect("error building Pulse")

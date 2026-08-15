@@ -5,6 +5,7 @@
 	import { getTrends } from '$lib/tauri/commands';
 	import { expandedStoryId } from '$lib/stores/briefing';
 	import type { TrendThread } from '$lib/tauri/types';
+	import { trackCitationClick } from '$lib/engagement';
 
 	let threads = $state<TrendThread[]>([]);
 	let isLoading = $state(true);
@@ -102,6 +103,9 @@
 	];
 
 	function navigateToStory(storyId: number) {
+		// See ChatSources: the destination can render blank for a story outside
+		// today's briefing (open defect #17). Record the click regardless.
+		trackCitationClick('/trends', storyId);
 		expandedStoryId.set(storyId);
 		goto('/');
 	}

@@ -7,6 +7,7 @@
 	import { isFetching, fetchDone, triggerFetch as storeTriggerFetch } from '$lib/stores/fetch';
 	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
 	import FetchProgressBar from '$lib/components/FetchProgressBar.svelte';
+	import { trackSectorFilter } from '$lib/engagement';
 
 	let usageStats = $state<UsageStats | null>(null);
 	let tavilyQuota = $state<TavilyQuota | null>(null);
@@ -62,11 +63,14 @@
 
 	function toggleSector(id: SectorId) {
 		activeSectors.update(current => {
-			if (current.includes(id)) {
-				return current.filter(s => s !== id);
-			} else {
-				return [...current, id];
-			}
+			const next = current.includes(id)
+				? current.filter(s => s !== id)
+				: [...current, id];
+			// Which sectors get filtered to is the cheapest available signal of what
+			// is actually worth reading. Recorded with the resulting count so a
+			// narrowing can be told apart from a widening.
+			trackSectorFilter($page.route.id, id, next.length);
+			return next;
 		});
 	}
 

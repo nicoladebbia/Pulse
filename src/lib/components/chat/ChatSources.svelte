@@ -5,6 +5,7 @@
 	import { isTauri } from '$lib/tauri/mock';
 	import { SECTORS, type SectorId } from '$lib/config';
 	import type { StoryHeadline } from '$lib/tauri/types';
+	import { trackCitationClick } from '$lib/engagement';
 
 	let { storyIds }: { storyIds: number[] } = $props();
 
@@ -35,6 +36,12 @@
 	});
 
 	function navigateToStory(id: number) {
+		// Recorded before the navigation, because the destination may show nothing:
+		// +page.svelte resolves expandedStoryId against today's briefing only, so a
+		// citation to an older story lands on a blank page (open defect #17). The
+		// click still happened — read this count against #17's status, not as
+		// evidence that citations are unused.
+		trackCitationClick('/ask', id);
 		expandedStoryId.set(id);
 		goto('/');
 	}

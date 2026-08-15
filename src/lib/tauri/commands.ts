@@ -1,4 +1,5 @@
 import { invoke, Channel, type InvokeArgs } from '@tauri-apps/api/core';
+import { trackChatMessage } from '$lib/engagement';
 import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ConversationResponse, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus } from './types';
 
 export function safeInvoke<T>(cmd: string, args?: InvokeArgs): Promise<T | null>;
@@ -56,6 +57,10 @@ export async function getFetchStatus(): Promise<FetchStatus> {
 }
 
 export async function chatSend(threadId: string | null, message: string): Promise<ConversationResponse> {
+	// Instrumented here rather than in the Ask page, because the inline follow-up
+	// inside StoryExpanded is also a chat message and would otherwise go uncounted.
+	// Only the length is recorded — never the question.
+	trackChatMessage(message.length);
 	return invoke('chat_send', { threadId, message });
 }
 
@@ -76,6 +81,7 @@ export async function chatSendStream(
 	message: string,
 	onEvent: (event: ChatStreamEvent) => void
 ): Promise<void> {
+	trackChatMessage(message.length);
 	const channel = new Channel<ChatStreamEvent>();
 	channel.onmessage = onEvent;
 	return invoke('chat_send_stream', { threadId, message, onEvent: channel });

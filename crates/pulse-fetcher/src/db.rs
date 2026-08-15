@@ -45,6 +45,7 @@ const MIGRATION_029: &str = include_str!("../../../migrations/029_ticker_eligibi
 const MIGRATION_030: &str = include_str!("../../../migrations/030_repair_prediction_citations.sql");
 const MIGRATION_031: &str = include_str!("../../../migrations/031_drop_dead_tables_and_prune_usage.sql");
 const MIGRATION_032: &str = include_str!("../../../migrations/032_story_count_excludes_filings.sql");
+const MIGRATION_033: &str = include_str!("../../../migrations/033_engagement_events.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -658,6 +659,14 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_032)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (32)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 33: local-only engagement events (the consumption side)
+    if !applied.contains(&33) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_033)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (33)", [])?;
         tx.commit()?;
     }
 
