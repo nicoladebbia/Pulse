@@ -2,6 +2,9 @@ use crate::sources::RawArticle;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
+// Superseded by the dedup performed inside the pipeline; kept because its tests below
+// still pin the similarity behaviour that logic relies on.
+#[allow(dead_code)]
 pub fn deduplicate(articles: Vec<RawArticle>) -> Vec<RawArticle> {
     deduplicate_with_history(articles, HashSet::new(), Vec::new())
 }

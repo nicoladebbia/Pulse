@@ -16,6 +16,7 @@ struct FinnhubQuote {
     l: f64,  // low
     o: f64,  // open
     pc: f64, // previous close
+    #[allow(dead_code)] // part of Finnhub's quote payload; not consumed yet
     t: i64,  // timestamp
 }
 
@@ -573,6 +574,9 @@ async fn backfill_candles_finnhub(
 
 /// Fetch historical daily candles for backtesting.
 /// Uses Finnhub stock candle endpoint.
+// Reachable entry point for `--mode backfill-prices`; no in-process caller, so rustc
+// cannot see it is used.
+#[allow(dead_code)]
 pub async fn fetch_historical(
     db_path: &std::path::Path,
     ticker: &str,

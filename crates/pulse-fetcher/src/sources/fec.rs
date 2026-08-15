@@ -6,11 +6,15 @@ use serde::Deserialize;
 /// Free key, 60 req/min (1000/hr). Env var: FEC_API_KEY
 
 #[derive(Deserialize)]
+// Fields mirror the FEC API response shape; some are parsed but not yet consumed.
+#[allow(dead_code)]
 struct FecResponse {
     results: Vec<FecContribution>,
 }
 
 #[derive(Deserialize)]
+// Fields mirror the FEC API response shape; some are parsed but not yet consumed.
+#[allow(dead_code)]
 struct FecContribution {
     contributor_name: Option<String>,
     committee: Option<FecCommittee>,
@@ -23,6 +27,8 @@ struct FecContribution {
 }
 
 #[derive(Deserialize)]
+// Fields mirror the FEC API response shape; some are parsed but not yet consumed.
+#[allow(dead_code)]
 struct FecCommittee {
     name: Option<String>,
     party: Option<String>,

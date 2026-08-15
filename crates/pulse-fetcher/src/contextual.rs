@@ -1,5 +1,4 @@
 use crate::claude::SummarizedStory;
-use anyhow::Context;
 use serde::Deserialize;
 
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
