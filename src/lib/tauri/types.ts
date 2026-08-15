@@ -654,7 +654,11 @@ export interface BacktestMonthlyReturn {
 export interface BacktestResult {
 	config_summary: string;
 	total_signals: number;
+	/** Closed exits only. Positions still open when the price data ran out are
+	 *  counted in `open_at_end` — they move the equity curve but are not outcomes,
+	 *  so hit_rate, avg_return_pct and avg_holding_days all exclude them. */
 	trades_taken: number;
+	open_at_end: number;
 	trades_won: number;
 	trades_lost: number;
 	hit_rate: number;

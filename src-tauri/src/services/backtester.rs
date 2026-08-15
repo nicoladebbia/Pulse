@@ -36,7 +36,14 @@ pub struct MonthlyReturn {
 pub struct BacktestResult {
     pub config_summary: String,
     pub total_signals: usize,
+    /// Closed exits only — positions force-closed when the price data ran out
+    /// are counted in `open_at_end`, not here. Every realized statistic below
+    /// is computed over this sample.
     pub trades_taken: usize,
+    /// Positions still open at the end of the walk, marked to their last bar.
+    /// They contribute to the equity curve and total return but are not outcomes.
+    #[serde(default)]
+    pub open_at_end: usize,
     pub trades_won: usize,
     pub trades_lost: usize,
     pub hit_rate: f64,
@@ -299,7 +306,7 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
                 (Some(a), Some(b)) => (b - a).num_days(),
                 _ => 0,
             };
-            trades.push(close_trade(&pos, &exit_date, exit_price, pnl_pct, pnl_dollars, days_held, "data_end"));
+            trades.push(close_trade(&pos, &exit_date, exit_price, pnl_pct, pnl_dollars, days_held, DATA_END));
         }
         // Don't overwrite the final curve point — the mark-to-market already
         // equals realized + unrealized at that date, and the force-close is
@@ -309,21 +316,20 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
 
     // ---------------- Metrics ----------------
 
-    let trades_taken = trades.len();
-    let trades_won = trades.iter().filter(|t| t.pnl_pct > 0.0).count();
-    let trades_lost = trades_taken - trades_won;
-    let hit_rate = if trades_taken > 0 { trades_won as f64 / trades_taken as f64 * 100.0 } else { 0.0 };
-
-    let returns_pct: Vec<f64> = trades.iter().map(|t| t.pnl_pct).collect();
-    let avg_return_pct = if returns_pct.is_empty() { 0.0 }
-        else { returns_pct.iter().sum::<f64>() / returns_pct.len() as f64 };
+    // A `data_end` row is not an outcome — it is an open position marked to the
+    // last bar we have. Counting one as a win says a trade succeeded when all we
+    // know is that it was up on the day the price data stopped; a position at
+    // +2% that would have hit the stop next week scores identically to one that
+    // actually took profit. Realized statistics run over closed exits only.
+    // They stay in `trades` (the equity curve and total return need their marks,
+    // and the trade list should still show them) — they just aren't outcomes.
+    let RealizedMetrics {
+        trades_taken, open_at_end, trades_won, trades_lost,
+        hit_rate, avg_return_pct, avg_holding_days,
+    } = realized_metrics(&trades);
 
     let ending_equity = starting_equity + realized_pnl;
     let total_return_pct = (ending_equity - starting_equity) / starting_equity * 100.0;
-
-    let holding_days: Vec<f64> = trades.iter().map(|t| t.holding_days as f64).collect();
-    let avg_holding_days = if holding_days.is_empty() { 0.0 }
-        else { holding_days.iter().sum::<f64>() / holding_days.len() as f64 };
 
     let sharpe_ratio = compute_sharpe(&equity_curve);
     let max_drawdown_pct = compute_max_drawdown(&equity_curve);
@@ -340,6 +346,7 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
         config_summary: config_summary.clone(),
         total_signals,
         trades_taken,
+        open_at_end,
         trades_won,
         trades_lost,
         hit_rate,
@@ -382,20 +389,26 @@ pub fn get_backtest_history(conn: &Connection, limit: usize) -> Result<Vec<Backt
         // Try new shape first.
         if let Some(json) = &details_json {
             if let Ok(blob) = serde_json::from_str::<DetailsBlob>(json) {
-                let trades_won = blob.trades.iter().filter(|t| t.pnl_pct > 0.0).count();
-                let trades_lost = blob.trades.len() - trades_won;
+                // Recompute the realized statistics from the stored trades rather
+                // than reading the stored columns. Rows written before `data_end`
+                // was excluded hold a hit rate, average return and average hold
+                // computed over open marks as well as closed exits — replaying the
+                // blob under the current rule is what keeps a stored result and a
+                // fresh re-run of the same backtest reporting the same numbers.
+                let m = realized_metrics(&blob.trades);
                 return Ok(BacktestResult {
                     config_summary,
                     total_signals: total_signals as usize,
-                    trades_taken: blob.trades.len(),
-                    trades_won,
-                    trades_lost,
-                    hit_rate,
-                    avg_return_pct: avg_return,
+                    trades_taken: m.trades_taken,
+                    open_at_end: m.open_at_end,
+                    trades_won: m.trades_won,
+                    trades_lost: m.trades_lost,
+                    hit_rate: m.hit_rate,
+                    avg_return_pct: m.avg_return_pct,
                     total_return_pct: blob.total_return_pct,
                     max_drawdown_pct: blob.max_drawdown_pct,
                     sharpe_ratio: blob.sharpe_ratio,
-                    avg_holding_days: avg_hold,
+                    avg_holding_days: m.avg_holding_days,
                     starting_equity: blob.starting_equity,
                     ending_equity: blob.ending_equity,
                     trades: blob.trades,
@@ -409,21 +422,27 @@ pub fn get_backtest_history(conn: &Connection, limit: usize) -> Result<Vec<Backt
         let legacy_trades: Vec<BacktestTrade> = details_json
             .and_then(|d| serde_json::from_str(&d).ok())
             .unwrap_or_default();
-        let trades_won = legacy_trades.iter().filter(|t| t.pnl_pct > 0.0).count();
+        // Recompute from the trades when there are any. A row whose `details`
+        // is missing or unparseable has no trades to replay, and zeroing its
+        // metrics would destroy the only record of it — so those fall back to
+        // the stored columns, which is all such a row has ever had.
+        let m = realized_metrics(&legacy_trades);
+        let have_trades = !legacy_trades.is_empty();
         let total_pnl: f64 = legacy_trades.iter().map(|t| t.pnl_dollars).sum();
 
         Ok(BacktestResult {
             config_summary,
             total_signals: total_signals as usize,
-            trades_taken: legacy_trades.len(),
-            trades_won,
-            trades_lost: legacy_trades.len() - trades_won,
-            hit_rate,
-            avg_return_pct: avg_return,
+            trades_taken: m.trades_taken,
+            open_at_end: m.open_at_end,
+            trades_won: m.trades_won,
+            trades_lost: m.trades_lost,
+            hit_rate: if have_trades { m.hit_rate } else { hit_rate },
+            avg_return_pct: if have_trades { m.avg_return_pct } else { avg_return },
             total_return_pct: total_pnl / 100_000.0 * 100.0,
             max_drawdown_pct: max_drawdown_col,
             sharpe_ratio: sharpe_col,
-            avg_holding_days: avg_hold,
+            avg_holding_days: if have_trades { m.avg_holding_days } else { avg_hold },
             starting_equity: 100_000.0,
             ending_equity: 100_000.0 + total_pnl,
             trades: legacy_trades,
@@ -447,6 +466,43 @@ fn count_trading_days(conn: &Connection, start: &str, end: &str) -> Result<i64, 
         params![start, end],
         |row| row.get::<_, i64>(0),
     ).map_err(|e| e.to_string())
+}
+
+/// Exit reason written for a position that was still open when the price data
+/// ran out. Not a strategy exit — see `split_closed`.
+pub(crate) const DATA_END: &str = "data_end";
+
+/// The realized statistics, computed over closed exits only.
+pub(crate) struct RealizedMetrics {
+    pub trades_taken: usize,
+    pub open_at_end: usize,
+    pub trades_won: usize,
+    pub trades_lost: usize,
+    pub hit_rate: f64,
+    pub avg_return_pct: f64,
+    pub avg_holding_days: f64,
+}
+
+/// Single source of truth for every count and average derived from trades.
+/// `run_backtest` computes them from the live walk and `get_backtest_history`
+/// replays them from the stored blob — they call this so the two cannot drift,
+/// which is what would otherwise make a stored result and a re-run of the same
+/// backtest disagree.
+pub(crate) fn realized_metrics(trades: &[BacktestTrade]) -> RealizedMetrics {
+    let (closed, open): (Vec<&BacktestTrade>, Vec<&BacktestTrade>) =
+        trades.iter().partition(|t| t.exit_reason != DATA_END);
+    let trades_taken = closed.len();
+    let trades_won = closed.iter().filter(|t| t.pnl_pct > 0.0).count();
+    let mean = |v: Vec<f64>| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+    RealizedMetrics {
+        trades_taken,
+        open_at_end: open.len(),
+        trades_won,
+        trades_lost: trades_taken - trades_won,
+        hit_rate: if trades_taken > 0 { trades_won as f64 / trades_taken as f64 * 100.0 } else { 0.0 },
+        avg_return_pct: mean(closed.iter().map(|t| t.pnl_pct).collect()),
+        avg_holding_days: mean(closed.iter().map(|t| t.holding_days as f64).collect()),
+    }
 }
 
 fn add_days(date_str: &str, days: i64) -> Option<String> {
@@ -695,12 +751,112 @@ fn save_result(
 fn empty_result(config: &BacktestConfig) -> BacktestResult {
     BacktestResult {
         config_summary: format!("{} to {} — no convergence signals found", config.start_date, config.end_date),
-        total_signals: 0, trades_taken: 0, trades_won: 0, trades_lost: 0,
+        total_signals: 0, trades_taken: 0, open_at_end: 0, trades_won: 0, trades_lost: 0,
         hit_rate: 0.0, avg_return_pct: 0.0, total_return_pct: 0.0,
         max_drawdown_pct: 0.0, sharpe_ratio: 0.0, avg_holding_days: 0.0,
         starting_equity: 100_000.0, ending_equity: 100_000.0,
         trades: Vec::new(),
         equity_curve: Vec::new(),
         monthly_returns: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod realized_metrics_tests {
+    use super::*;
+
+    fn trade(pnl_pct: f64, holding_days: i64, exit_reason: &str) -> BacktestTrade {
+        BacktestTrade {
+            ticker: "T".into(),
+            entity_name: "T Inc".into(),
+            entry_date: "2026-01-01".into(),
+            entry_price: 100.0,
+            exit_date: "2026-02-01".into(),
+            exit_price: 100.0 * (1.0 + pnl_pct / 100.0),
+            pnl_pct,
+            pnl_dollars: 50.0 * pnl_pct,
+            holding_days,
+            exit_reason: exit_reason.into(),
+            compound_score: 0.5,
+            signal_profile: "{}".into(),
+        }
+    }
+
+    /// The shape the auto-backtest actually produced: 22 rows, of which 6 were
+    /// positions still open when the price data ran out. Counting those as
+    /// outcomes is what made a 36.4% hit rate out of a sample that was never 22
+    /// closed trades.
+    #[test]
+    fn open_marks_are_excluded_from_every_realized_statistic() {
+        let trades = vec![
+            trade(15.0, 10, "take_profit"),
+            trade(-10.0, 20, "stop_loss"),
+            // Three open marks, all green and all long-held. If they leak into
+            // the statistics they drag the hit rate up and the average hold out.
+            trade(2.0, 100, DATA_END),
+            trade(3.0, 100, DATA_END),
+            trade(4.0, 100, DATA_END),
+        ];
+
+        let m = realized_metrics(&trades);
+
+        assert_eq!(m.trades_taken, 2, "sample is the closed exits, not every row");
+        assert_eq!(m.open_at_end, 3, "the open marks are reported, not discarded");
+        assert_eq!(m.trades_won, 1);
+        assert_eq!(m.trades_lost, 1);
+        // Contaminated, this would be 4/5 = 80%.
+        assert!((m.hit_rate - 50.0).abs() < 1e-9, "hit rate was {}", m.hit_rate);
+        // Contaminated, this would be (15-10+2+3+4)/5 = +2.8%.
+        assert!((m.avg_return_pct - 2.5).abs() < 1e-9, "avg return was {}", m.avg_return_pct);
+        // Contaminated, this would be (10+20+300)/5 = 66 days.
+        assert!((m.avg_holding_days - 15.0).abs() < 1e-9, "avg hold was {}", m.avg_holding_days);
+    }
+
+    #[test]
+    fn a_walk_that_closed_nothing_reports_no_hit_rate_rather_than_a_flattering_one() {
+        let trades = vec![trade(8.0, 40, DATA_END), trade(12.0, 40, DATA_END)];
+        let m = realized_metrics(&trades);
+        // Contaminated, two green marks read as a 100% hit rate off zero closes.
+        assert_eq!(m.trades_taken, 0);
+        assert_eq!(m.open_at_end, 2);
+        assert_eq!(m.hit_rate, 0.0);
+        assert_eq!(m.avg_return_pct, 0.0);
+        assert_eq!(m.avg_holding_days, 0.0);
+    }
+
+    /// `run_backtest` and `get_backtest_history` must agree. They agree only
+    /// because both call `realized_metrics`; this pins that they see the same
+    /// trade list the same way.
+    #[test]
+    fn stored_and_fresh_results_agree_on_the_same_trades() {
+        let trades = vec![
+            trade(15.0, 10, "take_profit"),
+            trade(-10.0, 20, "stop_loss"),
+            trade(1.0, 60, "max_hold"),
+            trade(5.0, 90, DATA_END),
+        ];
+        let blob = DetailsBlob {
+            trades: trades.clone(),
+            starting_equity: 100_000.0,
+            ending_equity: 105_500.0,
+            total_return_pct: 5.5,
+            sharpe_ratio: 0.9,
+            max_drawdown_pct: 3.0,
+            equity_curve: Vec::new(),
+            monthly_returns: Vec::new(),
+        };
+        let json = serde_json::to_string(&blob).expect("blob serializes");
+        let replayed: DetailsBlob = serde_json::from_str(&json).expect("blob round-trips");
+
+        let fresh = realized_metrics(&trades);
+        let stored = realized_metrics(&replayed.trades);
+
+        assert_eq!(fresh.trades_taken, stored.trades_taken);
+        assert_eq!(fresh.open_at_end, stored.open_at_end);
+        assert_eq!(fresh.hit_rate, stored.hit_rate);
+        assert_eq!(fresh.avg_return_pct, stored.avg_return_pct);
+        assert_eq!(fresh.avg_holding_days, stored.avg_holding_days);
+        assert_eq!(stored.trades_taken, 3);
+        assert_eq!(stored.open_at_end, 1);
     }
 }
