@@ -1294,18 +1294,57 @@ fn extract_keywords(text: &str) -> Vec<String> {
 // Retrieval confidence
 // ---------------------------------------------------------------------------
 
-/// Compute retrieval confidence from the score distribution of search results.
+/// How well the archive covers this question, as told to the model.
+///
+/// This must **not** compare `score` against absolute thresholds, because that
+/// field carries two incompatible scales. On the un-reranked path it is a
+/// score-weighted RRF blend: each channel contributes at most
+/// `raw / (RRF_K + rank + 1)` — about 0.021 semantic plus 0.016 FTS — which is
+/// then mixed with recency, topping out near 0.18 for Analytical queries. When
+/// the Voyage reranker runs it overwrites the same field with a calibrated 0-1
+/// relevance. The previous thresholds (avg > 0.6 and top > 0.8) were reachable
+/// only on the second scale, so identical retrieval read HIGH or LOW depending
+/// on whether a rerank happened to fire — and on the un-reranked path HIGH was
+/// arithmetically impossible.
+///
+/// The cost of that was not cosmetic: LOW makes the system prompt instruct the
+/// model to hedge about coverage, and it trips the automatic web-search
+/// fallback. Ask Pulse was talking itself down on its best questions.
+///
+/// So confidence is judged on two scale-invariant signals instead:
+///
+/// * **agreement** — how many stories keyword *and* vector search independently
+///   surfaced. Multiplying every score by a constant cannot change this.
+/// * **density** — the mean score as a fraction of the best score. A tight
+///   cluster near the top means a body of relevant material; one strong hit
+///   trailing off into noise means thin coverage. Also invariant under scaling.
 fn compute_retrieval_confidence(stories: &[search::ScoredStory]) -> &'static str {
     if stories.is_empty() {
         return "NONE";
     }
     let count = stories.len();
-    let avg_score: f32 = stories.iter().map(|s| s.score).sum::<f32>() / count as f32;
-    let top_score = stories.first().map(|s| s.score).unwrap_or(0.0);
 
-    if count >= 8 && avg_score > 0.6 && top_score > 0.8 {
+    let top = stories
+        .iter()
+        .map(|s| s.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let avg = stories.iter().map(|s| s.score).sum::<f32>() / count as f32;
+    // Guard the degenerate cases rather than dividing by them: all-zero scores
+    // carry no density signal, so lean entirely on agreement.
+    let density = if top.is_finite() && top > 0.0 {
+        avg / top
+    } else {
+        0.0
+    };
+
+    let agreed = stories
+        .iter()
+        .filter(|s| s.match_type == search::MatchType::Both)
+        .count();
+
+    if count >= 8 && (agreed >= 2 || density >= 0.55) {
         "HIGH"
-    } else if count >= 4 && avg_score > 0.4 {
+    } else if count >= 4 && (agreed >= 1 || density >= 0.40) {
         "MODERATE"
     } else {
         "LOW"
@@ -1601,6 +1640,93 @@ mod tests {
     fn test_retrieval_confidence_none() {
         let stories: Vec<search::ScoredStory> = vec![];
         assert_eq!(compute_retrieval_confidence(&stories), "NONE");
+    }
+
+    // --- retrieval confidence at the scale production actually produces --------
+    //
+    // The two tests above pass with `score: 0.9`, which the merge path can never
+    // emit. `merge_results` contributes at most `raw/(RRF_K + rank + 1)` per
+    // channel — 1.3/61 semantic plus 1.0/61 FTS ≈ 0.038 — and that is then
+    // blended with recency as `alpha*rrf + (1-alpha)*recency`, topping out near
+    // 0.18 for Analytical queries. The old thresholds (avg > 0.6, top > 0.8) were
+    // therefore unreachable, so Ask Pulse told the model its archive coverage was
+    // weak on exactly the query types where it was strongest.
+
+    fn scored(n: usize, score_of: impl Fn(usize) -> f32, mt: search::MatchType) -> Vec<search::ScoredStory> {
+        (0..n)
+            .map(|i| search::ScoredStory {
+                story_id: i as i64,
+                headline: format!("Story {i}"),
+                summary: String::new(),
+                key_facts: String::new(),
+                why_it_matters: String::new(),
+                sector: "ai".into(),
+                source_name: "test".into(),
+                date: "2026-08-15".into(),
+                score: score_of(i),
+                match_type: mt,
+                source: search::StorySource::Daily,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_strong_result_set_at_real_rrf_scale_is_not_called_low() {
+        // Nine tightly-clustered hits just under the RRF+recency ceiling: the
+        // archive answers this question well. The old code scored this LOW.
+        let stories = scored(9, |i| 0.182 - i as f32 * 0.004, search::MatchType::Semantic);
+        assert_eq!(compute_retrieval_confidence(&stories), "HIGH");
+    }
+
+    #[test]
+    fn confidence_is_invariant_to_the_score_scale() {
+        // The same result set arrives on two different scales depending on whether
+        // the Voyage reranker ran — it overwrites `score` with a calibrated 0-1
+        // relevance, while the un-reranked path leaves the tiny RRF blend. Both
+        // describe identical retrieval and must not disagree about confidence.
+        let rrf = scored(9, |i| 0.182 - i as f32 * 0.004, search::MatchType::Semantic);
+        let voyage = scored(9, |i| (0.182 - i as f32 * 0.004) * 5.0, search::MatchType::Semantic);
+        assert_eq!(
+            compute_retrieval_confidence(&rrf),
+            compute_retrieval_confidence(&voyage),
+            "confidence must not depend on which scale the scores happen to be on"
+        );
+    }
+
+    #[test]
+    fn one_strong_hit_trailing_into_noise_is_low_confidence() {
+        // A dominant top result with a long tail of near-misses means the archive
+        // holds *one* relevant story, which is thin coverage however many rows come
+        // back with it. Density is what separates this from the clustered case
+        // above; the two sets have the same count and the same top score.
+        //
+        // Telling the model to hedge here is correct — this is the case the
+        // confidence signal exists to catch.
+        let stories = scored(9, |i| if i == 0 { 0.18 } else { 0.02 }, search::MatchType::Semantic);
+        assert_eq!(compute_retrieval_confidence(&stories), "LOW");
+    }
+
+    #[test]
+    fn density_and_not_count_is_what_separates_thin_from_broad_coverage() {
+        // Same count, same top score, same match type — only the shape differs.
+        let broad = scored(9, |i| 0.182 - i as f32 * 0.004, search::MatchType::Semantic);
+        let thin = scored(9, |i| if i == 0 { 0.182 } else { 0.02 }, search::MatchType::Semantic);
+        assert_eq!(compute_retrieval_confidence(&broad), "HIGH");
+        assert_eq!(compute_retrieval_confidence(&thin), "LOW");
+    }
+
+    #[test]
+    fn dual_channel_agreement_carries_confidence_on_its_own() {
+        // Keyword and vector search independently surfacing the same stories is
+        // strong evidence regardless of the numbers attached.
+        let stories = scored(8, |_| 0.03, search::MatchType::Both);
+        assert_eq!(compute_retrieval_confidence(&stories), "HIGH");
+    }
+
+    #[test]
+    fn a_thin_result_set_is_still_low() {
+        let stories = scored(3, |_| 0.18, search::MatchType::Semantic);
+        assert_eq!(compute_retrieval_confidence(&stories), "LOW");
     }
 
     #[test]
