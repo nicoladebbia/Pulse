@@ -1213,15 +1213,28 @@ async fn backfill_missing_embeddings(db_path: &Path, max_stories: usize) -> anyh
         return Ok(0);
     }
 
+    // Batch by tokens, not a fixed 10 — the free tier caps TPM as well as RPM, and a
+    // 10-story request spends a quarter of the per-request token budget while still paying
+    // the full rate-limit pause. See embeddings::VOYAGE_REQUEST_TOKEN_BUDGET.
+    let all_texts: Vec<String> = stories.iter().map(|(_, headline, summary, key_facts)| {
+        format!("{}. {}. {}", headline, summary, key_facts)
+    }).collect();
+    let batches = crate::embeddings::batch_by_tokens(
+        &all_texts,
+        crate::embeddings::VOYAGE_REQUEST_TOKEN_BUDGET,
+    );
+
     let mut filled = 0;
-    for chunk in stories.chunks(10) {
+    for (bstart, bend) in batches {
+        let chunk = &stories[bstart..bend];
         if filled > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(21)).await;
+            // Was a hardcoded 21s that silently ignored PULSE_VOYAGE_RPM, so raising the
+            // rate limit sped up every embedding path EXCEPT this one.
+            let pause = crate::embeddings::rate_limit_pause_secs();
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
         }
 
-        let texts: Vec<String> = chunk.iter().map(|(_, headline, summary, key_facts)| {
-            format!("{}. {}. {}", headline, summary, key_facts)
-        }).collect();
+        let texts: Vec<String> = all_texts[bstart..bend].to_vec();
         let ids: Vec<i64> = chunk.iter().map(|(id, _, _, _)| *id).collect();
 
         match crate::embeddings::generate_from_texts(&texts).await {

@@ -529,7 +529,17 @@ async fn backfill_embeddings(
     let mut failed = 0usize;
     let mut out_of_time = false;
 
-    for (batch_no, chunk) in stories.chunks(10).enumerate() {
+    // Batch by tokens, not a fixed 10. The free tier caps 3 RPM *and* 10K TPM; at the
+    // measured 76-token average a 10-story request spent ~2.3K TPM, so the run paid the
+    // full rate-limit pause for a quarter-full request and the 90-minute budget cleared
+    // about a quarter of what it could. See embeddings::VOYAGE_REQUEST_TOKEN_BUDGET.
+    let all_texts: Vec<String> = stories.iter().map(|(_, headline, summary, key_facts)| {
+        format!("{}. {}. {}", headline, summary, key_facts)
+    }).collect();
+    let batches = embeddings::batch_by_tokens(&all_texts, embeddings::VOYAGE_REQUEST_TOKEN_BUDGET);
+
+    for (batch_no, &(bstart, bend)) in batches.iter().enumerate() {
+        let chunk = &stories[bstart..bend];
         if std::time::Instant::now() >= deadline {
             out_of_time = true;
             tracing::info!(
@@ -543,9 +553,7 @@ async fn backfill_embeddings(
             tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
         }
 
-        let texts: Vec<String> = chunk.iter().map(|(_, headline, summary, key_facts)| {
-            format!("{}. {}. {}", headline, summary, key_facts)
-        }).collect();
+        let texts: Vec<String> = all_texts[bstart..bend].to_vec();
         let ids: Vec<i64> = chunk.iter().map(|(id, _, _, _)| *id).collect();
 
         match embeddings::generate_from_texts(&texts).await {
