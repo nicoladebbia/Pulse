@@ -426,29 +426,41 @@ pub fn get_auto_trade_status() -> Result<AutoTradeStatus, String> {
     Ok(AutoTradeStatus { enabled, reason })
 }
 
+/// Bars older than this are not evidence about today's volatility. Must match
+/// `position_management::ATR_MAX_STALENESS_DAYS` — see the rationale there.
+const ATR_MAX_STALENESS_DAYS: i64 = 45;
+
 /// Mirror of pulse-fetcher's `position_management::compute_atr` — SMA of true
 /// ranges over `period` days from entity_prices. The fetcher crate is a binary
 /// and cannot be imported from here, so this copy must be kept in sync with
 /// crates/pulse-fetcher/src/position_management.rs.
+///
+/// This copy only *describes* the exit plan in the UI; the fetcher's copy makes
+/// the decision. They must agree exactly, or the Portfolio screen shows a
+/// trailing stop the engine will not act on.
 fn compute_atr(conn: &rusqlite::Connection, ticker: &str, period: usize) -> f64 {
+    let cutoff = (chrono::Local::now() - chrono::Duration::days(ATR_MAX_STALENESS_DAYS))
+        .format("%Y-%m-%d")
+        .to_string();
+
     let mut stmt = match conn.prepare(
         "SELECT high, low, close FROM entity_prices
-         WHERE ticker = ?1 AND high IS NOT NULL AND low IS NOT NULL
-         ORDER BY date DESC LIMIT ?2",
+         WHERE ticker = ?1 AND date >= ?2 AND high IS NOT NULL AND low IS NOT NULL
+         ORDER BY date DESC LIMIT ?3",
     ) {
         Ok(s) => s,
         Err(_) => return 0.0,
     };
 
     let candles: Vec<(f64, f64, f64)> = stmt
-        .query_map(rusqlite::params![ticker, period + 1], |row| {
+        .query_map(rusqlite::params![ticker, cutoff, period + 1], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .ok()
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
-    if candles.len() < 2 {
+    if candles.len() < period / 2 + 1 {
         return 0.0;
     }
 

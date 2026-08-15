@@ -21,28 +21,51 @@ pub enum PositionAction {
     CloseHalf { reason: String },
 }
 
+/// A price bar older than this says nothing about today's volatility.
+///
+/// `entity_prices` retains rows for tickers that have stopped updating — most
+/// of its ~1190 tickers stalled around 2026-06-03 while the table's newest bar
+/// is current. Without a date bound, `compute_atr` will happily build a 3x ATR
+/// trailing stop out of ten-week-old candles, and `evaluate_position` never
+/// reaches its documented `atr <= 0.0` fallback because rows do exist. 45 days
+/// leaves room for holidays and gaps while still covering a 14-day window.
+pub const ATR_MAX_STALENESS_DAYS: i64 = 45;
+
 /// Compute Average True Range (ATR) from recent price data.
 /// ATR = EMA of True Range over `period` days.
 /// True Range = max(high-low, abs(high-prev_close), abs(low-prev_close))
+///
+/// Returns 0.0 — meaning "no ATR", not "zero volatility" — when the data
+/// cannot support one: no bars inside the freshness window, or too few of
+/// them. Callers must treat 0.0 as the no-ATR fallback, never as a stop
+/// distance.
 pub fn compute_atr(conn: &Connection, ticker: &str, period: usize) -> f64 {
+    let cutoff = (chrono::Local::now() - chrono::Duration::days(ATR_MAX_STALENESS_DAYS))
+        .format("%Y-%m-%d")
+        .to_string();
+
     let mut stmt = match conn.prepare(
         "SELECT high, low, close FROM entity_prices
-         WHERE ticker = ?1 AND high IS NOT NULL AND low IS NOT NULL
-         ORDER BY date DESC LIMIT ?2"
+         WHERE ticker = ?1 AND date >= ?2 AND high IS NOT NULL AND low IS NOT NULL
+         ORDER BY date DESC LIMIT ?3"
     ) {
         Ok(s) => s,
         Err(_) => return 0.0,
     };
 
     let candles: Vec<(f64, f64, f64)> = stmt
-        .query_map(rusqlite::params![ticker, period + 1], |row| {
+        .query_map(rusqlite::params![ticker, cutoff, period + 1], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .ok()
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
-    if candles.len() < 2 {
+    // A handful of fresh bars is not a 14-day ATR. Two candles yield a single
+    // true range, and one quiet day would put the 3x trailing stop within
+    // pennies of the high-water mark — an instant exit on noise. Below half
+    // the period, report no ATR and let the fixed stop take over.
+    if candles.len() < period / 2 + 1 {
         return 0.0;
     }
 
@@ -268,6 +291,108 @@ pub fn generate_trade_journal(
         "UPDATE paper_trades SET trade_journal = ?1 WHERE id = ?2",
         rusqlite::params![journal, trade_id],
     ).ok();
+}
+
+#[cfg(test)]
+mod atr_recency_tests {
+    use super::*;
+
+    /// A ticker with `count` daily bars, the newest `age_days` old.
+    /// Each bar has a 2.00-wide high/low range, so a healthy ATR is ~2.00.
+    fn seed(conn: &Connection, ticker: &str, count: i64, age_days: i64) {
+        for i in 0..count {
+            let date = (chrono::Local::now() - chrono::Duration::days(age_days + i))
+                .format("%Y-%m-%d")
+                .to_string();
+            conn.execute(
+                "INSERT INTO entity_prices (ticker, date, high, low, close)
+                 VALUES (?1, ?2, 101.0, 99.0, 100.0)",
+                rusqlite::params![ticker, date],
+            )
+            .unwrap();
+        }
+    }
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entity_prices (
+                ticker TEXT NOT NULL, date TEXT NOT NULL,
+                high REAL, low REAL, close REAL NOT NULL,
+                UNIQUE(ticker, date));",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_ticker_that_stopped_updating_reports_no_atr() {
+        let conn = db();
+        // 20 bars, but the newest is 73 days old — the real INTC/META shape:
+        // last bar 2026-06-03 while the table's max date was 2026-08-15.
+        seed(&conn, "STALE", 20, 73);
+        assert_eq!(
+            compute_atr(&conn, "STALE", 14),
+            0.0,
+            "ten-week-old candles must not set a live trailing stop"
+        );
+    }
+
+    #[test]
+    fn too_few_fresh_bars_report_no_atr() {
+        let conn = db();
+        // Fresh, but only 4 bars — under half the 14-day period. A 3-true-range
+        // average is not an ATR, and a thin one puts the 3x stop on top of the
+        // high-water mark.
+        seed(&conn, "SPARSE", 4, 1);
+        assert_eq!(compute_atr(&conn, "SPARSE", 14), 0.0);
+    }
+
+    #[test]
+    fn a_currently_traded_ticker_still_gets_its_atr() {
+        let conn = db();
+        seed(&conn, "FRESH", 20, 1);
+        let atr = compute_atr(&conn, "FRESH", 14);
+        assert!(
+            (atr - 2.0).abs() < 0.001,
+            "expected the 2.00 daily range, got {atr}"
+        );
+    }
+
+    #[test]
+    fn stale_bars_do_not_pad_out_a_sparse_fresh_window() {
+        let conn = db();
+        // 3 fresh bars plus 20 ancient ones. Unbounded, the query would fill
+        // its LIMIT from the old rows and return a confident ATR.
+        seed(&conn, "MIXED", 3, 1);
+        seed(&conn, "MIXED", 20, 200);
+        assert_eq!(compute_atr(&conn, "MIXED", 14), 0.0);
+    }
+
+    #[test]
+    fn no_atr_falls_back_to_the_fixed_stop_not_an_instant_exit() {
+        let conn = db();
+        conn.execute_batch(
+            "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY,
+                entry_price REAL, high_water_mark REAL, trailing_stop REAL);
+             INSERT INTO paper_trades (id, entry_price) VALUES (1, 100.0);",
+        )
+        .unwrap();
+        seed(&conn, "STALE", 20, 73);
+
+        // Down 5% on a stale ticker: hold, because there is no ATR to stop on.
+        assert!(matches!(
+            evaluate_position(&conn, 1, "STALE", 100.0, 95.0),
+            PositionAction::Hold
+        ));
+        // Down 12%: the documented fixed -10% fallback, not a trailing stop.
+        match evaluate_position(&conn, 1, "STALE", 100.0, 88.0) {
+            PositionAction::CloseAll { reason } => {
+                assert!(reason.starts_with("fixed_stop_loss"), "got {reason}")
+            }
+            other => panic!("expected the no-ATR fixed stop, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
