@@ -654,6 +654,13 @@ export interface BacktestMonthlyReturn {
 export interface BacktestResult {
 	config_summary: string;
 	total_signals: number;
+	/** Distinct tickers among those signals. 0 on results read back from
+	 *  history — the column isn't persisted, so 0 means unknown, not none. */
+	tickers_signalled: number;
+	/** Of those, how many ever had a price bar on a day they signalled — the only
+	 *  ones the walk could admit. A gap here means the result covers part of the
+	 *  signal's universe. Not a live-trading limit; live entries price off Alpaca. */
+	tickers_tradable: number;
 	/** Closed exits only. Positions still open when the price data ran out are
 	 *  counted in `open_at_end` — they move the equity curve but are not outcomes,
 	 *  so hit_rate, avg_return_pct and avg_holding_days all exclude them. */

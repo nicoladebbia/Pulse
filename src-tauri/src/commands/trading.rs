@@ -372,14 +372,27 @@ pub fn auto_backtest_if_due(db: State<'_, DbState>) -> Result<AutoBacktestStatus
     } else {
         String::new()
     };
+    // And say which names it could see at all. A ticker with no price bar on a
+    // day it signalled is invisible to the walk, so the result covers only part
+    // of the signal's universe — the live trader prices off Alpaca and has no
+    // such gap, which makes this a limit of the measurement, not of the strategy.
+    let coverage = if result.tickers_tradable < result.tickers_signalled {
+        format!(
+            ". Covers {} of {} signalled tickers — the rest had no price bar on a day they signalled",
+            result.tickers_tradable, result.tickers_signalled
+        )
+    } else {
+        String::new()
+    };
     let summary = format!(
-        "Auto-backtest ran: {} closed trades{}, {:.1}% hit rate, {:+.2}% return, Sharpe {:.2}, max DD {:.1}%",
+        "Auto-backtest ran: {} closed trades{}, {:.1}% hit rate, {:+.2}% return, Sharpe {:.2}, max DD {:.1}%{}",
         result.trades_taken,
         still_open,
         result.hit_rate,
         result.total_return_pct,
         result.sharpe_ratio,
         result.max_drawdown_pct,
+        coverage,
     );
 
     Ok(AutoBacktestStatus {

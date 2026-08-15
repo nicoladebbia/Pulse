@@ -36,6 +36,15 @@ pub struct MonthlyReturn {
 pub struct BacktestResult {
     pub config_summary: String,
     pub total_signals: usize,
+    /// Distinct tickers among those signals.
+    #[serde(default)]
+    pub tickers_signalled: usize,
+    /// Of those, how many ever had a price bar on a day they signalled — the
+    /// only ones this backtest could admit. The gap is invisible in every other
+    /// number here. Not a live-trading limit: the live path prices entries off
+    /// Alpaca and never reads entity_prices.
+    #[serde(default)]
+    pub tickers_tradable: usize,
     /// Closed exits only — positions force-closed when the price data ran out
     /// are counted in `open_at_end`, not here. Every realized statistic below
     /// is computed over this sample.
@@ -163,6 +172,26 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
     if trading_dates.is_empty() {
         return Ok(empty_result(&config));
     }
+
+    // A ticker can only ever be admitted on a day it both signals AND has a
+    // bar, because entry takes that day's close and the walk refuses to peek
+    // forward. Tickers that never line up are silently invisible to the whole
+    // backtest — on the live data, eight of the twenty-three signalled names
+    // have no row in entity_prices at all (NU alone signalled 44 times), and
+    // three more never had a bar on a day they signalled. Without this count
+    // the result reads as a verdict on the signal, when it is a verdict on the
+    // half of the signal's names that happen to have price history.
+    //
+    // The live trader does not share this blind spot: it prices entries off
+    // Alpaca and never reads entity_prices, so it can and does trade names
+    // this backtest cannot see.
+    let tickers_signalled = tickers.len();
+    let tickers_tradable = candidates
+        .iter()
+        .filter(|c| prices.get(&c.ticker).is_some_and(|m| m.contains_key(&c.signal_date)))
+        .map(|c| c.ticker.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
 
     // Group candidates by signal_date for O(1) admission lookup.
     let mut candidates_by_date: HashMap<String, Vec<SignalCandidate>> = HashMap::new();
@@ -345,6 +374,8 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
     let result = BacktestResult {
         config_summary: config_summary.clone(),
         total_signals,
+        tickers_signalled,
+        tickers_tradable,
         trades_taken,
         open_at_end,
         trades_won,
@@ -399,6 +430,11 @@ pub fn get_backtest_history(conn: &Connection, limit: usize) -> Result<Vec<Backt
                 return Ok(BacktestResult {
                     config_summary,
                     total_signals: total_signals as usize,
+                    // Not persisted — backtest_results has no column for it and
+                    // recomputing would need the signal window replayed. Zero
+                    // reads as "unknown" rather than a fabricated coverage claim.
+                    tickers_signalled: 0,
+                    tickers_tradable: 0,
                     trades_taken: m.trades_taken,
                     open_at_end: m.open_at_end,
                     trades_won: m.trades_won,
@@ -433,6 +469,8 @@ pub fn get_backtest_history(conn: &Connection, limit: usize) -> Result<Vec<Backt
         Ok(BacktestResult {
             config_summary,
             total_signals: total_signals as usize,
+            tickers_signalled: 0,
+            tickers_tradable: 0,
             trades_taken: m.trades_taken,
             open_at_end: m.open_at_end,
             trades_won: m.trades_won,
@@ -751,7 +789,7 @@ fn save_result(
 fn empty_result(config: &BacktestConfig) -> BacktestResult {
     BacktestResult {
         config_summary: format!("{} to {} — no convergence signals found", config.start_date, config.end_date),
-        total_signals: 0, trades_taken: 0, open_at_end: 0, trades_won: 0, trades_lost: 0,
+        total_signals: 0, tickers_signalled: 0, tickers_tradable: 0, trades_taken: 0, open_at_end: 0, trades_won: 0, trades_lost: 0,
         hit_rate: 0.0, avg_return_pct: 0.0, total_return_pct: 0.0,
         max_drawdown_pct: 0.0, sharpe_ratio: 0.0, avg_holding_days: 0.0,
         starting_equity: 100_000.0, ending_equity: 100_000.0,
@@ -858,5 +896,100 @@ mod realized_metrics_tests {
         assert_eq!(fresh.avg_holding_days, stored.avg_holding_days);
         assert_eq!(stored.trades_taken, 3);
         assert_eq!(stored.open_at_end, 1);
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    /// Minimal schema: just the columns `get_signal_candidates` and
+    /// `load_prices` actually touch.
+    fn fixture() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE cross_signals (
+                 entity_id INTEGER, ticker TEXT, compound_score REAL,
+                 convergence_detected INTEGER, computed_at TEXT,
+                 insider_signal REAL, institutional_flow REAL, news_momentum REAL,
+                 government_signal REAL, search_trend REAL, patent_signal REAL,
+                 supply_chain REAL, political_signal REAL);
+             CREATE TABLE entity_tickers (entity_id INTEGER, ticker TEXT);
+             CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE entity_prices (
+                 ticker TEXT, date TEXT, open REAL, close REAL, high REAL, low REAL);",
+        )
+        .expect("schema");
+        conn
+    }
+
+    fn day(n: i64) -> String {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .expect("valid date")
+            .checked_add_signed(chrono::Duration::days(n))
+            .expect("in range")
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    /// PRICED signals and has bars — admissible.
+    /// UNPRICED signals just as often but has no row in entity_prices at all.
+    /// OFFDAY has bars, but never on a day it signals.
+    /// Only PRICED can ever be traded, and nothing else in the result says so.
+    #[test]
+    fn coverage_counts_only_tickers_that_could_actually_be_admitted() {
+        let conn = fixture();
+        // 40 trading days of bars for PRICED and OFFDAY.
+        for d in 0..40 {
+            for t in ["PRICED", "OFFDAY"] {
+                conn.execute(
+                    "INSERT INTO entity_prices (ticker, date, open, close, high, low)
+                     VALUES (?1, ?2, 100.0, 100.0, 101.0, 99.0)",
+                    params![t, day(d)],
+                )
+                .expect("insert bar");
+            }
+        }
+        // PRICED and UNPRICED signal on days that have bars; OFFDAY signals on a
+        // day well past the last bar, so it never lines up.
+        for (i, t) in ["PRICED", "UNPRICED"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO cross_signals (entity_id, ticker, compound_score,
+                     convergence_detected, computed_at)
+                 VALUES (?1, ?2, 0.9, 1, ?3)",
+                params![i as i64 + 1, t, format!("{} 12:00:00", day(5))],
+            )
+            .expect("insert signal");
+        }
+        conn.execute(
+            "INSERT INTO cross_signals (entity_id, ticker, compound_score,
+                 convergence_detected, computed_at)
+             VALUES (3, 'OFFDAY', 0.9, 1, ?1)",
+            params![format!("{} 12:00:00", day(80))],
+        )
+        .expect("insert offday signal");
+
+        let result = run_backtest(
+            &conn,
+            BacktestConfig {
+                start_date: day(0),
+                end_date: day(90),
+                min_score: 0.30,
+                stop_loss_pct: -10.0,
+                take_profit_pct: 15.0,
+                max_hold_days: 90,
+                max_positions: 10,
+                position_size_pct: 5.0,
+            },
+        )
+        .expect("backtest runs");
+
+        assert_eq!(result.total_signals, 3, "all three signalled");
+        assert_eq!(result.tickers_signalled, 3);
+        assert_eq!(
+            result.tickers_tradable, 1,
+            "only PRICED had a bar on a day it signalled; UNPRICED has no price \
+             data and OFFDAY never lines up"
+        );
     }
 }
