@@ -36,6 +36,7 @@ pub const MIGRATION_028: &str = include_str!("../../../migrations/028_pending_ca
 pub const MIGRATION_029: &str = include_str!("../../../migrations/029_ticker_eligibility_cache.sql");
 pub const MIGRATION_030: &str = include_str!("../../../migrations/030_repair_prediction_citations.sql");
 pub const MIGRATION_031: &str = include_str!("../../../migrations/031_drop_dead_tables_and_prune_usage.sql");
+pub const MIGRATION_032: &str = include_str!("../../../migrations/032_story_count_excludes_filings.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -655,6 +656,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_031)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (31)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 32: story_count counts news only, not bulk filings
+    if !applied.contains(&32) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_032)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (32)", [])?;
         tx.commit()?;
     }
 

@@ -2222,13 +2222,40 @@ fn write_freedoms_to_db(
     Ok(())
 }
 
-/// Dedup financial articles against the financial_dedup table.
+/// Drop articles that duplicate an EARLIER ARTICLE IN THE SAME BATCH.
+///
+/// The `financial_dedup` table only knows about previous runs — `record_financial_dedup`
+/// writes to it *after* storage — so when a source returned the same record twice in one
+/// fetch, both copies passed the table check because neither was in the table yet.
+///
+/// Measured 2026-08-15 before this existed: 7,563 duplicate story rows, **92% of every
+/// within-briefing duplicate in the database**. Worst case was 92 copies of one FEC
+/// contribution written in a single second (briefing 227, display_order 50..141,
+/// one distinct url_hash). Content-keyed dedup would have addressed only the other 8%.
+///
+/// Keyed on (feed_id, url) to match `financial_dedup`'s primary key exactly, so passing
+/// this filter and missing the table mean the same thing.
+fn dedup_within_batch(articles: Vec<sources::RawArticle>) -> Vec<sources::RawArticle> {
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::with_capacity(articles.len());
+    articles
+        .into_iter()
+        .filter(|a| seen.insert((a.feed_id.clone(), a.url.clone())))
+        .collect()
+}
+
+/// Dedup financial articles: first against the rest of this batch, then against the
+/// financial_dedup table (which covers previous runs only — see `dedup_within_batch`).
 /// Uses feed_id as source_type and url as source_id for dedup.
 /// Returns only articles not previously seen.
 fn dedup_financial_articles(
     db_path: &Path,
     articles: Vec<sources::RawArticle>,
 ) -> Vec<sources::RawArticle> {
+    // Batch-level dedup runs FIRST and unconditionally: the early returns below hand
+    // back the articles unfiltered, and a self-duplicating batch must not survive them.
+    let articles = dedup_within_batch(articles);
+
     let conn = match rusqlite::Connection::open(db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -2291,7 +2318,20 @@ fn write_financial_stories(
         )
         .map_err(|_| anyhow::anyhow!("No daily briefing found for {} — write_to_db must run first", today))?;
 
-    let mut stored = 0;
+    // Continue the briefing's existing display_order instead of restarting at 0.
+    // write_to_db has already numbered the news stories from 0, and a second run can
+    // write financial rows into the same briefing, so restarting collided both ways.
+    // Measured 2026-08-15: 453 (briefing_id, display_order) collision groups among
+    // financial rows alone.
+    let next_order: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(display_order), -1) + 1 FROM stories WHERE briefing_id = ?1",
+            [briefing_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let mut stored: i64 = 0;
     for story in stories {
         if story.article.source_type != "financial" {
             continue;
@@ -2299,7 +2339,7 @@ fn write_financial_stories(
 
         let key_facts_json = serde_json::to_string(&story.key_facts).unwrap_or_else(|_| "[]".to_string());
 
-        conn.execute(
+        match conn.execute(
             "INSERT INTO stories (
                 briefing_id, sector, original_title, original_url, original_language,
                 content_snippet, source_name, published_at, headline, summary,
@@ -2322,23 +2362,37 @@ fn write_financial_stories(
                 story.why_it_matters,
                 story.what_to_watch,
                 story.importance_score,
-                stored as i32,
+                (next_order + stored) as i32,
                 crate::dedup::url_hash(&story.article.url),
                 crate::dedup::title_hash(&story.article.title),
                 story.article.source_type,
                 story.article.financial_metadata,
             ],
-        ).ok(); // Non-fatal per story — dedup might reject
-        stored += 1;
+        ) {
+            // Non-fatal per story — a UNIQUE index may reject it. `stored` must count
+            // rows that ACTUALLY landed: the old code discarded the result with .ok()
+            // and then incremented unconditionally, so both the returned count and the
+            // next display_order advanced on failed inserts.
+            Ok(n) if n > 0 => stored += 1,
+            Ok(_) => {}
+            Err(e) => tracing::debug!("Financial story insert skipped: {}", e),
+        }
     }
 
-    // Update briefing story count
+    // Update briefing story count — NEWS only. Every surface that renders this column
+    // labels it "stories" (the header's "N stories across 4 sectors", the sidebar's All
+    // row, the archive timeline), but a raw COUNT(*) folded in the day's regulatory
+    // filings, so 2026-08-14 advertised 582 stories when it held 120 and 462 filings.
+    // Migration 032 backfills the same definition over the existing history.
     conn.execute(
-        "UPDATE briefings SET story_count = (SELECT COUNT(*) FROM stories WHERE briefing_id = ?1) WHERE id = ?1",
+        "UPDATE briefings SET story_count = (
+             SELECT COUNT(*) FROM stories
+             WHERE briefing_id = ?1 AND COALESCE(source_type, 'news') != 'financial'
+         ) WHERE id = ?1",
         [briefing_id],
     ).ok();
 
-    Ok(stored)
+    Ok(stored as usize)
 }
 
 /// Record financial articles in the dedup table after they're stored.
@@ -2711,24 +2765,218 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
     Ok(total)
 }
 
+#[cfg(test)]
+mod financial_dedup_tests {
+    use super::*;
 
+    fn article(feed_id: &str, url: &str, title: &str) -> sources::RawArticle {
+        sources::RawArticle {
+            title: title.to_string(),
+            url: url.to_string(),
+            source_name: "FEC".to_string(),
+            source_url: "https://api.open.fec.gov".to_string(),
+            published_at: None,
+            content_snippet: String::new(),
+            sector: "wealth".to_string(),
+            feed_id: feed_id.to_string(),
+            language: "en".to_string(),
+            source_type: "financial".to_string(),
+            financial_metadata: None,
+        }
+    }
 
+    /// Steady state: a clean batch must survive untouched. This is the case the
+    /// old code already handled, kept so a too-aggressive key shows up here.
+    #[test]
+    fn keeps_every_distinct_article() {
+        let batch = vec![
+            article("fec", "https://fec.gov/a", "A"),
+            article("fec", "https://fec.gov/b", "B"),
+            article("fec", "https://fec.gov/c", "C"),
+        ];
+        assert_eq!(dedup_within_batch(batch).len(), 3);
+    }
 
+    /// The mutation this function exists to survive, in the exact shape production
+    /// produced: one FEC contribution repeated 92 times inside a single fetch.
+    /// Before the fix all 92 were written (briefing 227, 2026-06-10 01:14:09).
+    #[test]
+    fn collapses_the_92_copy_batch() {
+        let batch: Vec<_> = (0..92)
+            .map(|_| article("fec", "https://fec.gov/dup", "ACTBLUE contributes $13K"))
+            .collect();
+        let out = dedup_within_batch(batch);
+        assert_eq!(out.len(), 1, "92 identical records must collapse to one");
+    }
 
+    /// Duplicates interleaved with real articles — an append-only test would pass
+    /// while a positional key silently mangled the middle of the batch.
+    #[test]
+    fn collapses_duplicates_interleaved_and_keeps_first_occurrence_order() {
+        let batch = vec![
+            article("fec", "https://fec.gov/a", "first A"),
+            article("fec", "https://fec.gov/b", "B"),
+            article("fec", "https://fec.gov/a", "second A"),
+            article("fec", "https://fec.gov/c", "C"),
+            article("fec", "https://fec.gov/b", "second B"),
+        ];
+        let out = dedup_within_batch(batch);
+        let titles: Vec<_> = out.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(titles, vec!["first A", "B", "C"]);
+    }
 
+    /// The key must match financial_dedup's PRIMARY KEY (source_type, source_id)
+    /// exactly. Same URL under a different feed is a genuinely different record;
+    /// collapsing it here would silently drop data the table would have kept.
+    #[test]
+    fn same_url_under_different_feeds_is_not_a_duplicate() {
+        let batch = vec![
+            article("fec", "https://example.gov/x", "via FEC"),
+            article("edgar", "https://example.gov/x", "via EDGAR"),
+        ];
+        assert_eq!(dedup_within_batch(batch).len(), 2);
+    }
 
+    #[test]
+    fn empty_batch_is_handled() {
+        assert!(dedup_within_batch(Vec::new()).is_empty());
+    }
+}
 
+#[cfg(test)]
+mod financial_write_tests {
+    use super::*;
 
+    fn story(url: &str, title: &str) -> crate::claude::SummarizedStory {
+        crate::claude::SummarizedStory {
+            article: sources::RawArticle {
+                title: title.to_string(),
+                url: url.to_string(),
+                source_name: "FEC".to_string(),
+                source_url: "https://api.open.fec.gov".to_string(),
+                published_at: None,
+                content_snippet: "snippet".to_string(),
+                // `finance`, not `wealth` — stories.sector has a CHECK constraint that
+                // predates the freedoms rename, and all 22,551 real financial rows use it.
+                sector: "finance".to_string(),
+                feed_id: "fec".to_string(),
+                language: "en".to_string(),
+                source_type: "financial".to_string(),
+                financial_metadata: None,
+            },
+            headline: title.to_string(),
+            summary: "summary".to_string(),
+            key_facts: vec!["fact".to_string()],
+            why_it_matters: "matters".to_string(),
+            what_to_watch: "watch".to_string(),
+            importance_score: 5,
+            sentiment: None,
+            novelty: None,
+            event_type: Some("financial_data".to_string()),
+        }
+    }
 
+    /// Builds a DB with today's daily briefing already present, since
+    /// write_financial_stories requires write_to_db to have run first.
+    fn db_with_briefing() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT INTO briefings (date, briefing_type, status) VALUES (?1, 'daily', 'complete')",
+            [&today],
+        )
+        .unwrap();
+        (dir, path)
+    }
 
+    /// The state transition the fix exists for: a SECOND write into the same briefing
+    /// must not restart display_order at 0. Before the fix both runs numbered from 0,
+    /// producing 453 (briefing_id, display_order) collision groups in production.
+    #[test]
+    fn second_write_continues_display_order_instead_of_restarting() {
+        let (_dir, path) = db_with_briefing();
 
+        let first = vec![story("https://fec.gov/1", "one"), story("https://fec.gov/2", "two")];
+        assert_eq!(write_financial_stories(&path, &first).unwrap(), 2);
 
+        let second = vec![story("https://fec.gov/3", "three")];
+        assert_eq!(write_financial_stories(&path, &second).unwrap(), 1);
 
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let distinct: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT display_order) FROM stories WHERE source_type = 'financial'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stories WHERE source_type = 'financial'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(distinct, 3, "every financial row needs its own display_order");
+    }
 
+    /// Financial rows must not reuse the display_order the news rows already hold.
+    #[test]
+    fn financial_does_not_collide_with_existing_news_ordering() {
+        let (_dir, path) = db_with_briefing();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let bid: i64 = conn
+            .query_row("SELECT id FROM briefings LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO stories (briefing_id, sector, original_title, original_url,
+                                      source_name, headline, summary, key_facts,
+                                      why_it_matters, what_to_watch, url_hash, title_hash,
+                                      importance_score, is_hero, display_order, source_type)
+                 VALUES (?1, 'ai', 'news', 'https://example.com/news', 'Example',
+                         'news', 's', '[]', 'w', 'w', ?3, ?4, 8, 0, ?2, 'news')",
+                rusqlite::params![bid, i, format!("url-hash-{i}"), format!("title-hash-{i}")],
+            )
+            .unwrap();
+        }
 
+        write_financial_stories(&path, &[story("https://fec.gov/9", "nine")]).unwrap();
 
+        let min_fin: i64 = conn
+            .query_row(
+                "SELECT MIN(display_order) FROM stories WHERE source_type = 'financial'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(min_fin, 3, "financial must start after the news rows, not at 0");
+    }
 
+    /// The returned count must reflect rows that actually landed. The old code
+    /// discarded the insert result with .ok() and incremented unconditionally, so a
+    /// rejected row still advanced the count — a false measurement of its own work.
+    #[test]
+    fn count_excludes_rows_that_failed_to_insert() {
+        let (_dir, path) = db_with_briefing();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_test_unique_url ON stories(briefing_id, url_hash)",
+            [],
+        )
+        .unwrap();
 
+        let dupes = vec![story("https://fec.gov/same", "a"), story("https://fec.gov/same", "b")];
+        let stored = write_financial_stories(&path, &dupes).unwrap();
+        assert_eq!(stored, 1, "the rejected duplicate must not be counted as stored");
+    }
 
-
-
+    /// Non-financial stories are skipped, and skipping must not consume an order slot.
+    #[test]
+    fn ignores_non_financial_stories() {
+        let (_dir, path) = db_with_briefing();
+        let mut news = story("https://example.com/n", "news item");
+        news.article.source_type = "news".to_string();
+        assert_eq!(write_financial_stories(&path, &[news]).unwrap(), 0);
+    }
+}

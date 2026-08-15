@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { currentBriefing, isLoading, activeSectors, expandedStoryId, getFilteredStories, getFeaturedFromList, getCompactFromList } from '$lib/stores/briefing';
+	import { currentBriefing, isLoading, activeSectors, expandedStoryId, getFilteredStories, getFeaturedFromList, getCompactFromList, isFiling } from '$lib/stores/briefing';
 	import { updateStoryList, focusedStoryId } from '$lib/stores/navigation';
 	import BriefingSummary from '$lib/components/stories/BriefingSummary.svelte';
 	import FeaturedCard from '$lib/components/stories/FeaturedCard.svelte';
@@ -14,12 +14,25 @@
 
 	let trendBadges = $state<Map<number, StoryTrendBadge>>(new Map());
 
-	let allStories = $derived(getFilteredStories($currentBriefing, $activeSectors));
+	// Filings are excluded from the front-page TIERS and count. Ranking already kept them
+	// out of the top 15 on 129 of 130 days (relevance beats their hardcoded importance 5),
+	// but they still inflated the "View all N stories" count with hundreds of SEC forms.
+	// They stay reachable in the archive's filings digest.
+	let sectorStories = $derived(getFilteredStories($currentBriefing, $activeSectors));
+	let allStories = $derived(sectorStories.filter(s => !isFiling(s)));
 	let featured = $derived(getFeaturedFromList(allStories, 3));
 	let compact = $derived(getCompactFromList(allStories, 3, 12));
 	let connections = $derived($currentBriefing?.connections ?? []);
 	let executiveSummary = $derived($currentBriefing?.briefing.executive_summary ?? null);
-	let expandedStory = $derived(allStories.find(s => s.id === $expandedStoryId) ?? null);
+	// Resolved against the WHOLE briefing, not the visible tiers: Ask Pulse citations and
+	// Trends both do `expandedStoryId.set(id); goto('/')`, and this is the only place that
+	// renders the panel. Narrowing this to `allStories` would blank any citation to a
+	// filing, and narrowing it to the sector filter blanks any citation to a deselected
+	// sector. (Citations to a story outside today's briefing still resolve to null — a
+	// pre-existing gap, tracked separately.)
+	let expandedStory = $derived(
+		($currentBriefing?.stories ?? []).find(s => s.id === $expandedStoryId) ?? null
+	);
 	let remainingCount = $derived(Math.max(0, allStories.length - 15));
 
 	let loadError = $state<string | null>(null);
@@ -176,7 +189,7 @@
 				</div>
 				{#if remainingCount > 0}
 					<a href="/archive?date=today" class="block text-center text-sm text-ai hover:underline mt-3 py-2">
-						View all {$currentBriefing.briefing.story_count} stories in Archive
+						View all {allStories.length} stories in Archive
 					</a>
 				{/if}
 			</div>

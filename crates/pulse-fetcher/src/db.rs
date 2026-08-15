@@ -6,13 +6,16 @@ const MIGRATION_003: &str = include_str!("../../../migrations/003_intelligence.s
 const MIGRATION_004: &str = include_str!("../../../migrations/004_freedoms.sql");
 const MIGRATION_005: &str = include_str!("../../../migrations/005_contextual_prefix.sql");
 const MIGRATION_006: &str = include_str!("../../../migrations/006_freedoms_search.sql");
-// NOTE (2026-08-15): MIGRATION_007/009/017 are declared here but never execute_batch'd by
-// this runner, and 012/013/014/020/022 are not declared at all — the APP's runner
-// (src-tauri/src/db/connection.rs) applies those. So the fetcher alone CANNOT build a
-// complete schema; it works today only because the app has always run first on this
-// machine. Kept (rather than deleted) so the asymmetry stays visible; #[allow(dead_code)]
-// silences the warning without erasing the signal. Reconciling the two runners is its own
-// change — it needs each of those five migrations checked for fetcher-side compatibility.
+// MIGRATION_007/009/017 are declared but not execute_batch'd: those three blocks inline
+// their SQL (a guarded ALTER, a DROP INDEX, a full table rebuild) rather than running the
+// file, exactly as the app's runner does. The const is kept so every migration file has a
+// declaration here and a missing one is visible at a glance.
+//
+// Until 2026-08-15 this runner also skipped 012/013/014/020/022 entirely, so it could not
+// build a complete schema on a fresh database: migration 023 rebuilds `stories` selecting
+// `sentiment`, which 014 adds, and the rebuild failed with "no such column: sentiment".
+// Masked in practice because the app had always run first on this machine. Both runners now
+// cover 001-031; `migration_parity_tests` below fails if they drift again.
 #[allow(dead_code)]
 const MIGRATION_007: &str = include_str!("../../../migrations/007_executive_summary.sql");
 const MIGRATION_008: &str = include_str!("../../../migrations/008_intelligence_upgrade.sql");
@@ -20,13 +23,18 @@ const MIGRATION_008: &str = include_str!("../../../migrations/008_intelligence_u
 const MIGRATION_009: &str = include_str!("../../../migrations/009_multiple_daily_briefings.sql");
 const MIGRATION_010: &str = include_str!("../../../migrations/010_trajectory_labels.sql");
 const MIGRATION_011: &str = include_str!("../../../migrations/011_rename_financial_to_wealth.sql");
+const MIGRATION_012: &str = include_str!("../../../migrations/012_chat_feedback.sql");
+const MIGRATION_013: &str = include_str!("../../../migrations/013_feedback_reputation.sql");
+const MIGRATION_014: &str = include_str!("../../../migrations/014_intelligence_upgrade.sql");
 const MIGRATION_015: &str = include_str!("../../../migrations/015_entity_aliases.sql");
 const MIGRATION_016: &str = include_str!("../../../migrations/016_feed_health.sql");
 #[allow(dead_code)]
 const MIGRATION_017: &str = include_str!("../../../migrations/017_financial_data.sql");
 const MIGRATION_018: &str = include_str!("../../../migrations/018_entity_resolution.sql");
 const MIGRATION_019: &str = include_str!("../../../migrations/019_position_management.sql");
+const MIGRATION_020: &str = include_str!("../../../migrations/020_performance_indexes.sql");
 const MIGRATION_021: &str = include_str!("../../../migrations/021_trade_journal.sql");
+const MIGRATION_022: &str = include_str!("../../../migrations/022_predictions_v2.sql");
 const MIGRATION_023: &str = include_str!("../../../migrations/023_freedom_whoop.sql");
 const MIGRATION_024: &str = include_str!("../../../migrations/024_rebuild_fts_porter.sql");
 const MIGRATION_025: &str = include_str!("../../../migrations/025_half_close_marker.sql");
@@ -36,6 +44,7 @@ const MIGRATION_028: &str = include_str!("../../../migrations/028_pending_calibr
 const MIGRATION_029: &str = include_str!("../../../migrations/029_ticker_eligibility_cache.sql");
 const MIGRATION_030: &str = include_str!("../../../migrations/030_repair_prediction_citations.sql");
 const MIGRATION_031: &str = include_str!("../../../migrations/031_drop_dead_tables_and_prune_usage.sql");
+const MIGRATION_032: &str = include_str!("../../../migrations/032_story_count_excludes_filings.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -173,6 +182,32 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_011)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (11)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 12: Chat feedback table
+    if !applied.contains(&12) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_012)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 13: Feedback reputation cache
+    if !applied.contains(&13) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_013)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 14: Intelligence upgrade (probability tracking, novelty, alerts).
+    // Adds stories.sentiment / stories.novelty — migration 023's table rebuild selects
+    // both, so skipping this one breaks the whole chain on a fresh database.
+    if !applied.contains(&14) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_014)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (14)", [])?;
         tx.commit()?;
     }
 
@@ -505,11 +540,27 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         tx.commit()?;
     }
 
+    // Migration 20: Performance indexes
+    if !applied.contains(&20) {
+        conn.execute_batch(MIGRATION_020)?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (20)", [])?;
+    }
+
+    // Migration 21: Trade journal
     if !applied.contains(&21) {
         if !column_exists(conn, "paper_trades", "trade_journal")? {
             conn.execute_batch(MIGRATION_021)?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (21)", [])?;
+    }
+
+    // Migration 22: Predictions v2.
+    // Idempotent guard: only run if the v2 column doesn't yet exist.
+    if !applied.contains(&22) {
+        if !column_exists(conn, "insights", "target_metric")? {
+            conn.execute_batch(MIGRATION_022)?;
+        }
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (22)", [])?;
     }
 
     // Migration 23: Add 'whoop' to freedom_stories CHECK constraint (rebuild table).
@@ -602,6 +653,14 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         tx.commit()?;
     }
 
+    // Migration 32: story_count counts news only, not bulk filings
+    if !applied.contains(&32) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_032)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (32)", [])?;
+        tx.commit()?;
+    }
+
     // Ensure composite indexes exist (idempotent)
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_freedom_stories_bf ON freedom_stories(briefing_id, freedom, display_order);"
@@ -628,4 +687,156 @@ pub fn log_api_usage(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![provider, model, endpoint, input_tokens, output_tokens, cost],
     ).ok();
+}
+
+#[cfg(test)]
+mod migration_parity_tests {
+    //! Guards the defect this module shipped with for months: `run_migrations` skipped
+    //! 012/013/014/020/022, so the fetcher alone could not build a working schema on a
+    //! fresh database — migration 023 rebuilds `stories` selecting `sentiment` (added by
+    //! 014) and died with "no such column: sentiment". It went unnoticed because the app's
+    //! separate runner in src-tauri/src/db/connection.rs had always run first here.
+    //!
+    //! These read `migrations/` from disk AT TEST TIME rather than asserting a hardcoded
+    //! list, so a migration 032 added tomorrow is covered without touching this file: forget
+    //! to wire it into `run_migrations` and `every_migration_file_is_applied` fails.
+
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn migrations_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations")
+    }
+
+    /// (version, filename, sql) for every migration file, ordered by version.
+    fn migration_files() -> Vec<(i64, String, String)> {
+        let mut out: Vec<(i64, String, String)> = std::fs::read_dir(migrations_dir())
+            .expect("migrations/ is readable")
+            .filter_map(|e| {
+                let path = e.ok()?.path();
+                if path.extension()? != "sql" {
+                    return None;
+                }
+                let name = path.file_name()?.to_str()?.to_string();
+                // Files are NNN_description.sql — the numeric prefix is the version.
+                let version: i64 = name.split('_').next()?.parse().ok()?;
+                Some((version, name, std::fs::read_to_string(&path).ok()?))
+            })
+            .collect();
+        out.sort_by_key(|(v, _, _)| *v);
+        assert!(!out.is_empty(), "found no migration files");
+        out
+    }
+
+    /// table name -> its column names, for every real table (FTS shadow tables and
+    /// bookkeeping excluded — neither is part of the schema contract).
+    fn schema_of(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name NOT LIKE 'sqlite_%'
+                   AND name NOT LIKE '%_fts_%'
+                   AND name NOT IN ('schema_migrations', 'fetcher_flags')
+                 ORDER BY name",
+            )
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        tables
+            .into_iter()
+            .map(|t| {
+                let mut cols = conn
+                    .prepare(&format!("PRAGMA table_info({t})"))
+                    .unwrap();
+                let set: BTreeSet<String> = cols
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                (t, set)
+            })
+            .collect()
+    }
+
+    /// Ground truth: apply every migration file in order, exactly as sqlite3 would.
+    fn reference_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for (version, name, sql) in migration_files() {
+            conn.execute_batch(&sql)
+                .unwrap_or_else(|e| panic!("migration {version} ({name}) failed: {e}"));
+        }
+        conn
+    }
+
+    fn runner_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).expect("run_migrations builds a schema from empty");
+        conn
+    }
+
+    #[test]
+    fn runner_builds_a_complete_schema_from_empty() {
+        // The regression test proper: before the fix this panicked inside run_migrations
+        // with "no such column: sentiment".
+        let runner = schema_of(&runner_db());
+        let reference = schema_of(&reference_db());
+
+        let missing_tables: Vec<_> = reference
+            .keys()
+            .filter(|t| !runner.contains_key(*t))
+            .collect();
+        assert!(
+            missing_tables.is_empty(),
+            "run_migrations never creates these tables: {missing_tables:?}"
+        );
+
+        // Column sets, not CREATE TABLE text: a rebuild migration reformats the SQL, and
+        // the missing column is what actually broke.
+        for (table, want) in &reference {
+            let got = &runner[table];
+            let missing: Vec<_> = want.difference(got).collect();
+            assert!(
+                missing.is_empty(),
+                "table `{table}` is missing columns {missing:?} after run_migrations"
+            );
+        }
+    }
+
+    #[test]
+    fn every_migration_file_is_applied() {
+        let conn = runner_db();
+        let recorded: BTreeSet<i64> = conn
+            .prepare("SELECT version FROM schema_migrations")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        let unapplied: Vec<_> = migration_files()
+            .into_iter()
+            .filter(|(v, _, _)| !recorded.contains(v))
+            .map(|(v, name, _)| format!("{v} ({name})"))
+            .collect();
+        assert!(
+            unapplied.is_empty(),
+            "migration files on disk that run_migrations never applies: {unapplied:?}"
+        );
+    }
+
+    #[test]
+    fn running_twice_is_a_no_op() {
+        // Every block is guarded by schema_migrations, but the guards are hand-written per
+        // migration and the ALTER/rebuild ones are the easy thing to get wrong.
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let first = schema_of(&conn);
+        run_migrations(&conn).expect("second run must be a no-op, not an error");
+        assert_eq!(first, schema_of(&conn), "a second run changed the schema");
+    }
 }

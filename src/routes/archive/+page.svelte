@@ -7,6 +7,7 @@
 	import type { BriefingWithStories, Briefing, Story, FreedomsBriefing } from '$lib/tauri/types';
 	import { isTauri, mockArchiveBriefings, mockBriefingData, mockFreedomsBriefing } from '$lib/tauri/mock';
 	import { safeInvoke } from '$lib/tauri/commands';
+	import { byRankDesc, isFiling } from '$lib/stores/briefing';
 
 	let briefings = $state<Briefing[]>([]);
 	let selectedBriefing = $state<BriefingWithStories | null>(null);
@@ -132,6 +133,28 @@
 		return groupedByDate.filter(([date]) => date >= cutoffStr);
 	});
 
+	// The daily view used to render EVERY story as a full card in raw display_order:
+	// 120 news plus up to 462 regulatory filings for a single day (2026-08-14), with the
+	// filings interleaved. The front page never had this problem because it ranks and
+	// takes 15. Split the two, rank the news, and collapse the filings into a digest.
+	const dailyStories = $derived(selectedBriefing?.stories ?? []);
+	const dailyNews = $derived([...dailyStories].filter(s => !isFiling(s)).sort(byRankDesc));
+	const dailyFilings = $derived(dailyStories.filter(isFiling));
+
+	// Filings are only meaningful grouped by their issuing body (SEC EDGAR 4, FEC, ...).
+	const filingsBySource = $derived.by(() => {
+		const groups = new Map<string, Story[]>();
+		for (const f of dailyFilings) {
+			const key = f.source_name || 'Other';
+			const bucket = groups.get(key);
+			if (bucket) bucket.push(f);
+			else groups.set(key, [f]);
+		}
+		return [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
+	});
+
+	let expandedFilingSource = $state<string | null>(null);
+
 	const freedomDefs = [
 		{ key: 'time_stories' as const, freedom: 'time', label: 'Time Freedom', color: 'var(--color-freedom-time)' },
 		{ key: 'wealth_stories' as const, freedom: 'wealth', label: 'Wealth Freedom', color: 'var(--color-freedom-financial)' },
@@ -181,11 +204,17 @@
 				</h3>
 				<span class="text-[10px] uppercase tracking-wider bg-ai/10 text-ai px-2 py-0.5 rounded">Daily</span>
 			</div>
-			<p class="text-sm text-text-secondary mt-1">{selectedBriefing.briefing.story_count} stories</p>
+			<!-- Honest count: the raw story_count folds in hundreds of filings, so a day
+			     reading "582 stories" was really 120 stories and 462 filings. -->
+			<p class="text-sm text-text-secondary mt-1">
+				{dailyNews.length} {dailyNews.length === 1 ? 'story' : 'stories'}{#if dailyFilings.length > 0}<span class="text-text-muted"> · {dailyFilings.length} filings</span>{/if}
+			</p>
 		</div>
 
-		{@const hero = selectedBriefing.stories.find(s => s.is_hero) ?? selectedBriefing.stories[0]}
-		{@const grid = selectedBriefing.stories.filter(s => s.id !== hero?.id)}
+		<!-- Hero comes from the NEWS, never a filing: the old `stories[0]` was whatever
+		     landed first in display_order. -->
+		{@const hero = dailyNews.find(s => s.is_hero) ?? dailyNews[0]}
+		{@const grid = dailyNews.filter(s => s.id !== hero?.id)}
 
 		{#if hero}
 			<HeroCard story={hero} onExpand={(s) => expandedStory = s} />
@@ -196,6 +225,51 @@
 					<StoryCard {story} onExpand={(s) => expandedStory = s} />
 				{/each}
 			</div>
+		{/if}
+
+		{#if dailyFilings.length > 0}
+			<!-- Regulatory filings: reference material, not reading. Collapsed by source
+			     so the day's actual journalism isn't buried under SEC Form 4s. -->
+			<section class="mt-10 pt-6 border-t border-border/60">
+				<h4 class="text-[10px] uppercase tracking-[0.25em] text-text-muted">
+					Filings · {dailyFilings.length} from {filingsBySource.length}
+					{filingsBySource.length === 1 ? 'source' : 'sources'}
+				</h4>
+				<div class="mt-3 space-y-1.5">
+					{#each filingsBySource as [source, items] (source)}
+						{@const open = expandedFilingSource === source}
+						<div class="rounded-lg border border-border/60 overflow-hidden">
+							<button
+								class="w-full flex items-center justify-between gap-3 px-3 py-2 text-left
+									hover:bg-bg-card-hover transition-colors"
+								onclick={() => expandedFilingSource = open ? null : source}
+								aria-expanded={open}
+							>
+								<span class="text-xs text-text-secondary truncate">{source}</span>
+								<span class="text-[11px] text-text-muted shrink-0 tabular-nums">
+									{items.length}
+									<span class="inline-block ml-1 transition-transform {open ? 'rotate-90' : ''}">›</span>
+								</span>
+							</button>
+							{#if open}
+								<ul class="border-t border-border/60 divide-y divide-border/40 max-h-80 overflow-y-auto">
+									{#each items as f (f.id)}
+										<li>
+											<button
+												class="w-full text-left px-3 py-2 text-[11px] leading-relaxed text-text-muted
+													hover:text-text hover:bg-bg-card-hover transition-colors"
+												onclick={() => expandedStory = f}
+											>
+												{f.headline}
+											</button>
+										</li>
+									{/each}
+								</ul>
+							{/if}
+						</div>
+					{/each}
+				</div>
+			</section>
 		{/if}
 
 	{:else if viewMode === 'freedoms' && selectedFreedoms}
