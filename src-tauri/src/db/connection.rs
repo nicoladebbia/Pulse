@@ -34,6 +34,8 @@ pub const MIGRATION_026: &str = include_str!("../../../migrations/026_drop_still
 pub const MIGRATION_027: &str = include_str!("../../../migrations/027_ai_trade_rationale.sql");
 pub const MIGRATION_028: &str = include_str!("../../../migrations/028_pending_calibration.sql");
 pub const MIGRATION_029: &str = include_str!("../../../migrations/029_ticker_eligibility_cache.sql");
+pub const MIGRATION_030: &str = include_str!("../../../migrations/030_repair_prediction_citations.sql");
+pub const MIGRATION_031: &str = include_str!("../../../migrations/031_drop_dead_tables_and_prune_usage.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -633,6 +635,26 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_029)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (29)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 30: strip prediction citations that stored a positional index instead of
+    // a stories.id. 70% of stored refs pointed at an unrelated article; the write-time fix
+    // is pipeline::resolve_story_refs, this repairs the history once. Both app + fetcher.
+    if !applied.contains(&30) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_030)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (30)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 31: drop the 5 tables with zero rows AND zero code references, backfill
+    // insight_evidence from the (now repaired) source_story_ids so the app-side readers
+    // stop seeing 0 for every prediction, and put a 90-day retention policy on api_usage.
+    if !applied.contains(&31) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_031)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (31)", [])?;
         tx.commit()?;
     }
 

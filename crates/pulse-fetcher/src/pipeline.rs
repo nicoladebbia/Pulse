@@ -2,6 +2,121 @@ use std::path::Path;
 
 // --- Progress reporting ---
 
+/// How often the heartbeat re-stamps `updated_at` while a run is in flight.
+/// Must stay well under the app's STALE_AFTER_SECS (240s) so a live run never
+/// drifts into the "interrupted" window between two ticks.
+const HEARTBEAT_SECS: u64 = 15;
+
+/// Serializes every write to the progress file inside this process. The heartbeat
+/// task and the pipeline's own stage writes both read-modify-write the same file;
+/// without this the heartbeat can rename a stale-stage record over a newer one, and
+/// two `atomic_write`s can collide. Held only around synchronous fs calls — never
+/// across an `.await`.
+static PROGRESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Distinguishes the temp file of concurrent writers. A shared `…tmp` path lets one
+/// writer truncate another's file mid-write, and `get_fetch_status` treats a JSON
+/// parse error as "idle" — so a torn write silently BLANKS the progress bar instead
+/// of erroring visibly.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write `json` to `path` atomically (unique temp file + rename), serialized against
+/// every other progress write in this process.
+fn write_progress_json(path: &Path, json: &serde_json::Value) {
+    let _guard = PROGRESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    write_progress_json_locked(path, json);
+}
+
+/// Atomic write assuming PROGRESS_LOCK is already held by the caller.
+fn write_progress_json_locked(path: &Path, json: &serde_json::Value) {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+    if std::fs::write(&tmp, serde_json::to_string(json).unwrap_or_default()).is_ok() {
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Stops the heartbeat when the run leaves scope — including the `?` early-returns
+/// (cost cap, mid-run abort). Otherwise a bailed run's non-terminal record would keep
+/// being stamped "fresh" and read as still-running forever.
+pub struct HeartbeatGuard(pub tokio::task::JoinHandle<()>);
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Keep the progress file's `updated_at` fresh for as long as this run is in flight.
+///
+/// The app classifies an in-progress record whose `updated_at` is older than
+/// STALE_AFTER_SECS (240s) as "Fetch stopped unexpectedly". But Phase 1 calls
+/// `start_stage(1)` ONCE and then collects sources for 9–120 minutes (measured from
+/// fetch-stdout.log over 2026-08-10..14: 53s, 9m, 14m, 16m, 16m, 31m, 34m, 65m,
+/// 120m), writing nothing in between — so a healthy run showed the red "interrupted"
+/// badge on essentially every slow-network day while it was still working.
+///
+/// This makes silence mean what the app already assumes it means: the process is
+/// gone. Only a dead (or hard-killed) fetcher stops stamping the file, so the 240s
+/// crash detector stays intact — see the `heartbeat` tests in commands/fetch.rs.
+pub fn spawn_heartbeat(path: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_SECS)).await;
+
+            // Re-read instead of caching: the pipeline's own writes own stage/percent,
+            // and the heartbeat must only ever touch `updated_at`. The whole
+            // read-modify-write runs under PROGRESS_LOCK (no `.await` inside) so it can
+            // never rename a stale-stage record over a newer one the pipeline just wrote.
+            let done = {
+                let _guard = PROGRESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                match std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                {
+                    Some(mut val) => {
+                        // Terminal record → the run is over. Stop ticking so a finished
+                        // (or failed) run is never held artificially "fresh".
+                        if matches!(val["stage"].as_str(), Some("complete") | Some("failed")) {
+                            true
+                        } else {
+                            // Phase 1 is the one stage that reports nothing while it
+                            // runs (the 14 sources are join!ed, so nothing logs until
+                            // they all return). Surface the completed-source count so
+                            // the bar moves instead of sitting at 0% for minutes —
+                            // "not lying" and "not looking stuck" are different bugs.
+                            if val["stage"].as_str() == Some("collecting") {
+                                let done = crate::sources::SOURCES_DONE
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    .min(crate::sources::SOURCE_COUNT);
+                                val["detail"] = serde_json::json!(format!(
+                                    "{}/{} sources",
+                                    done,
+                                    crate::sources::SOURCE_COUNT
+                                ));
+                            }
+                            val["updated_at"] =
+                                serde_json::json!(chrono::Utc::now().to_rfc3339());
+                            write_progress_json_locked(&path, &val);
+                            false
+                        }
+                    }
+                    // Unreadable/garbled right now (mid-rename, or not written yet) —
+                    // skip this tick rather than inventing a record.
+                    None => false,
+                }
+            };
+            if done {
+                return;
+            }
+        }
+    })
+}
+
 /// Stage weights (approximate % of total pipeline time)
 const STAGE_WEIGHTS: &[(u8, &str, &str)] = &[
     (5,  "collecting",         "Collecting sources"),
@@ -113,9 +228,7 @@ impl ProgressWriter {
     }
 
     fn atomic_write(&self, json: &serde_json::Value) -> std::io::Result<()> {
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_string(json).unwrap_or_default())?;
-        std::fs::rename(&tmp, &self.path)?;
+        write_progress_json(&self.path, json);
         Ok(())
     }
 }
@@ -140,23 +253,33 @@ pub fn write_failed_state(path: &Path, reason: &str) {
         "reason": reason.chars().take(200).collect::<String>(),
         "updated_at": chrono::Utc::now().to_rfc3339(),
     });
-    let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, serde_json::to_string(&json).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    write_progress_json(path, &json);
 }
 
 /// Log API usage to the database (opens its own connection for real-time visibility).
-fn log_usage(db_path: &Path, provider: &str, model: &str, endpoint: &str, input_tokens: i64, output_tokens: i64) {
+///
+/// `pub(crate)` so out-of-pipeline modes (e.g. `--mode backfill-embeddings` in main.rs)
+/// account for their spend too — the backfill used to be invisible to the daily cost cap.
+pub(crate) fn log_usage(db_path: &Path, provider: &str, model: &str, endpoint: &str, input_tokens: i64, output_tokens: i64) {
     if let Ok(conn) = rusqlite::Connection::open(db_path) {
         crate::db::log_api_usage(&conn, provider, model, endpoint, input_tokens, output_tokens);
     }
 }
 
 /// Default daily cost cap in USD. Override via PULSE_DAILY_COST_CAP env var.
-/// Set to a low value because Pulse should normally run for ~$0.30/day; anything
-/// above $0.50 means something is looping or a manual rerun got out of hand.
-const DEFAULT_DAILY_COST_CAP_USD: f64 = 0.50;
+///
+/// This is a RUNAWAY GUARD, not a budget — it should sit well above a busy-but-healthy
+/// day so it only ever fires on a genuine loop. Raised 0.50 -> 2.00 on 2026-08-15 after
+/// the old value started tripping on normal use: measured spend Jul 25 - Aug 14 was
+/// $0.24-$0.37 on a plain day, $0.46 on a day with one manual rerun, and $0.50 on
+/// 2026-08-14 — which aborted `run_freedoms` (it runs last, so it always starves first).
+/// A full healthy day is ~$0.33: daily pipeline ~$0.30 plus freedoms ~$0.034. At $2.00
+/// there is ~6x headroom for reruns while a real runaway (10-100x) still trips it.
+///
+/// Note this is checked at the TOP of `run()` / `run_freedoms()`, not per API call, so a
+/// single run that goes haywire is not stopped mid-flight — the cap only prevents the
+/// NEXT run from starting. Raising it does not change that; per-call enforcement would.
+const DEFAULT_DAILY_COST_CAP_USD: f64 = 2.00;
 
 /// Read today's accumulated API spend and abort if it's over the cap.
 /// Called at the top of `run()` / `run_freedoms()` so a stuck loop cannot keep
@@ -173,32 +296,85 @@ fn check_daily_cost_cap(db_path: &Path) -> anyhow::Result<()> {
         Err(_) => return Ok(()),
     };
 
+    // Range predicate, NOT `date(created_at) = date('now')`. Wrapping the column in a
+    // function makes every index unusable: the old form planned as a full SCAN of the
+    // 314k-row api_usage table on EVERY pipeline start. This form uses idx_api_usage_date.
+    // String comparison is correct here because created_at is 'YYYY-MM-DD HH:MM:SS', which
+    // sorts identically to its date prefix.
     let spent: f64 = conn
         .query_row(
             "SELECT COALESCE(SUM(estimated_cost_usd), 0.0)
              FROM api_usage
-             WHERE date(created_at) = date('now')",
+             WHERE created_at >= date('now')
+               AND created_at <  date('now', '+1 day')",
             [],
             |row| row.get(0),
         )
         .unwrap_or(0.0);
 
-    if spent >= cap {
-        anyhow::bail!(
+    match cap_verdict(spent, cap) {
+        CapVerdict::Abort => anyhow::bail!(
             "Daily cost cap hit: ${:.4} spent today (cap: ${:.2}). \
              Aborting before more API calls are made. \
              Override with PULSE_DAILY_COST_CAP=<usd> env var.",
-            spent, cap
-        );
+            spent,
+            cap
+        ),
+        CapVerdict::Warn { threshold } => {
+            tracing::warn!(
+                "Daily spend so far: ${:.4} — above the ${:.2} expected-day threshold (cap ${:.2}, {:.0}% used)",
+                spent, threshold, cap, spent / cap * 100.0
+            );
+            Ok(())
+        }
+        CapVerdict::Ok => Ok(()),
     }
+}
 
-    if spent > cap * 0.5 {
-        tracing::warn!(
-            "Daily spend so far: ${:.4} (cap ${:.2}, {:.0}% used)",
-            spent, cap, spent / cap * 100.0
-        );
+/// How long per-call API usage rows are kept. The cost cap only ever reads today's rows
+/// and the reporting views look back weeks, so 90 days is generous — the table had grown
+/// to 329,719 rows since 2026-04-10 with no policy at all.
+const API_USAGE_RETENTION_DAYS: i64 = 90;
+
+/// Alert if overall embedding coverage sits below this. Deliberately set BELOW the
+/// current 58.8% so it does not scream every single day while the scheduled backfill
+/// drains the ~15.8k-story backlog — it is a floor that must not be crossed again, not a
+/// target. Raise it toward 95% once the backlog is clear.
+const EMBEDDING_COVERAGE_FLOOR_PCT: f64 = 55.0;
+
+/// Alert if coverage falls this many percentage points in a single run. Catches a sudden
+/// collapse (an outright Voyage outage) immediately, rather than waiting for the slow
+/// average to sink past the floor — the decay that went unnoticed for five months.
+const EMBEDDING_COVERAGE_DROP_PCT: f64 = 2.0;
+
+/// A day's spend is "abnormal" above this even though it is nowhere near the cap.
+/// ~2x a healthy day (measured $0.24-$0.37, Jul 25 - Aug 14 2026).
+const ABNORMAL_DAY_USD: f64 = 0.75;
+
+#[derive(Debug, PartialEq)]
+enum CapVerdict {
+    Ok,
+    Warn { threshold: f64 },
+    Abort,
+}
+
+/// Pure decision half of `check_daily_cost_cap`, split out so the thresholds are testable
+/// without a DB or an env var.
+///
+/// Warns at whichever comes FIRST: half the cap, or `ABNORMAL_DAY_USD`. The second term is
+/// what keeps the early warning alive now that the cap is a loose runaway guard — 50% of
+/// $2.00 is 3x a healthy day, so a purely cap-relative warning would never fire and the
+/// first sign of a loop would be the hard abort itself.
+fn cap_verdict(spent: f64, cap: f64) -> CapVerdict {
+    if spent >= cap {
+        return CapVerdict::Abort;
     }
-    Ok(())
+    let threshold = (cap * 0.5).min(ABNORMAL_DAY_USD);
+    if spent > threshold {
+        CapVerdict::Warn { threshold }
+    } else {
+        CapVerdict::Ok
+    }
 }
 
 pub async fn run(db_path: &Path) -> anyhow::Result<()> {
@@ -208,6 +384,13 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // state) so the UI reflects THIS run during the pre-Phase-1 network calls below,
     // which run for several seconds before the first start_stage().
     progress.start_run();
+
+    // Keep `updated_at` moving for the whole run, so the app's 240s silence rule only
+    // ever fires on a genuinely dead process. Without this, Phase 1 alone (one progress
+    // write, then 9–120 minutes of collecting) painted a false "Fetch stopped
+    // unexpectedly" on nearly every run. Aborted on every exit path below.
+    let heartbeat = spawn_heartbeat(progress_file_path(db_path));
+    let _heartbeat = HeartbeatGuard(heartbeat);
 
     // Cost guardrail: bail before any LLM call if today's spend already crossed the cap.
     check_daily_cost_cap(db_path)?;
@@ -377,7 +560,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                 tracing::warn!("Pre-curation failed (non-fatal): {}", e);
                 pre_curate_fell_back = true;
                 // Sector-balanced cap: ensure each sector is represented
-                let mut fallback = if news_articles.len() > 150 {
+                let fallback = if news_articles.len() > 150 {
                     tracing::info!("Sector-balanced cap from {} to ~150 articles", news_articles.len());
                     let sectors = ["ai", "miami", "italy", "tech"];
                     let mut balanced = Vec::with_capacity(150);
@@ -646,10 +829,14 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     }
 
     // Phase 9: Extract entities (non-fatal)
+    // `entities_extracted` is captured for pipeline_health; it read 0 on every historical
+    // row purely because it was never passed to the INSERT, not because extraction failed.
+    let mut entities_extracted: i64 = 0;
     progress.start_stage(9);
     tracing::info!("Phase 9: Extracting entities...");
     match extract_entities_from_stories(db_path, &analysis, &progress).await {
         Ok(count) => {
+            entities_extracted += count as i64;
             tracing::info!("Extracted {} entity mentions", count);
             // ~2000 tokens in, ~500 out per batch of 30 stories; ~3 batches for 80 stories
             let batches = ((analysis.curated_stories.len() + 29) / 30) as i64;
@@ -662,6 +849,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     tracing::info!("Phase 9.5: Extracting entities from financial stories...");
     match extract_entities_from_financial_metadata(db_path) {
         Ok(count) => {
+            entities_extracted += count as i64;
             if count > 0 {
                 tracing::info!("Extracted {} entity mentions from financial metadata", count);
             }
@@ -683,7 +871,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 10: Deep summaries for top stories (non-fatal)
     progress.start_stage(10);
     tracing::info!("Phase 10: Generating deep summaries for top stories...");
-    match generate_deep_summaries(db_path, &analysis).await {
+    match generate_deep_summaries(db_path).await {
         Ok(count) => tracing::info!("Generated {} deep summaries", count),
         Err(e) => tracing::warn!("Deep summary generation failed (non-fatal): {}", e),
     }
@@ -691,8 +879,13 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 11: Resolve predictions (hybrid router: market/LLM/manual) (non-fatal)
     progress.update_detail("Resolving predictions", 100.0);
     tracing::info!("Phase 11: Resolving predictions...");
+    // Captured for pipeline_health below — this column read 0 on every row ever written
+    // because it was simply never passed to the INSERT, so the health table could not
+    // show that the prediction loop had stalled at 39 resolved for months.
+    let mut predictions_validated: i64 = 0;
     match validate_and_expire_predictions(db_path).await {
         Ok((resolved, expired)) => {
+            predictions_validated = resolved as i64;
             if resolved > 0 || expired > 0 {
                 tracing::info!("Predictions: {} resolved, {} expired", resolved, expired);
             }
@@ -930,12 +1123,30 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         let total_stories: i64 = conn.query_row("SELECT COUNT(*) FROM stories", [], |r| r.get(0)).unwrap_or(0);
         let total_embeddings: i64 = conn.query_row("SELECT COUNT(*) FROM story_embeddings WHERE story_id > 0", [], |r| r.get(0)).unwrap_or(0);
         let emb_pct = if total_stories > 0 { (total_embeddings as f64 / total_stories as f64) * 100.0 } else { 0.0 };
+        let feeds_failed =
+            crate::sources::SOURCES_FAILED.load(std::sync::atomic::Ordering::Relaxed) as i64;
+
+        // api_usage retention. Migration 031 does the one-time cleanup of the 329k rows
+        // that accumulated with no policy since April; this keeps it that way. Cheap —
+        // idx_api_usage_created makes it a range delete, and on a normal day it removes
+        // ~2,500 rows.
+        match conn.execute(
+            "DELETE FROM api_usage WHERE created_at < datetime('now', ?1)",
+            [format!("-{} day", API_USAGE_RETENTION_DAYS)],
+        ) {
+            Ok(n) if n > 0 => tracing::info!("Pruned {} api_usage rows older than {} days", n, API_USAGE_RETENTION_DAYS),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("api_usage prune failed (non-fatal): {}", e),
+        }
 
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         conn.execute(
-            "INSERT INTO pipeline_health (run_date, stories_fetched, stories_summarized, stories_embedded, embedding_coverage_pct, summary_failures, duration_secs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![today, raw_count, analysis.curated_stories.len(), total_embeddings, emb_pct, sum_failed, duration.as_secs_f64()],
+            // entities_extracted / predictions_validated / feeds_failed were MISSING from
+            // this INSERT, so all three read 0 on all 161 historical rows. The health
+            // table was reporting three permanent zeros as if they were measurements.
+            "INSERT INTO pipeline_health (run_date, stories_fetched, stories_summarized, stories_embedded, entities_extracted, predictions_validated, feeds_failed, embedding_coverage_pct, summary_failures, duration_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![today, raw_count, analysis.curated_stories.len(), total_embeddings, entities_extracted, predictions_validated, feeds_failed, emb_pct, sum_failed, duration.as_secs_f64()],
         ).ok();
 
         tracing::info!("╔══════════════════════════════════════════╗");
@@ -944,6 +1155,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         tracing::info!("║ Articles fetched:    {:>6}              ║", raw_count);
         tracing::info!("║ Stories summarized:  {:>6}              ║", analysis.curated_stories.len());
         tracing::info!("║ Summary failures:    {:>6}              ║", sum_failed);
+        tracing::info!("║ Sources failed:      {:>6}              ║", feeds_failed);
+        tracing::info!("║ Entities extracted:  {:>6}              ║", entities_extracted);
+        tracing::info!("║ Predictions graded:  {:>6}              ║", predictions_validated);
         tracing::info!("║ Embedding coverage:  {:>5.1}%              ║", emb_pct);
         tracing::info!("║ Total stories in DB: {:>6}              ║", total_stories);
         tracing::info!("║ Duration:            {:>5.1}s              ║", duration.as_secs_f64());
@@ -964,6 +1178,43 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         }
         if grounded_count == 0 {
             degradations.push("0 stories grounded in article text (all snippet-only)".into());
+        }
+        if feeds_failed > 0 {
+            degradations.push(format!("{} of {} sources failed or timed out",
+                feeds_failed, crate::sources::SOURCE_COUNT));
+        }
+        if crate::claude::client::groq_is_blocked() {
+            // The briefing LANDED — that is the whole point of the fallback — but on the
+            // paid provider, so this must be visible rather than silently more expensive.
+            degradations.push(
+                "Groq was IP-blocked; the whole briefing ran on the Anthropic fallback".into(),
+            );
+        }
+        // Embedding coverage: the number the app has been recording faithfully and never
+        // acting on. It fell 100% (Mar 2026) -> 49.7% (Aug 2026) — ~15.8k stories absent
+        // from vector search — entirely unnoticed, because pipeline_health had no reader.
+        // Two separate checks: an absolute floor, and a drop vs the last recorded run
+        // (which catches a sudden collapse long before it drags the average down).
+        if emb_pct < EMBEDDING_COVERAGE_FLOOR_PCT {
+            degradations.push(format!(
+                "embedding coverage {:.1}% is below the {:.0}% floor — {} stories are invisible to search",
+                emb_pct,
+                EMBEDDING_COVERAGE_FLOOR_PCT,
+                total_stories - total_embeddings
+            ));
+        }
+        if let Ok(prev) = conn.query_row::<f64, _, _>(
+            "SELECT embedding_coverage_pct FROM pipeline_health
+             WHERE run_date < ?1 ORDER BY run_date DESC LIMIT 1",
+            [&today],
+            |r| r.get(0),
+        ) {
+            if prev - emb_pct > EMBEDDING_COVERAGE_DROP_PCT {
+                degradations.push(format!(
+                    "embedding coverage dropped {:.1}pp since the last run ({:.1}% -> {:.1}%)",
+                    prev - emb_pct, prev, emb_pct
+                ));
+            }
         }
         if !analysis_degraded {
             // analyze succeeded — but on which provider? No anthropic row today
@@ -1093,10 +1344,30 @@ async fn validate_and_expire_predictions(db_path: &std::path::Path) -> anyhow::R
         [],
     ).unwrap_or(0);
 
-    tracing::info!("Predictions v2: {} resolved, {} expired, {} LLM checks used",
-        resolved, expired, llm_checks_used);
+    // 3. Drain the terminal-state backlog.
+    //
+    // Measured 2026-08-15: 324 predictions sat in `expired` (56 of them never attempted
+    // even once) and 118 in `needs_review`, against only 39 ever resolved. Both states
+    // were dead ends — nothing in the codebase ever looked at them again — so the
+    // prediction feature could not calibrate itself BY CONSTRUCTION: the calibration
+    // injection above needs 50 resolved and had been stuck at 39 for months.
+    //
+    // An expired prediction is not unresolvable; its deadline has simply passed, which is
+    // exactly when the outcome IS knowable. So spend whatever LLM budget the active pass
+    // left over on the oldest stuck ones. At ~15/day the 442-deep backlog drains in about
+    // a month, and calibration crosses its threshold within days.
+    let backlog_resolved = drain_resolution_backlog(
+        db_path,
+        &conn,
+        LLM_DAILY_CAP.saturating_sub(llm_checks_used),
+        &today,
+    )
+    .await;
 
-    Ok((resolved, expired))
+    tracing::info!("Predictions v2: {} resolved, {} expired, {} from backlog, {} LLM checks used",
+        resolved, expired, backlog_resolved, llm_checks_used);
+
+    Ok((resolved + backlog_resolved, expired))
 }
 
 // ----------------------------------------------------------------------------
@@ -1232,8 +1503,26 @@ async fn resolve_llm_prediction(
         return Ok(ResolutionOutcome::Unclear);
     }
 
+    // Judge the FULL prediction, not the title.
+    //
+    // `title` is `text.chars().take(100)` — the prediction truncated to 100 characters,
+    // frequently mid-sentence. The fact-checker was being asked to rule on a fragment,
+    // which is a direct cause of "unclear" verdicts and therefore of the 118 predictions
+    // that piled up in `needs_review` after three unclear attempts each.
+    //
+    // The stored `content` is `text + "\n\nReasoning: ..."`. Only the text half is used:
+    // showing the fact-checker the original rationale invites it to grade the argument
+    // rather than the outcome.
+    let prediction_text = p
+        .content
+        .split("\n\nReasoning:")
+        .next()
+        .unwrap_or(&p.content)
+        .trim();
+    let prediction_text = if prediction_text.is_empty() { p.title.as_str() } else { prediction_text };
+
     let mut input = format!("PREDICTION (made earlier): {}\n\nTARGET DATE: {}\n\nRECENT STORIES:\n",
-        p.title, p.target_date.as_deref().unwrap_or("unknown"));
+        prediction_text, p.target_date.as_deref().unwrap_or("unknown"));
     for (i, (h, s)) in stories.iter().enumerate() {
         input.push_str(&format!("[{}] {} — {}\n", i, h, s.chars().take(200).collect::<String>()));
     }
@@ -1462,6 +1751,106 @@ async fn compute_calibration_stats(db_path: &std::path::Path) -> anyhow::Result<
 }
 
 /// Persist a resolution: set status, actual_outcome, resolution_method, compute Brier.
+/// SQL selecting predictions stuck in a terminal state that are nonetheless resolvable.
+///
+/// `expired` and `needs_review` were both dead ends. A prediction is eligible to come back
+/// only if its deadline has actually passed — otherwise there is no outcome to grade yet —
+/// and the oldest are drained first so the backlog empties FIFO instead of thrashing the
+/// same few rows. `resolution_attempts` ascending keeps never-attempted rows at the front:
+/// 56 of the 324 expired had never been tried even once.
+const BACKLOG_QUERY: &str = "SELECT id, title, content, confidence, target_metric, target_date, resolution_attempts
+     FROM insights
+     WHERE insight_type = 'prediction'
+       AND status IN ('expired', 'needs_review')
+       AND COALESCE(target_date, predicted_date) IS NOT NULL
+       AND COALESCE(target_date, predicted_date) <= date('now')
+     ORDER BY resolution_attempts ASC, COALESCE(target_date, predicted_date) ASC
+     LIMIT ?1";
+
+/// Re-attempt resolution for predictions abandoned in `expired` / `needs_review`.
+///
+/// Returns how many reached a decisive outcome. Anything still unclear keeps its terminal
+/// status and gets its attempt counter bumped, so the ORDER BY naturally deprioritises
+/// rows that have already resisted several tries rather than retrying them forever.
+async fn drain_resolution_backlog(
+    db_path: &std::path::Path,
+    conn: &rusqlite::Connection,
+    budget: usize,
+    today: &str,
+) -> usize {
+    if budget == 0 {
+        return 0;
+    }
+
+    let stuck: Vec<PredToResolve> = match conn.prepare(BACKLOG_QUERY) {
+        Ok(mut stmt) => stmt
+            .query_map([budget as i64], |row| {
+                Ok(PredToResolve {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    content: row.get(2)?,
+                    confidence: row.get(3)?,
+                    target_metric: row.get::<_, Option<String>>(4)?,
+                    target_date: row.get::<_, Option<String>>(5)?,
+                    resolution_attempts: row.get::<_, i64>(6).unwrap_or(0),
+                })
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("Backlog drain query failed: {}", e);
+            return 0;
+        }
+    };
+
+    if stuck.is_empty() {
+        return 0;
+    }
+    tracing::info!("Predictions: draining {} stuck predictions (budget {})", stuck.len(), budget);
+
+    let mut resolved = 0usize;
+    for p in &stuck {
+        // Prefer the free market-based route when the prediction carries a ticker;
+        // only fall back to the paid LLM check when it does not.
+        let outcome = match p.target_metric.as_deref().and_then(|tm| {
+            serde_json::from_str::<serde_json::Value>(tm).ok()
+        }) {
+            Some(tm) if tm.get("ticker").and_then(|v| v.as_str()).is_some() => {
+                resolve_market_prediction(conn, &tm, p.target_date.as_deref())
+            }
+            _ => resolve_llm_prediction(db_path, conn, p, today)
+                .await
+                .unwrap_or(ResolutionOutcome::Unclear),
+        };
+
+        let (status, value, summary, method) = match outcome {
+            ResolutionOutcome::Validated { summary, method } => ("validated", 1.0, summary, method),
+            ResolutionOutcome::Invalidated { summary, method } => ("invalidated", 0.0, summary, method),
+            ResolutionOutcome::Partial { summary, method } => ("partially_validated", 0.5, summary, method),
+            ResolutionOutcome::Unclear => {
+                // Still unclear — keep the terminal status but record the attempt so the
+                // ORDER BY sends it to the back of the queue instead of re-picking it.
+                conn.execute(
+                    "UPDATE insights SET resolution_attempts = ?1, updated_at = datetime('now') WHERE id = ?2",
+                    rusqlite::params![p.resolution_attempts + 1, p.id],
+                )
+                .ok();
+                continue;
+            }
+        };
+
+        match apply_resolution(conn, p, status, value, &summary, &method, today) {
+            Ok(()) => {
+                resolved += 1;
+                tracing::info!("Predictions: backlog #{} resolved as {}", p.id, status);
+            }
+            Err(e) => tracing::warn!("Predictions: backlog #{} resolution failed to save: {}", p.id, e),
+        }
+    }
+
+    resolved
+}
+
 fn apply_resolution(
     conn: &rusqlite::Connection,
     p: &PredToResolve,
@@ -1505,100 +1894,8 @@ fn apply_resolution(
     Ok(())
 }
 
-/// Keyword-based fallback when Voyage API is unavailable.
-fn validate_predictions_keyword_fallback(
-    conn: &rusqlite::Connection,
-    predictions: &[(i64, String, String, f64)],
-    story_embeddings: &[(i64, Vec<f32>)],
-    today: &str,
-) -> anyhow::Result<(usize, usize)> {
-    let mut validated = 0usize;
 
-    for (pred_id, title, content, confidence) in predictions {
-        let pred_text = format!("{} {}", title, content).to_lowercase();
-        let pred_terms: std::collections::HashSet<String> = pred_text.split_whitespace()
-            .filter(|w| w.len() >= 4)
-            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
-            .filter(|w| !w.is_empty() && !["this", "that", "will", "with", "from", "have", "been",
-                "more", "than", "about", "would", "could", "should", "their", "these", "those",
-                "when", "what", "which", "there", "based", "likely", "expect"].contains(&w.as_str()))
-            .collect();
 
-        if pred_terms.len() < 3 { continue; }
-
-        let mut best_match: Option<(i64, f32)> = None;
-        for &(sid, _) in story_embeddings {
-            let story_text: Option<String> = conn.query_row(
-                "SELECT LOWER(headline || ' ' || summary || ' ' || key_facts) FROM stories WHERE id = ?1",
-                [sid], |row| row.get(0),
-            ).ok();
-
-            if let Some(text) = story_text {
-                let story_terms: std::collections::HashSet<&str> = text.split_whitespace()
-                    .filter(|w| w.len() >= 4).collect();
-                let overlap = pred_terms.iter()
-                    .filter(|t| story_terms.contains(t.as_str())).count();
-                let overlap_ratio = overlap as f32 / pred_terms.len() as f32;
-
-                if overlap_ratio > 0.4 {
-                    if best_match.is_none() || overlap_ratio > best_match.unwrap().1 {
-                        best_match = Some((sid, overlap_ratio));
-                    }
-                }
-            }
-        }
-
-        if let Some((sid, overlap)) = best_match {
-            let nudge = if overlap > 0.8 { 0.10 } else if overlap > 0.6 { 0.06 } else { 0.03 };
-            let new_prob = (confidence + nudge).min(0.95);
-
-            let history: String = conn.query_row(
-                "SELECT COALESCE(probability_history, '[]') FROM insights WHERE id = ?1",
-                [pred_id], |row| row.get(0),
-            ).unwrap_or_else(|_| "[]".to_string());
-
-            let mut entries: Vec<serde_json::Value> = serde_json::from_str(&history).unwrap_or_default();
-            entries.push(serde_json::json!({
-                "date": today,
-                "probability": new_prob,
-                "overlap": overlap,
-                "story_id": sid,
-                "reason": format!("Keyword fallback ({:.0}% term overlap)", overlap * 100.0)
-            }));
-
-            conn.execute(
-                "UPDATE insights SET probability_history = ?1, confidence = ?2 WHERE id = ?3",
-                rusqlite::params![serde_json::to_string(&entries).unwrap_or_default(), new_prob, pred_id],
-            ).ok();
-            validated += 1;
-        }
-    }
-
-    let expired: usize = conn.execute(
-        "UPDATE insights SET status = 'expired' WHERE insight_type = 'prediction' AND status = 'active' AND predicted_date IS NOT NULL AND predicted_date < date('now')",
-        [],
-    ).unwrap_or(0);
-
-    Ok((validated, expired))
-}
-
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max.min(s.len())]) }
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let (x, y) = (*x as f64, *y as f64);
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 { 0.0 } else { (dot / denom) as f32 }
-}
 
 async fn generate_freedoms_summary(curated: &[(&str, &crate::claude::SummarizedStory)], db_path: &Path) -> anyhow::Result<String> {
     let api_key = std::env::var("GROQ_API_KEY")
@@ -1761,6 +2058,52 @@ struct PredictionGenResponse {
     predictions: Vec<GeneratedPrediction>,
 }
 
+/// Outcome of validating one prediction's story references against the stories that were
+/// actually shown to the model.
+#[derive(Debug, Default, PartialEq)]
+pub struct RefResolution {
+    /// Real `stories.id` values, deduped, in the order the model gave them.
+    pub ids: Vec<i64>,
+    /// Refs that were a positional index into the presented list and got remapped.
+    pub remapped: usize,
+    /// Refs that matched neither a presented id nor a valid position — dropped.
+    pub dropped: usize,
+}
+
+/// Map the model's story references onto real `stories.id` values.
+///
+/// THE BUG THIS FIXES: the prompt presents each story as `[{i}] story_id={id} ...`, giving
+/// the model two numbers for the same story. It overwhelmingly returned the bracket INDEX.
+/// Measured on the live DB 2026-08-15: 1,146 of 1,641 stored refs were <= 200 against a
+/// table whose max id is 44,923, and only 32.5% resolved to a real story — so roughly
+/// two-thirds of every prediction's citations pointed at an unrelated article or nothing.
+/// Same index-space confusion as the cross-sector connections bug (`build_analysis_result`).
+///
+/// Precedence is deliberate: an exact `stories.id` match wins over a positional read, so a
+/// model that does the right thing is never "corrected" into the wrong story. A ref that is
+/// neither is DROPPED — a prediction with no citation is honest; one with a wrong citation
+/// is a fabrication wearing a citation's clothes.
+pub fn resolve_story_refs(model_refs: &[i64], presented_ids: &[i64]) -> RefResolution {
+    let mut out = RefResolution::default();
+    for &r in model_refs {
+        let resolved = if presented_ids.contains(&r) {
+            Some(r)
+        } else if r >= 0 && (r as usize) < presented_ids.len() {
+            out.remapped += 1;
+            Some(presented_ids[r as usize])
+        } else {
+            out.dropped += 1;
+            None
+        };
+        if let Some(id) = resolved {
+            if !out.ids.contains(&id) {
+                out.ids.push(id);
+            }
+        }
+    }
+    out
+}
+
 /// Generate fresh predictions from today's top stories + cross-signals.
 /// Runs once per daily pipeline. Uses Sonnet by default; on Sunday, uses Opus
 /// with a bigger input for a "weekly deep-dive" run (see plan Q2).
@@ -1787,20 +2130,34 @@ async fn generate_predictions(
         return Ok(0);
     }
 
-    // Build input block
-    let mut input = String::from("Today's top stories:\n");
-    for (i, (id, headline, summary, sector)) in top_stories.iter().take(max_stories).enumerate() {
+    // Build input block.
+    //
+    // NO bracket index. The old format was `[{i}] story_id={id} ...`, which handed the
+    // model two different numbers for the same story; it returned the index roughly
+    // two-thirds of the time, so stored citations pointed at unrelated articles. The
+    // presented ids are captured below and `resolve_story_refs` still repairs an index if
+    // the model produces one anyway — belt and braces, because the prompt alone is not a
+    // guarantee.
+    let presented_story_ids: Vec<i64> =
+        top_stories.iter().take(max_stories).map(|(id, ..)| *id).collect();
+    let presented_signal_ids: Vec<i64> =
+        top_signals.iter().take(max_signals).map(|(id, ..)| *id).collect();
+
+    let mut input = String::from(
+        "Today's top stories (cite ONLY by the story_id value shown):\n",
+    );
+    for (id, headline, summary, sector) in top_stories.iter().take(max_stories) {
         input.push_str(&format!(
-            "[{}] story_id={} sector={} | {} — {}\n",
-            i, id, sector, headline,
+            "story_id={} sector={} | {} — {}\n",
+            id, sector, headline,
             summary.chars().take(150).collect::<String>()
         ));
     }
-    input.push_str("\nTop cross-signals today:\n");
-    for (i, (eid, name, ticker, score)) in top_signals.iter().take(max_signals).enumerate() {
+    input.push_str("\nTop cross-signals today (cite ONLY by the signal_id value shown):\n");
+    for (eid, name, ticker, score) in top_signals.iter().take(max_signals) {
         input.push_str(&format!(
-            "[{}] signal_id={} entity=\"{}\" ticker={} score={:.2}\n",
-            i, eid, name, ticker.as_deref().unwrap_or("-"), score
+            "signal_id={} entity=\"{}\" ticker={} score={:.2}\n",
+            eid, name, ticker.as_deref().unwrap_or("-"), score
         ));
     }
     input.push_str(&format!(
@@ -1902,13 +2259,23 @@ async fn generate_predictions(
     // Insert into insights table
     let conn = rusqlite::Connection::open(db_path)?;
     let mut inserted = 0;
+    let mut total_remapped = 0usize;
+    let mut total_dropped = 0usize;
     for p in &parsed.predictions {
         // Confidence validation
         let confidence = p.confidence.clamp(0.5, 0.95);
 
+        // Validate every citation against what the model was actually shown. Anything
+        // that resolves to no real story is dropped rather than stored — see
+        // `resolve_story_refs` for why a wrong citation is worse than none.
+        let stories_res = resolve_story_refs(&p.source_story_ids, &presented_story_ids);
+        let signals_res = resolve_story_refs(&p.source_signal_ids, &presented_signal_ids);
+        total_remapped += stories_res.remapped + signals_res.remapped;
+        total_dropped += stories_res.dropped + signals_res.dropped;
+
         // Build "evidence" JSON in the legacy shape for back-compat
         let evidence = serde_json::json!(
-            p.source_story_ids.iter().map(|sid| serde_json::json!({
+            stories_res.ids.iter().map(|sid| serde_json::json!({
                 "story_id": sid,
                 "reasoning": "Evidence type: source"
             })).collect::<Vec<_>>()
@@ -1918,8 +2285,8 @@ async fn generate_predictions(
         let confidence_history = serde_json::json!([confidence]);
 
         let target_metric_str = p.target_metric.as_ref().map(|v| v.to_string());
-        let source_story_ids_str = serde_json::to_string(&p.source_story_ids).unwrap_or_else(|_| "[]".to_string());
-        let source_signal_ids_str = serde_json::to_string(&p.source_signal_ids).unwrap_or_else(|_| "[]".to_string());
+        let source_story_ids_str = serde_json::to_string(&stories_res.ids).unwrap_or_else(|_| "[]".to_string());
+        let source_signal_ids_str = serde_json::to_string(&signals_res.ids).unwrap_or_else(|_| "[]".to_string());
 
         let title = p.text.chars().take(100).collect::<String>();
         let content = if p.reasoning.is_empty() {
@@ -1951,12 +2318,43 @@ async fn generate_predictions(
         );
 
         match result {
-            Ok(_) => inserted += 1,
+            Ok(_) => {
+                inserted += 1;
+                // Mirror the citations into the NORMALISED table as well.
+                //
+                // Pulse had two parallel evidence representations: the fetcher wrote the
+                // denormalised `insights.source_story_ids` / `insights.evidence`, while
+                // `patterns.rs` and `predictions.rs` READ `insight_evidence` — a table
+                // with 0 rows. Every reader therefore saw "no evidence" for all 902
+                // predictions, and any logic gated on that count was silently dead.
+                // Writing both keeps the readers honest without a risky schema migration;
+                // the ids here are already validated by `resolve_story_refs`.
+                let insight_id = conn.last_insert_rowid();
+                for sid in &stories_res.ids {
+                    if let Err(e) = conn.execute(
+                        "INSERT OR IGNORE INTO insight_evidence (insight_id, story_id, role)
+                         VALUES (?1, ?2, 'support')",
+                        rusqlite::params![insight_id, sid],
+                    ) {
+                        // Non-fatal: the denormalised copy above is still authoritative.
+                        tracing::warn!("insight_evidence link {}->{} failed: {}", insight_id, sid, e);
+                    }
+                }
+            }
             Err(e) => tracing::warn!("Prediction insert failed: {}", e),
         }
     }
 
     tracing::info!("Predictions: inserted {} of {} generated predictions", inserted, parsed.predictions.len());
+    if total_remapped > 0 || total_dropped > 0 {
+        // Watch this line: after the prompt change the model should cite real story_ids,
+        // so a persistently high `remapped` means the prompt fix is not landing and the
+        // model is still emitting positional indices.
+        tracing::warn!(
+            "Predictions: citation repair — {} refs remapped from positional index, {} dropped as unresolvable",
+            total_remapped, total_dropped
+        );
+    }
     Ok(inserted)
 }
 
@@ -1989,7 +2387,9 @@ async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult, db
 /// Generate deep summaries for stories with relevance_score >= 8.
 /// Uses Anthropic Claude Sonnet for higher quality analysis.
 /// Capped at 5 stories to control API costs.
-async fn generate_deep_summaries(db_path: &std::path::Path, analysis: &crate::claude::AnalysisResult) -> anyhow::Result<usize> {
+// Takes no `analysis`: it selects its own candidates straight from the DB
+// (relevance_score >= 8 for today), so the parameter was always ignored.
+async fn generate_deep_summaries(db_path: &std::path::Path) -> anyhow::Result<usize> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
@@ -2081,41 +2481,7 @@ async fn generate_deep_summaries(db_path: &std::path::Path, analysis: &crate::cl
 }
 
 use crate::sources;
-use crate::sources::RawArticle;
 
-/// Pre-filter articles to ~150, balanced across sectors.
-/// Prioritizes RSS/direct feeds over Google News duplicates.
-fn prefilter_articles(mut articles: Vec<RawArticle>) -> Vec<RawArticle> {
-    let per_sector = 50; // 50 per sector → ~200 total max
-
-    // Prioritize: RSS/HN feeds first (higher quality), then Google News
-    articles.sort_by(|a, b| {
-        let a_priority = if a.feed_id.starts_with("google_news") { 1 } else { 0 };
-        let b_priority = if b.feed_id.starts_with("google_news") { 1 } else { 0 };
-        a_priority.cmp(&b_priority)
-    });
-
-    let mut result = Vec::new();
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-
-    for article in &articles {
-        let count = counts.entry(&article.sector).or_insert(0);
-        if *count < per_sector {
-            result.push(article.clone());
-            *count += 1;
-        }
-    }
-
-    tracing::info!(
-        "Pre-filter: ai={}, miami={}, italy={}, tech={}",
-        counts.get("ai").unwrap_or(&0),
-        counts.get("miami").unwrap_or(&0),
-        counts.get("italy").unwrap_or(&0),
-        counts.get("tech").unwrap_or(&0),
-    );
-
-    result
-}
 
 /// Backfill embeddings for stories that are missing them (from previous failed runs).
 /// Processes up to `max_stories` at a time to avoid long-running API calls.
@@ -2615,7 +2981,9 @@ Focus on MOST important entities (max 5 per story)."#,
     } else { text };
 
     #[derive(serde::Deserialize)]
-    struct Ent { name: String, entity_type: String, sentiment: f64, context: Option<String> }
+    // No `context` field: this path inserts into `entities` only, which has no context
+    // column. (entity_mentions.context is populated by the main extraction path.)
+    struct Ent { name: String, entity_type: String, sentiment: f64 }
     #[derive(serde::Deserialize)]
     struct Res { entities: Vec<Ent> }
 
@@ -6358,4 +6726,372 @@ pub fn notify_info(title: &str, body: &str) {
             title.replace('"', "'").replace('\\', "")
         ))
         .status();
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    fn seed() -> (tempfile::TempDir, rusqlite::Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("t.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE insights (
+                id INTEGER PRIMARY KEY, insight_type TEXT, title TEXT, content TEXT,
+                confidence REAL, target_metric TEXT, target_date TEXT,
+                predicted_date TEXT, status TEXT, resolution_attempts INTEGER DEFAULT 0);",
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn add(conn: &rusqlite::Connection, id: i64, status: &str, target: Option<&str>, attempts: i64) {
+        conn.execute(
+            "INSERT INTO insights (id, insight_type, title, content, confidence,
+                target_date, predicted_date, status, resolution_attempts)
+             VALUES (?1, 'prediction', 't', 'c', 0.6, ?2, ?2, ?3, ?4)",
+            rusqlite::params![id, target, status, attempts],
+        )
+        .unwrap();
+    }
+
+    fn selected(conn: &rusqlite::Connection, limit: i64) -> Vec<i64> {
+        let mut stmt = conn.prepare(BACKLOG_QUERY).unwrap();
+        stmt.query_map([limit], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    /// The 442 rows the drain exists for: both dead-end states must be reachable again.
+    #[test]
+    fn both_terminal_states_are_drained() {
+        let (_d, conn) = seed();
+        add(&conn, 1, "expired", Some("2020-01-01"), 0);
+        add(&conn, 2, "needs_review", Some("2020-01-02"), 0);
+        let got = selected(&conn, 10);
+        assert!(got.contains(&1) && got.contains(&2), "got {got:?}");
+    }
+
+    /// Already-graded predictions must never be re-opened — that would corrupt the
+    /// calibration set the whole feature depends on.
+    #[test]
+    fn resolved_predictions_are_never_reopened() {
+        let (_d, conn) = seed();
+        for (i, st) in ["validated", "invalidated", "partially_validated", "active"]
+            .iter()
+            .enumerate()
+        {
+            add(&conn, i as i64 + 1, st, Some("2020-01-01"), 0);
+        }
+        assert!(selected(&conn, 10).is_empty());
+    }
+
+    /// A deadline that has not passed has no outcome to grade yet.
+    #[test]
+    fn future_deadlines_are_not_drained() {
+        let (_d, conn) = seed();
+        add(&conn, 1, "expired", Some("2999-01-01"), 0);
+        assert!(selected(&conn, 10).is_empty());
+    }
+
+    /// 56 of the 324 expired had never been attempted once. Those go first.
+    #[test]
+    fn never_attempted_are_drained_before_repeatedly_failed() {
+        let (_d, conn) = seed();
+        add(&conn, 1, "expired", Some("2019-01-01"), 5); // oldest, but tried 5x
+        add(&conn, 2, "expired", Some("2020-01-01"), 0); // newer, never tried
+        assert_eq!(selected(&conn, 1), vec![2], "never-attempted must win");
+    }
+
+    /// Unclear rows keep their status and bump attempts, so the ORDER BY pushes them
+    /// back — without that the drain would re-pick the same rows every single day.
+    #[test]
+    fn bumped_attempts_move_a_row_to_the_back_of_the_queue() {
+        let (_d, conn) = seed();
+        add(&conn, 1, "expired", Some("2020-01-01"), 0);
+        add(&conn, 2, "expired", Some("2020-01-02"), 0);
+        assert_eq!(selected(&conn, 1), vec![1]);
+        conn.execute("UPDATE insights SET resolution_attempts = 1 WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(selected(&conn, 1), vec![2], "row 1 must yield to row 2");
+    }
+
+    /// Legacy rows carry predicted_date instead of target_date; they must still drain.
+    #[test]
+    fn falls_back_to_predicted_date_when_target_date_is_null() {
+        let (_d, conn) = seed();
+        conn.execute(
+            "INSERT INTO insights (id, insight_type, title, content, confidence,
+                target_date, predicted_date, status, resolution_attempts)
+             VALUES (1, 'prediction', 't', 'c', 0.6, NULL, '2020-01-01', 'expired', 0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(selected(&conn, 10), vec![1]);
+    }
+
+    /// No deadline at all = nothing to grade against. Must not be picked.
+    #[test]
+    fn rows_with_no_deadline_are_skipped() {
+        let (_d, conn) = seed();
+        conn.execute(
+            "INSERT INTO insights (id, insight_type, title, content, confidence,
+                target_date, predicted_date, status) 
+             VALUES (1, 'prediction', 't', 'c', 0.6, NULL, NULL, 'expired')",
+            [],
+        )
+        .unwrap();
+        assert!(selected(&conn, 10).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod citation_tests {
+    use super::*;
+
+    // Realistic ids: the live table's max is ~44,923, so nothing collides with an index.
+    const SHOWN: [i64; 5] = [44923, 44900, 44888, 44870, 44851];
+
+    /// The live bug, reproduced: the model returned bracket indices like [1,5,0] / [16].
+    /// Those must land on the RIGHT stories, not be stored raw.
+    #[test]
+    fn positional_indices_are_remapped_to_real_story_ids() {
+        let r = resolve_story_refs(&[1, 3, 0], &SHOWN);
+        assert_eq!(r.ids, vec![44900, 44870, 44923]);
+        assert_eq!(r.remapped, 3);
+        assert_eq!(r.dropped, 0);
+    }
+
+    /// A model that does the right thing must never be "corrected" into a wrong story.
+    /// Exact id match takes precedence over reading the number as a position.
+    #[test]
+    fn real_story_ids_pass_through_untouched() {
+        let r = resolve_story_refs(&[44888, 44851], &SHOWN);
+        assert_eq!(r.ids, vec![44888, 44851]);
+        assert_eq!(r.remapped, 0);
+        assert_eq!(r.dropped, 0);
+    }
+
+    /// The honesty rule: a citation that resolves to nothing is DROPPED, never stored.
+    /// 44999 was not shown and is not a valid position — it cites nothing real.
+    #[test]
+    fn unresolvable_refs_are_dropped_not_stored() {
+        let r = resolve_story_refs(&[44999, 2], &SHOWN);
+        assert_eq!(r.ids, vec![44888], "only the resolvable ref survives");
+        assert_eq!(r.dropped, 1);
+        assert_eq!(r.remapped, 1);
+    }
+
+    /// Position-derived keys break under insertion — my own rule says test that first.
+    /// The SAME index must follow the story it named when the presented list changes.
+    #[test]
+    fn remap_follows_the_list_when_a_story_is_inserted_mid_sequence() {
+        let before = resolve_story_refs(&[2], &SHOWN);
+        assert_eq!(before.ids, vec![44888]);
+
+        // A new story lands at position 1, pushing everything down.
+        let shifted = [44923, 44999, 44900, 44888, 44870, 44851];
+        let after = resolve_story_refs(&[2], &shifted);
+        assert_eq!(after.ids, vec![44900], "index 2 now names a different story");
+        // The point: the resolution is always taken against the list ACTUALLY presented
+        // to the model, never a remembered one — which is how the connections bug bit.
+    }
+
+    /// Duplicate refs (index + real id for the same story) must not double-cite.
+    #[test]
+    fn duplicate_refs_are_deduped() {
+        let r = resolve_story_refs(&[0, 44923, 0], &SHOWN);
+        assert_eq!(r.ids, vec![44923]);
+    }
+
+    #[test]
+    fn empty_and_negative_refs_are_safe() {
+        assert_eq!(resolve_story_refs(&[], &SHOWN), RefResolution::default());
+        let r = resolve_story_refs(&[-1], &SHOWN);
+        assert!(r.ids.is_empty());
+        assert_eq!(r.dropped, 1);
+    }
+
+    /// With nothing presented, every ref is unresolvable — no citation may be invented.
+    #[test]
+    fn nothing_presented_means_nothing_cited() {
+        let r = resolve_story_refs(&[0, 1, 44923], &[]);
+        assert!(r.ids.is_empty());
+        assert_eq!(r.dropped, 3);
+    }
+}
+
+#[cfg(test)]
+mod cost_cap_tests {
+    use super::*;
+
+    /// The regression this raise exists for: 2026-08-14 spent $0.5031 and the old $0.50
+    /// cap aborted `run_freedoms`. Same spend must now pass.
+    #[test]
+    fn real_aug14_spend_no_longer_aborts() {
+        assert_eq!(
+            cap_verdict(0.5031, DEFAULT_DAILY_COST_CAP_USD),
+            CapVerdict::Ok
+        );
+        assert_eq!(cap_verdict(0.5031, 0.50), CapVerdict::Abort, "old cap did abort");
+    }
+
+    /// A healthy day (measured $0.24-$0.37) must be silent — no warning noise.
+    #[test]
+    fn healthy_day_is_silent() {
+        for spent in [0.24, 0.30, 0.37, 0.4591] {
+            assert_eq!(
+                cap_verdict(spent, DEFAULT_DAILY_COST_CAP_USD),
+                CapVerdict::Ok,
+                "${spent} should be unremarkable"
+            );
+        }
+    }
+
+    /// The whole point of ABNORMAL_DAY_USD: at a $2.00 cap, half-the-cap would be $1.00
+    /// and nothing between a normal day and the hard abort would ever warn. Without the
+    /// min(), this case returns Ok and the first sign of a loop is the abort itself.
+    #[test]
+    fn warns_well_before_the_abort_at_a_loose_cap() {
+        assert_eq!(
+            cap_verdict(0.90, DEFAULT_DAILY_COST_CAP_USD),
+            CapVerdict::Warn { threshold: ABNORMAL_DAY_USD }
+        );
+        assert!(ABNORMAL_DAY_USD < DEFAULT_DAILY_COST_CAP_USD * 0.5);
+    }
+
+    /// With a tight override the cap-relative half still governs, so a small cap keeps
+    /// its proportional early warning instead of jumping straight to abort.
+    #[test]
+    fn tight_cap_uses_the_proportional_threshold() {
+        assert_eq!(cap_verdict(0.30, 0.50), CapVerdict::Warn { threshold: 0.25 });
+        assert_eq!(cap_verdict(0.20, 0.50), CapVerdict::Ok);
+    }
+
+    /// Boundary: the abort is `>=`, and it wins over the warn.
+    #[test]
+    fn spend_exactly_at_cap_aborts() {
+        assert_eq!(cap_verdict(2.00, 2.00), CapVerdict::Abort);
+        assert_eq!(cap_verdict(1.9999, 2.00), CapVerdict::Warn { threshold: ABNORMAL_DAY_USD });
+    }
+
+    /// A runaway is still caught — that is what the cap is for.
+    #[test]
+    fn runaway_still_aborts() {
+        assert_eq!(cap_verdict(5.0, DEFAULT_DAILY_COST_CAP_USD), CapVerdict::Abort);
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    /// The heartbeat must move `updated_at` on a live in-progress record — this is the
+    /// state transition the whole fix exists for (a steady-state test would pass even
+    /// with the heartbeat doing nothing).
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_refreshes_stale_in_progress_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fetch-progress.json");
+        let old = "2026-08-14T17:10:47+00:00";
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "stage": "collecting", "stage_label": "Collecting sources",
+                "percent": 0, "started_at": old, "updated_at": old,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let handle = spawn_heartbeat(path.clone());
+        tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_SECS * 3)).await;
+        handle.abort();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_ne!(
+            val["updated_at"].as_str().unwrap(),
+            old,
+            "heartbeat must refresh updated_at on a live run"
+        );
+        assert_eq!(
+            val["stage"].as_str(),
+            Some("collecting"),
+            "heartbeat must not disturb stage"
+        );
+    }
+
+    /// A terminal record must never be kept artificially fresh.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_stops_on_terminal_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fetch-progress.json");
+        let done = "2026-08-14T17:10:47+00:00";
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "stage": "complete", "percent": 100, "updated_at": done,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let handle = spawn_heartbeat(path.clone());
+        tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_SECS * 3)).await;
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(val["updated_at"].as_str(), Some(done));
+        assert!(handle.is_finished(), "heartbeat must exit on a terminal record");
+    }
+
+    /// Concurrent writers must never leave a half-written file: `get_fetch_status`
+    /// classifies a parse error as "idle", so a torn write blanks the bar silently.
+    #[test]
+    fn concurrent_writes_never_produce_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fetch-progress.json");
+        write_progress_json(&path, &serde_json::json!({"stage": "starting"}));
+
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                let path = path.clone();
+                scope.spawn(move || {
+                    for i in 0..250 {
+                        write_progress_json(
+                            &path,
+                            &serde_json::json!({
+                                "stage": "collecting",
+                                "detail": format!("writer {writer} iter {i}"),
+                                "percent": i % 100,
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            }),
+                        );
+                    }
+                });
+            }
+            // Reader races the writers the way the app's poll does.
+            scope.spawn(|| {
+                for _ in 0..1000 {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        assert!(
+                            serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+                            "progress file must always parse; got: {text}"
+                        );
+                    }
+                }
+            });
+        });
+
+        // No temp files may be left behind in the app-support directory.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leaked temp files: {leftovers:?}");
+    }
 }

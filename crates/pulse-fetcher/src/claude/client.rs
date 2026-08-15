@@ -9,6 +9,68 @@ const STRONG_MODEL_DEFAULT: &str = "llama-3.3-70b-versatile";
 const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 const MODELS_URL: &str = "https://api.groq.com/openai/v1/models";
 
+/// Latched "Groq is blocked for this whole run" flag.
+///
+/// The block is a PRE-AUTH 403 tied to the source IP, and it persists for HOURS — so
+/// retrying per call is worthless: 4 attempts with backoff burn ~150s, and at ~140
+/// summarize calls a day that is over five hours of pure sleeping before the run gives up.
+/// Detect once, latch, and send everything else straight to Anthropic.
+///
+/// This is what turns a week-long outage into a slightly more expensive briefing.
+/// Measured impact of NOT having it: 10 of 45 days with no briefing at all (2026-07-03..12
+/// and 2026-08-08..13), every one of them a Groq 403 while Anthropic answered 200 on the
+/// same network.
+static GROQ_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True once any call has seen a Groq 403, or the preflight probe reported blocked.
+pub fn groq_is_blocked() -> bool {
+    GROQ_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Force the blocked state from the environment (`PULSE_FORCE_GROQ_BLOCKED=1`).
+///
+/// This exists so the fallback can be EXERCISED on demand. The path it guards only runs
+/// on days Groq happens to block the source IP, which is precisely when nobody is at a
+/// keyboard to watch it — an untested failover is not a failover. Called once at startup.
+pub fn apply_forced_block_from_env() {
+    if std::env::var("PULSE_FORCE_GROQ_BLOCKED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        mark_groq_blocked("PULSE_FORCE_GROQ_BLOCKED=1 (forced for testing)");
+    }
+}
+
+/// Latch the block. Idempotent; logs only on the transition so the line means something.
+pub fn mark_groq_blocked(reason: &str) {
+    if !GROQ_BLOCKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "GROQ BLOCKED ({}). Routing the rest of this run to Anthropic — the briefing \
+             still lands, at a higher per-call cost. The daily cost cap still applies.",
+            reason
+        );
+    }
+}
+
+/// Anthropic stand-in for a Groq model.
+///
+/// Both Groq models map to Haiku 4.5: it is the cheapest Anthropic model that reliably
+/// produces the structured output these prompts ask for, and the fallback is a
+/// availability measure, not a quality upgrade. Deliberately NOT Sonnet/Opus — a blocked
+/// day would then cost several times the daily cap and abort halfway through.
+pub fn anthropic_equivalent(groq_model: &str) -> &'static str {
+    match groq_model {
+        FAST_MODEL => "claude-haiku-4-5-20251001",
+        _ => "claude-haiku-4-5-20251001",
+    }
+}
+
+/// Does this Groq HTTP status mean "your IP is blocked", as opposed to a transient blip?
+/// 403 is the pre-auth block signature; everything else retries normally.
+pub fn is_groq_block_status(code: u16) -> bool {
+    code == 403
+}
+
 /// Preflight reachability probe. Groq blocks certain source IPs (NordVPN exit
 /// nodes when in Italy, the school network on Tuesdays) with a PRE-AUTH
 /// `403 "Access denied. Please check your network settings."`. That 403 persists
@@ -242,6 +304,13 @@ impl GroqClient {
     }
 
     pub async fn call(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+        // Groq already known blocked this run -> do not spend 150s of retries proving it
+        // again for every one of ~140 stories. Straight to Anthropic.
+        if groq_is_blocked() {
+            return self
+                .call_anthropic(anthropic_equivalent(model), endpoint, system, user_msg, max_tokens)
+                .await;
+        }
         let request = ChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -286,7 +355,17 @@ impl GroqClient {
             // retryable — a single 8 AM network blip used to abort the whole daily run.
             // Only genuinely fatal statuses (400 bad request, 401 unauthorized) bail.
             let code = status.as_u16();
-            if !status.is_success() && (code == 403 || code == 408 || (500..600).contains(&code)) {
+            // A 403 is the pre-auth IP block, and it lasts for HOURS — retrying it is the
+            // behaviour that produced ~90-minute runs that then aborted anyway. Latch it
+            // and switch this call (and every later one) to Anthropic instead.
+            if is_groq_block_status(code) {
+                let body = resp.text().await.unwrap_or_default();
+                mark_groq_blocked(&format!("HTTP 403 on {}: {}", endpoint, body.chars().take(80).collect::<String>()));
+                return self
+                    .call_anthropic(anthropic_equivalent(model), endpoint, system, user_msg, max_tokens)
+                    .await;
+            }
+            if !status.is_success() && (code == 408 || (500..600).contains(&code)) {
                 let body = resp.text().await.unwrap_or_default();
                 let delay = 15 * (attempt + 1) as u64;
                 tracing::warn!("Groq transient error {} (attempt {}): {}, retrying in {}s", status, attempt + 1, body.chars().take(120).collect::<String>(), delay);
@@ -350,6 +429,11 @@ impl GroqClient {
     /// Like `call()` but returns plain text (no JSON response_format constraint).
     /// Used for executive summaries and other prose generation.
     pub async fn call_text(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+        if groq_is_blocked() {
+            return self
+                .call_anthropic(anthropic_equivalent(model), endpoint, system, user_msg, max_tokens)
+                .await;
+        }
         let request = ChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -389,11 +473,19 @@ impl GroqClient {
                 continue;
             }
 
-            // Transient/network-layer blocks (403 Access denied, 408 timeout, 5xx) are
-            // retryable — a single 8 AM network blip used to abort the whole daily run.
+            // 408/5xx are retryable — a single 8 AM network blip used to abort the whole
+            // daily run. 403 is NOT retryable: it is the pre-auth IP block, it lasts for
+            // hours, and it is handled above by latching and switching to Anthropic.
             // Only genuinely fatal statuses (400 bad request, 401 unauthorized) bail.
             let code = status.as_u16();
-            if !status.is_success() && (code == 403 || code == 408 || (500..600).contains(&code)) {
+            if is_groq_block_status(code) {
+                let body = resp.text().await.unwrap_or_default();
+                mark_groq_blocked(&format!("HTTP 403 on {}: {}", endpoint, body.chars().take(80).collect::<String>()));
+                return self
+                    .call_anthropic(anthropic_equivalent(model), endpoint, system, user_msg, max_tokens)
+                    .await;
+            }
+            if !status.is_success() && (code == 408 || (500..600).contains(&code)) {
                 let body = resp.text().await.unwrap_or_default();
                 let delay = 15 * (attempt + 1) as u64;
                 tracing::warn!("Groq transient error {} (attempt {}): {}, retrying in {}s", status, attempt + 1, body.chars().take(120).collect::<String>(), delay);
@@ -1344,3 +1436,58 @@ mod tests {
 }
 
 
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    /// 403 is the pre-auth IP block — the ONLY status that should abandon Groq for the
+    /// run. Treating 429/5xx the same way would send a briefing to the paid provider over
+    /// an ordinary rate limit that a retry would have cleared.
+    #[test]
+    fn only_403_counts_as_a_block() {
+        assert!(is_groq_block_status(403));
+        for code in [200, 400, 401, 408, 429, 500, 502, 503] {
+            assert!(!is_groq_block_status(code), "{code} must not latch the block");
+        }
+    }
+
+    /// The fallback exists for availability, not quality. Both Groq models must map to a
+    /// CHEAP Anthropic model: a blocked day on Sonnet/Opus would blow the daily cost cap
+    /// and abort the run halfway, turning a degraded briefing into no briefing.
+    #[test]
+    fn fallback_models_are_the_cheap_tier() {
+        for m in [FAST_MODEL, STRONG_MODEL_DEFAULT, "some-future-groq-model"] {
+            let target = anthropic_equivalent(m);
+            assert!(target.starts_with("claude-haiku"), "{m} -> {target} is not the cheap tier");
+        }
+    }
+
+    /// The latch must be idempotent and one-way within a run: once blocked, every
+    /// subsequent call skips Groq rather than re-proving the block for ~140 stories.
+    #[test]
+    fn block_latch_is_idempotent_and_sticky() {
+        // Serialised with the other latch test — these share process-global state.
+        let _g = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        GROQ_BLOCKED.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!groq_is_blocked());
+
+        mark_groq_blocked("first");
+        assert!(groq_is_blocked());
+        mark_groq_blocked("second");
+        assert!(groq_is_blocked(), "latch must stay set");
+
+        GROQ_BLOCKED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Default state must be "not blocked" — a fresh run always tries the cheap provider
+    /// first. If this ever defaulted true, every run would silently go to Anthropic.
+    #[test]
+    fn default_is_unblocked() {
+        let _g = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        GROQ_BLOCKED.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!groq_is_blocked());
+    }
+
+    static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}

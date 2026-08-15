@@ -37,6 +37,17 @@ pub async fn trigger_manual_fetch() -> Result<String, String> {
         return Err("Fetch already in progress".to_string());
     }
 
+    // FETCHING only knows about THIS app's spawns. A launchd slot can be mid-run right
+    // now, and the fetcher it would spawn exits immediately on the single-instance lock —
+    // leaving write_starting()'s record to go stale and paint a false "interrupted" over
+    // a healthy run. Defer to whoever is already running.
+    if let Ok(status) = get_fetch_status() {
+        if status.running {
+            FETCHING.store(false, Ordering::SeqCst);
+            return Err("Fetch already in progress".to_string());
+        }
+    }
+
     // Find the fetcher binary (release or debug)
     let fetcher_path = {
         let release = dirs::home_dir()
@@ -279,9 +290,17 @@ fn last_line(s: &str) -> String {
 
 fn atomic_write(contents: &str) -> std::io::Result<()> {
     let path = progress_file_path();
-    let tmp = path.with_extension("tmp");
+    // Unique temp name: the fetcher process writes this same file (its own heartbeat +
+    // stage writes). A shared "…tmp" path lets one process truncate the other's file
+    // mid-write, and classify_status treats a parse error as "idle" — so a torn write
+    // silently blanks the bar rather than erroring visibly.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, &path)
+    let result = std::fs::rename(&tmp, &path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn progress_file_path() -> std::path::PathBuf {
@@ -399,5 +418,43 @@ mod tests {
             "percent": 0, "started_at": ts(2), "updated_at": ts(2),
         });
         assert!(classify_status(&v, now()).running);
+    }
+
+    // --- The regression this whole heartbeat exists for ---
+    //
+    // Phase 1 writes progress ONCE and then collects for 9–120 minutes (measured from
+    // fetch-stdout.log, 2026-08-10..14). Before the fetcher heartbeat, every such run
+    // read "interrupted" while it was still working — the red banner Nicola kept seeing.
+    // These two tests pin BOTH directions: heartbeated-long-run stays running, and a
+    // genuinely dead process still gets caught.
+
+    #[test]
+    fn hour_long_heartbeated_collect_reads_running() {
+        // 62 minutes into Phase 1, still 0%, but the heartbeat stamped 15s ago.
+        let v = json!({
+            "stage": "collecting", "stage_label": "Collecting sources",
+            "stage_num": 1, "percent": 0,
+            "started_at": ts(3720), "updated_at": ts(15),
+        });
+        let s = classify_status(&v, now());
+        assert!(s.running, "a heartbeated long collect must NOT read interrupted");
+        assert_eq!(s.last_status, "running");
+        assert_ne!(s.detail.as_deref(), Some("Fetch stopped unexpectedly"));
+    }
+
+    #[test]
+    fn killed_mid_collect_still_reads_interrupted() {
+        // Same long collect, but the process was killed: no heartbeat for 5 minutes.
+        // The 240s crash detector must still fire — the heartbeat makes silence
+        // meaningful, it does not suppress the interrupted state.
+        let v = json!({
+            "stage": "collecting", "stage_label": "Collecting sources",
+            "stage_num": 1, "percent": 0,
+            "started_at": ts(3720), "updated_at": ts(300),
+        });
+        let s = classify_status(&v, now());
+        assert!(!s.running);
+        assert_eq!(s.last_status, "interrupted");
+        assert_eq!(s.detail.as_deref(), Some("Fetch stopped unexpectedly"));
     }
 }

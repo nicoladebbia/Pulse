@@ -19,49 +19,30 @@
         <string>/Users/nicoladebbia</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
-        <!-- Cost A/B: Llama-4 Scout for PRE_CURATE only (~3.3x cheaper, simple
-             index-list output it handles fine). analyze is pinned to 70B in code
-             (client.rs) regardless of this var — scout failed the large analyze
-             payload twice on 2026-06-25 (json_validate + serde type mismatch).
-             Scout is a Groq Preview model — if deprecated, remove this key and
-             pre_curate falls back to llama-3.3-70b (the code default). -->
-        <key>PULSE_STRONG_MODEL</key>
-        <string>meta-llama/llama-4-scout-17b-16e-instruct</string>
+        <!-- PULSE_STRONG_MODEL removed 2026-08-06: Groq decommissioned Llama-4
+             Scout (~2026-07-17), so the override 404'd and daily pre_curate fell
+             back to the dumb sector cap for 3 weeks. pre_curate now uses the code
+             default llama-3.3-70b. -->
     </dict>
 
-    <!-- 4 fixed slots: 7am, 12pm, 6pm, 10pm. Groq blocks the VPN/school source IP
-         intermittently (per-exit-server), so a single fixed time misses most days.
-         Each run does a cheap preflight probe (client.rs::groq_reachable) and exits
-         in <2s if blocked, so 4 slots is nearly free and catches whatever reachable
-         window opens. The news-based skip check (main.rs) makes extra slots no-ops
-         once the day already has news. See .plans/groq-vpn-block-plan.md. -->
+    <!-- Hourly, on the hour. Groq blocks the VPN/school source IP intermittently
+         (per-exit-server), so the only thing that reliably catches a clean window is
+         sampling more often. The 4-slot version (7am/12pm/6pm/10pm) missed every
+         window for 4 days straight (2026-08-10→14: 96h with no briefing, every slot
+         logging "Groq unreachable"), while a manual probe at 19:18 got HTTP 200 —
+         i.e. reachable windows existed between the slots.
+
+         A slot that can't work costs ~2s: the preflight probe
+         (client.rs::groq_reachable) exits early when blocked, and the news-based skip
+         check (main.rs) makes extra slots no-ops once the day already has news. A slot
+         that fires while a fetch is still running exits in <1s on the single-instance
+         flock (main.rs::acquire_single_instance_lock) without touching the DB or the
+         progress file. See .plans/groq-vpn-block-plan.md. -->
     <key>StartCalendarInterval</key>
-    <array>
-        <dict>
-            <key>Hour</key>
-            <integer>7</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>12</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>18</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>22</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-    </array>
+    <dict>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
 
     <key>WorkingDirectory</key>
     <string>/Users/nicoladebbia/Projects/Pulse</string>

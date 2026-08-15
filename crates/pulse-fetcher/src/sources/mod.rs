@@ -127,23 +127,85 @@ fn default_source_type() -> String {
     "news".to_string()
 }
 
+/// Wall-clock budget for a single source inside Phase 1.
+///
+/// `collect_all` joins 14 source futures, so the stage lasts as long as its slowest
+/// member. Sources that loop sequentially with their own retries (EDGAR walks tracked
+/// CIKs with a 30s per-request timeout) can stretch to hours on a degraded network:
+/// measured Phase-1 durations were 34m, 65m and 120m, all returning 0 articles, versus
+/// 9m for the slowest HEALTHY run (1267 articles). 600s clears every healthy run with
+/// margin while capping the stage near 10 minutes, and the timeout log line names the
+/// culprit — which the join'd per-source logs cannot, since they all print after the
+/// join returns.
+const SOURCE_TIMEOUT_SECS: u64 = 600;
+
+/// How many sources `collect_all` joins. Kept next to the join! so the two move together.
+pub const SOURCE_COUNT: usize = 14;
+
+/// Sources finished (successfully or not) in the current Phase 1. The progress heartbeat
+/// reads this to move the bar during a collect that legitimately runs minutes with no
+/// stage change — a bar frozen at 0% reads as "stuck" even when the run is healthy.
+///
+/// Process-global, reset at the top of every `collect_all`. That is safe only because two
+/// collects never overlap: `--mode daily` and `--mode freedoms` (pipeline.rs, the second
+/// `collect_all` caller) run sequentially, and the flock in main.rs keeps a second process
+/// out. It also only matters while a record is in-progress — the heartbeat stops writing
+/// once the progress file reads `complete`/`failed`, which it does before freedoms starts.
+/// If a concurrent collect path is ever added, this counter must become per-run state.
+pub static SOURCES_DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sources that errored or timed out in the current Phase 1. Read by the pipeline for the
+/// `pipeline_health.feeds_failed` column, which had been a permanent 0 on all 161 rows
+/// because nothing ever counted this — a run losing half its sources looked identical to
+/// a clean one in the health table.
+pub static SOURCES_FAILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+async fn bounded<T>(
+    name: &'static str,
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let outcome =
+        match tokio::time::timeout(std::time::Duration::from_secs(SOURCE_TIMEOUT_SECS), fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    "SOURCE TIMEOUT: {} exceeded {}s and was abandoned",
+                    name,
+                    SOURCE_TIMEOUT_SECS
+                );
+                Err(anyhow::anyhow!(
+                    "{} timed out after {}s",
+                    name,
+                    SOURCE_TIMEOUT_SECS
+                ))
+            }
+        };
+    SOURCES_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if outcome.is_err() {
+        SOURCES_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    outcome
+}
+
 pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
-    // Fetch news and financial sources concurrently
+    SOURCES_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+    SOURCES_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    // Fetch news and financial sources concurrently, each under its own time budget.
     let (google, rss, hn, reddit_posts, arxiv_papers, biorxiv_papers, usa_spending, fed_register, sec_edgar, fred_data, fec_data, eia_data, lda_data, patent_data) = tokio::join!(
-        google_news::fetch_all(),
-        rss_feeds::fetch_all(),
-        hacker_news::fetch(),
-        reddit::fetch(),
-        arxiv::fetch(),
-        biorxiv::fetch(),
-        usaspending::fetch(),
-        federal_register::fetch(),
-        edgar::fetch(),
-        fred::fetch(),
-        fec::fetch(),
-        eia::fetch(),
-        lobbying::fetch(),
-        patents::fetch(),
+        bounded("Google News", google_news::fetch_all()),
+        bounded("RSS feeds", rss_feeds::fetch_all()),
+        bounded("Hacker News", hacker_news::fetch()),
+        bounded("Reddit", reddit::fetch()),
+        bounded("ArXiv", arxiv::fetch()),
+        bounded("bioRxiv", biorxiv::fetch()),
+        bounded("USASpending", usaspending::fetch()),
+        bounded("Federal Register", federal_register::fetch()),
+        bounded("SEC EDGAR", edgar::fetch()),
+        bounded("FRED", fred::fetch()),
+        bounded("FEC", fec::fetch()),
+        bounded("EIA", eia::fetch()),
+        bounded("LDA Lobbying", lobbying::fetch()),
+        bounded("Patents", patents::fetch()),
     );
 
     let mut articles = Vec::new();

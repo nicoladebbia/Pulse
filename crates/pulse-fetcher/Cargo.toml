@@ -27,6 +27,10 @@ anyhow = { workspace = true }
 dirs = "6"
 dotenvy = { workspace = true }
 futures = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# test-util is NOT in tokio's "full" feature set; needed for #[tokio::test(start_paused)]
+# so the heartbeat tests advance virtual time instead of really sleeping 45s.
+tokio = { workspace = true, features = ["test-util"] }

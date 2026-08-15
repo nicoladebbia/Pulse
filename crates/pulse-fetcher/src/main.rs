@@ -16,6 +16,41 @@ use clap::Parser;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
+/// Holds an exclusive `flock` on a lockfile for the lifetime of the process. The kernel
+/// releases it on ANY exit — clean, panic, or SIGKILL — so unlike a pidfile there is no
+/// stale-lock state to repair.
+struct SingleInstanceLock(#[allow(dead_code)] std::fs::File);
+
+/// Take the whole-machine "a fetch is running" lock, or return None if another fetcher
+/// already holds it.
+///
+/// Two fetchers on the same DB write the same SQLite file AND the same progress file,
+/// with `started_at` ping-ponging between runs. Nothing prevented that before: the app's
+/// FETCHING flag only guards its own spawns, and the news-based skip check exits early
+/// only when the day ALREADY has news — precisely not the case on a failing day, which
+/// is when scheduled slots and a manual "Refresh Briefing" are most likely to overlap.
+fn acquire_single_instance_lock(db_path: &std::path::Path) -> Option<SingleInstanceLock> {
+    use std::os::unix::io::AsRawFd;
+    let path = db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("fetcher.lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    // LOCK_NB: never queue behind the running fetch — a slot that can't run should exit
+    // immediately and let the next one try.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if locked {
+        Some(SingleInstanceLock(file))
+    } else {
+        None
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "pulse-fetcher", about = "Daily news fetch pipeline for Pulse")]
 struct Args {
@@ -58,6 +93,17 @@ struct Args {
     /// ~60 bars per call).
     #[arg(long, default_value_t = 60)]
     days_back: i64,
+
+    /// backfill-embeddings mode: cap on stories selected per run. The wall-clock budget
+    /// (--max-minutes) is the real limiter; this is a secondary guard on query size.
+    #[arg(long, default_value_t = 20000)]
+    limit: usize,
+
+    /// backfill-embeddings mode: wall-clock budget in minutes. The Voyage free tier does
+    /// ~30 stories/min, so the default 120min clears ~3.6k stories per run — enough to
+    /// drain a 15k backlog over a few nights without ever overlapping the daily fetch.
+    #[arg(long, default_value_t = 120)]
+    max_minutes: u64,
 }
 
 #[tokio::main]
@@ -87,6 +133,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Pulse fetcher starting in {} mode", args.mode);
     tracing::info!("Database: {}", db_path.display());
 
+    // Must run before any pipeline work so a forced-block test exercises the same code
+    // path a real 403 would, from the first call onward.
+    crate::claude::client::apply_forced_block_from_env();
+
     match args.mode.as_str() {
         "notify-test" => {
             // Self-test for the failure-alert path. Fires the FAILED and DEGRADED
@@ -99,56 +149,95 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Test notifications fired");
         }
         "backfill-embeddings" => {
+            // Shares the daily fetch's lock: this mode is now SCHEDULED, so it must never
+            // run alongside a daily fetch that is writing the same tables and racing the
+            // same Voyage rate limit. A collision costs nothing — whichever loses exits.
+            let _instance_lock = match acquire_single_instance_lock(&db_path) {
+                Some(lock) => lock,
+                None => {
+                    tracing::info!(
+                        "A fetch is already running — skipping backfill, the next slot will retry."
+                    );
+                    return Ok(());
+                }
+            };
+            // Yield to the daily briefing. The backfill holds the lock for up to
+            // --max-minutes, and the daily slots are hourly, so a backfill started before
+            // the day's news is in could block the exact slot that catches a clean Groq
+            // window. Once today's news EXISTS every daily slot skips in <1s anyway, so
+            // that is the only window where holding the lock is free.
+            if !args.force && news_today(&db_path) == 0 {
+                tracing::info!(
+                    "Today's briefing has no news yet — deferring backfill so it cannot \
+                     block a daily slot. Next backfill slot will retry (--force to override)."
+                );
+                return Ok(());
+            }
             tracing::info!("Backfilling embeddings for stories without them...");
-            backfill_embeddings(&db_path).await?;
+            backfill_embeddings(&db_path, args.limit, args.max_minutes).await?;
         }
         "extract-entities" => {
             tracing::info!("Extracting entities from all stories...");
             extract_entities(&db_path).await?;
         }
         "daily" => {
+            // Single-instance guard FIRST — before the skip check, the preflight probe and
+            // any DB read. A second fetcher must cost nothing and must not touch the
+            // progress file the running one owns.
+            let _instance_lock = match acquire_single_instance_lock(&db_path) {
+                Some(lock) => lock,
+                None => {
+                    tracing::info!(
+                        "Another pulse-fetcher is already running — exiting (its progress file is authoritative)."
+                    );
+                    return Ok(());
+                }
+            };
+
             // Idempotent skip: a day is "done" only if today's daily briefing already
             // has NEWS stories. This is deliberately NOT `status='complete'` — a run
             // blocked at the Groq summarize step still writes financial stories (they
             // skip summarization) and marks the briefing complete with ZERO news, which
             // is exactly the degraded state we want a LATER slot to retry, not skip.
             // Success == news present (source_type='news'). See groq-vpn-block-plan.md.
-            if !args.force && db_path.exists() {
-                let conn = rusqlite::Connection::open_with_flags(
-                    &db_path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )?;
-                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                let news_today: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM stories s \
-                         JOIN briefings b ON s.briefing_id = b.id \
-                         WHERE b.date = ?1 AND b.briefing_type = 'daily' AND s.source_type = 'news'",
-                        [&today],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                if news_today > 0 {
-                    tracing::info!("Already fetched {} news stories for {} — skipping (use --force to override)", news_today, today);
+            if !args.force {
+                let n = news_today(&db_path);
+                if n > 0 {
+                    tracing::info!(
+                        "Already fetched {} news stories for {} — skipping (use --force to override)",
+                        n,
+                        chrono::Local::now().format("%Y-%m-%d")
+                    );
                     return Ok(());
                 }
             }
 
-            // Preflight reachability probe: if the source IP is on Groq's blocklist
-            // (VPN exit node / school network) the whole run would 403 and abort after
-            // ~90 min, firing the daily "not working" alert. A blocked slot is EXPECTED,
-            // not a failure — exit 0 SILENTLY (no notification) so a later slot retries.
-            // With 4 daily slots (7am/12pm/6pm/10pm) one usually catches a clean window.
+            // Preflight reachability probe. If the source IP is on Groq's blocklist (VPN
+            // exit node / school network) every Groq call this run will 403.
+            //
+            // This used to exit 0 silently and wait for a later slot. That was the right
+            // call when Groq was the only provider — but it is why 10 of 45 days had NO
+            // briefing at all (2026-07-03..12, 2026-08-08..13): the block persisted across
+            // every slot, so "a later slot will retry" quietly became "no briefing for a
+            // week". Anthropic answers 200 on exactly the network where Groq answers 403.
+            //
+            // So: latch the block and RUN ANYWAY on Anthropic. A briefing that costs more
+            // beats no briefing. `PULSE_NO_ANTHROPIC_FALLBACK=1` restores the old
+            // skip-and-wait behaviour if a blocked day should stay cheap instead.
             if !crate::claude::client::groq_reachable().await {
-                tracing::info!("Groq unreachable (blocked source IP) — skipping this slot silently, a later slot will retry.");
-                // Silent-skip staleness alarm: a single skipped slot is expected, but
-                // skips can repeat for DAYS with zero user-visible signal (paid
-                // 2026-08-07→09: six consecutive preflight skips, no briefing for 2
-                // days, nobody told). If the newest briefing is >36h old at skip
-                // time, fire ONE notification per calendar day (stamp file dedupes
-                // across the 4 slots).
-                notify_if_stale(&db_path);
-                return Ok(());
+                let fallback_disabled = std::env::var("PULSE_NO_ANTHROPIC_FALLBACK")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if fallback_disabled {
+                    tracing::info!("Groq unreachable and Anthropic fallback disabled — skipping this slot silently.");
+                    // Staleness alarm: skips can repeat for DAYS with zero user-visible
+                    // signal (paid 2026-08-07→09). If the newest briefing is >36h old,
+                    // fire ONE notification per calendar day (stamp file dedupes slots).
+                    notify_if_stale(&db_path);
+                    return Ok(());
+                }
+                crate::claude::client::mark_groq_blocked("preflight probe returned blocked");
+                tracing::info!("Groq unreachable — running this briefing on Anthropic instead of skipping the slot.");
             }
 
             // Notify-on-failure safety net: a scheduled daily run that errors AFTER a
@@ -366,20 +455,47 @@ fn notify_if_stale(db_path: &std::path::Path) {
     ));
 }
 
-async fn backfill_embeddings(db_path: &std::path::Path) -> anyhow::Result<()> {
+/// Repair the embedding gap left by dropped batches during the daily run.
+///
+/// Bounded on purpose so this can be SCHEDULED rather than run by hand. At the Voyage
+/// free tier (3 RPM = 30 stories/min) the Aug-2026 backlog of ~15.8k stories is ~9 hours
+/// of wall clock, which must not be one unbounded job that collides with the daily fetch.
+/// `max_minutes` is the real budget; `limit` is a secondary cap on rows selected.
+///
+/// Newest stories first: a story from this week matters more to search than one from
+/// April, and if the budget runs out mid-backlog the useful half is already done.
+async fn backfill_embeddings(
+    db_path: &std::path::Path,
+    limit: usize,
+    max_minutes: u64,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_minutes * 60);
     let conn = rusqlite::Connection::open(db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    // Any mode that writes to the DB must be on the current schema. This mode is now
+    // scheduled independently of the daily fetch, so it can be the first process to touch
+    // the DB after an update.
+    db::run_migrations(&conn)?;
 
-    // Find stories without embeddings
+    let (before_embedded, total_stories) = coverage(&conn)?;
+    tracing::info!(
+        "Embedding coverage before backfill: {}/{} ({:.1}%)",
+        before_embedded,
+        total_stories,
+        pct(before_embedded, total_stories)
+    );
+
+    // Find stories without embeddings, newest first.
     let stories: Vec<(i64, String, String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.headline, s.summary, s.key_facts
              FROM stories s
              LEFT JOIN story_embeddings se ON se.story_id = s.id
              WHERE se.story_id IS NULL
-             ORDER BY s.id"
+             ORDER BY s.id DESC
+             LIMIT ?1"
         )?;
-        stmt.query_map([], |row| {
+        stmt.query_map([limit as i64], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?.collect::<Result<Vec<_>, _>>()?
     };
@@ -389,39 +505,146 @@ async fn backfill_embeddings(db_path: &std::path::Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tracing::info!("Found {} stories without embeddings", stories.len());
+    let pause = embeddings::rate_limit_pause_secs();
+    tracing::info!(
+        "Backfilling {} stories (budget {}min, {}s between batches)",
+        stories.len(),
+        max_minutes,
+        pause
+    );
 
-    // Process in batches of 10 (Voyage free tier: 10K TPM limit)
-    for chunk in stories.chunks(10) {
+    let mut filled = 0usize;
+    let mut failed = 0usize;
+    let mut out_of_time = false;
+
+    for (batch_no, chunk) in stories.chunks(10).enumerate() {
+        if std::time::Instant::now() >= deadline {
+            out_of_time = true;
+            tracing::info!(
+                "Backfill budget of {}min reached after {} batches — remaining stories \
+                 are picked up by the next scheduled run.",
+                max_minutes, batch_no
+            );
+            break;
+        }
+        if batch_no > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
+        }
+
         let texts: Vec<String> = chunk.iter().map(|(_, headline, summary, key_facts)| {
             format!("{}. {}. {}", headline, summary, key_facts)
         }).collect();
-
         let ids: Vec<i64> = chunk.iter().map(|(id, _, _, _)| *id).collect();
 
         match embeddings::generate_from_texts(&texts).await {
-            Ok(embeddings) => {
-                for (i, emb) in embeddings.iter().enumerate() {
+            Ok(embs) => {
+                // Voyage returns embeddings positionally; a short response would silently
+                // misalign story ids with vectors, so refuse rather than corrupt.
+                if embs.len() != ids.len() {
+                    failed += ids.len();
+                    tracing::error!(
+                        "Backfill batch {}: got {} embeddings for {} stories — skipping \
+                         batch rather than risk misaligning vectors with story ids",
+                        batch_no + 1, embs.len(), ids.len()
+                    );
+                    continue;
+                }
+                for (i, emb) in embs.iter().enumerate() {
+                    if emb.len() != 512 {
+                        failed += 1;
+                        tracing::warn!(
+                            "Backfill: story {} got {} dims, expected 512 — skipped",
+                            ids[i], emb.len()
+                        );
+                        continue;
+                    }
                     let blob: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
                     conn.execute(
                         "INSERT OR REPLACE INTO story_embeddings (story_id, embedding) VALUES (?1, ?2)",
                         rusqlite::params![ids[i], blob],
                     )?;
+                    filled += 1;
                 }
-                tracing::info!("Embedded batch of {} stories (IDs {}-{})", chunk.len(), ids[0], ids[ids.len()-1]);
+                tracing::info!(
+                    "Backfill batch {}: embedded {} stories (IDs {}..{})",
+                    batch_no + 1, chunk.len(), ids[ids.len() - 1], ids[0]
+                );
             }
             Err(e) => {
-                tracing::warn!("Embedding batch failed: {}", e);
+                failed += ids.len();
+                tracing::warn!("Backfill batch {} failed after retries: {}", batch_no + 1, e);
             }
         }
-
-        // Rate limit pause (Voyage free tier = 3 RPM)
-        tokio::time::sleep(std::time::Duration::from_secs(21)).await;
     }
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM story_embeddings", [], |r| r.get(0))?;
-    tracing::info!("Backfill complete. Total embeddings in DB: {}", count);
+    // Cost accounting — the backfill was previously invisible to the daily cost cap.
+    if filled > 0 {
+        pipeline::log_usage(
+            db_path,
+            "voyage",
+            "voyage-3-lite",
+            "backfill_embeddings",
+            (filled as i64) * 200,
+            0,
+        );
+    }
+
+    let (after_embedded, total_after) = coverage(&conn)?;
+    tracing::info!(
+        "Backfill done: +{} embedded, {} failed. Coverage {:.1}% -> {:.1}% ({}/{}){}",
+        filled,
+        failed,
+        pct(before_embedded, total_stories),
+        pct(after_embedded, total_after),
+        after_embedded,
+        total_after,
+        if out_of_time { " [budget reached]" } else { "" }
+    );
     Ok(())
+}
+
+/// How many NEWS stories today's daily briefing already has.
+///
+/// This is the project's definition of "the day is done", and it is deliberately NOT
+/// `briefings.status='complete'`: a run blocked at the Groq summarize step still writes
+/// financial stories (they skip summarization) and marks the briefing complete with ZERO
+/// news — exactly the degraded state a later slot should RETRY, not skip.
+/// See groq-vpn-block-plan.md. Returns 0 if the DB is missing or unreadable.
+fn news_today(db_path: &std::path::Path) -> i64 {
+    if !db_path.exists() {
+        return 0;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return 0;
+    };
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    conn.query_row(
+        "SELECT COUNT(*) FROM stories s \
+         JOIN briefings b ON s.briefing_id = b.id \
+         WHERE b.date = ?1 AND b.briefing_type = 'daily' AND s.source_type = 'news'",
+        [&today],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// (stories with an embedding, total stories)
+fn coverage(conn: &rusqlite::Connection) -> anyhow::Result<(i64, i64)> {
+    let embedded: i64 = conn.query_row(
+        "SELECT count(*) FROM stories s
+         JOIN story_embeddings e ON e.story_id = s.id",
+        [],
+        |r| r.get(0),
+    )?;
+    let total: i64 = conn.query_row("SELECT count(*) FROM stories", [], |r| r.get(0))?;
+    Ok((embedded, total))
+}
+
+fn pct(part: i64, whole: i64) -> f64 {
+    if whole == 0 { 0.0 } else { 100.0 * part as f64 / whole as f64 }
 }
 
 async fn extract_entities(db_path: &std::path::Path) -> anyhow::Result<()> {
@@ -652,4 +875,98 @@ fn recompute_signals(conn: &rusqlite::Connection, today: &str) -> anyhow::Result
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+
+    fn db_with(stories: &[(i64, bool)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE briefings (id INTEGER PRIMARY KEY, date TEXT, briefing_type TEXT);
+             CREATE TABLE stories (id INTEGER PRIMARY KEY, briefing_id INTEGER,
+                 source_type TEXT, headline TEXT, summary TEXT, key_facts TEXT);
+             CREATE TABLE story_embeddings (story_id INTEGER PRIMARY KEY, embedding BLOB);",
+        )
+        .unwrap();
+        for (id, embedded) in stories {
+            conn.execute(
+                "INSERT INTO stories (id, briefing_id, source_type, headline, summary, key_facts)
+                 VALUES (?1, 1, 'news', 'h', 's', 'k')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            if *embedded {
+                conn.execute(
+                    "INSERT INTO story_embeddings (story_id, embedding) VALUES (?1, x'00')",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            }
+        }
+        (dir, path)
+    }
+
+    /// The number the whole fix exists to move. Coverage must count stories WITH an
+    /// embedding over ALL stories — the metric that decayed 100% -> 49.7% unnoticed.
+    #[test]
+    fn coverage_counts_embedded_over_total() {
+        let (_d, path) = db_with(&[(1, true), (2, false), (3, true), (4, false)]);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (embedded, total) = coverage(&conn).unwrap();
+        assert_eq!((embedded, total), (2, 4));
+        assert_eq!(pct(embedded, total), 50.0);
+    }
+
+    #[test]
+    fn pct_handles_empty_db_without_dividing_by_zero() {
+        assert_eq!(pct(0, 0), 0.0);
+    }
+
+    /// The backfill must yield to the daily briefing: it is gated on today's news
+    /// EXISTING, because until then an hourly daily slot may still need the lock.
+    #[test]
+    fn news_today_is_zero_until_a_news_story_lands_today() {
+        let (_d, path) = db_with(&[(1, false)]);
+        assert_eq!(news_today(&path), 0, "no briefing row yet");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT INTO briefings (id, date, briefing_type) VALUES (1, ?1, 'daily')",
+            [&today],
+        )
+        .unwrap();
+        assert_eq!(news_today(&path), 1, "news present -> backfill may run");
+    }
+
+    /// A financial-only briefing (Groq blocked at summarize) marks itself complete with
+    /// ZERO news. That day must still read as "not done" so a later slot retries — and
+    /// so the backfill does not grab the lock out from under it.
+    #[test]
+    fn financial_only_day_does_not_count_as_done() {
+        let (_d, path) = db_with(&[]);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT INTO briefings (id, date, briefing_type) VALUES (1, ?1, 'daily')",
+            [&today],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stories (id, briefing_id, source_type, headline, summary, key_facts)
+             VALUES (99, 1, 'financial', 'h', 's', 'k')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(news_today(&path), 0, "financial-only day must NOT read as done");
+    }
+
+    #[test]
+    fn missing_db_is_not_a_panic() {
+        assert_eq!(news_today(std::path::Path::new("/nonexistent/pulse.db")), 0);
+    }
 }
