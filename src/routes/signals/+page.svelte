@@ -411,9 +411,17 @@
 	));
 
 	// --- Convergence Watchlist (intelligence tool, NOT auto-trading) ---
-	// The auto-trading strategy backtested as no-edge (NO-GO, 2026-06-05), so the
-	// convergence engine is surfaced as a RESEARCH watchlist: "these companies have
-	// multiple independent signals stacking — go look", not "buy this".
+	// The auto-trading strategy backtested as no-edge, so the convergence engine is
+	// surfaced as a RESEARCH watchlist: "these companies have multiple independent
+	// signals stacking — go look", not "buy this".
+	//
+	// That verdict is NOT the daily auto-backtest in the Portfolio tab. It comes
+	// from scripts/replay_engine.py — walk-forward out-of-sample with 20bps
+	// round-trip costs and a Monte Carlo null — and the standing record is
+	// scripts/TRADING_STATUS.md, which carries the last-verified date (2026-06-17
+	// as of writing; this comment used to cite 2026-06-05 and had already gone
+	// stale) and the exact commands to re-run the gate. Read the file, not a date
+	// pasted into a component.
 	const SIGNAL_LABELS: Record<string, { key: keyof CrossSignal; label: string; color: string }[]> = {
 		all: [
 			{ key: 'insider_signal', label: 'Insider', color: 'text-blue-300 bg-blue-500/10' },
