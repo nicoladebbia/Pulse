@@ -46,6 +46,78 @@ pub fn scale_in_notional(buying_power: f64) -> Option<f64> {
     Some(raw.clamp(ENTRY_FLOOR, SCALE_IN_CAP))
 }
 
+/// Share-weighted average cost after adding `add_notional` at `add_price` to a
+/// position of `held_notional` opened at `held_entry`.
+///
+/// Scale-in only fires on a position that is already up, so the added shares
+/// always cost more than the original ones and the true basis always rises.
+/// Leaving `entry_price` at the first fill is not a rounding error:
+/// `pnl_pct` is measured off it, `pnl` multiplies that percentage by the
+/// grown `position_size`, and the -15% hard stop and 3x-ATR profit target are
+/// both struck from it. An understated basis therefore overstates the reported
+/// gain and pushes the stop further away than the money at risk allows.
+///
+/// Returns `None` when either leg's price is unusable — the caller must then
+/// leave the recorded basis alone rather than write a wrong one.
+pub fn blended_entry_price(
+    held_notional: f64,
+    held_entry: f64,
+    add_notional: f64,
+    add_price: f64,
+) -> Option<f64> {
+    if held_notional <= 0.0 || held_entry <= 0.0 || add_notional <= 0.0 || add_price <= 0.0 {
+        return None;
+    }
+    let shares = held_notional / held_entry + add_notional / add_price;
+    if shares <= 0.0 || !shares.is_finite() {
+        return None;
+    }
+    let basis = (held_notional + add_notional) / shares;
+    basis.is_finite().then_some(basis)
+}
+
+#[cfg(test)]
+mod basis_tests {
+    use super::*;
+
+    #[test]
+    fn adding_higher_priced_shares_raises_the_basis() {
+        // $5,000 at $100 = 50 shares. Add $2,500 at $110 = 22.727 shares.
+        // $7,500 over 72.727 shares = $103.125.
+        let basis = blended_entry_price(5_000.0, 100.0, 2_500.0, 110.0).unwrap();
+        assert!((basis - 103.125).abs() < 0.001, "got {basis}");
+    }
+
+    #[test]
+    fn the_understated_basis_is_worth_real_money() {
+        // Same position, marked at $110. Reporting the original $100 entry
+        // claims +10% on $7,500 = $750. The truth is +6.67% = $500.
+        let basis = blended_entry_price(5_000.0, 100.0, 2_500.0, 110.0).unwrap();
+        let honest_pct = (110.0 - basis) / basis * 100.0;
+        let stale_pct = (110.0 - 100.0) / 100.0 * 100.0;
+        assert!((honest_pct - 6.6667).abs() < 0.01, "got {honest_pct}");
+        assert!(stale_pct - honest_pct > 3.0, "the gap is the overstatement");
+
+        // And the -15% hard stop moves up with it: $85.00 off the stale entry,
+        // $87.66 off the real one — 2.66 dollars of unintended risk per share.
+        assert!((basis * 0.85 - 87.656).abs() < 0.01);
+    }
+
+    #[test]
+    fn adding_at_the_same_price_leaves_the_basis_alone() {
+        let basis = blended_entry_price(5_000.0, 100.0, 2_500.0, 100.0).unwrap();
+        assert!((basis - 100.0).abs() < 0.001, "got {basis}");
+    }
+
+    #[test]
+    fn an_unusable_price_yields_no_basis_rather_than_a_wrong_one() {
+        assert!(blended_entry_price(5_000.0, 100.0, 2_500.0, 0.0).is_none());
+        assert!(blended_entry_price(5_000.0, 0.0, 2_500.0, 110.0).is_none());
+        assert!(blended_entry_price(0.0, 100.0, 2_500.0, 110.0).is_none());
+        assert!(blended_entry_price(5_000.0, 100.0, 0.0, 110.0).is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

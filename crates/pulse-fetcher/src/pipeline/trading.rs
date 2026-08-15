@@ -444,8 +444,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     }
 
     // Scale-in: check if existing positions have strengthening signals
-    let scale_in_candidates: Vec<(i64, String, f64, f64)> = conn.prepare(
-        "SELECT pt.id, pt.ticker, pt.original_compound_score, cs.compound_score
+    let scale_in_candidates: Vec<(i64, String, f64, f64, f64, f64)> = conn.prepare(
+        "SELECT pt.id, pt.ticker, pt.original_compound_score, cs.compound_score,
+                pt.entry_price, pt.position_size
          FROM paper_trades pt
          JOIN cross_signals cs ON cs.ticker = pt.ticker
          WHERE pt.status = 'open'
@@ -457,14 +458,19 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
          LIMIT 3"
     ).ok()
     .map(|mut stmt| {
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?,
+            ))
+        })
             .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
             .unwrap_or_default()
     })
     .unwrap_or_default();
 
-    for (trade_id, ticker, _old_score, new_score) in &scale_in_candidates {
+    for (trade_id, ticker, _old_score, new_score, held_entry, held_notional) in &scale_in_candidates {
         let scale_notional = match crate::position_sizing::scale_in_notional(buying_power) {
             Some(n) => n,
             None => {
@@ -492,12 +498,60 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             .await?;
 
         if resp.status().is_success() {
-            conn.execute(
-                "UPDATE paper_trades SET scale_in_count = COALESCE(scale_in_count, 0) + 1,
-                 position_size = position_size + ?1 WHERE id = ?2",
-                rusqlite::params![scale_notional, trade_id],
-            ).ok();
-            tracing::info!("Scale-in: added ${:.2} to {} position", scale_notional, ticker);
+            let order_id = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
+                .unwrap_or_default();
+
+            // The added shares cost more than the original ones — scale-in only
+            // fires on a winner — so the basis has to move with the size. Both
+            // columns update together or `pnl_pct`, the -15% hard stop and the
+            // profit target all keep measuring against a price we no longer
+            // paid.
+            let fill = if order_id.is_empty() {
+                None
+            } else {
+                poll_fill(&client, &alpaca_key, &alpaca_secret, &order_id).await
+            };
+            let add_price = fill.as_ref().map(|f| f.price).filter(|p| *p > 0.0);
+            let new_basis = add_price.and_then(|p| {
+                crate::position_sizing::blended_entry_price(
+                    *held_notional, *held_entry, scale_notional, p,
+                )
+            });
+
+            match new_basis {
+                Some(basis) => {
+                    conn.execute(
+                        "UPDATE paper_trades SET scale_in_count = COALESCE(scale_in_count, 0) + 1,
+                         position_size = position_size + ?1, entry_price = ?2 WHERE id = ?3",
+                        rusqlite::params![scale_notional, basis, trade_id],
+                    ).ok();
+                    tracing::info!(
+                        "Scale-in: added ${:.2} to {} at ${:.2} — basis ${:.2} -> ${:.2}",
+                        scale_notional, ticker, add_price.unwrap_or(0.0), held_entry, basis
+                    );
+                }
+                None => {
+                    // The money is committed either way, so the size must be
+                    // recorded — an unrecorded fill is a ghost position. But
+                    // without a fill price there is no honest basis to write,
+                    // and a stale entity_prices close is exactly the kind of
+                    // guess that put a wrong number in this column before.
+                    conn.execute(
+                        "UPDATE paper_trades SET scale_in_count = COALESCE(scale_in_count, 0) + 1,
+                         position_size = position_size + ?1 WHERE id = ?2",
+                        rusqlite::params![scale_notional, trade_id],
+                    ).ok();
+                    tracing::warn!(
+                        "Scale-in: added ${:.2} to {} but no fill price (order {}) — \
+                         size recorded, basis left at ${:.2} and now understated",
+                        scale_notional, ticker, order_id, held_entry
+                    );
+                }
+            }
             traded += 1;
         }
 
