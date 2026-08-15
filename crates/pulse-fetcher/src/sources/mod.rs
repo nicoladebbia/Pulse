@@ -445,3 +445,58 @@ pub async fn collect_freedoms() -> anyhow::Result<Vec<RawArticle>> {
 
     Ok(articles)
 }
+
+#[cfg(test)]
+mod freedom_source_tests {
+    use super::*;
+
+    /// Network test. Run explicitly:
+    /// `cargo test -p pulse-fetcher -- --ignored --nocapture freedoms_collection`
+    ///
+    /// `collect_news_sources` is a hand-maintained list, and the only symptom of
+    /// it going stale is a Freedoms page that quietly gets thinner — the shape of
+    /// failure this project has lost days to before. Nothing else can catch it:
+    /// the offline suite makes no network calls, and the pipeline's own run bails
+    /// on the daily cost cap before it ever reaches collection. This hits only
+    /// free news sources and spends no paid API quota.
+    #[tokio::test]
+    #[ignore = "makes live network calls"]
+    async fn freedoms_collection_still_produces_every_freedom() {
+        let articles = collect_freedoms().await.expect("collection should not fail");
+
+        let freedom: Vec<_> = articles
+            .iter()
+            .filter(|a| a.sector.starts_with("freedom_"))
+            .collect();
+
+        let mut per_freedom: std::collections::BTreeMap<&str, usize> =
+            ["freedom_time", "freedom_wealth", "freedom_location", "freedom_health", "freedom_whoop"]
+                .into_iter()
+                .map(|k| (k, 0))
+                .collect();
+        let mut per_source: std::collections::BTreeMap<String, usize> = Default::default();
+        for a in &freedom {
+            if let Some(n) = per_freedom.get_mut(a.sector.as_str()) {
+                *n += 1;
+            }
+            *per_source.entry(a.source_name.clone()).or_default() += 1;
+        }
+
+        println!("collected {} articles, {} of them freedom_*", articles.len(), freedom.len());
+        for (k, n) in &per_freedom {
+            println!("  {:<18} {}", k, n);
+        }
+        println!("  -- by source --");
+        for (k, n) in &per_source {
+            println!("  {:<40} {}", k, n);
+        }
+
+        let empty: Vec<_> = per_freedom.iter().filter(|(_, n)| **n == 0).map(|(k, _)| *k).collect();
+        assert!(
+            empty.is_empty(),
+            "no articles collected for {:?} — either a source stopped returning them or it \
+             was dropped from collect_news_sources",
+            empty
+        );
+    }
+}
