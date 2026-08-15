@@ -4,6 +4,7 @@
 	import { FREEDOM_CONFIG, FREEDOM_ORDER } from '$lib/config';
 	import { isTauri, mockFreedomsBriefing } from '$lib/tauri/mock';
 	import { safeInvoke } from '$lib/tauri/commands';
+	import { localDateStr, shiftDateStr, isSameOrBefore } from '$lib/date';
 
 	let briefing = $state<FreedomsBriefing | null>(null);
 	let isLoading = $state(true);
@@ -13,26 +14,25 @@
 
 	const freedoms = FREEDOM_ORDER.map(id => FREEDOM_CONFIG[id]);
 
+	// All four of these used to build their date with toISOString(), which is UTC.
+	// The backend writes and queries local dates, so after 20:00 in Miami the page
+	// thought tomorrow had begun: "Today" stopped matching, and one click of
+	// "← Previous day" re-rendered today's briefing labelled "Yesterday".
 	function todayStr(): string {
-		const d = new Date();
-		return d.toISOString().slice(0, 10);
+		return localDateStr();
 	}
 
 	function formatDisplayDate(dateStr: string): string {
-		const d = new Date(dateStr + 'T12:00:00');
 		const today = todayStr();
 		if (dateStr === today) return 'Today';
-		const yesterday = new Date();
-		yesterday.setDate(yesterday.getDate() - 1);
-		if (dateStr === yesterday.toISOString().slice(0, 10)) return 'Yesterday';
+		if (dateStr === shiftDateStr(today, -1)) return 'Yesterday';
+		const d = new Date(dateStr + 'T12:00:00');
 		return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 	}
 
 	function shiftDate(days: number) {
-		const d = new Date(selectedDate + 'T12:00:00');
-		d.setDate(d.getDate() + days);
-		const newDate = d.toISOString().slice(0, 10);
-		if (newDate > todayStr()) return;
+		const newDate = shiftDateStr(selectedDate, days);
+		if (!isSameOrBefore(newDate, todayStr())) return;
 		selectedDate = newDate;
 		loadFreedoms();
 	}

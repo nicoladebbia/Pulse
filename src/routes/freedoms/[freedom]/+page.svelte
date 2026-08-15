@@ -149,7 +149,10 @@
 					</button>
 				</div>
 			{:else if stories.length === 0}
-				<p class="text-sm text-text-muted italic py-12 text-center">No intelligence gathered today for this freedom.</p>
+				<!-- Said "today" unconditionally, which is wrong on every historical date. -->
+				<p class="text-sm text-text-muted italic py-12 text-center">
+					No intelligence gathered {dateParam ? 'on this day' : 'today'} for this freedom.
+				</p>
 			{:else}
 				<!-- Hero story: huge, prominent -->
 				{#if hero}
