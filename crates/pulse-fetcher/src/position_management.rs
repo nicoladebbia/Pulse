@@ -241,9 +241,14 @@ pub fn generate_trade_journal(
         .and_then(|e| chrono::NaiveDate::parse_from_str(exit_date, "%Y-%m-%d").map(|x| (x - e).num_days()))
         .unwrap_or(0);
 
+    // 'expired' no longer describes anything this engine does — the 90-day
+    // calendar limit it used to name was removed on 2026-07-15 (see
+    // evaluate_position, which has no time-based exit at all) and nothing has
+    // written the status since. Left mapped rather than dropped so an older
+    // database still renders, but it no longer claims a rule that was deleted.
     let exit_reason = match status {
         "stopped_out" => "trailing stop was hit",
-        "expired" => "the 90-day holding limit was reached",
+        "expired" => "the retired calendar-expiry engine closed it (that rule no longer exists)",
         "closed" if pnl_pct > 0.0 => "profit target was reached",
         "closed" => "signal decay triggered an exit",
         _ => "position was closed",

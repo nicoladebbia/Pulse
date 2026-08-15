@@ -543,12 +543,18 @@ fn generate_journal_text(
         };
 
         // SEV2: the DB has no close_reason column, so we can only state the reason the STATUS
-        // actually encodes. stopped_out/expired were written by the old exit engine and carry a
-        // real reason. A plain 'closed' row is a manual close with the reason NOT recorded — do
+        // actually encodes. stopped_out was written by the exit engine and carries a real
+        // reason. A plain 'closed' row is a manual close with the reason NOT recorded — do
         // not invent "signal decay"/"profit target" (fabricated claims the data can't support).
+        //
+        // 'expired' used to read "the 90-day holding limit was reached". There is no such
+        // limit: the calendar expiry was removed from position_management on 2026-07-15 and
+        // nothing has written this status since. No row in the live ledger carries it, but an
+        // older database might, and telling its owner a deleted rule closed their position is
+        // exactly the fabrication the note above forbids.
         let exit_reason = match status {
             "stopped_out" => "the trailing stop was hit",
-            "expired" => "the 90-day holding limit was reached",
+            "expired" => "the retired calendar-expiry engine closed it (that rule no longer exists)",
             _ => "it was closed manually (exit reason not recorded)",
         };
 
