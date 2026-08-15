@@ -38,6 +38,10 @@
 	--color-freedom-location-dim: #1A2530;
 	--color-freedom-health: #B07070;
 	--color-freedom-health-dim: #2B1A1A;
+	/* Whoop is its own card, not a shade of Health — it had been borrowing
+	   Health's red, so the two adjacent cards read as one section. */
+	--color-freedom-whoop: #8F7BAF;
+	--color-freedom-whoop-dim: #221B2E;
 
 	/* Relevance score colors */
 	--color-relevance-high: #22c55e;

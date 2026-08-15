@@ -142,13 +142,16 @@ const SOURCE_TIMEOUT_SECS: u64 = 600;
 /// How many sources `collect_all` joins. Kept next to the join! so the two move together.
 pub const SOURCE_COUNT: usize = 14;
 
+/// How many of those `collect_news_sources` joins — the freedoms run's whole world.
+pub const NEWS_SOURCE_COUNT: usize = 6;
+
 /// Sources finished (successfully or not) in the current Phase 1. The progress heartbeat
 /// reads this to move the bar during a collect that legitimately runs minutes with no
 /// stage change — a bar frozen at 0% reads as "stuck" even when the run is healthy.
 ///
-/// Process-global, reset at the top of every `collect_all`. That is safe only because two
-/// collects never overlap: `--mode daily` and `--mode freedoms` (pipeline.rs, the second
-/// `collect_all` caller) run sequentially, and the flock in main.rs keeps a second process
+/// Process-global, reset at the top of every collect. That is safe only because two
+/// collects never overlap: `--mode daily` (`collect_all`) and `--mode freedoms`
+/// (`collect_freedoms`) run sequentially, and the flock in main.rs keeps a second process
 /// out. It also only matters while a record is in-progress — the heartbeat stops writing
 /// once the progress file reads `complete`/`failed`, which it does before freedoms starts.
 /// If a concurrent collect path is ever added, this counter must become per-run state.
@@ -187,30 +190,26 @@ async fn bounded<T>(
     outcome
 }
 
-pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
-    SOURCES_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
-    SOURCES_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
-    // Fetch news and financial sources concurrently, each under its own time budget.
-    let (google, rss, hn, reddit_posts, arxiv_papers, biorxiv_papers, usa_spending, fed_register, sec_edgar, fred_data, fec_data, eia_data, lda_data, patent_data) = tokio::join!(
+/// The six news sources. These are the only sources that can carry a
+/// `freedom_*` sector — confirmed at the assignment site, not by filename:
+/// every `sector:` literal in the eight financial/government sources is
+/// "finance" or "tech", and the two that derive a sector at runtime
+/// (`agency_to_sector`, `naics_to_sector`) return only those two.
+///
+/// Returns the articles and the names of the sources that failed, so each
+/// caller does its own health reporting.
+async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
+    let (google, rss, hn, reddit_posts, arxiv_papers, biorxiv_papers) = tokio::join!(
         bounded("Google News", google_news::fetch_all()),
         bounded("RSS feeds", rss_feeds::fetch_all()),
         bounded("Hacker News", hacker_news::fetch()),
         bounded("Reddit", reddit::fetch()),
         bounded("ArXiv", arxiv::fetch()),
         bounded("bioRxiv", biorxiv::fetch()),
-        bounded("USASpending", usaspending::fetch()),
-        bounded("Federal Register", federal_register::fetch()),
-        bounded("SEC EDGAR", edgar::fetch()),
-        bounded("FRED", fred::fetch()),
-        bounded("FEC", fec::fetch()),
-        bounded("EIA", eia::fetch()),
-        bounded("LDA Lobbying", lobbying::fetch()),
-        bounded("Patents", patents::fetch()),
     );
 
     let mut articles = Vec::new();
-    let mut failed_sources = Vec::new();
-
+    let mut failed = Vec::new();
     // News sources. ORDER MATTERS: dedup keeps the FIRST copy of a duplicate
     // story, so direct-URL sources (RSS, HN) go before Google News — google
     // links are JS redirect shells that article_text::enrich cannot fetch and
@@ -223,7 +222,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::error!("RSS feeds FAILED: {}", e);
-            failed_sources.push("RSS feeds");
+            failed.push("RSS feeds");
         }
     }
     match hn {
@@ -233,7 +232,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::error!("Hacker News FAILED: {}", e);
-            failed_sources.push("Hacker News");
+            failed.push("Hacker News");
         }
     }
     match google {
@@ -243,7 +242,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::error!("Google News FAILED: {}", e);
-            failed_sources.push("Google News");
+            failed.push("Google News");
         }
     }
     match reddit_posts {
@@ -253,7 +252,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("Reddit FAILED (non-fatal): {}", e);
-            failed_sources.push("Reddit");
+            failed.push("Reddit");
         }
     }
     match arxiv_papers {
@@ -263,7 +262,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("ArXiv FAILED (non-fatal): {}", e);
-            failed_sources.push("ArXiv");
+            failed.push("ArXiv");
         }
     }
     match biorxiv_papers {
@@ -273,10 +272,29 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("bioRxiv FAILED (non-fatal): {}", e);
-            failed_sources.push("bioRxiv");
+            failed.push("bioRxiv");
         }
     }
 
+    (articles, failed)
+}
+
+/// The eight financial/government sources. Never produce a `freedom_*`
+/// sector, which is why the freedoms run skips them entirely.
+async fn collect_financial_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
+    let (usa_spending, fed_register, sec_edgar, fred_data, fec_data, eia_data, lda_data, patent_data) = tokio::join!(
+        bounded("USASpending", usaspending::fetch()),
+        bounded("Federal Register", federal_register::fetch()),
+        bounded("SEC EDGAR", edgar::fetch()),
+        bounded("FRED", fred::fetch()),
+        bounded("FEC", fec::fetch()),
+        bounded("EIA", eia::fetch()),
+        bounded("LDA Lobbying", lobbying::fetch()),
+        bounded("Patents", patents::fetch()),
+    );
+
+    let mut articles = Vec::new();
+    let mut failed = Vec::new();
     // Financial sources (non-fatal — pipeline continues if any fail)
     match usa_spending {
         Ok(a) => {
@@ -285,7 +303,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("USASpending FAILED (non-fatal): {}", e);
-            failed_sources.push("USASpending");
+            failed.push("USASpending");
         }
     }
     match fed_register {
@@ -295,7 +313,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("Federal Register FAILED (non-fatal): {}", e);
-            failed_sources.push("Federal Register");
+            failed.push("Federal Register");
         }
     }
     match sec_edgar {
@@ -305,7 +323,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("SEC EDGAR FAILED (non-fatal): {}", e);
-            failed_sources.push("SEC EDGAR");
+            failed.push("SEC EDGAR");
         }
     }
     match fred_data {
@@ -317,7 +335,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("FRED FAILED (non-fatal): {}", e);
-            failed_sources.push("FRED");
+            failed.push("FRED");
         }
     }
     match fec_data {
@@ -329,7 +347,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("FEC FAILED (non-fatal): {}", e);
-            failed_sources.push("FEC");
+            failed.push("FEC");
         }
     }
     match eia_data {
@@ -341,7 +359,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("EIA FAILED (non-fatal): {}", e);
-            failed_sources.push("EIA");
+            failed.push("EIA");
         }
     }
     match lda_data {
@@ -353,7 +371,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("LDA Lobbying FAILED (non-fatal): {}", e);
-            failed_sources.push("LDA");
+            failed.push("LDA");
         }
     }
     match patent_data {
@@ -365,9 +383,22 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
         }
         Err(e) => {
             tracing::warn!("Patents FAILED (non-fatal): {}", e);
-            failed_sources.push("Patents");
+            failed.push("Patents");
         }
     }
+
+    (articles, failed)
+}
+
+pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
+    SOURCES_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+    SOURCES_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    // Both halves run concurrently and every source inside them keeps its own
+    // time budget, so all SOURCE_COUNT sources are still in flight at once.
+    let ((mut articles, mut failed_sources), (financial, financial_failed)) =
+        tokio::join!(collect_news_sources(), collect_financial_sources());
+    articles.extend(financial);
+    failed_sources.extend(financial_failed);
 
     if !failed_sources.is_empty() {
         tracing::warn!("SOURCE HEALTH: {} source(s) failed: {}", failed_sources.len(), failed_sources.join(", "));
@@ -380,6 +411,37 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
     if news_count < 50 {
         tracing::warn!("SOURCE HEALTH: only {} news articles (expected 100+)", news_count);
     }
+
+    Ok(articles)
+}
+
+/// Collect only the sources the freedoms pipeline can actually use.
+///
+/// `run_freedoms` runs in the same process right after the daily run and used
+/// to call `collect_all`, then throw away everything without a `freedom_`
+/// sector. That meant a second full pass over all SOURCE_COUNT sources every
+/// morning, including a second day's hit on the rate-limited government APIs
+/// (FRED, EIA, SEC EDGAR, FEC, LDA, Patents, USASpending, Federal Register) —
+/// none of which has ever produced a freedom article.
+///
+/// The caller still filters on `freedom_` afterwards, so if a news source is
+/// ever added to the pipeline and not to `collect_news_sources`, the freedoms
+/// page gets thinner rather than wrong.
+pub async fn collect_freedoms() -> anyhow::Result<Vec<RawArticle>> {
+    SOURCES_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+    SOURCES_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let (articles, failed) = collect_news_sources().await;
+
+    if !failed.is_empty() {
+        tracing::warn!(
+            "SOURCE HEALTH (freedoms): {} of {} news source(s) failed: {}",
+            failed.len(),
+            NEWS_SOURCE_COUNT,
+            failed.join(", ")
+        );
+    }
+    tracing::info!("Freedoms collection: {} articles from news sources", articles.len());
 
     Ok(articles)
 }

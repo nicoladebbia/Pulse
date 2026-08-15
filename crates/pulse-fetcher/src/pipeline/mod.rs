@@ -1807,10 +1807,13 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     // Cost guardrail: bail before any LLM call if today's spend already crossed the cap.
     check_daily_cost_cap(db_path)?;
 
-    // Phase 1: Collect from all sources, filter to freedom_* only
+    // Phase 1: Collect from the news sources, filter to freedom_* only.
+    // The filter stays even though collect_freedoms only fetches sources that
+    // can produce a freedom sector — those sources also produce daily-sector
+    // articles, and it is the guard that makes a stale source list survivable.
     tracing::info!("Freedoms: Collecting articles...");
     sources::API_CALLS.reset();
-    let all_articles = sources::collect_all().await?;
+    let all_articles = sources::collect_freedoms().await?;
     // Log per-call API usage for this fetch run
     {
         let snapshot = sources::API_CALLS.snapshot();
@@ -2163,7 +2166,19 @@ fn write_freedoms_to_db(
         tx.execute("DELETE FROM briefings WHERE id = ?1", [old_id])?;
     }
 
-    // Count per freedom
+    // Count per freedom. The briefings table has exactly four sector-count
+    // columns, named for the daily briefing's sectors, and a freedoms row
+    // borrows them positionally: ai=time, miami=wealth, italy=location,
+    // tech=health. There is no fifth column, so `whoop_count` reaches the log
+    // line at the end of this function but never the database.
+    //
+    // That is fine and deliberate: nothing reads these columns for a freedoms
+    // row — every reader (Sidebar, BriefingSummary, Archive) goes through the
+    // daily briefing — and the page counts each bucket from the stories it
+    // loaded. `story_count` is the honest total and does include Whoop. Adding
+    // a column for a number no one reads would cost a migration and buy
+    // nothing; this comment exists so the asymmetry doesn't read as an
+    // oversight next time.
     let time_count = curated.iter().filter(|(f, _)| *f == "time").count();
     let wealth_count = curated.iter().filter(|(f, _)| *f == "wealth").count();
     let location_count = curated.iter().filter(|(f, _)| *f == "location").count();
@@ -2179,10 +2194,21 @@ fn write_freedoms_to_db(
     )?;
     let briefing_id = tx.last_insert_rowid();
 
-    // Insert freedom stories
+    // Insert freedom stories.
+    //
+    // `is_hero` marks the story each freedom card leads with — one per freedom,
+    // which is what the page renders (it takes stories[0] of each bucket). It
+    // used to be `i == 0`, flagging only the single first row of the whole
+    // briefing, so four of the five cards had no hero at all. `curated` arrives
+    // grouped by freedom in priority order, so the first row of each group is
+    // that freedom's lead.
+    //
+    // Deliberately different from `briefings.hero_story_id` set below, which is
+    // one story for the whole briefing. Both are correct; don't collapse them.
+    let mut freedom_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (i, (freedom, story)) in curated.iter().enumerate() {
         let key_facts_json = serde_json::to_string(&story.key_facts)?;
-        let is_hero = if i == 0 { 1 } else { 0 };
+        let is_hero = if freedom_seen.insert(freedom) { 1 } else { 0 };
 
         tx.execute(
             "INSERT INTO freedom_stories (
@@ -3096,5 +3122,96 @@ mod financial_write_tests {
         let mut news = story("https://example.com/n", "news item");
         news.article.source_type = "news".to_string();
         assert_eq!(write_financial_stories(&path, &[news]).unwrap(), 0);
+    }
+}
+
+/// `is_hero` marks the story each freedom card leads with. It used to be
+/// `i == 0` over the whole briefing, so four of the five cards had none.
+#[cfg(test)]
+mod freedom_hero_tests {
+    use super::*;
+
+    fn story(url: &str, title: &str) -> crate::claude::SummarizedStory {
+        crate::claude::SummarizedStory {
+            article: sources::RawArticle {
+                title: title.to_string(),
+                url: url.to_string(),
+                source_name: "RSS".to_string(),
+                source_url: "https://example.com".to_string(),
+                published_at: None,
+                content_snippet: "snippet".to_string(),
+                sector: "freedom_time".to_string(),
+                feed_id: "rss".to_string(),
+                language: "en".to_string(),
+                source_type: "news".to_string(),
+                financial_metadata: None,
+            },
+            headline: title.to_string(),
+            summary: "summary".to_string(),
+            key_facts: vec!["fact".to_string()],
+            why_it_matters: "matters".to_string(),
+            what_to_watch: "watch".to_string(),
+            importance_score: 5,
+            sentiment: None,
+            novelty: None,
+            event_type: None,
+        }
+    }
+
+    /// Reads back (freedom, headline) for every row written with is_hero = 1.
+    fn heroes_of(curated: &[(&str, &crate::claude::SummarizedStory)]) -> Vec<(String, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        write_freedoms_to_db(&path, curated).unwrap();
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT freedom, headline FROM freedom_stories
+                 WHERE is_hero = 1 ORDER BY display_order",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    #[test]
+    fn every_freedom_leads_with_its_own_first_story() {
+        let a = story("https://a.test/1", "Time first");
+        let b = story("https://b.test/2", "Time second");
+        let c = story("https://c.test/3", "Wealth first");
+        let d = story("https://d.test/4", "Wealth second");
+        let e = story("https://e.test/5", "Whoop only");
+        let curated = vec![
+            ("time", &a),
+            ("time", &b),
+            ("wealth", &c),
+            ("wealth", &d),
+            ("whoop", &e),
+        ];
+
+        assert_eq!(
+            heroes_of(&curated),
+            vec![
+                ("time".to_string(), "Time first".to_string()),
+                ("wealth".to_string(), "Wealth first".to_string()),
+                ("whoop".to_string(), "Whoop only".to_string()),
+            ],
+            "each freedom that has stories should contribute exactly one hero"
+        );
+    }
+
+    #[test]
+    fn a_freedom_with_no_stories_contributes_no_hero() {
+        let a = story("https://a.test/1", "Only story");
+        let curated = vec![("health", &a)];
+        assert_eq!(
+            heroes_of(&curated),
+            vec![("health".to_string(), "Only story".to_string())]
+        );
     }
 }
