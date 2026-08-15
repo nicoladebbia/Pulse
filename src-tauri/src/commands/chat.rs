@@ -916,6 +916,7 @@ pub async fn chat_send_stream(
 
     let on_event_clone = on_event.clone();
     let abort_clone = abort_flag.0.clone();
+    let abort_for_loop = abort_flag.0.clone();
     let (raw_response, llm_usage) = llm.send_message_stream(
         &system_prompt,
         &messages_for_llm,
@@ -929,6 +930,13 @@ pub async fn chat_send_stream(
                 tracing::warn!("failed to send Delta event: {}", e);
             }
         },
+        // Stops the read loop itself. Suppressing deltas alone left the request
+        // running to completion, so everything below — storing the message and
+        // emitting Complete — ran with the FULL answer and the cancelled text
+        // reappeared in the UI. With the loop broken, `raw_response` holds only
+        // what actually streamed, so the message stored and the Complete event
+        // both carry exactly what the user saw before pressing Stop.
+        move || abort_for_loop.load(std::sync::atomic::Ordering::Relaxed),
     )
     .await
     .map_err(|e| {

@@ -847,16 +847,26 @@ impl ClaudeConversation {
     /// Stream a Claude response, calling `on_chunk` for each text delta.
     /// Returns the fully accumulated response text plus real token usage
     /// (input from `message_start`, output from the final `message_delta`).
-    pub async fn send_message_stream<F>(
+    /// Stream a completion, calling `on_chunk` for each text delta.
+    ///
+    /// `is_cancelled` is polled before every read. When it returns true the loop
+    /// breaks and the response is dropped, which closes the HTTP connection —
+    /// without it a "Stop" button stops nothing: the read loop ran to completion,
+    /// the full answer was stored, and a Complete event overwrote the UI with the
+    /// answer the user had just cancelled. Whatever streamed before the cancel is
+    /// returned, so what the user saw is what they keep.
+    pub async fn send_message_stream<F, A>(
         &self,
         system: &str,
         messages: &[(String, String)],
         model: &str,
         max_tokens: u32,
         on_chunk: F,
+        is_cancelled: A,
     ) -> Result<(String, Option<LlmUsage>)>
     where
         F: Fn(&str) + Send,
+        A: Fn() -> bool + Send,
     {
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
@@ -897,6 +907,16 @@ impl ClaudeConversation {
         let mut output_tokens: Option<i64> = None;
 
         while let Some(chunk) = stream.next().await {
+            // Checked before consuming the chunk so a cancel takes effect on the
+            // very next read. Breaking here drops `stream` and with it the
+            // response, closing the connection instead of draining it.
+            if is_cancelled() {
+                tracing::info!(
+                    "chat stream cancelled by user after {} chars — closing connection",
+                    accumulated.len()
+                );
+                break;
+            }
             let bytes = chunk.context("stream read error")?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 

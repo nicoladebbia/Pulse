@@ -79,6 +79,14 @@ export async function loadThreads() {
 
 export async function loadThread(threadId: string) {
 	streamGeneration++; // Invalidate any in-flight stream
+	// Bumping the generation discards the old stream's events but left isStreaming
+	// true, and the composer is disabled purely off that global — so switching
+	// threads mid-answer locked the NEW thread's input until the abandoned
+	// generation happened to finish. Cancel the old stream and clear the flags
+	// that belong to it.
+	if (get(isStreaming)) cancelStream();
+	isStreaming.set(false);
+	isSearching.set(false);
 	activeThreadId.set(threadId);
 	try {
 		const ipc = (window as any).__TAURI_INTERNALS__;
@@ -147,7 +155,10 @@ export async function sendMessage(message: string) {
 			}
 
 			if (event.event === 'Delta') {
-				// Cancel requested — stop rendering but let backend finish
+				// Stop rendering immediately. The backend now breaks its read loop on
+				// the same flag, so the Complete that follows carries only the text
+				// that actually streamed — it used to carry the full answer and
+				// overwrite the UI with the response the user had just cancelled.
 				if (cancelRequested) return;
 
 				// First delta means search is done, streaming has started
