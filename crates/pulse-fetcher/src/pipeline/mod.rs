@@ -1756,6 +1756,51 @@ fn log_freedom_histogram<'a>(stage: &str, sectors: impl Iterator<Item = &'a str>
     tracing::info!("Freedoms[{}]: {}", stage, summary.join(" "));
 }
 
+/// Assign each curated story to exactly one freedom, first list winning.
+///
+/// The curator returns five independent index lists and nothing stops it filing
+/// one story under two freedoms — the prompt does not forbid it and the parser
+/// cannot see across lists. Measured on the live database before this guard
+/// existed: **53 briefing-days had the same headline on two different freedom
+/// cards**, which is the most visible way a curated feature can look sloppy.
+///
+/// Two mechanisms produce that, and both are covered here: the same index
+/// appearing in two lists, and two *different* indices whose stories share a
+/// title (the known dedup residual — identical headline, different URL). The
+/// caller supplies the title hash so this stays pure and so "near-identical"
+/// means the same thing here as everywhere else in the pipeline.
+///
+/// Order of `lists` is the priority order; a story lands under the first freedom
+/// that claims it. `max_per_freedom` counts stories actually kept, so a freedom
+/// whose top picks were claimed earlier still fills up from its remaining ones.
+fn assign_freedom_indices<'a>(
+    lists: &[(&'a str, &Vec<usize>)],
+    title_hash_of: impl Fn(usize) -> Option<String>,
+    max_per_freedom: usize,
+) -> Vec<(&'a str, usize)> {
+    let mut claimed_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut claimed_title: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<(&'a str, usize)> = Vec::new();
+
+    for (label, indices) in lists {
+        let mut kept = 0;
+        for &idx in indices.iter() {
+            if kept >= max_per_freedom {
+                break;
+            }
+            // An index the curator invented for a story that does not exist is
+            // dropped, exactly as the previous `sorted.get(idx)` guard did.
+            let Some(th) = title_hash_of(idx) else { continue };
+            if !claimed_idx.insert(idx) || !claimed_title.insert(th) {
+                continue;
+            }
+            out.push((label, idx));
+            kept += 1;
+        }
+    }
+    out
+}
+
 pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
 
@@ -1949,16 +1994,20 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         ("health", &parsed.curation.health),
         ("whoop", &parsed.curation.whoop),
     ];
+    let assigned = assign_freedom_indices(
+        &freedom_lists,
+        |idx| sorted.get(idx).map(|s| crate::dedup::title_hash(&s.headline)),
+        max_per_freedom,
+    );
+    for (label, idx) in &assigned {
+        curated.push((label, &sorted[*idx]));
+    }
     for (label, indices) in &freedom_lists {
-        let mut count = 0;
-        for &idx in *indices {
-            if count >= max_per_freedom { break; }
-            if let Some(s) = sorted.get(idx) {
-                curated.push((label, s));
-                count += 1;
-            }
-        }
-        tracing::info!("Freedoms: {} = {} stories (LLM returned {})", label, count, indices.len());
+        let kept = assigned.iter().filter(|(l, _)| l == label).count();
+        tracing::info!(
+            "Freedoms: {} = {} stories (LLM returned {}, {} dropped as duplicates)",
+            label, kept, indices.len(), indices.len().saturating_sub(kept)
+        );
     }
 
     tracing::info!("Freedoms: {} curated stories total", curated.len());
@@ -2796,7 +2845,6 @@ mod financial_dedup_tests {
         ];
         assert_eq!(dedup_within_batch(batch).len(), 3);
     }
-
     /// The mutation this function exists to survive, in the exact shape production
     /// produced: one FEC contribution repeated 92 times inside a single fetch.
     /// Before the fix all 92 were written (briefing 227, 2026-06-10 01:14:09).
@@ -2840,6 +2888,76 @@ mod financial_dedup_tests {
     #[test]
     fn empty_batch_is_handled() {
         assert!(dedup_within_batch(Vec::new()).is_empty());
+    }
+}
+
+/// Guards the defect measured on the live database: 53 briefing-days carried
+/// the same headline under two different freedom cards.
+#[cfg(test)]
+mod freedom_assignment_tests {
+    use super::*;
+
+    /// Titles keyed by index. Distinct titles unless a test says otherwise.
+    fn titles(n: usize) -> impl Fn(usize) -> Option<String> {
+        move |i| (i < n).then(|| format!("title-{i}"))
+    }
+
+    fn lists<'a>(pairs: &'a [(&'a str, Vec<usize>)]) -> Vec<(&'a str, &'a Vec<usize>)> {
+        pairs.iter().map(|(l, v)| (*l, v)).collect()
+    }
+
+    #[test]
+    fn a_story_claimed_by_two_freedoms_lands_in_the_first_only() {
+        let p = [("time", vec![0, 1]), ("wealth", vec![1, 2])];
+        let got = assign_freedom_indices(&lists(&p), titles(3), 10);
+        assert_eq!(got, vec![("time", 0), ("time", 1), ("wealth", 2)]);
+    }
+
+    #[test]
+    fn two_different_indices_sharing_a_title_count_as_one_story() {
+        // The dedup residual: same headline, different URL, so different indices.
+        let p = [("time", vec![0]), ("health", vec![7])];
+        let same = |_: usize| Some("identical headline".to_string());
+        let got = assign_freedom_indices(&lists(&p), same, 10);
+        assert_eq!(got, vec![("time", 0)]);
+    }
+
+    #[test]
+    fn a_repeated_index_within_one_list_is_taken_once() {
+        let p = [("time", vec![0, 0, 1])];
+        let got = assign_freedom_indices(&lists(&p), titles(2), 10);
+        assert_eq!(got, vec![("time", 0), ("time", 1)]);
+    }
+
+    #[test]
+    fn the_cap_counts_kept_stories_so_a_freedom_still_fills_up() {
+        // wealth's first two picks were claimed by time; with a cap of 2 it must
+        // still end up with two stories, not zero.
+        let p = [("time", vec![0, 1]), ("wealth", vec![0, 1, 2, 3, 4])];
+        let got = assign_freedom_indices(&lists(&p), titles(5), 2);
+        assert_eq!(got, vec![("time", 0), ("time", 1), ("wealth", 2), ("wealth", 3)]);
+    }
+
+    #[test]
+    fn an_index_with_no_story_behind_it_is_dropped_not_counted() {
+        // The curator can hallucinate an index past the end of the list.
+        let p = [("time", vec![99, 0])];
+        let got = assign_freedom_indices(&lists(&p), titles(1), 10);
+        assert_eq!(got, vec![("time", 0)]);
+    }
+
+    #[test]
+    fn distinct_stories_across_freedoms_are_all_kept() {
+        // The guard must not be so aggressive that it eats legitimate coverage.
+        let p = [
+            ("time", vec![0, 1]),
+            ("wealth", vec![2]),
+            ("location", vec![3]),
+            ("health", vec![4]),
+            ("whoop", vec![5]),
+        ];
+        let got = assign_freedom_indices(&lists(&p), titles(6), 10);
+        assert_eq!(got.len(), 6);
     }
 }
 
