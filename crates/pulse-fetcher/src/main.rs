@@ -641,6 +641,12 @@ async fn backfill_embeddings(
 /// fired every hour for twenty consecutive runs. The root cause in launchd is not known and
 /// does not need to be: the plist now uses the shape that demonstrably fires — hourly — and
 /// this gate decides which of those wakeups actually does anything.
+///
+/// The plist wakes at :30, so these are the 02:30 and 14:30 wakeups. Tradeoff worth knowing:
+/// a slot the machine sleeps through is SKIPPED, not deferred, because the gate only sees
+/// the hour it actually woke in. That is acceptable here — the daily fetch has fired every
+/// hour round the clock for 20+ runs, so this machine is awake at both slots — and the
+/// in-pipeline drain still runs on every briefing regardless.
 const BACKFILL_HOURS: [u32; 2] = [2, 14];
 
 /// Whether `hour` (0-23, local) is one of the backfill slots.

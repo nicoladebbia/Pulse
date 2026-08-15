@@ -27,8 +27,8 @@
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 
-    <!-- Wakes EVERY hour at :30. The hour selection (02:00 and 14:00) is enforced by the
-         binary, in BACKFILL_HOURS, NOT here — measured on this machine 2026-08-15, a
+    <!-- Wakes EVERY hour at :30; the binary does the work only at 02:30 and 14:30. The
+         hour selection lives in BACKFILL_HOURS, NOT here — measured on this machine 2026-08-15, a
          LaunchAgent naming an `Hour` in StartCalendarInterval never fires, while a
          Minute-only interval fires reliably (com.pulse.daily-fetch has done so 20 runs
          running). Four probes identical but for the calendar spec confirmed it, including a
