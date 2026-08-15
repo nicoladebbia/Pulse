@@ -62,20 +62,22 @@
 	}
 
 	function toggleSector(id: SectorId) {
-		activeSectors.update(current => {
-			const next = current.includes(id)
-				? current.filter(s => s !== id)
-				: [...current, id];
-			// Which sectors get filtered to is the cheapest available signal of what
-			// is actually worth reading. Recorded with the resulting count so a
-			// narrowing can be told apart from a widening.
-			trackSectorFilter($page.route.id, id, next.length);
-			return next;
-		});
+		const next = $activeSectors.includes(id)
+			? $activeSectors.filter(s => s !== id)
+			: [...$activeSectors, id];
+		activeSectors.set(next);
+		// Which sectors get filtered to is the cheapest available signal of what is
+		// actually worth reading. Recorded with the resulting count so a narrowing can
+		// be told apart from a widening — and after the store settles, so no IPC runs
+		// inside a store updater.
+		trackSectorFilter($page.route.id, id, next.length);
 	}
 
 	function selectAll() {
 		activeSectors.set([]);
+		// "Show me everything" is a filter action too. Without it the sector data would
+		// only ever record narrowing.
+		trackSectorFilter($page.route.id, null, 0);
 	}
 
 	function getSectorCount(sectorId: SectorId): number {

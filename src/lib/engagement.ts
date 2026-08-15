@@ -114,16 +114,21 @@ export function trackStoryClose(
 	});
 }
 
+/**
+ * `toggled` is null when every filter was cleared at once. That is a widening, not a
+ * toggle of one sector, and naming a fake sector for it would put a phantom row in
+ * the per-sector rollup that `get_engagement_summary` groups.
+ */
 export function trackSectorFilter(
 	routeId: string | null | undefined,
-	toggled: string,
+	toggled: string | null,
 	activeCount: number
 ): void {
 	track({
 		surface: surfaceFromRoute(routeId),
 		event: 'sector_filter',
 		sector: toggled,
-		detail: buildDetail({ active: activeCount })
+		detail: buildDetail({ active: activeCount, cleared: toggled === null })
 	});
 }
 

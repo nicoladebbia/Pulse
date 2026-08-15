@@ -482,6 +482,25 @@ mod engagement_tests {
         assert_eq!(italy.dwell_ms_total, 1_000);
     }
 
+    /// Clearing every filter at once is a sector event with no sector — the frontend
+    /// deliberately sends null rather than inventing an "all" pseudo-sector. The
+    /// rollup must drop it, otherwise the sector table grows a phantom row with zero
+    /// opens and zero dwell that reads as "a sector nobody looks at".
+    #[test]
+    fn a_sector_event_with_no_sector_stays_out_of_the_rollup() {
+        let conn = db();
+        let mut opened = ev("/", "story_open");
+        opened.sector = Some("ai".into());
+        insert_event(&conn, &opened).unwrap();
+        insert_event(&conn, &ev("/", "sector_filter")).unwrap();
+
+        let s = summarize(&conn, 30).unwrap();
+        assert_eq!(s.sectors.len(), 1);
+        assert_eq!(s.sectors[0].sector, "ai");
+        // It is still recorded — only excluded from the per-sector breakdown.
+        assert_eq!(s.total_events, 2);
+    }
+
     #[test]
     fn retention_prunes_only_what_is_past_the_window() {
         let conn = db();
