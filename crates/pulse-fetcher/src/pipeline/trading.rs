@@ -1,5 +1,75 @@
 use super::*;
 
+/// What Alpaca actually filled, as opposed to what we asked for.
+pub(crate) struct Fill {
+    /// `filled_avg_price`. Can be 0.0 if Alpaca reports the order filled but
+    /// omits the price — callers must supply their own estimate, never treat
+    /// 0.0 as free.
+    pub price: f64,
+    pub qty: f64,
+    /// `filled_at`, converted to local time.
+    pub at_local: String,
+}
+
+/// Poll an Alpaca order for up to five seconds and return its fill.
+///
+/// `None` means the order is live but not yet filled — the normal pre-market
+/// case, not an error. A caller that treats `None` as executed will invent a
+/// position, and one that treats it as failed will lose a real one; both the
+/// entry and exit paths depend on the distinction.
+///
+/// This existed in three near-identical copies (entry, scale-in, exit). They
+/// are one function now because a poll that drifts between the buy and sell
+/// sides silently desyncs the ledger from the broker.
+pub(crate) async fn poll_fill(
+    client: &reqwest::Client,
+    alpaca_key: &str,
+    alpaca_secret: &str,
+    order_id: &str,
+) -> Option<Fill> {
+    for _ in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let Ok(resp) = client
+            .get(format!("https://paper-api.alpaca.markets/v2/orders/{}", order_id))
+            .header("APCA-API-KEY-ID", alpaca_key)
+            .header("APCA-API-SECRET-KEY", alpaca_secret)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(order) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
+        if order.get("status").and_then(|v| v.as_str()) != Some("filled") {
+            continue;
+        }
+        let num = |k: &str| {
+            order
+                .get(k)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        let at_local = order
+            .get("filled_at")
+            .and_then(|v| v.as_str())
+            .and_then(|ft| chrono::DateTime::parse_from_rfc3339(ft).ok())
+            .map(|dt| {
+                dt.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string());
+        return Some(Fill {
+            price: num("filled_avg_price"),
+            qty: num("filled_qty"),
+            at_local,
+        });
+    }
+    None
+}
+
 /// Auto-execute paper trades when convergence signals are detected.
 /// Only trades entities with tickers, not already held, with convergence_detected = true.
 ///
@@ -249,42 +319,16 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             let order_id = order_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
             // Poll for fill — market orders fill within seconds
-            let mut filled_price = 0.0;
-            let mut filled_qty = 0.0;
-            let mut fill_time = entry_datetime.clone();
-            for attempt in 0..5 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if let Ok(check_resp) = client
-                    .get(format!("https://paper-api.alpaca.markets/v2/orders/{}", order_id))
-                    .header("APCA-API-KEY-ID", &alpaca_key)
-                    .header("APCA-API-SECRET-KEY", &alpaca_secret)
-                    .send().await
-                {
-                    if let Ok(check) = check_resp.json::<serde_json::Value>().await {
-                        let status = check.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        if status == "filled" {
-                            filled_price = check.get("filled_avg_price")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0.0);
-                            filled_qty = check.get("filled_qty")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0.0);
-                            if let Some(ft) = check.get("filled_at").and_then(|v| v.as_str()) {
-                                // Parse ISO 8601 to local datetime
-                                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ft) {
-                                    fill_time = dt.with_timezone(&chrono::Local).format("%Y-%m-%dT%H:%M:%S").to_string();
-                                }
-                            }
-                            break;
-                        }
-                        if attempt == 4 {
-                            tracing::warn!("Auto-trade: order {} not filled after 5s (status: {})", order_id, status);
-                        }
-                    }
-                }
+            let fill = poll_fill(&client, &alpaca_key, &alpaca_secret, &order_id).await;
+            if fill.is_none() {
+                tracing::warn!("Auto-trade: order {} not filled after 5s", order_id);
             }
+            let mut filled_price = fill.as_ref().map(|f| f.price).unwrap_or(0.0);
+            let filled_qty = fill.as_ref().map(|f| f.qty).unwrap_or(0.0);
+            let fill_time = fill
+                .as_ref()
+                .map(|f| f.at_local.clone())
+                .unwrap_or_else(|| entry_datetime.clone());
 
             if filled_price <= 0.0 {
                 // Order submitted but fill price unknown — use latest known price as estimate
@@ -744,43 +788,24 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         let order_id = order_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
         // Poll for fill (day orders may sit unfilled pre-market — that's fine).
-        let mut filled_price = 0.0;
-        let mut filled = false;
-        for attempt in 0..5 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if let Ok(check) = client
-                .get(format!("https://paper-api.alpaca.markets/v2/orders/{}", order_id))
-                .header("APCA-API-KEY-ID", &alpaca_key)
-                .header("APCA-API-SECRET-KEY", &alpaca_secret)
-                .send().await
-            {
-                if let Ok(j) = check.json::<serde_json::Value>().await {
-                    if j.get("status").and_then(|v| v.as_str()) == Some("filled") {
-                        filled_price = j.get("filled_avg_price")
-                            .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(current_price);
-                        filled = true;
-                        break;
-                    }
-                    if attempt == 4 {
-                        tracing::warn!(
-                            "Position mgmt: sell for {} not filled in 5s (likely pre-market) — \
-                             order {} placed, will reconcile next run", ticker, order_id
-                        );
-                    }
-                }
-            }
-        }
+        let fill = poll_fill(&client, &alpaca_key, &alpaca_secret, &order_id).await;
 
         crate::db::log_api_usage(&conn, "alpaca", "trading", "sell_order", 0, 0);
 
-        if !filled {
+        let Some(fill) = fill else {
             // Order is live but unfilled. Do NOT mark closed — next run sees it
             // gone from Alpaca (or filled) and reconciles. Avoids ghost-closing.
+            tracing::warn!(
+                "Position mgmt: sell for {} not filled in 5s (likely pre-market) — \
+                 order {} placed, will reconcile next run", ticker, order_id
+            );
             actions += 1;
             continue;
-        }
+        };
 
-        let exit_price = filled_price;
+        // Filled, but Alpaca occasionally omits the average price. Fall back to
+        // the mark we decided on rather than booking the exit at $0.
+        let exit_price = if fill.price > 0.0 { fill.price } else { current_price };
         if is_full {
             let pnl_pct_final = ((exit_price - entry_price) / entry_price) * 100.0;
             let pnl_dollars = (exit_price - entry_price) * held_qty;
