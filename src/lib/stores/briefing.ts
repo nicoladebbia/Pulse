@@ -41,3 +41,40 @@ export function getCompactFromList(stories: Story[], skip: number = 3, count: nu
 export function isFiling(s: Story): boolean {
 	return s.source_type === 'financial';
 }
+
+/**
+ * Resolve the story the expanded panel should render.
+ *
+ * Ask Pulse cites from the whole corpus and Trends spans months, so the cited id is
+ * usually NOT in today's briefing. Matching against today alone returned null, and the
+ * front page then rendered as though the citation had never been clicked. `loaded` is a
+ * story fetched by id; it only counts when it is the one currently wanted, so a response
+ * that arrives after the user has clicked a second citation cannot be shown under the
+ * wrong headline.
+ */
+export function resolveExpandedStory(
+	wantedId: number | null,
+	todayStories: Story[],
+	loaded: Story | null
+): Story | null {
+	if (wantedId === null) return null;
+	return (
+		todayStories.find(s => s.id === wantedId) ??
+		(loaded && loaded.id === wantedId ? loaded : null)
+	);
+}
+
+/**
+ * Whether the panel still needs to load the wanted story. False once it is in hand and
+ * false once it is known missing — otherwise a story that has been pruned from the DB
+ * would be re-requested on every re-render.
+ */
+export function needsStoryFetch(
+	wantedId: number | null,
+	todayStories: Story[],
+	loaded: Story | null,
+	knownMissingId: number | null
+): boolean {
+	if (wantedId === null || wantedId === knownMissingId) return false;
+	return resolveExpandedStory(wantedId, todayStories, loaded) === null;
+}

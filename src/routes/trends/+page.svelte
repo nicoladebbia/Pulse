@@ -103,8 +103,8 @@
 	];
 
 	function navigateToStory(storyId: number) {
-		// See ChatSources: the destination can render blank for a story outside
-		// today's briefing (open defect #17). Record the click regardless.
+		// Trends spans months, so most of these are outside today's briefing; the front
+		// page loads them by id. See +page.svelte.
 		trackCitationClick('/trends', storyId);
 		expandedStoryId.set(storyId);
 		goto('/');

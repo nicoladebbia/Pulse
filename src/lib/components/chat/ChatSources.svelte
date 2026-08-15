@@ -36,11 +36,8 @@
 	});
 
 	function navigateToStory(id: number) {
-		// Recorded before the navigation, because the destination may show nothing:
-		// +page.svelte resolves expandedStoryId against today's briefing only, so a
-		// citation to an older story lands on a blank page (open defect #17). The
-		// click still happened — read this count against #17's status, not as
-		// evidence that citations are unused.
+		// Recorded before the navigation. +page.svelte now loads any cited story by id,
+		// so a citation to an older story opens rather than landing on a blank page.
 		trackCitationClick('/ask', id);
 		expandedStoryId.set(id);
 		goto('/');

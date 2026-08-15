@@ -5,7 +5,9 @@ import {
 	byRankDesc,
 	isFiling,
 	getFeaturedFromList,
-	getCompactFromList
+	getCompactFromList,
+	resolveExpandedStory,
+	needsStoryFetch
 } from './briefing';
 
 /**
@@ -150,5 +152,65 @@ describe('featured and compact do not overlap', () => {
 		const originalOrder = stories.map((s) => s.id);
 		getFeaturedFromList(stories, 2);
 		expect(stories.map((s) => s.id)).toEqual(originalOrder);
+	});
+});
+
+/**
+ * The citation defect: Ask Pulse and Trends set expandedStoryId and route to the front
+ * page, which resolved the id against today's briefing only. Every citation to an older
+ * story was a silent no-op — no panel, no error, the page just re-rendered.
+ */
+describe('resolveExpandedStory', () => {
+	it('finds a story that is in today briefing', () => {
+		const s = story();
+		expect(resolveExpandedStory(s.id, [s], null)).toBe(s);
+	});
+
+	it('falls back to a story loaded by id when today has no such story', () => {
+		const today = story();
+		const cited = story({ created_at: '2026-05-02T08:00:00Z' });
+		expect(resolveExpandedStory(cited.id, [today], cited)).toBe(cited);
+	});
+
+	it('prefers today copy over a loaded one so the panel matches the grid', () => {
+		const today = story({ headline: 'from today' });
+		const stale = { ...today, headline: 'from an older fetch' };
+		expect(resolveExpandedStory(today.id, [today], stale)?.headline).toBe('from today');
+	});
+
+	it('ignores a loaded story whose id is no longer the one wanted', () => {
+		// Two citations clicked in a row: the first response must not render under the
+		// second headline.
+		const first = story();
+		const second = story();
+		expect(resolveExpandedStory(second.id, [], first)).toBeNull();
+	});
+
+	it('resolves to nothing when no story is wanted', () => {
+		expect(resolveExpandedStory(null, [story()], story())).toBeNull();
+	});
+});
+
+describe('needsStoryFetch', () => {
+	it('is true for a citation to a story outside today briefing', () => {
+		const today = story();
+		expect(needsStoryFetch(today.id + 999, [today], null, null)).toBe(true);
+	});
+
+	it('is false once the story is in hand', () => {
+		const cited = story();
+		expect(needsStoryFetch(cited.id, [], cited, null)).toBe(false);
+	});
+
+	it('is false for a story already known to be missing, so it is asked for once', () => {
+		expect(needsStoryFetch(4242, [], null, 4242)).toBe(false);
+	});
+
+	it('is true again for a different id after one was found missing', () => {
+		expect(needsStoryFetch(7, [], null, 4242)).toBe(true);
+	});
+
+	it('is false when nothing is expanded', () => {
+		expect(needsStoryFetch(null, [], null, null)).toBe(false);
 	});
 });
