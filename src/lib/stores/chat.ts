@@ -189,6 +189,10 @@ export async function sendMessage(message: string) {
 							estimated_cost: event.data.estimated_cost,
 							model_used: event.data.model_used,
 							search_source: event.data.search_source,
+							// Kept alongside `sources` (everything retrieved) so the panel can
+							// show what the answer actually cited. Persisted in the message's
+							// metadata column too, so it survives a thread reload.
+							cited_story_ids: event.data.cited_story_ids,
 						};
 					}
 					return updated;

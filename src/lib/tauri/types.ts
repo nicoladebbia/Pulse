@@ -127,7 +127,10 @@ export type ChatStreamEvent =
 			data: {
 				message: string;
 				message_id: string;
+				/** Everything retrieved, whether or not the answer used it. */
 				source_story_ids: number[];
+				/** Only what the answer actually cited, in citation order. */
+				cited_story_ids: number[];
 				suggested_followups: string[];
 				thread_topic: string;
 				thread_title: string | null;

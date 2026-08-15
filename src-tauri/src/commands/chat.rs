@@ -15,7 +15,11 @@ pub enum ChatStreamEvent {
     Complete {
         message: String,
         message_id: String,
+        /// Everything retrieved, whether or not the answer used it.
         source_story_ids: Vec<i64>,
+        /// Only what the answer actually cited, in citation order. The panel
+        /// shows these when present so "Sources" means sources.
+        cited_story_ids: Vec<i64>,
         suggested_followups: Vec<String>,
         thread_topic: String,
         thread_title: Option<String>,
@@ -987,9 +991,23 @@ pub async fn chat_send_stream(
         .filter(|id| *id > 0) // Filter out encoded freedom story IDs (negative)
         .collect::<std::collections::HashSet<_>>()
         .into_iter().collect();
+
+    // The stories the model actually pointed at, in the order it cited them —
+    // kept separate from the union above. The panel used to show that union, so
+    // an answer citing one story still displayed ten "Sources", which is the
+    // opposite of verifiable. Carried in metadata rather than a new column so
+    // historical messages keep working and no migration is needed.
+    let cited_story_ids: Vec<i64> = {
+        let mut seen = std::collections::HashSet::new();
+        source_ids.iter().copied()
+            .filter(|id| *id > 0 && seen.insert(*id))
+            .collect()
+    };
+    let metadata = serde_json::json!({ "cited_story_ids": cited_story_ids });
+
     let assistant_msg_id = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        conversation::store_message(&conn, &thread.id, "assistant", &clean_message, Some(&all_source_ids), None)
+        conversation::store_message(&conn, &thread.id, "assistant", &clean_message, Some(&all_source_ids), Some(&metadata))
             .map_err(|e| e.to_string())?
     };
 
@@ -1045,6 +1063,7 @@ pub async fn chat_send_stream(
         message: clean_message,
         message_id: assistant_msg_id,
         source_story_ids: all_source_ids,
+        cited_story_ids,
         suggested_followups: followups,
         thread_topic: topic.to_string(),
         thread_title,
