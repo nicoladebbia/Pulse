@@ -78,6 +78,45 @@ pub(crate) async fn poll_fill(
 /// set in the environment. Pulse is a news/intelligence app first — the trading
 /// layer is dormant scaffolding that should not place real orders until a
 /// 6-month auto-backtest history demonstrates a durable edge.
+/// Alpaca's current market value for an open position in `ticker`, or 0.0.
+///
+/// Market value, not cost basis: the concentration cap is about how much of the
+/// portfolio a name occupies *now*. `paper_trades.position_size` would look
+/// cheaper than the truth on exactly the positions the scale-in path targets,
+/// since it only scales into winners.
+///
+/// A 404 means no position, which is genuinely 0.0. Any other failure also reads
+/// as 0.0, which is the unsafe direction — it lets a trade through that hidden
+/// exposure should have trimmed. That was the pre-existing behaviour on the
+/// entry path and is left as-is here rather than changed silently alongside a
+/// sizing fix; the notional's own cap still bounds the order.
+async fn current_exposure(
+    client: &reqwest::Client,
+    alpaca_key: &str,
+    alpaca_secret: &str,
+    ticker: &str,
+) -> f64 {
+    match client
+        .get(format!("https://paper-api.alpaca.markets/v2/positions/{ticker}"))
+        .header("APCA-API-KEY-ID", alpaca_key)
+        .header("APCA-API-SECRET-KEY", alpaca_secret)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| {
+                v.get("market_value")
+                    .and_then(|m| m.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+            })
+            .unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
 pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     // Hard kill switch. Default = OFF. Re-enable via `AUTO_TRADE_ENABLED=true`
     // in `.env` once the auto-backtest has shown a positive expectancy across
@@ -191,14 +230,15 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     // Hard cap on per-ticker exposure. Without this, a bug or repeated signals
     // can stack the same name into 20%+ of the portfolio (META did exactly this
     // — 5x duplicate fills put 23% of equity into a single position before any
-    // human review). 5% is restrictive enough to *bite* against the existing
-    // $10k ENTRY_CAP at $100k portfolio sizes.
-    const MAX_PER_TICKER_PCT: f64 = 0.05;
-    let max_per_ticker_dollars = if portfolio_value > 0.0 {
-        portfolio_value * MAX_PER_TICKER_PCT
-    } else {
-        f64::INFINITY // No portfolio value reported — fall back to ENTRY_CAP only.
-    };
+    // human review).
+    //
+    // The percentage now lives in `position_sizing` beside the tiers it has to
+    // agree with, and is derived from the top tier rather than written out
+    // again. It was a local const here at 0.05 while the tiers were doubled to
+    // 2/5/10% in another file, so from 2026-07-23 every top-conviction entry was
+    // rejected by this check — see MAX_PER_TICKER_PCT's own doc comment.
+    use crate::position_sizing::MAX_PER_TICKER_PCT;
+    let max_per_ticker_dollars = crate::position_sizing::ticker_headroom(portfolio_value, 0.0);
 
     let now = chrono::Local::now();
     let entry_datetime = now.format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -227,7 +267,11 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             continue;
         }
 
-        let notional = match crate::position_sizing::entry_notional(buying_power, *score) {
+        let notional = match crate::position_sizing::entry_notional(
+            portfolio_value,
+            buying_power,
+            *score,
+        ) {
             Some(n) => n,
             None => {
                 tracing::info!("Auto-trade: skipping {} — buying power below entry floor", ticker);
@@ -235,37 +279,39 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             }
         };
 
-        // Concentration check: ask Alpaca for the current market value of any
-        // existing position in this ticker. If proposed notional + existing
-        // exposure would exceed MAX_PER_TICKER_PCT of portfolio_value, skip.
-        let existing_exposure: f64 = match client
-            .get(format!("https://paper-api.alpaca.markets/v2/positions/{}", ticker))
-            .header("APCA-API-KEY-ID", &alpaca_key)
-            .header("APCA-API-SECRET-KEY", &alpaca_secret)
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => {
-                r.json::<serde_json::Value>().await.ok()
-                    .and_then(|v| v.get("market_value")
-                        .and_then(|m| m.as_str())
-                        .and_then(|s| s.parse::<f64>().ok()))
-                    .unwrap_or(0.0)
-            }
-            // 404 = no existing position, treat as 0 exposure. Other errors:
-            // be conservative and treat as 0 (the trade still gets capped by
-            // notional itself, just won't account for hidden exposure).
-            _ => 0.0,
-        };
+        let existing_exposure =
+            current_exposure(&client, &alpaca_key, &alpaca_secret, ticker).await;
 
-        if existing_exposure + notional > max_per_ticker_dollars {
-            tracing::warn!(
-                "Auto-trade: blocking {} ({}) — would push exposure to ${:.0} (existing ${:.0} + ${:.0}), cap is ${:.0} ({:.0}% of ${:.0} portfolio)",
-                name, ticker, existing_exposure + notional, existing_exposure, notional,
-                max_per_ticker_dollars, MAX_PER_TICKER_PCT * 100.0, portfolio_value
-            );
-            continue;
-        }
+        // Trim to the room left rather than dropping the order. A name holding
+        // 9% of the portfolio has 1% of room, and throwing away the whole signal
+        // because it did not fit whole was never the intent — the cap bounds
+        // exposure, it does not veto participation. Only a remainder below the
+        // entry floor is skipped, because an order that small is not worth the
+        // round trip.
+        let notional = match crate::position_sizing::clamp_to_ticker_cap(
+            portfolio_value,
+            existing_exposure,
+            notional,
+        ) {
+            Some(trimmed) => {
+                if trimmed < notional {
+                    tracing::info!(
+                        "Auto-trade: trimming {} ({}) from ${:.0} to ${:.0} — existing ${:.0} against a ${:.0} cap ({:.0}% of ${:.0} portfolio)",
+                        name, ticker, notional, trimmed, existing_exposure,
+                        max_per_ticker_dollars, MAX_PER_TICKER_PCT * 100.0, portfolio_value
+                    );
+                }
+                trimmed
+            }
+            None => {
+                tracing::warn!(
+                    "Auto-trade: blocking {} ({}) — existing exposure ${:.0} leaves no room worth taking under the ${:.0} cap ({:.0}% of ${:.0} portfolio)",
+                    name, ticker, existing_exposure,
+                    max_per_ticker_dollars, MAX_PER_TICKER_PCT * 100.0, portfolio_value
+                );
+                continue;
+            }
+        };
 
         tracing::info!("Auto-trade: {} ({}) — score {:.2}, notional ${:.2}", name, ticker, score, notional);
 
@@ -475,6 +521,38 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             Some(n) => n,
             None => {
                 tracing::info!("Scale-in: skipping {} — buying power below floor", ticker);
+                continue;
+            }
+        };
+
+        // The concentration cap applied to entries and not to scale-ins, because
+        // it was a const local to the entry loop. That left the accumulation hole
+        // the cap exists to close: a name already at the ceiling could still take
+        // 1% of *buying power* on top, which on a margin account is a bigger
+        // number than the cap being bypassed. Only one scale-in per trade is
+        // allowed, so the overshoot was bounded — it was not prevented.
+        let scale_exposure =
+            current_exposure(&client, &alpaca_key, &alpaca_secret, ticker).await;
+        let scale_notional = match crate::position_sizing::clamp_to_ticker_cap(
+            portfolio_value,
+            scale_exposure,
+            scale_notional,
+        ) {
+            Some(trimmed) => {
+                if trimmed < scale_notional {
+                    tracing::info!(
+                        "Scale-in: trimming {} from ${:.0} to ${:.0} — already holding ${:.0} of a ${:.0} cap",
+                        ticker, scale_notional, trimmed, scale_exposure, max_per_ticker_dollars
+                    );
+                }
+                trimmed
+            }
+            None => {
+                tracing::info!(
+                    "Scale-in: skipping {} — already holding ${:.0} against a ${:.0} cap ({:.0}% of ${:.0} portfolio)",
+                    ticker, scale_exposure, max_per_ticker_dollars,
+                    MAX_PER_TICKER_PCT * 100.0, portfolio_value
+                );
                 continue;
             }
         };

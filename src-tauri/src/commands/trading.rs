@@ -540,7 +540,12 @@ pub struct TradeSizing {
     pub entry_floor: f64,
     pub entry_cap: f64,
     pub clamped: bool,
-    pub implied_buying_power: Option<f64>,
+    /// The account figure the tier percentage was applied to, back-derived from
+    /// the notional. Deliberately not named for a specific figure: entries up to
+    /// 2026-08-17 were sized off buying power, later ones off portfolio value
+    /// (see `position_sizing::entry_notional`), and a row does not record which.
+    /// All 11 trades in the live DB predate the change.
+    pub implied_sizing_base: Option<f64>,
     pub scale_in_count: i64,
 }
 
@@ -671,6 +676,10 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
 
     // Sizing derivation — mirrors position_sizing::entry_notional tiers.
     // Long-term design (2026-07-23): doubled from 1%/2%/5%, cap $10K -> $20K.
+    // The tier thresholds must stay identical to position_sizing::tier_pct: this
+    // copy only EXPLAINS a size on the Portfolio screen while the fetcher's copy
+    // decides it, so a drift here shows the user a rationale for a number the
+    // engine did not produce.
     let score = original_compound_score.unwrap_or(trade.confidence);
     let tier_pct = if score > 0.6 { 0.10 } else if score > 0.4 { 0.05 } else { 0.02 };
     let scale_ins = scale_in_count.unwrap_or(0);
@@ -678,7 +687,7 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         || (trade.position_size - 20_000.0).abs() < 0.01;
     // Scale-ins add to position_size, so back-deriving buying power from the
     // final notional is only valid for never-scaled, unclamped entries.
-    let implied_buying_power = if !clamped && scale_ins == 0 && tier_pct > 0.0 {
+    let implied_sizing_base = if !clamped && scale_ins == 0 && tier_pct > 0.0 {
         Some(trade.position_size / tier_pct)
     } else {
         None
@@ -690,7 +699,7 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         entry_floor: 50.0,
         entry_cap: 20_000.0,
         clamped,
-        implied_buying_power,
+        implied_sizing_base,
         scale_in_count: scale_ins,
     };
 

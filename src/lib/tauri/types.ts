@@ -531,7 +531,7 @@ export interface TradeSizing {
 	entry_floor: number;
 	entry_cap: number;
 	clamped: boolean;
-	implied_buying_power: number | null;
+	implied_sizing_base: number | null;
 	scale_in_count: number;
 }
 
