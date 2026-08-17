@@ -272,6 +272,12 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = pipeline::run_freedoms(&db_path).await {
                 tracing::warn!("Freedoms pipeline failed (non-fatal): {}", e);
             }
+
+            // Last thing on a SUCCESSFUL run: a run can finish clean and still
+            // have computed every score without one of its inputs. Checked here
+            // rather than in the failure path precisely because the failure path
+            // is not where this hides.
+            notify_stale_signal_sources(&db_path);
         }
         "freedoms" => {
             tracing::info!("Running Four Freedoms pipeline...");
@@ -465,6 +471,105 @@ fn notify_if_stale(db_path: &std::path::Path) {
         "No briefing for {}h — fetch slots keep getting skipped (Groq 403-blocked from this network). Check VPN/network.",
         age_hours
     ));
+}
+
+/// The sources that feed a weighted signal dimension, the weight they carry in
+/// the compound score, and how long each may go quiet before that is an outage.
+///
+/// `notify_if_stale` above only asks whether a briefing was produced. A single
+/// source can therefore die while briefings keep appearing every morning, and
+/// the dimension it feeds silently reads 0.0 for every entity. Both halves of
+/// that were live when this was written (measured 2026-08-17):
+///
+///   Senate LDA    — 403 Forbidden on EVERY run since 2026-08-03, 14 days,
+///                   logged only as `SOURCE HEALTH: ... LDA` at warn level.
+///                   political_signal is tied for the LARGEST weight at 0.2391.
+///   Google Patents— no stored story since 2026-06-01, 77 days, while the
+///                   endpoint itself answers and the fetch logs successes.
+///
+/// Thresholds come from each source's measured AVERAGE gap between story-days
+/// over its history, times ~3.5, floored at 7 — deliberately not its WORST
+/// observed gap, because the worst gap is usually a previous undetected outage
+/// and using it would bake the bug into the baseline. LDA's worst gap was 13
+/// days against an average of 1, which is exactly that trap: a 20-day threshold
+/// would still be silent about today's two-week hole.
+///
+/// FRED is absent on purpose — it feeds supply_chain, which is zero-weighted.
+const SIGNAL_SOURCES: &[(&str, &str, f64, i64)] = &[
+    // (source_name in `stories`, dimension it feeds, weight, max quiet days)
+    ("SEC EDGAR 4", "insider_signal", 0.2391, 7),
+    ("Senate LDA", "political_signal", 0.2391, 7),
+    ("USASpending", "government_signal", 0.1848, 7),
+    ("Federal Register", "government_signal", 0.1848, 7),
+    ("Wikipedia Pageviews", "search_trend", 0.0543, 14),
+    ("Google Patents", "patent_signal", 0.0435, 21),
+];
+
+/// A source that has stopped producing stories takes its signal dimension to
+/// zero without failing the run. Report it, once per calendar day.
+///
+/// Deliberately a STATE check over `stories` rather than an event check on the
+/// fetch result: it catches a source that errors (LDA) and a source whose fetch
+/// reports success while nothing lands (Patents) with one rule, and a single
+/// transient 403 on one of the four daily slots cannot trip it.
+///
+/// Best-effort throughout — a broken DB read must never turn a good run into a
+/// crash on the way out.
+fn notify_stale_signal_sources(db_path: &std::path::Path) {
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return;
+    };
+
+    let dead = stale_signal_sources(&conn);
+    if dead.is_empty() {
+        return;
+    }
+
+    let stamp = db_path.with_file_name("stale-source-alert-date.txt");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    if std::fs::read_to_string(&stamp).map(|s| s.trim() == today).unwrap_or(false) {
+        return;
+    }
+    let _ = std::fs::write(&stamp, &today);
+
+    let summary = dead.join("; ");
+    tracing::warn!("SIGNAL SOURCE STALE: {}", summary);
+    notify_failure(&format!(
+        "Signal sources have gone quiet — scores are being computed without them: {summary}"
+    ));
+}
+
+/// The decision half, split out so it can be tested without shelling out to
+/// `osascript`. Returns one human-readable line per stale source, empty when all
+/// of them are current.
+fn stale_signal_sources(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut dead: Vec<String> = Vec::new();
+    for (source, dimension, weight, max_quiet_days) in SIGNAL_SOURCES {
+        let days: Option<i64> = conn
+            .query_row(
+                "SELECT CAST(julianday('now') - julianday(MAX(date(created_at))) AS INTEGER)
+                 FROM stories WHERE source_name = ?1",
+                [source],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        // No rows at all is not reported here: a source that has never produced
+        // anything is a setup problem, not a regression, and would alarm every
+        // day forever without telling the user anything new.
+        let Some(days) = days else { continue };
+        if days > *max_quiet_days {
+            dead.push(format!(
+                "{source} ({dimension}, {:.0}% of the score) — {days}d quiet",
+                weight * 100.0
+            ));
+        }
+    }
+
+    dead
 }
 
 /// Repair the embedding gap left by dropped batches during the daily run.
@@ -959,6 +1064,111 @@ mod hour_gate_tests {
         for h in BACKFILL_HOURS {
             assert!(h < 24, "slot {h} is not a reachable hour — gate could never open");
             assert!(is_backfill_hour(h), "slot {h} must be accepted by its own gate");
+        }
+    }
+}
+
+#[cfg(test)]
+mod stale_source_tests {
+    use super::*;
+
+    /// `stories` with just the two columns this check reads.
+    fn db(rows: &[(&str, i64)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE stories (id INTEGER PRIMARY KEY, source_name TEXT, created_at TEXT);",
+        )
+        .unwrap();
+        for (source, days_ago) in rows {
+            conn.execute(
+                "INSERT INTO stories (source_name, created_at)
+                 VALUES (?1, datetime('now', ?2))",
+                rusqlite::params![source, format!("-{days_ago} days")],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn every_current_source_is_silent() {
+        let rows: Vec<(&str, i64)> = SIGNAL_SOURCES.iter().map(|(s, _, _, _)| (*s, 0)).collect();
+        assert!(stale_signal_sources(&db(&rows)).is_empty());
+    }
+
+    #[test]
+    fn the_live_lda_outage_is_reported() {
+        // The state on 2026-08-17: LDA last produced a story on 2026-08-03 while
+        // every other source was within three days. Fourteen days of silence in
+        // the joint-largest-weighted dimension, and nothing said so.
+        let mut rows: Vec<(&str, i64)> =
+            SIGNAL_SOURCES.iter().map(|(s, _, _, _)| (*s, 2)).collect();
+        for r in rows.iter_mut() {
+            if r.0 == "Senate LDA" {
+                r.1 = 14;
+            }
+        }
+        let dead = stale_signal_sources(&db(&rows));
+        assert_eq!(dead.len(), 1, "expected only LDA, got {dead:?}");
+        assert!(dead[0].contains("Senate LDA"), "{}", dead[0]);
+        assert!(
+            dead[0].contains("political_signal") && dead[0].contains("24%"),
+            "the alert must name the dimension and what it is worth: {}",
+            dead[0]
+        );
+    }
+
+    #[test]
+    fn a_source_inside_its_own_threshold_is_not_reported() {
+        // Patents legitimately goes quiet for weeks — it rotates companies and
+        // re-sees patents it already stored. 20 days is inside its 21-day budget
+        // while the same gap would be an outage for a daily source.
+        let dead = stale_signal_sources(&db(&[("Google Patents", 20), ("SEC EDGAR 4", 20)]));
+        assert_eq!(dead.len(), 1, "{dead:?}");
+        assert!(dead[0].contains("SEC EDGAR 4"), "{}", dead[0]);
+    }
+
+    #[test]
+    fn a_source_that_never_produced_anything_is_not_alarmed_about() {
+        // An empty table means "not set up", which would otherwise fire every
+        // single day forever and train the user to ignore the notification.
+        assert!(stale_signal_sources(&db(&[])).is_empty());
+    }
+
+    #[test]
+    fn several_dead_sources_are_all_named() {
+        let dead = stale_signal_sources(&db(&[
+            ("Senate LDA", 14),
+            ("Google Patents", 77),
+            ("SEC EDGAR 4", 1),
+        ]));
+        assert_eq!(dead.len(), 2, "{dead:?}");
+        assert!(dead.iter().any(|d| d.contains("Senate LDA")));
+        assert!(dead.iter().any(|d| d.contains("Google Patents")));
+    }
+
+    #[test]
+    fn every_weighted_dimension_has_a_source_watching_it() {
+        // The point of the table is coverage. If a dimension carries weight and
+        // no row here watches its source, this check cannot see it die.
+        for dim in [
+            "insider_signal",
+            "news_momentum",
+            "government_signal",
+            "search_trend",
+            "patent_signal",
+            "political_signal",
+        ] {
+            let watched = SIGNAL_SOURCES.iter().any(|(_, d, _, _)| *d == dim);
+            if dim == "news_momentum" {
+                // news_momentum is computed over Pulse's own story windows rather
+                // than one named source, so a single source_name cannot stand for
+                // it. Its death shows up as the whole run producing no stories,
+                // which notify_if_stale already covers.
+                assert!(!watched, "news_momentum should not be watched by source name");
+            } else {
+                assert!(watched, "{dim} carries weight but no source is watched for it");
+            }
         }
     }
 }

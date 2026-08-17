@@ -191,8 +191,25 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
         for ticker in &needs_backfill {
             match backfill_candles(&client, &api_key, &conn, ticker, 35).await {
                 Ok(n) if n > 0 => backfilled += 1,
-                Ok(_) => {}
-                Err(e) => tracing::debug!("Candle backfill failed for {}: {}", ticker, e),
+                // A zero here is not nothing: it means the ticker was selected,
+                // asked for, and came back empty. Measured 2026-08-17 — the
+                // twelve freshly-quoted signalled tickers went through this loop
+                // (their change_7d/change_30d were recomputed, which only
+                // happens for names in this list) and ended the run with one
+                // bar each, while `--mode backfill-prices` stored 28 apiece for
+                // NVDA/META/AAPL seconds later off the same binary and keys. So
+                // the provider had the data and this path did not keep it.
+                //
+                // Both arms were silent before — Ok(0) said nothing at all and
+                // the error went to debug, which the launchd runs do not
+                // capture. That silence is why a ticker could be priced and
+                // still have no ATR for weeks without a trace. The cause is NOT
+                // established; this is the instrument that will name it on the
+                // next run rather than a guess about what it will say.
+                Ok(_) => tracing::warn!(
+                    "Candle backfill returned no candles for {ticker} — priced today but no ATR history"
+                ),
+                Err(e) => tracing::warn!("Candle backfill FAILED for {ticker}: {e}"),
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
