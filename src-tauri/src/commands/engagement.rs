@@ -193,7 +193,7 @@ pub fn summarize(conn: &rusqlite::Connection, days: u32) -> rusqlite::Result<Eng
         "SELECT surface,
                 COUNT(*),
                 SUM(CASE WHEN event = 'surface_view' THEN 1 ELSE 0 END),
-                COUNT(DISTINCT date(occurred_at)),
+                COUNT(DISTINCT date(occurred_at, 'localtime')),
                 MAX(occurred_at)
          FROM engagement_events
          WHERE occurred_at >= datetime('now', ?1)
@@ -457,6 +457,50 @@ mod engagement_tests {
         assert_eq!(s.total_events, 1);
         assert_eq!(s.surfaces.len(), 1);
         assert_eq!(s.surfaces[0].surface, "/archive");
+    }
+
+    #[test]
+    fn days_active_counts_human_days_not_utc_days() {
+        // occurred_at is stored UTC (the column DEFAULT is datetime('now')), and
+        // every window filter compares UTC to UTC, which is self-consistent. The
+        // one place the storage clock leaks is this bucket: "days active" is a
+        // claim about days a person used the app. Two events two hours apart, in
+        // the same evening for the user, straddle UTC midnight anywhere east of
+        // Greenwich and would report two days of use for one sitting.
+        //
+        // Expected is derived from the machine's own offset so this asserts
+        // "buckets by local day" rather than "buckets by CEST". On a UTC box the
+        // two instants genuinely are two local days and the expectation follows.
+        let conn = db();
+        let instants = ["2026-08-16 23:00:00", "2026-08-17 01:00:00"];
+        for ts in instants {
+            insert_event(&conn, &ev("/", "surface_view")).unwrap();
+            conn.execute(
+                "UPDATE engagement_events SET occurred_at = ?1 WHERE id = ?2",
+                rusqlite::params![ts, conn.last_insert_rowid()],
+            )
+            .unwrap();
+        }
+
+        let expected = instants
+            .iter()
+            .map(|ts| {
+                let utc = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                    .unwrap()
+                    .and_utc();
+                utc.with_timezone(&chrono::Local).date_naive()
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64;
+
+        // A 30-day window anchored on `now` cannot contain a fixed 2026 date
+        // forever, so ask for a window wide enough to keep this test honest.
+        let s = summarize(&conn, 36_500).unwrap();
+        assert_eq!(s.surfaces.len(), 1);
+        assert_eq!(
+            s.surfaces[0].days_active, expected,
+            "days_active must bucket by the user's calendar day"
+        );
     }
 
     #[test]
