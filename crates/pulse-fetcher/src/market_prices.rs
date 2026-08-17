@@ -23,6 +23,63 @@ struct FinnhubQuote {
 /// Finnhub quotes we fetch per day. ~4,100 public tickers compete for these.
 pub const DAILY_PRICE_SLOTS: usize = 200;
 
+/// Write one candle, filling gaps in a row that already exists.
+///
+/// This replaces the `INSERT OR IGNORE` that every candle path used to issue.
+/// `OR IGNORE` was aimed at the right thing — a quote row for today is more
+/// authoritative than a settled candle, so `close` must not be overwritten —
+/// but it threw away the whole row rather than just the close, and rows with a
+/// close and no range do exist. ATR needs the range, so every backfill aimed at
+/// repairing one was silently discarded.
+///
+/// Measured 2026-08-17: 330 rows across 31 tickers in the trailing 45 days hold
+/// a close with NULL high/low — the window `ATR_MAX_STALENESS_DAYS` reads. They
+/// were written by the app's own `refresh_prices`
+/// (`src-tauri/src/commands/cross_signals.rs`), which deserialised only `c`/`pc`
+/// from the Finnhub quote and stored it with `INSERT OR REPLACE`, nulling the
+/// range on every date it touched. That writer made the holes and this one could
+/// not fill them; both halves are fixed, and this half also guards against any
+/// future writer that leaves a column empty.
+///
+/// The `WHERE` clause on the conflict branch is what makes the return value
+/// mean something: an already-complete row updates nothing and reports 0, a
+/// fresh insert or a filled hole reports 1. Callers sum this, so their counter
+/// now counts rows actually written rather than rows attempted.
+///
+/// It has to test the incoming value too, not just the stored one. `volume` is
+/// NULL in all 19,517 live rows and no caller supplies it, so a bare
+/// `volume IS NULL` made the guard true for every conflict, the update ran on
+/// every row, and `changes()` reported 1 — reintroducing the attempt-counting
+/// this function exists to remove. A column is only worth updating when the row
+/// lacks it *and* the caller has it.
+#[allow(clippy::too_many_arguments)] // one parameter per column; a struct here would only rename them
+fn upsert_candle(
+    conn: &Connection,
+    entity_id: Option<i64>,
+    ticker: &str,
+    date: &str,
+    open: Option<f64>,
+    close: f64,
+    high: Option<f64>,
+    low: Option<f64>,
+    volume: Option<i64>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO entity_prices (entity_id, ticker, date, open, close, high, low, volume)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(ticker, date) DO UPDATE SET
+             open   = COALESCE(open, excluded.open),
+             high   = COALESCE(high, excluded.high),
+             low    = COALESCE(low, excluded.low),
+             volume = COALESCE(volume, excluded.volume)
+         WHERE (open   IS NULL AND excluded.open   IS NOT NULL)
+            OR (high   IS NULL AND excluded.high   IS NOT NULL)
+            OR (low    IS NULL AND excluded.low    IS NOT NULL)
+            OR (volume IS NULL AND excluded.volume IS NOT NULL)",
+        rusqlite::params![entity_id, ticker, date, open, close, high, low, volume],
+    )
+}
+
 /// Choose which tickers get one of the day's limited price slots.
 ///
 /// Two groups are pinned to the front, because for them a missing candle is not
@@ -191,23 +248,24 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
         for ticker in &needs_backfill {
             match backfill_candles(&client, &api_key, &conn, ticker, 35).await {
                 Ok(n) if n > 0 => backfilled += 1,
-                // A zero here is not nothing: it means the ticker was selected,
-                // asked for, and came back empty. Measured 2026-08-17 — the
-                // twelve freshly-quoted signalled tickers went through this loop
-                // (their change_7d/change_30d were recomputed, which only
-                // happens for names in this list) and ended the run with one
-                // bar each, while `--mode backfill-prices` stored 28 apiece for
-                // NVDA/META/AAPL seconds later off the same binary and keys. So
-                // the provider had the data and this path did not keep it.
+                // `n` counts rows actually written, not bars received — see
+                // `upsert_candle`. That distinction is the whole point: this
+                // counter used to increment once per bar the API returned, so a
+                // run whose every write was discarded still reported success.
                 //
-                // Both arms were silent before — Ok(0) said nothing at all and
-                // the error went to debug, which the launchd runs do not
-                // capture. That silence is why a ticker could be priced and
-                // still have no ATR for weeks without a trace. The cause is NOT
-                // established; this is the instrument that will name it on the
-                // next run rather than a guess about what it will say.
+                // Measured 2026-08-17 — twelve freshly-quoted signalled tickers
+                // went through this loop (their change_7d/change_30d were
+                // recomputed, which only happens for names in this list) and
+                // ended the run with one usable bar each, while
+                // `--mode backfill-prices` stored 28 apiece for NVDA/META/AAPL
+                // seconds later off the same binary and keys. The mechanism
+                // found for that is the `INSERT OR IGNORE` those writes used:
+                // a ticker with a quote-only row on every date in the window
+                // has every candle silently dropped and keeps zero range. That
+                // is fixed at the write, and this arm now reports the residue
+                // instead of a guess about it.
                 Ok(_) => tracing::warn!(
-                    "Candle backfill returned no candles for {ticker} — priced today but no ATR history"
+                    "Candle backfill wrote no rows for {ticker} — priced today but ATR history unchanged"
                 ),
                 Err(e) => tracing::warn!("Candle backfill FAILED for {ticker}: {e}"),
             }
@@ -315,8 +373,8 @@ async fn backfill_candles(
     backfill_candles_finnhub(client, api_key, conn, ticker, days_back).await
 }
 
-/// Alpaca daily bars → entity_prices rows. INSERT OR IGNORE keeps existing
-/// quote-sourced rows (e.g. today's) authoritative.
+/// Alpaca daily bars → entity_prices rows via `upsert_candle`, which keeps an
+/// existing row's `close` authoritative while still filling its missing range.
 async fn backfill_candles_alpaca(
     client: &reqwest::Client,
     alpaca_key: &str,
@@ -373,12 +431,7 @@ async fn backfill_candles_alpaca(
         let high = bar.get("h").and_then(|v| v.as_f64());
         let low = bar.get("l").and_then(|v| v.as_f64());
 
-        conn.execute(
-            "INSERT OR IGNORE INTO entity_prices (entity_id, ticker, date, open, close, high, low)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![entity_id, ticker, date, open, close, high, low],
-        )?;
-        stored += 1;
+        stored += upsert_candle(conn, entity_id, ticker, &date, open, close, high, low, None)?;
     }
 
     crate::db::log_api_usage(conn, "alpaca", "bars", "backfill_candles", 0, 0);
@@ -627,12 +680,7 @@ async fn backfill_candles_finnhub(
         let high = highs.get(i).and_then(|v| v.as_f64());
         let low = lows.get(i).and_then(|v| v.as_f64());
 
-        conn.execute(
-            "INSERT OR IGNORE INTO entity_prices (entity_id, ticker, date, open, close, high, low)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![entity_id, ticker, date, open, close, high, low],
-        )?;
-        stored += 1;
+        stored += upsert_candle(conn, entity_id, ticker, &date, open, close, high, low, None)?;
     }
 
     Ok(stored)
@@ -711,13 +759,7 @@ pub async fn fetch_historical(
         let low = lows.get(i).and_then(|v| v.as_f64());
         let volume = volumes.get(i).and_then(|v| v.as_i64());
 
-        conn.execute(
-            "INSERT OR IGNORE INTO entity_prices
-             (entity_id, ticker, date, open, close, high, low, volume)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![entity_id, ticker, date, open, close, high, low, volume],
-        )?;
-        stored += 1;
+        stored += upsert_candle(&conn, entity_id, ticker, &date, open, close, high, low, volume)?;
     }
 
     crate::db::log_api_usage(&conn, "finnhub", "candle", "fetch_historical", 0, 0);
@@ -876,5 +918,170 @@ mod slot_priority_tests {
         )
         .unwrap();
         assert!(!picked(&conn, 10).contains(&"DONE".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod candle_write_tests {
+    use super::*;
+
+    /// The real constraint set, because the bug being guarded here IS the
+    /// conflict behaviour. A test table without `UNIQUE(ticker, date)` would
+    /// never take the conflict branch and would pass against the old
+    /// `INSERT OR IGNORE` too.
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entity_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id INTEGER, ticker TEXT NOT NULL, date TEXT NOT NULL,
+                open REAL, close REAL NOT NULL, high REAL, low REAL, volume INTEGER,
+                change_1d REAL, change_7d REAL, change_30d REAL,
+                UNIQUE(ticker, date));",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// A quote row: Finnhub gave a price but no range, so the row has a close
+    /// and nothing ATR can use. 330 such rows existed live on 2026-08-17.
+    fn quote_only(conn: &Connection, ticker: &str, date: &str, close: f64) {
+        conn.execute(
+            "INSERT INTO entity_prices (ticker, date, close) VALUES (?1, ?2, ?3)",
+            rusqlite::params![ticker, date, close],
+        )
+        .unwrap();
+    }
+
+    fn row(conn: &Connection, ticker: &str, date: &str) -> (Option<f64>, f64, Option<f64>, Option<f64>) {
+        conn.query_row(
+            "SELECT open, close, high, low FROM entity_prices WHERE ticker = ?1 AND date = ?2",
+            rusqlite::params![ticker, date],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_candle_fills_the_range_a_quote_row_is_missing() {
+        let conn = db();
+        quote_only(&conn, "NVDA", "2026-08-01", 100.0);
+
+        let wrote =
+            upsert_candle(&conn, Some(7), "NVDA", "2026-08-01", Some(99.0), 101.0, Some(105.0), Some(98.0), None)
+                .unwrap();
+
+        let (open, _, high, low) = row(&conn, "NVDA", "2026-08-01");
+        assert_eq!(high, Some(105.0), "the candle's high must land in the empty column");
+        assert_eq!(low, Some(98.0));
+        assert_eq!(open, Some(99.0));
+        assert_eq!(wrote, 1, "filling a hole is a write and must be counted as one");
+    }
+
+    #[test]
+    fn the_quote_close_stays_authoritative() {
+        // This is what INSERT OR IGNORE was protecting and the fix must keep:
+        // today's quote is live, the settled candle for the same date may
+        // disagree, and the quote wins.
+        let conn = db();
+        quote_only(&conn, "NVDA", "2026-08-01", 100.0);
+
+        upsert_candle(&conn, Some(7), "NVDA", "2026-08-01", None, 101.0, Some(105.0), Some(98.0), None).unwrap();
+
+        let (_, close, high, _) = row(&conn, "NVDA", "2026-08-01");
+        assert_eq!(close, 100.0, "the candle's close must not overwrite the quote's");
+        assert_eq!(high, Some(105.0), "…while its range still lands");
+    }
+
+    #[test]
+    fn a_row_that_needs_nothing_reports_no_write() {
+        // The counter feeds a `warn!` on zero. A complete row must report 0 so
+        // that signal means "nothing landed", not "nothing was asked for".
+        let conn = db();
+        upsert_candle(&conn, Some(7), "NVDA", "2026-08-01", Some(99.0), 100.0, Some(105.0), Some(98.0), Some(10))
+            .unwrap();
+
+        let again =
+            upsert_candle(&conn, Some(7), "NVDA", "2026-08-01", Some(99.0), 100.0, Some(105.0), Some(98.0), Some(10))
+                .unwrap();
+
+        assert_eq!(again, 0, "a complete row must not be counted as written again");
+    }
+
+    #[test]
+    fn a_caller_with_nothing_to_add_reports_no_write() {
+        // The live shape, and the one the first version of this guard missed.
+        // No candle path supplies `volume`, and every stored row has it NULL, so
+        // a guard that only asked "is the column empty?" was true on every
+        // conflict and counted every row as written. The guard has to ask
+        // whether the *caller* can fill the gap.
+        let conn = db();
+        conn.execute(
+            "INSERT INTO entity_prices (ticker, date, open, close, high, low)
+             VALUES ('NVDA', '2026-08-01', 99.0, 100.0, 105.0, 98.0)",
+            [],
+        )
+        .unwrap();
+
+        let wrote =
+            upsert_candle(&conn, Some(7), "NVDA", "2026-08-01", Some(99.0), 100.0, Some(105.0), Some(98.0), None)
+                .unwrap();
+
+        assert_eq!(wrote, 0, "volume is NULL here and stays NULL — that is not a write");
+    }
+
+    #[test]
+    fn a_fresh_date_is_inserted_and_counted() {
+        let conn = db();
+        let wrote =
+            upsert_candle(&conn, Some(7), "NVDA", "2026-08-01", Some(99.0), 100.0, Some(105.0), Some(98.0), None)
+                .unwrap();
+        assert_eq!(wrote, 1);
+        let (_, close, high, _) = row(&conn, "NVDA", "2026-08-01");
+        assert_eq!(close, 100.0);
+        assert_eq!(high, Some(105.0));
+    }
+
+    #[test]
+    fn the_whole_window_becomes_atr_usable_not_just_the_untouched_dates() {
+        // The live shape: a ticker quoted every day for a month, then backfilled.
+        // Under INSERT OR IGNORE this ended with zero usable bars no matter how
+        // many candles the provider returned — which is the symptom that was
+        // observed on twelve signalled tickers and could not be explained from
+        // the counter, because the counter said every bar had been stored.
+        let conn = db();
+        for d in 1..=20 {
+            quote_only(&conn, "LMT", &format!("2026-08-{d:02}"), 400.0 + d as f64);
+        }
+
+        let mut wrote = 0;
+        for d in 1..=20 {
+            wrote += upsert_candle(
+                &conn,
+                Some(7),
+                "LMT",
+                &format!("2026-08-{d:02}"),
+                Some(400.0),
+                410.0,
+                Some(420.0 + d as f64),
+                Some(390.0),
+                None,
+            )
+            .unwrap();
+        }
+
+        let usable: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_prices
+                 WHERE ticker = 'LMT' AND high IS NOT NULL AND low IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(usable, 20, "every quoted date must end up ATR-usable");
+        assert_eq!(wrote, 20, "and each fill must be counted");
+
+        let (_, close, _, _) = row(&conn, "LMT", "2026-08-05");
+        assert_eq!(close, 405.0, "each date keeps its own quote close");
     }
 }

@@ -1111,9 +1111,14 @@ mod stale_source_tests {
         let dead = stale_signal_sources(&db(&rows));
         assert_eq!(dead.len(), 1, "expected only LDA, got {dead:?}");
         assert!(dead[0].contains("Senate LDA"), "{}", dead[0]);
+        // Deliberately not asserting the rendered "24%": that string is a
+        // rounding of a weight owned by `signals.rs`, so pinning it here would
+        // fail a recalibration for a reason unrelated to staleness detection.
+        // The weight still belongs in the message — a reader needs to know what
+        // the dead dimension is worth — it just is not this test's subject.
         assert!(
-            dead[0].contains("political_signal") && dead[0].contains("24%"),
-            "the alert must name the dimension and what it is worth: {}",
+            dead[0].contains("political_signal"),
+            "the alert must name the dimension that went dark: {}",
             dead[0]
         );
     }
