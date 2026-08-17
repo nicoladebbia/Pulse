@@ -20,6 +20,65 @@ struct FinnhubQuote {
     t: i64,  // timestamp
 }
 
+/// Finnhub quotes we fetch per day. ~4,100 public tickers compete for these.
+pub const DAILY_PRICE_SLOTS: usize = 200;
+
+/// Choose which tickers get one of the day's limited price slots.
+///
+/// Two groups are pinned to the front, because for them a missing candle is not
+/// a gap in a chart — it is a decision the system cannot make:
+///
+/// 1. **Open positions.** The exit engine's trailing stop and profit target are
+///    computed from `entity_prices` candles, so a held ticker with no rows has
+///    no ATR and falls back to a crude fixed stop. Found 2026-07-19: ARM had 0
+///    rows while holding a $4k position.
+/// 2. **Recently signalled tickers.** Same failure one step earlier. A
+///    convergence signal is what the trader acts on, yet a signalled ticker used
+///    to compete on `entity_tickers.confidence` — an entity-extraction score
+///    with nothing to do with trading — and lost. Measured 2026-08-17: 13 of the
+///    14 tickers that signalled in the previous 30 days had no bar that day, and
+///    all 14 were `is_public = 1`, so they were losing the tie-break, not the
+///    eligibility check. Names as liquid as MU, QCOM, CMCSA and NU had never
+///    received a single row; NU alone had signalled 44 times.
+///
+/// The 30-day window keeps the pinned set bounded — it was 14 tickers of the 200
+/// slots when this was written, against 65 for all time. Pinning costs no extra
+/// API calls; it only reorders who gets the calls already being made.
+///
+/// `GROUP BY` dedups tickers mapped by several entity rows so they don't burn
+/// two slots. Front position also keeps both groups ahead of any Finnhub 429s
+/// that hit later in the list.
+pub fn select_tickers_to_price(
+    conn: &Connection,
+    today: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT MIN(et.entity_id), et.ticker FROM entity_tickers et
+         WHERE et.is_public = 1
+         AND et.ticker NOT IN (
+             SELECT ticker FROM entity_prices WHERE date = ?1
+         )
+         GROUP BY et.ticker
+         ORDER BY (et.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open')) DESC,
+                  (et.ticker IN (
+                      SELECT ticker FROM cross_signals
+                      WHERE convergence_detected = 1
+                        AND ticker IS NOT NULL AND ticker <> ''
+                        AND computed_at >= date(?1, '-30 days')
+                  )) DESC,
+                  MAX(et.confidence) DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![today, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
 /// Fetch and store prices for all entities with ticker mappings.
 /// Returns the number of prices stored.
 pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
@@ -34,30 +93,7 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
     let conn = Connection::open(db_path)?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    // Get all tickers that need price updates today. Open-position tickers are
-    // pinned to the FRONT of the list: the exit engine's ATR levels (trailing
-    // stop, profit target) read entity_prices candles, and with ~4,100 public
-    // tickers competing for 200 slots on a confidence tie-break, a held ticker
-    // can otherwise never get a single candle (ARM: 0 rows while holding a
-    // $4k position — found 2026-07-19). Front position also keeps them ahead
-    // of any Finnhub 429s that hit later in the list. GROUP BY dedups tickers
-    // mapped by multiple entity rows so they don't burn extra API slots.
-    let tickers: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT MIN(et.entity_id), et.ticker FROM entity_tickers et
-             WHERE et.is_public = 1
-             AND et.ticker NOT IN (
-                 SELECT ticker FROM entity_prices WHERE date = ?1
-             )
-             GROUP BY et.ticker
-             ORDER BY (et.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open')) DESC,
-                      MAX(et.confidence) DESC
-             LIMIT 200"
-        )?;
-        stmt.query_map([&today], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect()
-    };
+    let tickers = select_tickers_to_price(&conn, &today, DAILY_PRICE_SLOTS)?;
 
     if tickers.is_empty() {
         tracing::info!("Finnhub: no tickers need price updates today");
@@ -120,15 +156,28 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
     tracing::info!("Finnhub: stored {} prices ({} errors)", stored, errors);
 
     // Backfill 30-day candle history for tickers missing 7d/30d changes.
-    // Open-position tickers first — on a day with many fresh tickers the
+    // Held and recently-signalled tickers first, for the same reason they are
+    // pinned in `select_tickers_to_price`: on a day with many fresh tickers the
     // LIMIT 30 otherwise picks an arbitrary subset and a held ticker can miss
     // the cut (ARM did on 2026-07-19).
+    //
+    // This list matters more to the exit engine than the quote list does. A
+    // daily quote contributes one bar; `compute_atr` needs over half of a
+    // 14-day period inside its freshness window before it will return an ATR at
+    // all, and this backfill is what supplies those bars in one call. A
+    // newly-signalled ticker that misses it is priced but still un-stoppable.
     let needs_backfill: Vec<String> = {
         let mut stmt = conn.prepare(
             "SELECT ep.ticker FROM entity_prices ep
              WHERE ep.date = ?1 AND (ep.change_7d IS NULL OR ep.change_30d IS NULL)
              GROUP BY ep.ticker
-             ORDER BY (ep.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open')) DESC
+             ORDER BY (ep.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open')) DESC,
+                      (ep.ticker IN (
+                          SELECT ticker FROM cross_signals
+                          WHERE convergence_detected = 1
+                            AND ticker IS NOT NULL AND ticker <> ''
+                            AND computed_at >= date(?1, '-30 days')
+                      )) DESC
              LIMIT 30"
         )?;
         stmt.query_map([&today], |row| row.get::<_, String>(0))?
@@ -658,3 +707,157 @@ pub async fn fetch_historical(
     Ok(stored)
 }
 
+
+#[cfg(test)]
+mod slot_priority_tests {
+    use super::*;
+
+    /// A universe of `noise` high-confidence tickers that would fill every slot,
+    /// plus the named specials at the *lowest* possible confidence.
+    fn db(noise: usize, specials: &[&str]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entity_tickers (entity_id INTEGER PRIMARY KEY, ticker TEXT NOT NULL,
+                is_public INTEGER DEFAULT 1, confidence REAL DEFAULT 1.0);
+             CREATE TABLE entity_prices (ticker TEXT NOT NULL, date TEXT NOT NULL, close REAL);
+             CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, ticker TEXT, status TEXT);
+             CREATE TABLE cross_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT,
+                convergence_detected INTEGER DEFAULT 0, computed_at TEXT);",
+        )
+        .unwrap();
+        for i in 0..noise {
+            conn.execute(
+                "INSERT INTO entity_tickers (entity_id, ticker, confidence) VALUES (?1, ?2, 1.0)",
+                rusqlite::params![i as i64 + 1000, format!("NOISE{i}")],
+            )
+            .unwrap();
+        }
+        for (i, t) in specials.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO entity_tickers (entity_id, ticker, confidence) VALUES (?1, ?2, 0.01)",
+                rusqlite::params![i as i64 + 1, t],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn picked(conn: &Connection, limit: usize) -> Vec<String> {
+        select_tickers_to_price(conn, "2026-08-17", limit)
+            .unwrap()
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect()
+    }
+
+    #[test]
+    fn a_signalled_ticker_outranks_the_confidence_field() {
+        let conn = db(300, &["SIGNALLED"]);
+        conn.execute(
+            "INSERT INTO cross_signals (ticker, convergence_detected, computed_at)
+             VALUES ('SIGNALLED', 1, '2026-08-10')",
+            [],
+        )
+        .unwrap();
+        let got = picked(&conn, DAILY_PRICE_SLOTS);
+        assert_eq!(got.len(), DAILY_PRICE_SLOTS);
+        assert!(
+            got.contains(&"SIGNALLED".to_string()),
+            "a ticker the trader acts on must not lose its slot to entity-extraction confidence"
+        );
+    }
+
+    #[test]
+    fn an_open_position_still_outranks_a_signal() {
+        let conn = db(300, &["SIGNALLED", "HELD"]);
+        conn.execute(
+            "INSERT INTO cross_signals (ticker, convergence_detected, computed_at)
+             VALUES ('SIGNALLED', 1, '2026-08-10')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO paper_trades (ticker, status) VALUES ('HELD', 'open')",
+            [],
+        )
+        .unwrap();
+        // Only one slot: money already committed beats a candidate entry.
+        assert_eq!(picked(&conn, 1), vec!["HELD".to_string()]);
+    }
+
+    #[test]
+    fn a_stale_signal_does_not_hold_a_slot_forever() {
+        let conn = db(300, &["OLD"]);
+        conn.execute(
+            "INSERT INTO cross_signals (ticker, convergence_detected, computed_at)
+             VALUES ('OLD', 1, '2026-01-05')",
+            [],
+        )
+        .unwrap();
+        assert!(!picked(&conn, DAILY_PRICE_SLOTS).contains(&"OLD".to_string()));
+    }
+
+    #[test]
+    fn a_non_convergent_signal_earns_no_pin() {
+        let conn = db(300, &["WEAK"]);
+        conn.execute(
+            "INSERT INTO cross_signals (ticker, convergence_detected, computed_at)
+             VALUES ('WEAK', 0, '2026-08-10')",
+            [],
+        )
+        .unwrap();
+        assert!(!picked(&conn, DAILY_PRICE_SLOTS).contains(&"WEAK".to_string()));
+    }
+
+    #[test]
+    fn an_empty_ticker_never_takes_a_slot() {
+        // Not observed live — 2026-08-17 the table held 1,091 convergence rows
+        // with a NULL ticker (entities with no listed equity) and zero empty
+        // strings. NULL is excluded by the IS NOT NULL clause; this guards the
+        // `<> ''` clause beside it, which nothing else exercises.
+        let conn = db(10, &[""]);
+        conn.execute(
+            "INSERT INTO cross_signals (ticker, convergence_detected, computed_at)
+             VALUES ('', 1, '2026-08-10')",
+            [],
+        )
+        .unwrap();
+        assert!(!picked(&conn, 5).contains(&String::new()));
+    }
+
+    #[test]
+    fn the_entity_id_travels_with_the_ticker() {
+        // The caller writes this id straight into entity_prices.entity_id, so a
+        // GROUP BY that returned the wrong MIN — or a swapped tuple — would file
+        // every quote under the wrong entity without failing any ticker check.
+        let conn = db(5, &["SIGNALLED"]);
+        conn.execute(
+            "INSERT INTO cross_signals (ticker, convergence_detected, computed_at)
+             VALUES ('SIGNALLED', 1, '2026-08-10')",
+            [],
+        )
+        .unwrap();
+        // Same ticker mapped by a second, higher entity row: MIN must win.
+        conn.execute(
+            "INSERT INTO entity_tickers (entity_id, ticker, confidence)
+             VALUES (9999, 'SIGNALLED', 0.9)",
+            [],
+        )
+        .unwrap();
+        let rows = select_tickers_to_price(&conn, "2026-08-17", DAILY_PRICE_SLOTS).unwrap();
+        let hit: Vec<_> = rows.iter().filter(|(_, t)| t == "SIGNALLED").collect();
+        assert_eq!(hit.len(), 1, "a ticker mapped twice must not burn two slots");
+        assert_eq!(hit[0].0, 1, "expected the MIN entity_id, got {}", hit[0].0);
+    }
+
+    #[test]
+    fn a_ticker_already_priced_today_is_not_refetched() {
+        let conn = db(3, &["DONE"]);
+        conn.execute(
+            "INSERT INTO entity_prices (ticker, date, close) VALUES ('DONE', '2026-08-17', 10.0)",
+            [],
+        )
+        .unwrap();
+        assert!(!picked(&conn, 10).contains(&"DONE".to_string()));
+    }
+}

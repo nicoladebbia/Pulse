@@ -23,10 +23,13 @@ pub enum PositionAction {
 
 /// A price bar older than this says nothing about today's volatility.
 ///
-/// `entity_prices` retains rows for tickers that have stopped updating — most
-/// of its ~1190 tickers stalled around 2026-06-03 while the table's newest bar
-/// is current. Without a date bound, `compute_atr` will happily build a 3x ATR
-/// trailing stop out of ten-week-old candles, and `evaluate_position` never
+/// `entity_prices` retains rows for tickers that have stopped updating. Only
+/// ~200 of its ~1190 tickers can be quoted on any given day (see
+/// `market_prices::DAILY_PRICE_SLOTS`), so coverage rotates and names drop out:
+/// measured 2026-08-17, 161 tickers were stale table-wide, and among the names
+/// that had actually signalled convergence, 14 were stale and 15 had never been
+/// priced at all. Without a date bound, `compute_atr` will happily build a 3x
+/// ATR trailing stop out of ten-week-old candles, and `evaluate_position` never
 /// reaches its documented `atr <= 0.0` fallback because rows do exist. 45 days
 /// leaves room for holidays and gaps while still covering a 14-day window.
 pub const ATR_MAX_STALENESS_DAYS: i64 = 45;
