@@ -963,7 +963,7 @@ To optimize for time freedom, consider leveraging AI tools. Explore the creator 
 BAD — meta preamble (NEVER produce this):
 Here's a summary of today's four freedoms: ..."#;
 
-    let raw = client.call_text("llama-3.3-70b-versatile", "freedoms_executive_summary", system, &input, 600).await?;
+    let raw = client.call_text(&crate::claude::client::strong_model(), "freedoms_executive_summary", system, &input, 600).await?;
     Ok(clean_theme_output(&raw))
 }
 
@@ -1088,7 +1088,7 @@ async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult, db
 
     let system = "You write executive summaries for a daily intelligence briefing. The reader is a tech founder in Miami who builds AI apps, Shopify tools, and iOS apps. Italian heritage, follows Serie A.\n\nWrite exactly 3-5 sentences synthesizing today's most important developments. Name specific companies, numbers, and developments. Be direct and insightful — no preamble, no bullet points, no greeting. Just flowing prose that answers 'what happened today?'";
 
-    client.call_text("llama-3.1-8b-instant", "executive_summary", system, &input, 300).await
+    client.call_text(crate::claude::client::fast_model(), "executive_summary", system, &input, 300).await
 }
 
 /// Generate deep summaries for stories with relevance_score >= 8.
@@ -1959,7 +1959,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
     let curation_text = client
         .call(
-            "llama-3.3-70b-versatile",
+            &crate::claude::client::strong_model(),
             "freedoms_analyze",
             crate::claude::prompts::FREEDOMS_ANALYSIS_SYSTEM,
             &user_msg,

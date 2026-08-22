@@ -4,8 +4,20 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 // Groq models — fast inference, OpenAI-compatible API
-const FAST_MODEL: &str = "llama-3.1-8b-instant";
-const STRONG_MODEL_DEFAULT: &str = "llama-3.3-70b-versatile";
+//
+// 2026-08-22: Groq removed the ENTIRE Llama family. `llama-3.1-8b-instant` and
+// `llama-3.3-70b-versatile` both 404 with "The model does not exist", and
+// /models lists no Llama chat model at all — this is not the Scout
+// decommission repeating on one model, it is the whole family. Every summarize
+// call failed ("Summarized 0/150 stories"), the run aborted rather than store a
+// news-empty briefing, and Pulse produced no briefing from 2026-08-17 onward.
+//
+// The replacements are REASONING models: they emit reasoning tokens that count
+// against `max_tokens` before any answer appears. Sending the old budgets
+// unchanged returns HTTP 400 "Failed to validate JSON" — measured, not assumed:
+// gpt-oss-20b at max_tokens=300 fails, at 2000 succeeds. See `reasoning_params`.
+const FAST_MODEL: &str = "openai/gpt-oss-20b";
+const STRONG_MODEL_DEFAULT: &str = "openai/gpt-oss-120b";
 const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 const MODELS_URL: &str = "https://api.groq.com/openai/v1/models";
 
@@ -125,11 +137,49 @@ pub async fn groq_reachable() -> bool {
     true
 }
 
+/// The cheap Groq model for per-story work (summaries, executive summaries).
+pub(crate) fn fast_model() -> &'static str {
+    FAST_MODEL
+}
+
+/// True for a Groq model that spends tokens thinking before it answers.
+///
+/// Matters because reasoning tokens are drawn from the SAME `max_tokens` budget
+/// as the answer. A budget sized for a non-reasoning model gets consumed by
+/// reasoning and the response is truncated mid-JSON, which Groq rejects with a
+/// 400 rather than returning the partial text.
+pub(crate) fn is_reasoning_model(model: &str) -> bool {
+    model.contains("gpt-oss") || model.starts_with("qwen/")
+}
+
+/// Extra tokens granted to a reasoning model on top of what the caller asked
+/// for, plus the effort level to send.
+///
+/// Measured against Groq 2026-08-22 on a one-paragraph summarize call:
+/// gpt-oss-20b spent 369 completion tokens at default effort and 150 at
+/// `"low"`, both returning valid JSON; the same call capped at 300 tokens with
+/// no effort setting returned HTTP 400. The allowance is deliberately larger
+/// than the 369 observed — reasoning length scales with input, and the failure
+/// mode of too little budget is a hard 400, while the cost of too much is a few
+/// unused tokens on the cheapest models Groq sells.
+///
+/// `"low"` is chosen over omitting the field: it more than halves the reasoning
+/// spend with no observed quality loss on these tasks, all of which are
+/// extraction and summarization rather than multi-step reasoning.
+pub(crate) fn reasoning_params(model: &str, max_tokens: u32) -> (u32, Option<&'static str>) {
+    const ALLOWANCE: u32 = 1024;
+    if is_reasoning_model(model) {
+        (max_tokens.saturating_add(ALLOWANCE), Some("low"))
+    } else {
+        (max_tokens, None)
+    }
+}
+
 /// The "strong" Groq model for pre-curation. Overridable via PULSE_STRONG_MODEL
 /// for A/B testing, but ONLY with a model confirmed live on Groq's /models list —
 /// the Llama-4 Scout override 404'd silently for 3 weeks after Groq
 /// decommissioned it (~2026-07-17). Defaults to llama-3.3-70b-versatile.
-fn strong_model() -> String {
+pub(crate) fn strong_model() -> String {
     std::env::var("PULSE_STRONG_MODEL").unwrap_or_else(|_| STRONG_MODEL_DEFAULT.to_string())
 }
 
@@ -175,6 +225,9 @@ struct ChatRequest {
     max_tokens: u32,
     temperature: f32,
     response_format: ResponseFormat,
+    /// Only sent for reasoning models — Groq 400s on models that do not accept it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -311,6 +364,7 @@ impl GroqClient {
                 .call_anthropic(anthropic_equivalent(model), endpoint, system, user_msg, max_tokens)
                 .await;
         }
+        let (max_tokens, reasoning_effort) = reasoning_params(model, max_tokens);
         let request = ChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -320,6 +374,7 @@ impl GroqClient {
             max_tokens,
             temperature: 0.3,
             response_format: ResponseFormat { fmt_type: "json_object".to_string() },
+            reasoning_effort,
         };
 
         // Retry with backoff for rate limits and transient connection errors
@@ -434,6 +489,7 @@ impl GroqClient {
                 .call_anthropic(anthropic_equivalent(model), endpoint, system, user_msg, max_tokens)
                 .await;
         }
+        let (max_tokens, reasoning_effort) = reasoning_params(model, max_tokens);
         let request = ChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -443,6 +499,7 @@ impl GroqClient {
             max_tokens,
             temperature: 0.3,
             response_format: ResponseFormat { fmt_type: "text".to_string() },
+            reasoning_effort,
         };
 
         let mut last_err = None;
@@ -1490,4 +1547,91 @@ mod fallback_tests {
     }
 
     static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+#[cfg(test)]
+mod reasoning_model_tests {
+    use super::*;
+
+    /// The whole outage in one assertion. Groq removed every Llama chat model on
+    /// ~2026-08-17; a Llama id here means the fetcher is calling a model that
+    /// returns 404 for every story and the run aborts with no briefing.
+    #[test]
+    fn no_configured_model_is_a_decommissioned_llama() {
+        for m in [FAST_MODEL, STRONG_MODEL_DEFAULT] {
+            assert!(
+                !m.contains("llama"),
+                "{m} is from the family Groq decommissioned — nothing on /models is a Llama"
+            );
+        }
+    }
+
+    /// Both configured models must get the reasoning treatment. If one silently
+    /// stops matching `is_reasoning_model`, its budget goes back to the caller's
+    /// raw number and JSON calls start returning HTTP 400.
+    #[test]
+    fn both_configured_models_are_recognised_as_reasoning_models() {
+        assert!(is_reasoning_model(FAST_MODEL));
+        assert!(is_reasoning_model(STRONG_MODEL_DEFAULT));
+    }
+
+    /// A reasoning model must never be handed the caller's raw budget: reasoning
+    /// tokens are drawn from it before the answer starts, so 300 buys thinking
+    /// and a truncated response. Measured: gpt-oss-20b at 300 returns a 400.
+    #[test]
+    fn a_reasoning_model_gets_headroom_the_caller_did_not_ask_for() {
+        let (budget, effort) = reasoning_params(FAST_MODEL, 300);
+        assert!(budget > 300, "budget must exceed the caller's request");
+        assert!(
+            budget >= 1024,
+            "300 + allowance must clear the ~369 tokens a small call was measured to spend"
+        );
+        assert_eq!(effort, Some("low"));
+    }
+
+    /// A non-reasoning model must be left exactly as the caller specified, and
+    /// must NOT receive `reasoning_effort` — Groq 400s on models that reject it.
+    #[test]
+    fn a_plain_model_is_passed_through_untouched() {
+        let (budget, effort) = reasoning_params("some-plain-chat-model", 300);
+        assert_eq!(budget, 300);
+        assert_eq!(effort, None);
+    }
+
+    /// The allowance is additive, not a floor that flattens large requests — the
+    /// analyze call asks for thousands of tokens of structured output and must
+    /// keep every one of them plus room to think.
+    #[test]
+    fn a_large_request_keeps_its_own_budget_and_gains_headroom() {
+        let (budget, _) = reasoning_params(STRONG_MODEL_DEFAULT, 8000);
+        assert!(budget > 8000, "an 8000-token request must not be capped at a floor");
+    }
+
+    /// `saturating_add` and not `+`: a caller passing a near-max budget must not
+    /// panic in release-mode arithmetic or wrap to a tiny number.
+    #[test]
+    fn an_absurd_budget_saturates_rather_than_wrapping() {
+        let (budget, _) = reasoning_params(FAST_MODEL, u32::MAX);
+        assert_eq!(budget, u32::MAX);
+    }
+
+    /// `reasoning_effort` must be omitted from the JSON body entirely for a plain
+    /// model, not sent as null — Groq rejects the field on models without it.
+    #[test]
+    fn the_effort_field_is_absent_from_the_body_when_unset() {
+        let req = ChatRequest {
+            model: "plain".into(),
+            messages: vec![],
+            max_tokens: 300,
+            temperature: 0.3,
+            response_format: ResponseFormat { fmt_type: "json_object".into() },
+            reasoning_effort: None,
+        };
+        let body = serde_json::to_string(&req).unwrap();
+        assert!(!body.contains("reasoning_effort"), "field must be omitted, got {body}");
+
+        let req = ChatRequest { reasoning_effort: Some("low"), ..req };
+        let body = serde_json::to_string(&req).unwrap();
+        assert!(body.contains("\"reasoning_effort\":\"low\""), "got {body}");
+    }
 }
