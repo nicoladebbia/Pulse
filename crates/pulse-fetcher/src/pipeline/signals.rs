@@ -807,16 +807,20 @@ mod calibrated_weights_tests {
 
     /// A clean override — only live dimensions, still summing to 1.0. This one
     /// IS honoured; the discard below must not degrade into "ignore every
-    /// override".
-    const A_CLEAN_OVERRIDE: &str = r#"[["insider_signal",0.30],["news_momentum",0.30],["government_signal",0.40]]"#;
+    /// override". Note it must account for EVERY live dimension: leaving
+    /// search_trend at its default while re-cutting the other three pushes the
+    /// total to 1.0543, and the sum invariant rejects that (which is how this
+    /// fixture was caught when search_trend was restored on 2026-08-22).
+    const A_CLEAN_OVERRIDE: &str = r#"[["insider_signal",0.30],["news_momentum",0.30],["government_signal",0.3457],["search_trend",0.0543]]"#;
 
     #[test]
     fn a_stale_override_cannot_resurrect_a_zeroed_dimension() {
         let w = load_calibrated_weights(&db_with_override(Some(THE_STALE_BATCH_AS_WRITTEN)));
         // [insider, institutional, news, government, search, patent, supply, political]
-        assert_eq!(w[4], 0.0, "search_trend must stay dark");
         assert_eq!(w[5], 0.0, "patent_signal must stay dark");
         assert_eq!(w[7], 0.0, "political_signal must stay dark");
+        assert_eq!(w[1], 0.0, "institutional_flow must stay dark");
+        assert_eq!(w[6], 0.0, "supply_chain must stay dark");
     }
 
     /// The whole blob is discarded, not repaired in place. Keeping its three
@@ -837,7 +841,9 @@ mod calibrated_weights_tests {
         let w = load_calibrated_weights(&db_with_override(Some(A_CLEAN_OVERRIDE)));
         assert!((w[0] - 0.30).abs() < 1e-12, "insider was {}", w[0]);
         assert!((w[2] - 0.30).abs() < 1e-12, "news was {}", w[2]);
-        assert!((w[3] - 0.40).abs() < 1e-12, "government was {}", w[3]);
+        assert!((w[3] - 0.3457).abs() < 1e-12, "government was {}", w[3]);
+        let sum: f64 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-3, "summed to {sum}");
     }
 
     #[test]

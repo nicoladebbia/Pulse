@@ -412,7 +412,9 @@ mod weight_tests {
         // Not "small". A dark dimension left at a small weight still drags the
         // score toward zero for every entity; the point of zeroing is that its
         // share moves to a dimension that can actually earn it.
-        for dim in ["institutional_flow", "supply_chain", "political_signal", "patent_signal", "search_trend"] {
+        // search_trend left this list 2026-08-22 — the Wikipedia title
+        // normalisation restored it. The rest are still dark.
+        for dim in ["institutional_flow", "supply_chain", "political_signal", "patent_signal"] {
             let w = DEFAULT_WEIGHTS.iter().find(|(k, _)| *k == dim).map(|(_, v)| *v);
             assert_eq!(w, Some(0.0), "{dim} is documented as dark but carries weight {w:?}");
         }
@@ -423,7 +425,7 @@ mod weight_tests {
         // The mirror of the above: if a dimension is not in the dark list it
         // must be earning its share, or the sum invariant is being satisfied by
         // a dimension nobody is scoring.
-        for dim in ["insider_signal", "news_momentum", "government_signal"] {
+        for dim in ["insider_signal", "news_momentum", "government_signal", "search_trend"] {
             let w = DEFAULT_WEIGHTS.iter().find(|(k, _)| *k == dim).map(|(_, v)| *v).unwrap_or(0.0);
             assert!(w > 0.0, "{dim} is treated as live but carries no weight");
         }

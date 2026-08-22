@@ -59,10 +59,13 @@ pub const DIMENSIONS: [&str; 8] = [
 /// - `patent_signal` — nonzero in **0** rows. Google Patents still fetches
 ///   (20 articles on 2026-08-16) but stores no new stories, so the dimension has
 ///   been dark for longer than the LDA outage.
-/// - `search_trend` — nonzero in 1–3 rows per day out of ~500. This is the one
-///   that is genuinely **fixable**: Wikimedia Pageviews answered a live probe
-///   (Nvidia 2024-06-01 = 11,432 views, daily granularity, no auth). Restoring it
-///   is a backfill job, and its weight should come back with it.
+/// - `search_trend` — **RESTORED 2026-08-22 at its original 0.0543.** It was
+///   nonzero in 1–3 rows per day out of ~500, and the cause was found: the
+///   Wikipedia source built its article title with `name.replace(' ', "_")` on the
+///   raw SEC canonical name, so it was requesting `KENNAMETAL_INC__(KMT)` and
+///   `CITIZENS_FINANCIAL_GROUP_INC/RI`. Measured against the live Pageviews API
+///   over the 25 most recently mentioned ticker-mapped entities: **4/25 resolved
+///   before the fix, 14/25 after** (`sources::wikipedia::title_candidates`).
 ///
 /// Restore any of these the same way `institutional_flow` and `supply_chain` are
 /// meant to be restored: fix the source first, confirm non-zero rows appear, then
@@ -77,11 +80,11 @@ pub const DIMENSIONS: [&str; 8] = [
 /// dimension deliberately zeroed here. It lives in its own crate for exactly
 /// that reason: the app must not depend on the whole fetcher to know one vector.
 pub const DEFAULT_WEIGHTS: &[(&str, f64)] = &[
-    ("insider_signal", 0.3606),
+    ("insider_signal", 0.3411),
     ("institutional_flow", 0.0),    // ZEROED 2026-06-05: substring-match bug (ticker "X" = 61 funds); restore when fixed
-    ("news_momentum", 0.3606),
-    ("government_signal", 0.2787),
-    ("search_trend", 0.0),          // ZEROED 2026-08-17: see below. FIXABLE — Wikimedia Pageviews verified live
+    ("news_momentum", 0.3411),
+    ("government_signal", 0.2636),
+    ("search_trend", 0.0543),       // RESTORED 2026-08-22: title normalisation fixed, 4/25 -> 14/25 resolved
     ("patent_signal", 0.0),         // ZEROED 2026-08-17: no entity has scored non-zero in 16,871 rows
     ("supply_chain", 0.0),          // ZEROED 2026-06-05: market-wide constant, no per-entity discriminative power
     ("political_signal", 0.0),      // ZEROED 2026-08-17: Senate LDA 403 since 2026-08-03, see below
@@ -319,15 +322,27 @@ mod tests {
         assert!(!stale.is_empty(), "the live batch must not be applicable");
 
         let named: Vec<&str> = stale.iter().map(|s| s.dimension.as_str()).collect();
-        for dim in ["political_signal", "patent_signal", "search_trend"] {
+        for dim in ["political_signal", "patent_signal"] {
             assert!(named.contains(&dim), "{} must be objected to", dim);
         }
-        // These three would be resurrected outright — the expensive failure.
+        // These two would be resurrected outright — the expensive failure.
         for s in &stale {
-            if ["political_signal", "patent_signal", "search_trend"].contains(&s.dimension.as_str()) {
+            if ["political_signal", "patent_signal"].contains(&s.dimension.as_str()) {
                 assert_eq!(s.reason, StaleReason::ResurrectsZeroed);
             }
         }
+        // search_trend was restored on 2026-08-22 at exactly the 0.0543 these
+        // batches snapshotted, so that dimension alone no longer objects. The
+        // batch is still refused, on the dimensions that genuinely moved —
+        // asserted so a future restore cannot quietly empty this guard out.
+        assert!(
+            !named.contains(&"search_trend"),
+            "search_trend matches the code default again and must not object"
+        );
+        assert!(
+            named.contains(&"insider_signal"),
+            "insider moved 0.2391 -> 0.3411 and must still mark the batch stale"
+        );
     }
 
     /// The batch's numbers sum to 1.0, which is why a sum check never caught it.
@@ -464,7 +479,7 @@ mod tests {
         let r = resolve_overrides(&[("insider_signal".to_string(), 0.0)]);
         assert!(r.rejected.is_empty(), "nothing was resurrected");
         let sum = r.bad_sum.expect("a 0.639 vector must be caught");
-        assert!((sum - 0.6393).abs() < 1e-3, "sum was {sum}");
+        assert!((sum - 0.659).abs() < 1e-3, "sum was {sum}");
         assert_eq!(r.weights, default_vector(), "and it falls back");
     }
 
@@ -472,15 +487,20 @@ mod tests {
     /// must not degrade into "ignore every override".
     #[test]
     fn a_clean_override_is_applied_as_given() {
+        // Must name every LIVE dimension: leaving search_trend at its default
+        // while re-cutting the other three totals 1.0543 and the sum invariant
+        // rejects it. That is how this fixture was caught when search_trend came
+        // back on 2026-08-22 — a clean-override test has to stay a valid vector.
         let r = resolve_overrides(&[
             ("insider_signal".to_string(), 0.30),
             ("news_momentum".to_string(), 0.30),
-            ("government_signal".to_string(), 0.40),
+            ("government_signal".to_string(), 0.3457),
+            ("search_trend".to_string(), 0.0543),
         ]);
-        assert!(r.rejected.is_empty());
+        assert!(!r.was_rejected(), "{}", r.rejection_reason());
         assert_eq!(r.weights[0], 0.30);
         assert_eq!(r.weights[2], 0.30);
-        assert_eq!(r.weights[3], 0.40);
+        assert_eq!(r.weights[3], 0.3457);
     }
 
     #[test]
@@ -513,7 +533,8 @@ mod tests {
     /// down while the gates stay fixed, so zeroed must mean exactly 0.0.
     #[test]
     fn a_zeroed_dimension_is_exactly_zero() {
-        for dim in ["institutional_flow", "search_trend", "patent_signal", "supply_chain", "political_signal"] {
+        // search_trend left this list 2026-08-22 when its source was fixed.
+        for dim in ["institutional_flow", "patent_signal", "supply_chain", "political_signal"] {
             let i = DIMENSIONS.iter().position(|d| *d == dim).unwrap();
             assert_eq!(default_vector()[i], 0.0, "{dim} must be exactly zero");
         }
