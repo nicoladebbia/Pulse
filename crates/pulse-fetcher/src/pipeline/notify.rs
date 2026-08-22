@@ -18,7 +18,8 @@ pub(crate) fn notify_degraded_test(msg: &str) {
 }
 
 /// Alert that a run completed but the news briefing is degraded (most summaries
-/// failed — typically a blocked API). Best-effort; mirrors send_notification's
+/// failed). The caller now names the OBSERVED cause rather than guessing at a
+/// blocked API — see `claude::dominant_failure`. Best-effort; mirrors send_notification's
 /// proven-from-launchd delivery path. Distinct from main::notify_failure, which
 /// fires only on a hard run-level Err.
 pub(crate) fn notify_degraded(msg: &str) {

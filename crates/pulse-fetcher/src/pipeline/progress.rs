@@ -243,12 +243,22 @@ pub(crate) fn progress_file_path(db_path: &Path) -> std::path::PathBuf {
 /// Standalone durable-failure writer. Used by `ProgressWriter::fail` AND directly by
 /// main.rs when `pipeline::run` returns Err (the cost-cap bail can fire before any
 /// ProgressWriter method was called, so main.rs owns writing the terminal state).
+/// Cap on the stored `reason`. Raised from 200 on 2026-08-22: the abort message
+/// now carries the OBSERVED upstream error verbatim (see `claude::dominant_failure`)
+/// and at 200 the quoted error was cut off entirely — the file kept the diagnosis
+/// and dropped the evidence, which is the wrong half. Nothing renders `reason` in
+/// the UI, so length costs nothing; a human reading fetch-progress.json during an
+/// outage is the only consumer.
+const REASON_CAP: usize = 600;
+
 pub(crate) fn write_failed_state(path: &Path, reason: &str) {
     let json = serde_json::json!({
         "stage": "failed",
         "stage_label": "Fetch failed",
         "percent": 0,
-        "reason": reason.chars().take(200).collect::<String>(),
+        // chars(), not bytes — a multibyte cut would panic here, in the handler
+        // that exists to report a failure.
+        "reason": reason.chars().take(REASON_CAP).collect::<String>(),
         "updated_at": chrono::Utc::now().to_rfc3339(),
     });
     write_progress_json(path, &json);
@@ -364,5 +374,63 @@ mod progress_tests {
             .filter(|n| n.contains("tmp"))
             .collect();
         assert!(leftovers.is_empty(), "leaked temp files: {leftovers:?}");
+    }
+}
+
+#[cfg(test)]
+mod failed_state_tests {
+    use super::write_failed_state;
+
+    /// The whole point of naming the observed cause is that a human reads it in
+    /// `fetch-progress.json`. At the old 200-char cap the message's diagnosis fit
+    /// and the quoted upstream error did not — so this asserts the EVIDENCE
+    /// survives the write, not merely that a reason was written.
+    #[test]
+    fn the_real_abort_message_survives_the_write_with_its_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fetch-progress.json");
+
+        // The message the August 2026 outage would produce, assembled the way
+        // pipeline/mod.rs assembles it.
+        let msg = format!(
+            "No news stories could be summarized. {} Aborting so a later slot \
+             retries instead of storing a news-empty briefing.",
+            crate::claude::dominant_failure(
+                &vec![
+                    r#"Groq API error 404 Not Found: {"error":{"message":"The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}"#.to_string();
+                    130
+                ],
+                130,
+            )
+            .unwrap()
+        );
+
+        write_failed_state(&path, &msg);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let reason = written["reason"].as_str().unwrap();
+
+        assert_eq!(written["stage"], "failed");
+        assert!(reason.contains("no longer exists at the provider"), "{reason}");
+        assert!(
+            reason.contains("llama-3.3-70b-versatile"),
+            "the verbatim upstream error was truncated away: {reason}"
+        );
+        assert!(
+            !reason.to_ascii_lowercase().contains("vpn"),
+            "{reason}"
+        );
+    }
+
+    /// The cap still applies — an unbounded reason must not be written, and
+    /// cutting it must not panic on a multibyte boundary.
+    #[test]
+    fn an_enormous_multibyte_reason_is_capped_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fetch-progress.json");
+        write_failed_state(&path, &"è".repeat(5000));
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["reason"].as_str().unwrap().chars().count(), 600);
     }
 }

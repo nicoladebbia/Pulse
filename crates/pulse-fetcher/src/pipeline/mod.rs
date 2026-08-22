@@ -278,7 +278,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         .count();
     tracing::info!("Phase 3: Summarizing {} stories ({} grounded in article text)...",
         articles_to_summarize.len(), grounded_count);
-    let summaries = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress), db_path).await?;
+    let outcome = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress), db_path).await?;
+    let summarize_failure = outcome.failure;
+    let summaries = outcome.stories;
     let sum_count = summaries.len() as i64;
     let sum_failed = articles_to_summarize.len() as i64 - sum_count;
     // No hardcoded log_usage here — GroqClient now logs each summarize_story call
@@ -301,7 +303,21 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // The preflight probe should catch most blocks before we get here; this is the
     // backstop for a block that starts mid-run (reachable at probe, blocked by summarize).
     if summaries.is_empty() {
-        anyhow::bail!("No news stories could be summarized — likely a blocked API (VPN/network). Aborting so a later slot retries instead of storing a news-empty briefing.");
+        // Report the error that was actually observed. This line lands at the top
+        // of fetch-progress.json and is the first thing read during an outage; it
+        // used to assert "likely a blocked API (VPN/network)" no matter what the
+        // upstream said, and in August 2026 that guess pointed at the network for
+        // days while the real cause was Groq deleting the whole Llama family.
+        anyhow::bail!(
+            "No news stories could be summarized. {} Aborting so a later slot retries \
+             instead of storing a news-empty briefing.",
+            summarize_failure
+                .as_deref()
+                .map(|f| format!("{f}."))
+                .unwrap_or_else(|| "No per-story errors were recorded, which is itself \
+                     unexpected — check fetch-stdout.log for the upstream error."
+                    .to_string())
+        );
     }
 
     // Degraded-briefing alert: the run will continue (financial stories may have
@@ -312,8 +328,10 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let attempted = articles_to_summarize.len() as i64;
     if attempted > 0 && sum_count * 2 < attempted {
         let msg = format!(
-            "Only {}/{} news stories summarized — likely a blocked API (VPN?). Briefing is degraded.",
-            sum_count, attempted
+            "Only {}/{} news stories summarized. Briefing is degraded. {}",
+            sum_count,
+            attempted,
+            summarize_failure.as_deref().unwrap_or("No per-story errors were recorded.")
         );
         tracing::error!("{}", msg);
         notify_degraded(&msg);
@@ -1919,7 +1937,11 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
         .count();
     tracing::info!("Freedoms: Summarizing {} stories ({} grounded in article text)...",
         to_summarize.len(), grounded);
-    let summaries = crate::claude::summarize_stories(&to_summarize, None, db_path).await?;
+    let outcome = crate::claude::summarize_stories(&to_summarize, None, db_path).await?;
+    if let Some(ref why) = outcome.failure {
+        tracing::warn!("Freedoms: some summaries failed — {}", why);
+    }
+    let summaries = outcome.stories;
     tracing::info!("Freedoms: {} summaries", summaries.len());
 
     // Phase 4: Curate with freedoms prompt
