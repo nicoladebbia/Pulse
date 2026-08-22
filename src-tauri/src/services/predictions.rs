@@ -300,7 +300,7 @@ pub fn get_all_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
             })
         })?
         .filter_map(|r| r.ok())
-        .map(|r| row_to_prediction(r))
+        .map(row_to_prediction)
         .collect();
 
     Ok(predictions)
@@ -343,7 +343,7 @@ pub fn get_active_predictions(conn: &Connection) -> Result<Vec<Prediction>> {
             })
         })?
         .filter_map(|r| r.ok())
-        .map(|r| row_to_prediction(r))
+        .map(row_to_prediction)
         .collect();
 
     Ok(predictions)
@@ -389,7 +389,7 @@ pub fn get_predictions_for_topic(conn: &Connection, topic: &str) -> Result<Vec<P
             })
         })?
         .filter_map(|r| r.ok())
-        .map(|r| row_to_prediction(r))
+        .map(row_to_prediction)
         .collect();
 
     Ok(predictions)

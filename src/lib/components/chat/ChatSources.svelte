@@ -5,14 +5,22 @@
 	import { isTauri } from '$lib/tauri/mock';
 	import { SECTORS, type SectorId } from '$lib/config';
 	import type { StoryHeadline } from '$lib/tauri/types';
+	import { trackCitationClick } from '$lib/engagement';
 
-	let { storyIds }: { storyIds: number[] } = $props();
+	let { storyIds, citedIds = [] }: { storyIds: number[]; citedIds?: number[] } = $props();
 
 	let headlines = $state<StoryHeadline[]>([]);
 	let loaded = $state(false);
 	let expanded = $state(false);
 
-	const validIds = $derived(storyIds.filter(id => id > 0));
+	// Prefer what the answer actually cited. `storyIds` is the union of the cited
+	// stories with everything retrieved, so showing it made an answer that cited
+	// one story display ten "Sources" — the opposite of verifiable. Messages
+	// written before the backend recorded citations separately have no citedIds
+	// and fall back to the retrieved list, honestly relabelled.
+	const cited = $derived(citedIds.filter(id => id > 0));
+	const showingCited = $derived(cited.length > 0);
+	const validIds = $derived(showingCited ? cited : storyIds.filter(id => id > 0));
 
 	function relativeDate(dateStr: string): string {
 		const d = new Date(dateStr + 'T12:00:00');
@@ -35,6 +43,9 @@
 	});
 
 	function navigateToStory(id: number) {
+		// Recorded before the navigation. +page.svelte now loads any cited story by id,
+		// so a citation to an older story opens rather than landing on a blank page.
+		trackCitationClick('/ask', id);
 		expandedStoryId.set(id);
 		goto('/');
 	}
@@ -47,7 +58,7 @@
 {#if validIds.length > 0}
 	<div class="mt-2 pt-2 border-t border-border/50">
 		<p class="text-[10px] uppercase tracking-wider text-text-muted mb-1.5">
-			Sources ({validIds.length})
+			{showingCited ? 'Sources' : 'Retrieved'} ({validIds.length})
 		</p>
 		<div class="space-y-1">
 			{#if headlines.length > 0}

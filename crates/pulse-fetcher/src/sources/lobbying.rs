@@ -7,11 +7,15 @@ use serde::Deserialize;
 /// Replaces old lda.senate.gov (dies June 30, 2026).
 
 #[derive(Deserialize)]
+// Fields mirror the Senate LDA API response shape; some are parsed but not yet consumed.
+#[allow(dead_code)]
 struct LdaResponse {
     results: Vec<LdaFiling>,
 }
 
 #[derive(Deserialize)]
+// Fields mirror the Senate LDA API response shape; some are parsed but not yet consumed.
+#[allow(dead_code)]
 struct LdaFiling {
     filing_uuid: Option<String>,
     filing_type_display: Option<String>,
@@ -25,17 +29,23 @@ struct LdaFiling {
 }
 
 #[derive(Deserialize)]
+// Fields mirror the Senate LDA API response shape; some are parsed but not yet consumed.
+#[allow(dead_code)]
 struct LdaRegistrant {
     name: Option<String>,
 }
 
 #[derive(Deserialize)]
+// Fields mirror the Senate LDA API response shape; some are parsed but not yet consumed.
+#[allow(dead_code)]
 struct LdaClient {
     name: Option<String>,
     general_description: Option<String>,
 }
 
 #[derive(Deserialize)]
+// Fields mirror the Senate LDA API response shape; some are parsed but not yet consumed.
+#[allow(dead_code)]
 struct LdaActivity {
     general_issue_code_display: Option<String>,
     description: Option<String>,
@@ -43,6 +53,8 @@ struct LdaActivity {
 }
 
 #[derive(Deserialize)]
+// Fields mirror the Senate LDA API response shape; some are parsed but not yet consumed.
+#[allow(dead_code)]
 struct LdaGovEntity {
     name: Option<String>,
 }

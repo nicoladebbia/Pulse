@@ -276,8 +276,10 @@ Respond ONLY with valid JSON in this exact format:
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         for mut idea in ideas {
-            let competitors_json = serde_json::to_string(&idea.competitors).unwrap_or_default();
-            let source_ids_json = serde_json::to_string(&idea.source_story_ids).unwrap_or_default();
+            let competitors_json = serde_json::to_string(&idea.competitors)
+                .map_err(|e| format!("failed to serialize competitors: {e}"))?;
+            let source_ids_json = serde_json::to_string(&idea.source_story_ids)
+                .map_err(|e| format!("failed to serialize source_story_ids: {e}"))?;
 
             conn.execute(
                 "INSERT INTO project_ideas (title, description, why_now, competitors, differentiation, tech_stack, difficulty, relevance_score, source_story_ids, status)
@@ -379,10 +381,9 @@ fn read_idea(row: &rusqlite::Row) -> rusqlite::Result<ProjectIdea> {
 
 fn extract_json(text: &str) -> String {
     let trimmed = text.trim();
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
+    if let Some(start) = trimmed.find('{')
+        && let Some(end) = trimmed.rfind('}') {
             return trimmed[start..=end].to_string();
         }
-    }
     trimmed.to_string()
 }

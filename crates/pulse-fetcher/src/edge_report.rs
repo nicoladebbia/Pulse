@@ -191,13 +191,18 @@ pub struct BadPnlRow {
 /// Invariant (both derive from exit−entry, so any mismatch = broken write):
 ///   exit_price NOT NULL  AND  pnl NOT NULL  AND  pnl_pct NOT NULL
 ///   AND  sign(pnl) == sign(pnl_pct)
+/// One resolved `paper_trades` row: `(id, ticker, pnl, pnl_pct, exit_price)`.
+/// The three money columns are nullable — a row can be closed with the P&L
+/// write missing, which is the whole thing this module screens for.
+type ResolvedTrade = (i64, String, Option<f64>, Option<f64>, Option<f64>);
+
 pub fn verify_pnl_writes(db_path: &Path, now: &str, notify: Notifier) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)?;
     ensure_flags_table(&conn)?;
 
     // All resolved post-arm rows, so we can both count (for the first-close latch)
     // and screen each for the invariant.
-    let rows: Vec<(i64, String, Option<f64>, Option<f64>, Option<f64>)> = {
+    let rows: Vec<ResolvedTrade> = {
         let mut stmt = conn.prepare(
             "SELECT id, ticker, pnl, pnl_pct, exit_price
              FROM paper_trades

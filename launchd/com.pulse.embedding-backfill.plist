@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pulse.embedding-backfill</string>
+
+    <!-- Repairs the embedding gap the daily run leaves behind when a Voyage batch fails.
+         Coverage had decayed 100% (Mar 2026) -> 49.7% (Aug 2026) = 15,839 stories absent
+         from vector search, because a failed batch was logged and dropped forever
+         (embeddings.rs) and this repair mode existed but was NEVER SCHEDULED. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/nicoladebbia/Projects/Pulse/target/release/pulse-fetcher</string>
+        <string>--mode</string>
+        <string>backfill-embeddings</string>
+        <string>--max-minutes</string>
+        <string>90</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/nicoladebbia</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Wakes EVERY hour at :30; the binary does the work only at 02:30 and 14:30. The
+         hour selection lives in BACKFILL_HOURS, NOT here — measured on this machine 2026-08-15, a
+         LaunchAgent naming an `Hour` in StartCalendarInterval never fires, while a
+         Minute-only interval fires reliably (com.pulse.daily-fetch has done so 20 runs
+         running). Four probes identical but for the calendar spec confirmed it, including a
+         UTC-hour probe that ruled out a timezone reading. So: schedule the shape that
+         works, gate the hour in code.
+
+         :30 not :00 — the daily fetch owns :00, and although the flock makes a collision
+         harmless, there is no reason to race it every hour.
+
+         Three safeguards make a 90-minute backfill harmless:
+         (1) the hour gate exits in <1s on the 22 wakeups that are not a slot, before it
+             touches the lock or the DB at all;
+         (2) it takes the SAME flock as the daily fetch, so the two can never overlap;
+         (3) it exits unless today's briefing already has news — once that is true every
+             hourly daily slot skips in <1s anyway, so holding the lock is free. Without
+             this a backfill could block the exact slot that catches a clean Groq window. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Minute</key><integer>30</integer>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/nicoladebbia/Projects/Pulse</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/nicoladebbia/Library/Logs/Pulse/embedding-backfill.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/nicoladebbia/Library/Logs/Pulse/embedding-backfill-err.log</string>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Backfill is strictly lower priority than the briefing: never let it compete for
+         I/O or CPU with a daily fetch that happens to start right as it finishes. -->
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>

@@ -35,7 +35,13 @@ fn defaults() -> Vec<PriceEntry> {
         e("anthropic", "claude-haiku", 1.0, 5.0),
         e("anthropic", "claude-sonnet", 3.0, 15.0),
         e("anthropic", "claude-opus", 5.0, 25.0),
-        // Groq
+        // Groq. gpt-oss prices confirmed against console.groq.com/docs/models.md
+        // 2026-08-22, the day Groq's Llama family stopped existing. The llama
+        // entries are KEPT deliberately: no live call can hit them any more, but
+        // `api_usage` rows written before 2026-08-17 still need to price.
+        e("groq", "gpt-oss-120b", 0.15, 0.60),
+        e("groq", "gpt-oss-20b", 0.075, 0.30),
+        e("groq", "qwen", 0.15, 0.60),
         e("groq", "8b", 0.05, 0.08),
         e("groq", "scout", 0.11, 0.34),
         e("groq", "llama", 0.59, 0.79), // catch-all for other llama models (70B rates)
@@ -113,9 +119,24 @@ mod tests {
         assert_eq!(cost("groq", "llama-3.1-8b-instant"), Some((0.05, 0.08)));
         assert_eq!(cost("groq", "llama-3.3-70b-versatile"), Some((0.59, 0.79)));
         assert_eq!(cost("groq", "meta-llama/llama-4-scout-17b-16e-instruct"), Some((0.11, 0.34)));
+        // The models that replaced the decommissioned Llama family. Without
+        // these, every Groq call after 2026-08-22 logs $0.00 — the silent
+        // undercount this crate exists to prevent, in a new coat.
+        assert_eq!(cost("groq", "openai/gpt-oss-20b"), Some((0.075, 0.30)));
+        assert_eq!(cost("groq", "openai/gpt-oss-120b"), Some((0.15, 0.60)));
+        assert_eq!(cost("groq", "qwen/qwen3.6-27b"), Some((0.15, 0.60)));
         assert_eq!(cost("voyage", "voyage-3-lite"), Some((0.01, 0.0)));
         // Free APIs fall through to no entry.
         assert_eq!(cost("fred", "economic"), None);
+    }
+
+    /// The 20b and 120b prefixes differ by one character in the middle of the
+    /// string, and 20b is 2x cheaper. A prefix-ordering slip here misprices
+    /// every call rather than failing loudly.
+    #[test]
+    fn the_two_gpt_oss_sizes_do_not_match_each_other() {
+        assert_eq!(estimate_from(&defaults(), "groq", "openai/gpt-oss-120b", 1_000_000, 0), 0.15);
+        assert_eq!(estimate_from(&defaults(), "groq", "openai/gpt-oss-20b", 1_000_000, 0), 0.075);
     }
 
     #[test]

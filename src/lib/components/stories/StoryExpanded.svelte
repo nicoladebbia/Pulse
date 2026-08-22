@@ -5,10 +5,29 @@
 	import { chatSendStream } from '$lib/tauri/commands';
 	import { openExternal } from '$lib/tauri/shell';
 	import { isTauri, simulateChatStream } from '$lib/tauri/mock';
+	import { page } from '$app/stores';
+	import { trackStoryOpen, trackStoryClose } from '$lib/engagement';
 
 	let { story, onClose }: { story: Story; onClose: () => void } = $props();
 
 	let sector = $derived(SECTORS[story.sector as SectorId]);
+
+	// Open + dwell, instrumented here rather than at the six call sites that open a
+	// story. The $effect cleanup covers both ways a story stops being read: the
+	// panel closing (unmount) and switching straight to another story, which the
+	// front page does by swapping this component's prop without remounting it.
+	//
+	// The dependency is the whole `story` prop, so a briefing reload that hands back
+	// an equal-but-new object mid-read emits a close/open pair with a short dwell.
+	// That is rare and self-evident in the data; the alternative — keying on the id
+	// alone — loses the cleanup that makes dwell work at all.
+	$effect(() => {
+		const opened = story;
+		const routeId = $page.route.id;
+		const startedAt = Date.now();
+		trackStoryOpen(opened, routeId);
+		return () => trackStoryClose(opened, routeId, Date.now() - startedAt);
+	});
 
 	// Inline AI conversation state
 	interface AiMessage {

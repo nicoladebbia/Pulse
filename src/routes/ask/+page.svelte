@@ -33,13 +33,29 @@
 		}
 	});
 
-	// Auto-scroll to bottom during searching and streaming
+	// Auto-scroll to bottom during searching and streaming — but only while the user
+	// is already at the bottom. Scrolling up detaches the auto-scroll until they
+	// return to the bottom (or send a new message).
+	let stickToBottom = $state(true);
+
+	function isNearBottom(): boolean {
+		if (!messagesContainer) return true;
+		const { scrollTop, scrollHeight, clientHeight } = messagesContainer;
+		return scrollHeight - scrollTop - clientHeight < 80;
+	}
+
+	function handleScroll() {
+		stickToBottom = isNearBottom();
+	}
+
 	$effect(() => {
 		const _ = $messages;
 		const __ = $isSearching;
-		if (($isStreaming || $isSearching) && messagesContainer) {
+		if (($isStreaming || $isSearching) && stickToBottom && messagesContainer) {
 			requestAnimationFrame(() => {
-				messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'instant' });
+				if (stickToBottom) {
+					messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'instant' });
+				}
 			});
 		}
 	});
@@ -64,16 +80,19 @@
 
 		query = '';
 
-		// Scroll to bottom immediately after user message appears
+		// Sending a message re-attaches auto-scroll and jumps to the bottom.
+		stickToBottom = true;
 		requestAnimationFrame(() => {
 			messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'instant' });
 		});
 
 		await sendMessage(q);
 
-		// Final scroll after streaming completes
+		// Final scroll after streaming completes — only if still attached.
 		requestAnimationFrame(() => {
-			messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+			if (stickToBottom) {
+				messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+			}
 		});
 	}
 
@@ -110,7 +129,7 @@
 
 <div class="flex flex-col h-full max-w-2xl mx-auto">
 	<!-- Messages -->
-	<div class="flex-1 overflow-y-auto space-y-4 py-4" bind:this={messagesContainer}>
+	<div class="flex-1 overflow-y-auto space-y-4 py-4" bind:this={messagesContainer} onscroll={handleScroll}>
 		{#if $messages.length === 0}
 			<div class="text-center pt-12">
 				<div class="w-3 h-3 rounded-full bg-ai mx-auto mb-4 animate-pulse"></div>

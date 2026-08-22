@@ -94,7 +94,7 @@ pub fn get_profile(conn: &Connection) -> Result<UserProfile> {
     }
 
     // Sort entities by count descending
-    entity_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    entity_counts.sort_by_key(|e| std::cmp::Reverse(e.1));
     let top_entities: Vec<String> = entity_counts.into_iter().map(|(name, _)| name).collect();
 
     // Determine primary sector from interests

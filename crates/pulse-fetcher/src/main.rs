@@ -16,6 +16,41 @@ use clap::Parser;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
+/// Holds an exclusive `flock` on a lockfile for the lifetime of the process. The kernel
+/// releases it on ANY exit — clean, panic, or SIGKILL — so unlike a pidfile there is no
+/// stale-lock state to repair.
+struct SingleInstanceLock(#[allow(dead_code)] std::fs::File);
+
+/// Take the whole-machine "a fetch is running" lock, or return None if another fetcher
+/// already holds it.
+///
+/// Two fetchers on the same DB write the same SQLite file AND the same progress file,
+/// with `started_at` ping-ponging between runs. Nothing prevented that before: the app's
+/// FETCHING flag only guards its own spawns, and the news-based skip check exits early
+/// only when the day ALREADY has news — precisely not the case on a failing day, which
+/// is when scheduled slots and a manual "Refresh Briefing" are most likely to overlap.
+fn acquire_single_instance_lock(db_path: &std::path::Path) -> Option<SingleInstanceLock> {
+    use std::os::unix::io::AsRawFd;
+    let path = db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("fetcher.lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    // LOCK_NB: never queue behind the running fetch — a slot that can't run should exit
+    // immediately and let the next one try.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if locked {
+        Some(SingleInstanceLock(file))
+    } else {
+        None
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "pulse-fetcher", about = "Daily news fetch pipeline for Pulse")]
 struct Args {
@@ -58,6 +93,17 @@ struct Args {
     /// ~60 bars per call).
     #[arg(long, default_value_t = 60)]
     days_back: i64,
+
+    /// backfill-embeddings mode: cap on stories selected per run. The wall-clock budget
+    /// (--max-minutes) is the real limiter; this is a secondary guard on query size.
+    #[arg(long, default_value_t = 20000)]
+    limit: usize,
+
+    /// backfill-embeddings mode: wall-clock budget in minutes. The Voyage free tier does
+    /// ~30 stories/min, so the default 120min clears ~3.6k stories per run — enough to
+    /// drain a 15k backlog over a few nights without ever overlapping the daily fetch.
+    #[arg(long, default_value_t = 120)]
+    max_minutes: u64,
 }
 
 #[tokio::main]
@@ -87,6 +133,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Pulse fetcher starting in {} mode", args.mode);
     tracing::info!("Database: {}", db_path.display());
 
+    // Must run before any pipeline work so a forced-block test exercises the same code
+    // path a real 403 would, from the first call onward.
+    crate::claude::client::apply_forced_block_from_env();
+
     match args.mode.as_str() {
         "notify-test" => {
             // Self-test for the failure-alert path. Fires the FAILED and DEGRADED
@@ -94,61 +144,130 @@ async fn main() -> anyhow::Result<()> {
             // from the launchd context without waiting for an actual outage.
             // (Proved the fire-and-exit timing bug + the .status() fix on 2026-06-22.)
             tracing::info!("Firing test failure + degraded notifications (blocking delivery)...");
-            notify_failure("TEST: this is what a failed daily run looks like.");
-            crate::pipeline::notify_degraded_test("TEST: this is what a degraded run looks like.");
-            tracing::info!("Test notifications fired");
+            // Fire the REAL message shape, not a benign string. Since 2026-08-22 the
+            // abort embeds a verbatim upstream API body — braces, colons, double
+            // quotes, backticks — into an `osascript display notification "..."`
+            // literal. Whether AppleScript parses that is external to this process,
+            // so no unit test can answer it; this mode is the only place it gets
+            // exercised. A benign placeholder here would pass while the real banner
+            // silently failed to appear during an actual outage.
+            let realistic = format!(
+                "TEST: No news stories could be summarized. {} Aborting so a later slot retries.",
+                crate::claude::dominant_failure(
+                    &vec![
+                        r#"Groq API error 404 Not Found: {"error":{"message":"The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}"#.to_string();
+                        130
+                    ],
+                    130,
+                )
+                .unwrap_or_default()
+            );
+            notify_failure(&realistic);
+            crate::pipeline::notify_degraded_test(&realistic);
+            tracing::info!("Test notifications fired with the real message shape ({} chars)", realistic.chars().count());
         }
         "backfill-embeddings" => {
+            // Hour gate FIRST — before the lock, before any DB read. launchd wakes this
+            // mode EVERY hour because an hourly interval is the only calendar shape that
+            // fires at all (see BACKFILL_HOURS); 22 of those 24 wakeups must cost nothing
+            // and must never touch the lock the daily fetch may be holding.
+            let hour = {
+                use chrono::Timelike;
+                chrono::Local::now().hour()
+            };
+            if !args.force && !is_backfill_hour(hour) {
+                tracing::debug!("Hour {} is not a backfill slot {:?} — exiting.", hour, BACKFILL_HOURS);
+                return Ok(());
+            }
+            // Shares the daily fetch's lock: this mode is now SCHEDULED, so it must never
+            // run alongside a daily fetch that is writing the same tables and racing the
+            // same Voyage rate limit. A collision costs nothing — whichever loses exits.
+            let _instance_lock = match acquire_single_instance_lock(&db_path) {
+                Some(lock) => lock,
+                None => {
+                    tracing::info!(
+                        "A fetch is already running — skipping backfill, the next slot will retry."
+                    );
+                    return Ok(());
+                }
+            };
+            // Yield to the daily briefing. The backfill holds the lock for up to
+            // --max-minutes, and the daily slots are hourly, so a backfill started before
+            // the day's news is in could block the exact slot that catches a clean Groq
+            // window. Once today's news EXISTS every daily slot skips in <1s anyway, so
+            // that is the only window where holding the lock is free.
+            if !args.force && news_today(&db_path) == 0 {
+                tracing::info!(
+                    "Today's briefing has no news yet — deferring backfill so it cannot \
+                     block a daily slot. Next backfill slot will retry (--force to override)."
+                );
+                return Ok(());
+            }
             tracing::info!("Backfilling embeddings for stories without them...");
-            backfill_embeddings(&db_path).await?;
+            backfill_embeddings(&db_path, args.limit, args.max_minutes).await?;
         }
         "extract-entities" => {
             tracing::info!("Extracting entities from all stories...");
             extract_entities(&db_path).await?;
         }
         "daily" => {
+            // Single-instance guard FIRST — before the skip check, the preflight probe and
+            // any DB read. A second fetcher must cost nothing and must not touch the
+            // progress file the running one owns.
+            let _instance_lock = match acquire_single_instance_lock(&db_path) {
+                Some(lock) => lock,
+                None => {
+                    tracing::info!(
+                        "Another pulse-fetcher is already running — exiting (its progress file is authoritative)."
+                    );
+                    return Ok(());
+                }
+            };
+
             // Idempotent skip: a day is "done" only if today's daily briefing already
             // has NEWS stories. This is deliberately NOT `status='complete'` — a run
             // blocked at the Groq summarize step still writes financial stories (they
             // skip summarization) and marks the briefing complete with ZERO news, which
             // is exactly the degraded state we want a LATER slot to retry, not skip.
             // Success == news present (source_type='news'). See groq-vpn-block-plan.md.
-            if !args.force && db_path.exists() {
-                let conn = rusqlite::Connection::open_with_flags(
-                    &db_path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )?;
-                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                let news_today: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM stories s \
-                         JOIN briefings b ON s.briefing_id = b.id \
-                         WHERE b.date = ?1 AND b.briefing_type = 'daily' AND s.source_type = 'news'",
-                        [&today],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                if news_today > 0 {
-                    tracing::info!("Already fetched {} news stories for {} — skipping (use --force to override)", news_today, today);
+            if !args.force {
+                let n = news_today(&db_path);
+                if n > 0 {
+                    tracing::info!(
+                        "Already fetched {} news stories for {} — skipping (use --force to override)",
+                        n,
+                        chrono::Local::now().format("%Y-%m-%d")
+                    );
                     return Ok(());
                 }
             }
 
-            // Preflight reachability probe: if the source IP is on Groq's blocklist
-            // (VPN exit node / school network) the whole run would 403 and abort after
-            // ~90 min, firing the daily "not working" alert. A blocked slot is EXPECTED,
-            // not a failure — exit 0 SILENTLY (no notification) so a later slot retries.
-            // With 4 daily slots (7am/12pm/6pm/10pm) one usually catches a clean window.
+            // Preflight reachability probe. If the source IP is on Groq's blocklist (VPN
+            // exit node / school network) every Groq call this run will 403.
+            //
+            // This used to exit 0 silently and wait for a later slot. That was the right
+            // call when Groq was the only provider — but it is why 10 of 45 days had NO
+            // briefing at all (2026-07-03..12, 2026-08-08..13): the block persisted across
+            // every slot, so "a later slot will retry" quietly became "no briefing for a
+            // week". Anthropic answers 200 on exactly the network where Groq answers 403.
+            //
+            // So: latch the block and RUN ANYWAY on Anthropic. A briefing that costs more
+            // beats no briefing. `PULSE_NO_ANTHROPIC_FALLBACK=1` restores the old
+            // skip-and-wait behaviour if a blocked day should stay cheap instead.
             if !crate::claude::client::groq_reachable().await {
-                tracing::info!("Groq unreachable (blocked source IP) — skipping this slot silently, a later slot will retry.");
-                // Silent-skip staleness alarm: a single skipped slot is expected, but
-                // skips can repeat for DAYS with zero user-visible signal (paid
-                // 2026-08-07→09: six consecutive preflight skips, no briefing for 2
-                // days, nobody told). If the newest briefing is >36h old at skip
-                // time, fire ONE notification per calendar day (stamp file dedupes
-                // across the 4 slots).
-                notify_if_stale(&db_path);
-                return Ok(());
+                let fallback_disabled = std::env::var("PULSE_NO_ANTHROPIC_FALLBACK")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if fallback_disabled {
+                    tracing::info!("Groq unreachable and Anthropic fallback disabled — skipping this slot silently.");
+                    // Staleness alarm: skips can repeat for DAYS with zero user-visible
+                    // signal (paid 2026-08-07→09). If the newest briefing is >36h old,
+                    // fire ONE notification per calendar day (stamp file dedupes slots).
+                    notify_if_stale(&db_path);
+                    return Ok(());
+                }
+                crate::claude::client::mark_groq_blocked("preflight probe returned blocked");
+                tracing::info!("Groq unreachable — running this briefing on Anthropic instead of skipping the slot.");
             }
 
             // Notify-on-failure safety net: a scheduled daily run that errors AFTER a
@@ -171,6 +290,12 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = pipeline::run_freedoms(&db_path).await {
                 tracing::warn!("Freedoms pipeline failed (non-fatal): {}", e);
             }
+
+            // Last thing on a SUCCESSFUL run: a run can finish clean and still
+            // have computed every score without one of its inputs. Checked here
+            // rather than in the failure path precisely because the failure path
+            // is not where this hides.
+            notify_stale_signal_sources(&db_path);
         }
         "freedoms" => {
             tracing::info!("Running Four Freedoms pipeline...");
@@ -318,13 +443,13 @@ fn notify_failure(summary: &str) {
     // gets killed before notificationd delivers the banner. Measured 2026-06-22:
     // fire-and-exit dropped the banner silently; blocking delivers it.
     // best-effort; never let a notification failure mask the real error.
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(format!(
+    crate::pipeline::notify::run_osascript(
+        &format!(
             r#"display notification "{}" with title "Pulse fetch FAILED" sound name "Basso""#,
             summary.replace('"', "'").replace('\\', "")
-        ))
-        .status();
+        ),
+        "failure",
+    );
 }
 
 /// Preflight silent-skip staleness alarm. Skipping one blocked slot is expected;
@@ -366,20 +491,169 @@ fn notify_if_stale(db_path: &std::path::Path) {
     ));
 }
 
-async fn backfill_embeddings(db_path: &std::path::Path) -> anyhow::Result<()> {
+/// The sources that feed a weighted signal dimension, the weight they carry in
+/// the compound score, and how long each may go quiet before that is an outage.
+///
+/// `notify_if_stale` above only asks whether a briefing was produced. A single
+/// source can therefore die while briefings keep appearing every morning, and
+/// the dimension it feeds silently reads 0.0 for every entity. Both halves of
+/// that were live when this was written (measured 2026-08-17):
+///
+///   Senate LDA    — 403 Forbidden on EVERY run since 2026-08-03, 14 days,
+///                   logged only as `SOURCE HEALTH: ... LDA` at warn level.
+///                   political_signal was then tied for the LARGEST weight; it
+///                   was zeroed on 2026-08-17 once the block proved unfixable,
+///                   so this alert now reports it at 0% — still worth saying,
+///                   because it is the only standing signal that the source is
+///                   broken and the weight is owed back.
+///   Google Patents— no stored story since 2026-06-01, 77 days, while the
+///                   endpoint itself answers and the fetch logs successes.
+///
+/// Thresholds come from each source's measured AVERAGE gap between story-days
+/// over its history, times ~3.5, floored at 7 — deliberately not its WORST
+/// observed gap, because the worst gap is usually a previous undetected outage
+/// and using it would bake the bug into the baseline. LDA's worst gap was 13
+/// days against an average of 1, which is exactly that trap: a 20-day threshold
+/// would still be silent about today's two-week hole.
+///
+/// FRED is absent on purpose — it feeds supply_chain, which is zero-weighted.
+///
+/// The weight is NOT stored here. It was, and within a day of the 2026-08-17
+/// reweight this table would have told the user that a dead Senate LDA cost them
+/// "24% of the score" when the answer had become 0% — the same hand-copied-number
+/// drift that `load_calibrated_weights` was already refactored to avoid. It is
+/// read from `calibration::DEFAULT_WEIGHTS` at call time instead.
+const SIGNAL_SOURCES: &[(&str, &str, i64)] = &[
+    // (source_name in `stories`, dimension it feeds, max quiet days)
+    ("SEC EDGAR 4", "insider_signal", 7),
+    ("Senate LDA", "political_signal", 7),
+    ("USASpending", "government_signal", 7),
+    ("Federal Register", "government_signal", 7),
+    ("Wikipedia Pageviews", "search_trend", 14),
+    ("Google Patents", "patent_signal", 21),
+];
+
+/// A source that has stopped producing stories takes its signal dimension to
+/// zero without failing the run. Report it, once per calendar day.
+///
+/// Deliberately a STATE check over `stories` rather than an event check on the
+/// fetch result: it catches a source that errors (LDA) and a source whose fetch
+/// reports success while nothing lands (Patents) with one rule, and a single
+/// transient 403 on one of the four daily slots cannot trip it.
+///
+/// Best-effort throughout — a broken DB read must never turn a good run into a
+/// crash on the way out.
+fn notify_stale_signal_sources(db_path: &std::path::Path) {
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return;
+    };
+
+    let dead = stale_signal_sources(&conn);
+    if dead.is_empty() {
+        return;
+    }
+
+    let stamp = db_path.with_file_name("stale-source-alert-date.txt");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    if std::fs::read_to_string(&stamp).map(|s| s.trim() == today).unwrap_or(false) {
+        return;
+    }
+    let _ = std::fs::write(&stamp, &today);
+
+    let summary = dead.join("; ");
+    tracing::warn!("SIGNAL SOURCE STALE: {}", summary);
+    notify_failure(&format!(
+        "Signal sources have gone quiet — scores are being computed without them: {summary}"
+    ));
+}
+
+/// The decision half, split out so it can be tested without shelling out to
+/// `osascript`. Returns one human-readable line per stale source, empty when all
+/// of them are current.
+fn stale_signal_sources(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut dead: Vec<String> = Vec::new();
+    let weight_of = |dim: &str| -> f64 {
+        crate::calibration::DEFAULT_WEIGHTS
+            .iter()
+            .find(|(k, _)| *k == dim)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
+    };
+    for (source, dimension, max_quiet_days) in SIGNAL_SOURCES {
+        let days: Option<i64> = conn
+            .query_row(
+                "SELECT CAST(julianday('now') - julianday(MAX(date(created_at))) AS INTEGER)
+                 FROM stories WHERE source_name = ?1",
+                [source],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        // No rows at all is not reported here: a source that has never produced
+        // anything is a setup problem, not a regression, and would alarm every
+        // day forever without telling the user anything new.
+        let Some(days) = days else { continue };
+        if days > *max_quiet_days {
+            // A dimension already zeroed reads "0% of the score", which is the
+            // honest thing to say: the outage is real but it is no longer
+            // costing anything, because its weight was moved to a source that
+            // still reports. Suppressing the alert instead would lose the only
+            // standing reminder that the source is still broken.
+            let weight = weight_of(dimension);
+            dead.push(format!(
+                "{source} ({dimension}, {:.0}% of the score) — {days}d quiet",
+                weight * 100.0
+            ));
+        }
+    }
+
+    dead
+}
+
+/// Repair the embedding gap left by dropped batches during the daily run.
+///
+/// Bounded on purpose so this can be SCHEDULED rather than run by hand. At the Voyage
+/// free tier (3 RPM = 30 stories/min) the Aug-2026 backlog of ~15.8k stories is ~9 hours
+/// of wall clock, which must not be one unbounded job that collides with the daily fetch.
+/// `max_minutes` is the real budget; `limit` is a secondary cap on rows selected.
+///
+/// Newest stories first: a story from this week matters more to search than one from
+/// April, and if the budget runs out mid-backlog the useful half is already done.
+async fn backfill_embeddings(
+    db_path: &std::path::Path,
+    limit: usize,
+    max_minutes: u64,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_minutes * 60);
     let conn = rusqlite::Connection::open(db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    // Any mode that writes to the DB must be on the current schema. This mode is now
+    // scheduled independently of the daily fetch, so it can be the first process to touch
+    // the DB after an update.
+    db::run_migrations(&conn)?;
 
-    // Find stories without embeddings
+    let (before_embedded, total_stories) = coverage(&conn)?;
+    tracing::info!(
+        "Embedding coverage before backfill: {}/{} ({:.1}%)",
+        before_embedded,
+        total_stories,
+        pct(before_embedded, total_stories)
+    );
+
+    // Find stories without embeddings, newest first.
     let stories: Vec<(i64, String, String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.headline, s.summary, s.key_facts
              FROM stories s
              LEFT JOIN story_embeddings se ON se.story_id = s.id
              WHERE se.story_id IS NULL
-             ORDER BY s.id"
+             ORDER BY s.id DESC
+             LIMIT ?1"
         )?;
-        stmt.query_map([], |row| {
+        stmt.query_map([limit as i64], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?.collect::<Result<Vec<_>, _>>()?
     };
@@ -389,39 +663,185 @@ async fn backfill_embeddings(db_path: &std::path::Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tracing::info!("Found {} stories without embeddings", stories.len());
+    let pause = embeddings::rate_limit_pause_secs();
+    tracing::info!(
+        "Backfilling {} stories (budget {}min, {}s between batches)",
+        stories.len(),
+        max_minutes,
+        pause
+    );
 
-    // Process in batches of 10 (Voyage free tier: 10K TPM limit)
-    for chunk in stories.chunks(10) {
-        let texts: Vec<String> = chunk.iter().map(|(_, headline, summary, key_facts)| {
-            format!("{}. {}. {}", headline, summary, key_facts)
-        }).collect();
+    let mut filled = 0usize;
+    let mut failed = 0usize;
+    let mut out_of_time = false;
 
+    // Batch by tokens, not a fixed 10. The free tier caps 3 RPM *and* 10K TPM; at the
+    // measured 76-token average a 10-story request spent ~2.3K TPM, so the run paid the
+    // full rate-limit pause for a quarter-full request and the 90-minute budget cleared
+    // about a quarter of what it could. See embeddings::VOYAGE_REQUEST_TOKEN_BUDGET.
+    let all_texts: Vec<String> = stories.iter().map(|(_, headline, summary, key_facts)| {
+        format!("{}. {}. {}", headline, summary, key_facts)
+    }).collect();
+    let batches = embeddings::batch_by_tokens(&all_texts, embeddings::VOYAGE_REQUEST_TOKEN_BUDGET);
+
+    for (batch_no, &(bstart, bend)) in batches.iter().enumerate() {
+        let chunk = &stories[bstart..bend];
+        if std::time::Instant::now() >= deadline {
+            out_of_time = true;
+            tracing::info!(
+                "Backfill budget of {}min reached after {} batches — remaining stories \
+                 are picked up by the next scheduled run.",
+                max_minutes, batch_no
+            );
+            break;
+        }
+        if batch_no > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
+        }
+
+        let texts: Vec<String> = all_texts[bstart..bend].to_vec();
         let ids: Vec<i64> = chunk.iter().map(|(id, _, _, _)| *id).collect();
 
         match embeddings::generate_from_texts(&texts).await {
-            Ok(embeddings) => {
-                for (i, emb) in embeddings.iter().enumerate() {
+            Ok(embs) => {
+                // Voyage returns embeddings positionally; a short response would silently
+                // misalign story ids with vectors, so refuse rather than corrupt.
+                if embs.len() != ids.len() {
+                    failed += ids.len();
+                    tracing::error!(
+                        "Backfill batch {}: got {} embeddings for {} stories — skipping \
+                         batch rather than risk misaligning vectors with story ids",
+                        batch_no + 1, embs.len(), ids.len()
+                    );
+                    continue;
+                }
+                for (i, emb) in embs.iter().enumerate() {
+                    if emb.len() != 512 {
+                        failed += 1;
+                        tracing::warn!(
+                            "Backfill: story {} got {} dims, expected 512 — skipped",
+                            ids[i], emb.len()
+                        );
+                        continue;
+                    }
                     let blob: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
                     conn.execute(
                         "INSERT OR REPLACE INTO story_embeddings (story_id, embedding) VALUES (?1, ?2)",
                         rusqlite::params![ids[i], blob],
                     )?;
+                    filled += 1;
                 }
-                tracing::info!("Embedded batch of {} stories (IDs {}-{})", chunk.len(), ids[0], ids[ids.len()-1]);
+                tracing::info!(
+                    "Backfill batch {}: embedded {} stories (IDs {}..{})",
+                    batch_no + 1, chunk.len(), ids[ids.len() - 1], ids[0]
+                );
             }
             Err(e) => {
-                tracing::warn!("Embedding batch failed: {}", e);
+                failed += ids.len();
+                tracing::warn!("Backfill batch {} failed after retries: {}", batch_no + 1, e);
             }
         }
-
-        // Rate limit pause (Voyage free tier = 3 RPM)
-        tokio::time::sleep(std::time::Duration::from_secs(21)).await;
     }
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM story_embeddings", [], |r| r.get(0))?;
-    tracing::info!("Backfill complete. Total embeddings in DB: {}", count);
+    // Cost accounting — the backfill was previously invisible to the daily cost cap.
+    if filled > 0 {
+        pipeline::log_usage(
+            db_path,
+            "voyage",
+            "voyage-3-lite",
+            "backfill_embeddings",
+            (filled as i64) * 200,
+            0,
+        );
+    }
+
+    let (after_embedded, total_after) = coverage(&conn)?;
+    tracing::info!(
+        "Backfill done: +{} embedded, {} failed. Coverage {:.1}% -> {:.1}% ({}/{}){}",
+        filled,
+        failed,
+        pct(before_embedded, total_stories),
+        pct(after_embedded, total_after),
+        after_embedded,
+        total_after,
+        if out_of_time { " [budget reached]" } else { "" }
+    );
     Ok(())
+}
+
+/// Local hours at which the scheduled embedding backfill is allowed to do work.
+///
+/// This lives in the BINARY, not the plist, because launchd will not honour it. Measured on
+/// this machine (macOS 25.5, `gui/501` domain) on 2026-08-15: a LaunchAgent whose
+/// `StartCalendarInterval` names an `Hour` never fires. Four controlled probes, identical
+/// except for the calendar spec, one boundary each:
+///
+///   array of dicts, Hour+Minute ....... runs = 0
+///   single dict,    Hour+Minute ....... runs = 0
+///   single dict,    Hour+Minute in UTC. runs = 0   (rules out a timezone reading)
+///   single dict,    Minute only ....... runs = 1   FIRED
+///
+/// All four were confirmed loaded with armed triggers via `launchctl print`, and the three
+/// that failed were still at `runs = 0` eight minutes past their boundary, which rules out
+/// deferral or coalescing. `com.pulse.daily-fetch` uses a Minute-only interval and has
+/// fired every hour for twenty consecutive runs. The root cause in launchd is not known and
+/// does not need to be: the plist now uses the shape that demonstrably fires — hourly — and
+/// this gate decides which of those wakeups actually does anything.
+///
+/// The plist wakes at :30, so these are the 02:30 and 14:30 wakeups. Tradeoff worth knowing:
+/// a slot the machine sleeps through is SKIPPED, not deferred, because the gate only sees
+/// the hour it actually woke in. That is acceptable here — the daily fetch has fired every
+/// hour round the clock for 20+ runs, so this machine is awake at both slots — and the
+/// in-pipeline drain still runs on every briefing regardless.
+const BACKFILL_HOURS: [u32; 2] = [2, 14];
+
+/// Whether `hour` (0-23, local) is one of the backfill slots.
+fn is_backfill_hour(hour: u32) -> bool {
+    BACKFILL_HOURS.contains(&hour)
+}
+
+/// How many NEWS stories today's daily briefing already has.
+///
+/// This is the project's definition of "the day is done", and it is deliberately NOT
+/// `briefings.status='complete'`: a run blocked at the Groq summarize step still writes
+/// financial stories (they skip summarization) and marks the briefing complete with ZERO
+/// news — exactly the degraded state a later slot should RETRY, not skip.
+/// See groq-vpn-block-plan.md. Returns 0 if the DB is missing or unreadable.
+fn news_today(db_path: &std::path::Path) -> i64 {
+    if !db_path.exists() {
+        return 0;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return 0;
+    };
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    conn.query_row(
+        "SELECT COUNT(*) FROM stories s \
+         JOIN briefings b ON s.briefing_id = b.id \
+         WHERE b.date = ?1 AND b.briefing_type = 'daily' AND s.source_type = 'news'",
+        [&today],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// (stories with an embedding, total stories)
+fn coverage(conn: &rusqlite::Connection) -> anyhow::Result<(i64, i64)> {
+    let embedded: i64 = conn.query_row(
+        "SELECT count(*) FROM stories s
+         JOIN story_embeddings e ON e.story_id = s.id",
+        [],
+        |r| r.get(0),
+    )?;
+    let total: i64 = conn.query_row("SELECT count(*) FROM stories", [], |r| r.get(0))?;
+    Ok((embedded, total))
+}
+
+fn pct(part: i64, whole: i64) -> f64 {
+    if whole == 0 { 0.0 } else { 100.0 * part as f64 / whole as f64 }
 }
 
 async fn extract_entities(db_path: &std::path::Path) -> anyhow::Result<()> {
@@ -636,8 +1056,7 @@ fn recompute_signals(conn: &rusqlite::Connection, today: &str) -> anyhow::Result
             else if total >= 14 && *days_active >= 10 { "dominant" }
             else if total >= 7 && *days_active >= 5 { "hot" }
             else if acceleration < 0.8 && total >= 3 { "fading" }
-            else if total >= 3 || *days_active >= 2 { "rising" }
-            else if *w7 > 0 { "rising" }
+            else if total >= 3 || *days_active >= 2 || *w7 > 0 { "rising" }
             else { "dormant" };
 
         conn.execute(
@@ -652,4 +1071,247 @@ fn recompute_signals(conn: &rusqlite::Connection, today: &str) -> anyhow::Result
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod hour_gate_tests {
+    use super::*;
+
+    /// The gate exists because launchd will not honour an `Hour` in the plist, so the
+    /// binary is woken every hour and must reject 22 of those wakeups. Assert the whole
+    /// 24-hour space, not just the two slots — a gate that accepts everything would pass a
+    /// test that only checked hours 2 and 14.
+    #[test]
+    fn accepts_exactly_the_two_slots() {
+        let accepted: Vec<u32> = (0..24).filter(|h| is_backfill_hour(*h)).collect();
+        assert_eq!(accepted, vec![2, 14], "gate must open at 02:00 and 14:00 and nowhere else");
+    }
+
+    /// The failure this guards against is an hourly wakeup starting a 90-minute backfill
+    /// that holds the flock against the daily fetch. Name the hours that must be refused.
+    #[test]
+    fn refuses_the_daily_fetch_window() {
+        for h in [0, 1, 3, 7, 8, 9, 12, 13, 15, 20, 23] {
+            assert!(!is_backfill_hour(h), "hour {h} must not start a backfill");
+        }
+    }
+
+    /// Hours come from `chrono::Local::now().hour()`, which is 0-23. A slot outside that
+    /// range would be unreachable — the gate would never open and the backfill would go
+    /// back to never running, which is the exact bug being fixed here.
+    #[test]
+    fn every_slot_is_a_reachable_local_hour() {
+        for h in BACKFILL_HOURS {
+            assert!(h < 24, "slot {h} is not a reachable hour — gate could never open");
+            assert!(is_backfill_hour(h), "slot {h} must be accepted by its own gate");
+        }
+    }
+}
+
+#[cfg(test)]
+mod stale_source_tests {
+    use super::*;
+
+    /// `stories` with just the two columns this check reads.
+    fn db(rows: &[(&str, i64)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE stories (id INTEGER PRIMARY KEY, source_name TEXT, created_at TEXT);",
+        )
+        .unwrap();
+        for (source, days_ago) in rows {
+            conn.execute(
+                "INSERT INTO stories (source_name, created_at)
+                 VALUES (?1, datetime('now', ?2))",
+                rusqlite::params![source, format!("-{days_ago} days")],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn every_current_source_is_silent() {
+        let rows: Vec<(&str, i64)> = SIGNAL_SOURCES.iter().map(|(s, _, _)| (*s, 0)).collect();
+        assert!(stale_signal_sources(&db(&rows)).is_empty());
+    }
+
+    #[test]
+    fn the_live_lda_outage_is_reported() {
+        // The state on 2026-08-17: LDA last produced a story on 2026-08-03 while
+        // every other source was within three days. Fourteen days of silence in
+        // the joint-largest-weighted dimension, and nothing said so.
+        let mut rows: Vec<(&str, i64)> =
+            SIGNAL_SOURCES.iter().map(|(s, _, _)| (*s, 2)).collect();
+        for r in rows.iter_mut() {
+            if r.0 == "Senate LDA" {
+                r.1 = 14;
+            }
+        }
+        let dead = stale_signal_sources(&db(&rows));
+        assert_eq!(dead.len(), 1, "expected only LDA, got {dead:?}");
+        assert!(dead[0].contains("Senate LDA"), "{}", dead[0]);
+        // Deliberately not asserting the rendered "24%": that string is a
+        // rounding of a weight owned by `signals.rs`, so pinning it here would
+        // fail a recalibration for a reason unrelated to staleness detection.
+        // The weight still belongs in the message — a reader needs to know what
+        // the dead dimension is worth — it just is not this test's subject.
+        assert!(
+            dead[0].contains("political_signal"),
+            "the alert must name the dimension that went dark: {}",
+            dead[0]
+        );
+    }
+
+    #[test]
+    fn a_source_inside_its_own_threshold_is_not_reported() {
+        // Patents legitimately goes quiet for weeks — it rotates companies and
+        // re-sees patents it already stored. 20 days is inside its 21-day budget
+        // while the same gap would be an outage for a daily source.
+        let dead = stale_signal_sources(&db(&[("Google Patents", 20), ("SEC EDGAR 4", 20)]));
+        assert_eq!(dead.len(), 1, "{dead:?}");
+        assert!(dead[0].contains("SEC EDGAR 4"), "{}", dead[0]);
+    }
+
+    #[test]
+    fn a_source_that_never_produced_anything_is_not_alarmed_about() {
+        // An empty table means "not set up", which would otherwise fire every
+        // single day forever and train the user to ignore the notification.
+        assert!(stale_signal_sources(&db(&[])).is_empty());
+    }
+
+    #[test]
+    fn several_dead_sources_are_all_named() {
+        let dead = stale_signal_sources(&db(&[
+            ("Senate LDA", 14),
+            ("Google Patents", 77),
+            ("SEC EDGAR 4", 1),
+        ]));
+        assert_eq!(dead.len(), 2, "{dead:?}");
+        assert!(dead.iter().any(|d| d.contains("Senate LDA")));
+        assert!(dead.iter().any(|d| d.contains("Google Patents")));
+    }
+
+    #[test]
+    fn every_dimension_fed_by_a_named_source_has_a_watcher() {
+        // The point of the table is coverage, and it does NOT key off weight.
+        // Three of these dimensions are zero-weighted as of 2026-08-17; watching
+        // them is how we find out they came back, which is the precondition for
+        // giving them their weight again. Keying the table on weight would have
+        // deleted the watcher at exactly the moment it became the only record
+        // that the source is still broken.
+        for dim in [
+            "insider_signal",
+            "news_momentum",
+            "government_signal",
+            "search_trend",
+            "patent_signal",
+            "political_signal",
+        ] {
+            let watched = SIGNAL_SOURCES.iter().any(|(_, d, _)| *d == dim);
+            if dim == "news_momentum" {
+                // news_momentum is computed over Pulse's own story windows rather
+                // than one named source, so a single source_name cannot stand for
+                // it. Its death shows up as the whole run producing no stories,
+                // which notify_if_stale already covers.
+                assert!(!watched, "news_momentum should not be watched by source name");
+            } else {
+                assert!(watched, "{dim} carries weight but no source is watched for it");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+
+    fn db_with(stories: &[(i64, bool)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE briefings (id INTEGER PRIMARY KEY, date TEXT, briefing_type TEXT);
+             CREATE TABLE stories (id INTEGER PRIMARY KEY, briefing_id INTEGER,
+                 source_type TEXT, headline TEXT, summary TEXT, key_facts TEXT);
+             CREATE TABLE story_embeddings (story_id INTEGER PRIMARY KEY, embedding BLOB);",
+        )
+        .unwrap();
+        for (id, embedded) in stories {
+            conn.execute(
+                "INSERT INTO stories (id, briefing_id, source_type, headline, summary, key_facts)
+                 VALUES (?1, 1, 'news', 'h', 's', 'k')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            if *embedded {
+                conn.execute(
+                    "INSERT INTO story_embeddings (story_id, embedding) VALUES (?1, x'00')",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            }
+        }
+        (dir, path)
+    }
+
+    /// The number the whole fix exists to move. Coverage must count stories WITH an
+    /// embedding over ALL stories — the metric that decayed 100% -> 49.7% unnoticed.
+    #[test]
+    fn coverage_counts_embedded_over_total() {
+        let (_d, path) = db_with(&[(1, true), (2, false), (3, true), (4, false)]);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (embedded, total) = coverage(&conn).unwrap();
+        assert_eq!((embedded, total), (2, 4));
+        assert_eq!(pct(embedded, total), 50.0);
+    }
+
+    #[test]
+    fn pct_handles_empty_db_without_dividing_by_zero() {
+        assert_eq!(pct(0, 0), 0.0);
+    }
+
+    /// The backfill must yield to the daily briefing: it is gated on today's news
+    /// EXISTING, because until then an hourly daily slot may still need the lock.
+    #[test]
+    fn news_today_is_zero_until_a_news_story_lands_today() {
+        let (_d, path) = db_with(&[(1, false)]);
+        assert_eq!(news_today(&path), 0, "no briefing row yet");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT INTO briefings (id, date, briefing_type) VALUES (1, ?1, 'daily')",
+            [&today],
+        )
+        .unwrap();
+        assert_eq!(news_today(&path), 1, "news present -> backfill may run");
+    }
+
+    /// A financial-only briefing (Groq blocked at summarize) marks itself complete with
+    /// ZERO news. That day must still read as "not done" so a later slot retries — and
+    /// so the backfill does not grab the lock out from under it.
+    #[test]
+    fn financial_only_day_does_not_count_as_done() {
+        let (_d, path) = db_with(&[]);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT INTO briefings (id, date, briefing_type) VALUES (1, ?1, 'daily')",
+            [&today],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stories (id, briefing_id, source_type, headline, summary, key_facts)
+             VALUES (99, 1, 'financial', 'h', 's', 'k')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(news_today(&path), 0, "financial-only day must NOT read as done");
+    }
+
+    #[test]
+    fn missing_db_is_not_a_panic() {
+        assert_eq!(news_today(std::path::Path::new("/nonexistent/pulse.db")), 0);
+    }
 }

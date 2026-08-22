@@ -4,7 +4,6 @@ use serde::Deserialize;
 /// FRED (Federal Reserve Economic Data) — Key economic indicators.
 /// Free API key from https://fred.stlouisfed.org/docs/api/api_key.html
 /// 120 requests/minute. Env var: FRED_API_KEY
-
 const SERIES: &[(&str, &str)] = &[
     ("GDP", "Gross Domestic Product"),
     ("CPIAUCSL", "Consumer Price Index"),

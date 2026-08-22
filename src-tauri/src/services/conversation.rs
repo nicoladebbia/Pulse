@@ -154,8 +154,17 @@ pub fn store_message(
     metadata: Option<&serde_json::Value>,
 ) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let sources_json = sources.map(|s| serde_json::to_string(s).unwrap_or_default());
-    let metadata_json = metadata.map(|m| serde_json::to_string(m).unwrap_or_default());
+    // `.unwrap_or_default()` here stored an EMPTY STRING on failure, which the
+    // chat UI reads back as "this message had no sources" — a citation silently
+    // lost rather than an error surfaced.
+    let sources_json = sources
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to serialize chat message sources")?;
+    let metadata_json = metadata
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to serialize chat message metadata")?;
 
     conn.execute(
         "INSERT INTO chat_messages (id, thread_id, role, content, sources, metadata, created_at)
@@ -250,19 +259,40 @@ pub fn classify_topic(message: &str) -> &'static str {
 // Context assembly
 // ---------------------------------------------------------------------------
 
+/// Every context block that goes into the system prompt.
+///
+/// These were ten positional `&str` parameters. Since they are all the same
+/// type, swapping any two compiled silently and simply mislabelled a section
+/// in the prompt — invisible in a diff and invisible at runtime. Named fields
+/// make the swap a compile error.
+#[derive(Default)]
+pub struct PromptContext<'a> {
+    pub profile_summary: &'a str,
+    pub stories_context: &'a str,
+    pub entity_context: &'a str,
+    pub signal_context: &'a str,
+    pub causal_context: &'a str,
+    pub contrarian_context: &'a str,
+    pub pattern_context: &'a str,
+    pub predictions_context: &'a str,
+    pub prediction_calibration: &'a str,
+    pub query_type: &'a str,
+}
+
 /// Build the system prompt with all intelligence context.
-pub fn build_system_prompt(
-    profile_summary: &str,
-    stories_context: &str,
-    entity_context: &str,
-    signal_context: &str,
-    causal_context: &str,
-    contrarian_context: &str,
-    pattern_context: &str,
-    predictions_context: &str,
-    prediction_calibration: &str,
-    query_type: &str,
-) -> String {
+pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
+    let PromptContext {
+        profile_summary,
+        stories_context,
+        entity_context,
+        signal_context,
+        causal_context,
+        contrarian_context,
+        pattern_context,
+        predictions_context,
+        prediction_calibration,
+        query_type,
+    } = *ctx;
     let format_instruction = match query_type {
         "breaking" => "FORMAT: Lead with the headline — what just happened. Then context: why it matters, who's affected. Keep it tight and urgent. End with what to watch next.",
         "analytical" => "FORMAT: Bottom line first (no preamble). Then ## headers for deep analysis. Cite specific stories and signals with evidence. End with what to watch.",
@@ -334,7 +364,7 @@ MARKERS (UI extracts these):
 - Predictions: [prediction: "SPECIFIC OUTCOME by DATE" | confidence: 0.X | timeframe: "BY YYYY-MM-DD"]
   Each prediction must be falsifiable. State "Fails if: [condition]" after each one.
 
-Suggest 2-4 follow-ups."#);
+Suggest 2-4 follow-ups as [followup: ...] markers, each on its own line at the very END of your response. Do NOT write a visible "Suggested follow-ups" heading, section, or numbered list around them — the UI extracts the markers and renders them as buttons."#);
 
     prompt
 }
@@ -476,15 +506,14 @@ pub fn format_graph_context(
             &name.trim().to_lowercase(),
             3.0,
             5,
-        ) {
-            if !related.is_empty() {
+        )
+            && !related.is_empty() {
                 let rels: Vec<String> = related
                     .iter()
                     .map(|(rname, strength)| format!("{} ({}x)", rname, *strength as i64))
                     .collect();
                 lines.push(format!("{} — most often mentioned with: {}", name, rels.join(", ")));
             }
-        }
     }
     lines.join("\n")
 }
@@ -660,6 +689,45 @@ pub fn clean_response(response: &str) -> String {
         }
     }
 
+    // Marker removal can leave husks behind when the model wrapped markers in a
+    // visible list (e.g. "## Suggested Follow-ups\n1. [followup: ...]" becomes
+    // "## Suggested Follow-ups\n1."). Drop list items that are now empty, then
+    // drop any follow-up heading whose section no longer has content.
+    let lines: Vec<&str> = result.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        let empty_numbered = t.len() >= 2
+            && t.ends_with('.')
+            && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit());
+        if empty_numbered || t == "-" || t == "*" {
+            continue;
+        }
+        let is_followup_heading = {
+            let lower = t.to_lowercase();
+            (t.starts_with('#') || t.starts_with("**") || t.ends_with(':'))
+                && (lower.contains("follow-up") || lower.contains("followup") || lower.contains("follow up"))
+        };
+        if is_followup_heading {
+            // Keep only if something substantive remains in this section.
+            let has_content = lines[i + 1..]
+                .iter()
+                .take_while(|l| !l.trim().starts_with('#'))
+                .any(|l| {
+                    let lt = l.trim();
+                    let lt_empty_item = lt.len() >= 2
+                        && lt.ends_with('.')
+                        && lt[..lt.len() - 1].chars().all(|c| c.is_ascii_digit());
+                    !lt.is_empty() && !lt_empty_item && lt != "-" && lt != "*"
+                });
+            if !has_content {
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    result = kept.join("\n");
+
     // Clean up double spaces and trim
     while result.contains("  ") {
         result = result.replace("  ", " ");
@@ -808,16 +876,26 @@ impl ClaudeConversation {
     /// Stream a Claude response, calling `on_chunk` for each text delta.
     /// Returns the fully accumulated response text plus real token usage
     /// (input from `message_start`, output from the final `message_delta`).
-    pub async fn send_message_stream<F>(
+    /// Stream a completion, calling `on_chunk` for each text delta.
+    ///
+    /// `is_cancelled` is polled before every read. When it returns true the loop
+    /// breaks and the response is dropped, which closes the HTTP connection —
+    /// without it a "Stop" button stops nothing: the read loop ran to completion,
+    /// the full answer was stored, and a Complete event overwrote the UI with the
+    /// answer the user had just cancelled. Whatever streamed before the cancel is
+    /// returned, so what the user saw is what they keep.
+    pub async fn send_message_stream<F, A>(
         &self,
         system: &str,
         messages: &[(String, String)],
         model: &str,
         max_tokens: u32,
         on_chunk: F,
+        is_cancelled: A,
     ) -> Result<(String, Option<LlmUsage>)>
     where
         F: Fn(&str) + Send,
+        A: Fn() -> bool + Send,
     {
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
@@ -858,6 +936,16 @@ impl ClaudeConversation {
         let mut output_tokens: Option<i64> = None;
 
         while let Some(chunk) = stream.next().await {
+            // Checked before consuming the chunk so a cancel takes effect on the
+            // very next read. Breaking here drops `stream` and with it the
+            // response, closing the connection instead of draining it.
+            if is_cancelled() {
+                tracing::info!(
+                    "chat stream cancelled by user after {} chars — closing connection",
+                    accumulated.len()
+                );
+                break;
+            }
             let bytes = chunk.context("stream read error")?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -1142,6 +1230,28 @@ mod tests {
         assert!(cleaned.contains("here."));
     }
 
+    #[test]
+    fn test_clean_response_removes_followup_section_husk() {
+        // The model often wraps followup markers in a visible numbered section.
+        // After marker removal the list husk ("1." "2." ...) and the now-empty
+        // heading must not survive — this was the empty "Suggested Follow-ups
+        // 1. 2. 3. 4." rendering bug.
+        let response = "## Analysis\nSome real content.\n\n## Suggested Follow-ups\n1. [followup: \"What next?\" | type: \"deeper\"]\n2. [followup: \"Compare to Italy?\" | type: \"compare\"]\n3. [followup: \"When?\" | type: \"timeline\"]\n4. [followup: \"Odds?\" | type: \"predict\"]";
+        let cleaned = clean_response(response);
+        assert!(!cleaned.contains("[followup:"));
+        assert!(!cleaned.to_lowercase().contains("follow-up"), "empty heading must be dropped: {}", cleaned);
+        assert!(!cleaned.lines().any(|l| {
+            let t = l.trim();
+            t.len() >= 2 && t.ends_with('.') && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit())
+        }), "empty numbered husks must be dropped: {}", cleaned);
+        assert!(cleaned.contains("Some real content."));
+        // A followup heading with real content underneath survives.
+        let with_content = "## Suggested Follow-ups\nThese threads are worth pursuing because of X.";
+        let cleaned2 = clean_response(with_content);
+        assert!(cleaned2.contains("Suggested Follow-ups"));
+        assert!(cleaned2.contains("worth pursuing"));
+    }
+
     // -----------------------------------------------------------------------
     // Context formatting
     // -----------------------------------------------------------------------
@@ -1349,18 +1459,18 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_contains_sections() {
-        let prompt = build_system_prompt(
-            "Tech founder profile",
-            "Story context here",
-            "Entity context here",
-            "Signal context here",
-            "Causal context here",
-            "Contrarian context here",
-            "Pattern context here",
-            "Predictions context here",
-            "Predictions made: 10 total. Validated: 7 (70% accuracy).",
-            "general",
-        );
+        let prompt = build_system_prompt(&PromptContext {
+            profile_summary: "Tech founder profile",
+            stories_context: "Story context here",
+            entity_context: "Entity context here",
+            signal_context: "Signal context here",
+            causal_context: "Causal context here",
+            contrarian_context: "Contrarian context here",
+            pattern_context: "Pattern context here",
+            predictions_context: "Predictions context here",
+            prediction_calibration: "Predictions made: 10 total. Validated: 7 (70% accuracy).",
+            query_type: "general",
+        });
 
         assert!(prompt.contains("You are Pulse"));
         assert!(prompt.contains("Tech founder profile"));

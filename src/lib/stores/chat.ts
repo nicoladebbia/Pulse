@@ -42,8 +42,30 @@ export function regenerateLastMessage() {
 	sendMessage(lastUserMsg.content);
 }
 
-// Generation counter to prevent stale stream updates after thread switch
+// Generation counter to prevent stale stream updates after thread switch.
+//
+// Reached only through the three accessors below. It was a bare module-level
+// `let` mutated inline at each call site, which worked but could not be tested
+// and gave a reader no statement of the invariant. The invariant is: a
+// generation is issued once, never reissued, and every event carrying an older
+// one is discarded — so a stream abandoned by a thread switch can never revive
+// and write into a thread the user has already left.
 let streamGeneration = 0;
+
+/** Claim the next generation. The caller keeps it and passes it to `isStaleGeneration`. */
+export function nextStreamGeneration(): number {
+	return ++streamGeneration;
+}
+
+/** Abandon every in-flight stream without starting a new one. */
+export function invalidateStreams(): void {
+	streamGeneration++;
+}
+
+/** True when `mine` is no longer the running generation, so its events must be dropped. */
+export function isStaleGeneration(mine: number): boolean {
+	return streamGeneration !== mine;
+}
 
 // Topic colors for thread display
 export const TOPIC_COLORS: Record<string, string> = {
@@ -78,7 +100,15 @@ export async function loadThreads() {
 }
 
 export async function loadThread(threadId: string) {
-	streamGeneration++; // Invalidate any in-flight stream
+	invalidateStreams();
+	// Bumping the generation discards the old stream's events but left isStreaming
+	// true, and the composer is disabled purely off that global — so switching
+	// threads mid-answer locked the NEW thread's input until the abandoned
+	// generation happened to finish. Cancel the old stream and clear the flags
+	// that belong to it.
+	if (get(isStreaming)) cancelStream();
+	isStreaming.set(false);
+	isSearching.set(false);
 	activeThreadId.set(threadId);
 	try {
 		const ipc = (window as any).__TAURI_INTERNALS__;
@@ -125,7 +155,7 @@ export async function sendMessage(message: string) {
 	messages.update(m => [...m, assistantMsg]);
 
 	let accumulated = '';
-	const myGeneration = ++streamGeneration;
+	const myGeneration = nextStreamGeneration();
 
 	try {
 		const streamFn = isTauri()
@@ -134,7 +164,7 @@ export async function sendMessage(message: string) {
 
 		await streamFn((event: ChatStreamEvent) => {
 			// Discard events if user switched threads during this stream
-			if (streamGeneration !== myGeneration) return;
+			if (isStaleGeneration(myGeneration)) return;
 
 			if (event.event === 'Searching') {
 				searchSteps.update(steps => {
@@ -147,7 +177,10 @@ export async function sendMessage(message: string) {
 			}
 
 			if (event.event === 'Delta') {
-				// Cancel requested — stop rendering but let backend finish
+				// Stop rendering immediately. The backend now breaks its read loop on
+				// the same flag, so the Complete that follows carries only the text
+				// that actually streamed — it used to carry the full answer and
+				// overwrite the UI with the response the user had just cancelled.
 				if (cancelRequested) return;
 
 				// First delta means search is done, streaming has started
@@ -178,6 +211,10 @@ export async function sendMessage(message: string) {
 							estimated_cost: event.data.estimated_cost,
 							model_used: event.data.model_used,
 							search_source: event.data.search_source,
+							// Kept alongside `sources` (everything retrieved) so the panel can
+							// show what the answer actually cited. Persisted in the message's
+							// metadata column too, so it survives a thread reload.
+							cited_story_ids: event.data.cited_story_ids,
 						};
 					}
 					return updated;
@@ -207,7 +244,7 @@ export async function sendMessage(message: string) {
 
 		// If this was a new thread, update the active thread —
 		// but skip when the user switched threads mid-stream (otherwise we'd yank them back).
-		if (!threadId && streamGeneration === myGeneration) {
+		if (!threadId && !isStaleGeneration(myGeneration)) {
 			await loadThreads();
 			const currentThreads = get(threads);
 			const newThread = currentThreads[0];

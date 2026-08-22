@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/pulse-fetcher", "crates/pulse-pricing"]
+members = ["src-tauri", "crates/pulse-fetcher", "crates/pulse-pricing", "crates/pulse-weights"]
 
 [workspace.dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

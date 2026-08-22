@@ -1,12 +1,12 @@
 <script lang="ts">
-	import { currentBriefing, isLoading, activeSectors, expandedStoryId, getFilteredStories, getFeaturedFromList, getCompactFromList } from '$lib/stores/briefing';
+	import { currentBriefing, isLoading, activeSectors, expandedStoryId, getFilteredStories, getFeaturedFromList, getCompactFromList, isFiling, resolveExpandedStory, needsStoryFetch } from '$lib/stores/briefing';
 	import { updateStoryList, focusedStoryId } from '$lib/stores/navigation';
 	import BriefingSummary from '$lib/components/stories/BriefingSummary.svelte';
 	import FeaturedCard from '$lib/components/stories/FeaturedCard.svelte';
 	import CompactStoryRow from '$lib/components/stories/CompactStoryRow.svelte';
 	import ConnectionInsight from '$lib/components/stories/ConnectionInsight.svelte';
 	import StoryExpanded from '$lib/components/stories/StoryExpanded.svelte';
-	import type { Story, BriefingWithStories, StoryTrendBadge } from '$lib/tauri/types';
+	import type { Story, StoryDetail, BriefingWithStories, StoryTrendBadge } from '$lib/tauri/types';
 	import { isTauri, mockBriefingData } from '$lib/tauri/mock';
 	import { getStoryTrendBadges, safeInvoke } from '$lib/tauri/commands';
 	import { isFetching, fetchDone } from '$lib/stores/fetch';
@@ -14,12 +14,60 @@
 
 	let trendBadges = $state<Map<number, StoryTrendBadge>>(new Map());
 
-	let allStories = $derived(getFilteredStories($currentBriefing, $activeSectors));
+	// Filings are excluded from the front-page TIERS and count. Ranking already kept them
+	// out of the top 15 on 129 of 130 days (relevance beats their hardcoded importance 5),
+	// but they still inflated the "View all N stories" count with hundreds of SEC forms.
+	// They stay reachable in the archive's filings digest.
+	let sectorStories = $derived(getFilteredStories($currentBriefing, $activeSectors));
+	let allStories = $derived(sectorStories.filter(s => !isFiling(s)));
 	let featured = $derived(getFeaturedFromList(allStories, 3));
 	let compact = $derived(getCompactFromList(allStories, 3, 12));
 	let connections = $derived($currentBriefing?.connections ?? []);
 	let executiveSummary = $derived($currentBriefing?.briefing.executive_summary ?? null);
-	let expandedStory = $derived(allStories.find(s => s.id === $expandedStoryId) ?? null);
+	// The WHOLE briefing, not the visible tiers: Ask Pulse citations and Trends both do
+	// `expandedStoryId.set(id); goto('/')`, and this is the only place that renders the
+	// panel. Narrowing to `allStories` would blank any citation to a filing, and narrowing
+	// to the sector filter blanks any citation to a deselected sector.
+	let briefingStories = $derived($currentBriefing?.stories ?? []);
+
+	// Ask Pulse answers from the whole corpus and Trends spans months, so most citations
+	// point at a story that is NOT in today's briefing. Resolving against today alone made
+	// every one of those clicks a silent no-op — the id was set, nothing matched, and the
+	// front page simply re-rendered unchanged. Fall back to loading the story by id.
+	// `get_story_detail` already reads the whole stories table, so no new command is needed;
+	// StoryExpanded takes a Story and fetches its own entities.
+	let fetchedStory = $state<Story | null>(null);
+	// Remembered per id so a genuinely missing story reports itself once instead of
+	// re-requesting forever.
+	let missingStoryId = $state<number | null>(null);
+
+	let expandedStory = $derived(
+		resolveExpandedStory($expandedStoryId, briefingStories, fetchedStory)
+	);
+	let resolvingStory = $derived(
+		needsStoryFetch($expandedStoryId, briefingStories, fetchedStory, missingStoryId)
+	);
+
+	$effect(() => {
+		const wanted = $expandedStoryId;
+		if (wanted === null) return;
+		if (!needsStoryFetch(wanted, briefingStories, fetchedStory, missingStoryId)) return;
+		if (!isTauri()) {
+			missingStoryId = wanted;
+			return;
+		}
+		// The id can change while a request is in flight (two citations clicked in a row);
+		// a stale response must not overwrite the newer story.
+		let cancelled = false;
+		// StoryDetail is a Story plus sources and connections — the Rust struct flattens
+		// it, so the payload is directly usable as the panel's `story` prop.
+		safeInvoke<StoryDetail>('get_story_detail', { storyId: wanted }).then(detail => {
+			if (cancelled) return;
+			if (detail) fetchedStory = detail;
+			else missingStoryId = wanted;
+		});
+		return () => { cancelled = true; };
+	});
 	let remainingCount = $derived(Math.max(0, allStories.length - 15));
 
 	let loadError = $state<string | null>(null);
@@ -83,6 +131,28 @@
 
 {#if $expandedStoryId && expandedStory}
 	<StoryExpanded story={expandedStory} onClose={() => expandedStoryId.set(null)} />
+{:else if resolvingStory}
+	<div class="flex items-center justify-center h-64">
+		<div class="text-center">
+			<div class="w-8 h-8 border-2 border-ai border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+			<p class="text-text-muted">Opening story...</p>
+		</div>
+	</div>
+{:else if $expandedStoryId && missingStoryId === $expandedStoryId}
+	<!-- A citation to a story that is no longer in the database. Saying so beats the old
+	     behaviour, which was to render the front page as if nothing had been clicked. -->
+	<div class="flex items-center justify-center h-64">
+		<div class="text-center max-w-md">
+			<div class="text-4xl mb-4">◌</div>
+			<h2 class="text-xl font-semibold text-text mb-2">Story unavailable</h2>
+			<p class="text-text-secondary text-sm leading-relaxed mb-4">
+				This citation points to a story that is no longer in your database.
+			</p>
+			<button class="text-sm text-ai hover:underline" onclick={() => expandedStoryId.set(null)}>
+				Back to briefing
+			</button>
+		</div>
+	</div>
 {:else if $isLoading}
 	<div class="flex items-center justify-center h-64">
 		<div class="text-center">
@@ -175,8 +245,8 @@
 					{/each}
 				</div>
 				{#if remainingCount > 0}
-					<a href="/archive" class="block text-center text-sm text-ai hover:underline mt-3 py-2">
-						View all {$currentBriefing.briefing.story_count} stories in Archive
+					<a href="/archive?date=today" class="block text-center text-sm text-ai hover:underline mt-3 py-2">
+						View all {allStories.length} stories in Archive
 					</a>
 				{/if}
 			</div>

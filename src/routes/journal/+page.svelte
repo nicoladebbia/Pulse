@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import { isTauri } from '$lib/tauri/mock';
 	import { getPaperTrades, getAutoTradeStatus, autoBacktestIfDue, type AutoBacktestStatus, type AutoTradeStatus } from '$lib/tauri/commands';
 	import type { PaperTrade } from '$lib/tauri/types';
@@ -10,8 +9,16 @@
 	let backtestStatus = $state<AutoBacktestStatus | null>(null);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
+	let loadStarted = false;
 
-	onMount(async () => {
+	// onMount never fires with this app's ssr=false + prerender=true config — see +layout.svelte.
+	$effect(() => {
+		if (loadStarted) return;
+		loadStarted = true;
+		loadJournal();
+	});
+
+	async function loadJournal() {
 		if (!isTauri()) {
 			loading = false;
 			return;
@@ -37,7 +44,7 @@
 		} finally {
 			loading = false;
 		}
-	});
+	}
 
 	interface SignalProfile {
 		insider?: number;
@@ -92,7 +99,10 @@
 			case 'open': return { text: 'Open', cls: 'bg-blue-500/15 text-blue-400' };
 			case 'closed': return { text: 'Closed (profit)', cls: 'bg-emerald-500/15 text-emerald-400' };
 			case 'stopped_out': return { text: 'Stopped out', cls: 'bg-rose-500/15 text-rose-400' };
-			case 'expired': return { text: 'Expired (90d)', cls: 'bg-amber-500/15 text-amber-400' };
+			// "(90d)" named a calendar expiry that was removed from the exit engine
+			// on 2026-07-15. Nothing writes this status now; the badge stays so an
+			// older database still renders, minus the rule that no longer exists.
+			case 'expired': return { text: 'Expired (legacy)', cls: 'bg-amber-500/15 text-amber-400' };
 			default: return { text: s, cls: 'bg-bg-card text-text-muted' };
 		}
 	}

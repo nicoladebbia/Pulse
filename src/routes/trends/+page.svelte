@@ -5,6 +5,7 @@
 	import { getTrends } from '$lib/tauri/commands';
 	import { expandedStoryId } from '$lib/stores/briefing';
 	import type { TrendThread } from '$lib/tauri/types';
+	import { trackCitationClick } from '$lib/engagement';
 
 	let threads = $state<TrendThread[]>([]);
 	let isLoading = $state(true);
@@ -12,11 +13,43 @@
 	let error = $state<string | null>(null);
 	let sectorFilter = $state<string>('all');
 	let sortBy = $state<'hottest' | 'fastest' | 'connected'>('hottest');
+	let refreshing = $state(false);
 
 	$effect(() => {
 		if (loaded) return;
 		loaded = true;
 		loadTrends();
+	});
+
+	// When stale signals get recomputed in the background (see get_trends in
+	// trends.rs), the backend emits 'trends-recomputed' — re-fetch silently so
+	// the page opens instantly on cached data but still ends up fresh.
+	$effect(() => {
+		if (!isTauri()) return;
+		let cancelled = false;
+		let unlisten: (() => void) | null = null;
+		(async () => {
+			// The IIFE is floating, so a rejection from either await escapes as an
+			// unhandled rejection and takes the webview with it. The identical block in
+			// signals/+page.svelte has this try for the same reason.
+			try {
+				const { listen } = await import('@tauri-apps/api/event');
+				if (cancelled) return;
+				const un = await listen('trends-recomputed', async () => {
+					refreshing = true;
+					try {
+						threads = await getTrends();
+					} catch { /* keep showing current data */ }
+					refreshing = false;
+				});
+				if (cancelled) { un(); return; }
+				unlisten = un;
+			} catch {
+				// No live refresh, but the page still shows what it loaded. Stale trends
+				// beat a crashed page.
+			}
+		})();
+		return () => { cancelled = true; if (unlisten) unlisten(); };
 	});
 
 	async function loadTrends() {
@@ -80,6 +113,9 @@
 	];
 
 	function navigateToStory(storyId: number) {
+		// Trends spans months, so most of these are outside today's briefing; the front
+		// page loads them by id. See +page.svelte.
+		trackCitationClick('/trends', storyId);
 		expandedStoryId.set(storyId);
 		goto('/');
 	}
@@ -119,6 +155,9 @@
 			<h2 class="text-xl font-semibold text-text">Trend Radar</h2>
 			<p class="text-xs text-text-muted mt-0.5">Entities gaining momentum across your archive</p>
 		</div>
+		{#if refreshing}
+			<span class="text-[10px] text-text-muted animate-pulse">updating signals…</span>
+		{/if}
 	</div>
 
 	<!-- Sector filters + Sort -->

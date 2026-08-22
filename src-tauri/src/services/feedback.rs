@@ -194,7 +194,7 @@ pub fn load_reputation_cache(conn: &Connection) -> (HashMap<String, f32>, HashMa
         for row in rows.flatten() {
             let (key, kind, boost) = row;
             // key format is "source:{name}" or "sector:{name}"
-            let name = key.splitn(2, ':').nth(1).unwrap_or("").to_string();
+            let name = key.split_once(':').map(|x| x.1).unwrap_or("").to_string();
             if name.is_empty() { continue; }
 
             match kind.as_str() {

@@ -15,7 +15,11 @@ pub enum ChatStreamEvent {
     Complete {
         message: String,
         message_id: String,
+        /// Everything retrieved, whether or not the answer used it.
         source_story_ids: Vec<i64>,
+        /// Only what the answer actually cited, in citation order. The panel
+        /// shows these when present so "Sources" means sources.
+        cited_story_ids: Vec<i64>,
         suggested_followups: Vec<String>,
         thread_topic: String,
         thread_title: Option<String>,
@@ -29,462 +33,6 @@ pub enum ChatStreamEvent {
 
 // ============ New Intelligence Chat Commands ============
 
-#[tauri::command]
-pub async fn chat_send(
-    db: State<'_, DbState>,
-    thread_id: Option<String>,
-    message: String,
-) -> Result<conversation::ConversationResponse, String> {
-    if message.len() > 20_000 {
-        return Err("Message too long".to_string());
-    }
-
-    // 1. Classify topic and resolve thread
-    let topic = conversation::classify_topic(&message);
-
-    let (thread, is_new_thread) = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        if let Some(tid) = &thread_id {
-            // Use existing thread
-            let threads = conversation::list_threads(&conn).map_err(|e| e.to_string())?;
-            let thread = threads.into_iter().find(|t| t.id == *tid)
-                .ok_or_else(|| "Thread not found".to_string())?;
-            (thread, false)
-        } else {
-            // Try to find a recent thread for the same topic
-            let recent = conversation::find_recent_thread(&conn, topic).map_err(|e| e.to_string())?;
-            if let Some(t) = recent {
-                (t, false)
-            } else {
-                let t = conversation::create_thread(&conn, topic).map_err(|e| e.to_string())?;
-                (t, true)
-            }
-        }
-    };
-
-    // 2. Store user message
-    {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        conversation::store_message(&conn, &thread.id, "user", &message, None, None)
-            .map_err(|e| e.to_string())?;
-
-        // Track user interests
-        profile::track_interest(&conn, &format!("interest:{}", topic)).ok();
-    }
-
-    // 2.5. Load conversation context for context-aware query rewriting
-    let conversation_context: Option<String> = if !is_new_thread {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let history = conversation::get_thread_messages(&conn, &thread.id)
-            .map_err(|e| e.to_string())?;
-        let recent: Vec<_> = history.iter().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-        if recent.is_empty() {
-            None
-        } else {
-            Some(recent.iter().map(|m| format!("{}: {}", m.role, m.content)).collect::<Vec<_>>().join("\n"))
-        }
-    } else {
-        None
-    };
-
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY not set. Add it to .env".to_string())?;
-
-    let query_type = search::classify_query_type(&message);
-    tracing::info!("Query type: {:?}", query_type);
-
-    // 3. Parallel: rewrite query + embed raw query concurrently
-    let rewrite_fut = search::rewrite_query(&api_key, &message, conversation_context.as_deref());
-    let embed_fut = async {
-        match embeddings::VoyageProvider::from_env() {
-            Ok(provider) => {
-                match provider.embed(&[message.clone()], "query").await {
-                    Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
-                    _ => None,
-                }
-            }
-            Err(_) => None,
-        }
-    };
-    let (expanded, query_embedding) = tokio::join!(rewrite_fut, embed_fut);
-
-    // HyDE recovery + entity expansion
-    let hyde_embedding: Option<Vec<f32>> = if expanded.semantic_text != expanded.original && expanded.semantic_text.len() > 20 {
-        match embeddings::VoyageProvider::from_env() {
-            Ok(provider) => provider.embed(&[expanded.semantic_text.clone()], "query").await.ok().and_then(|mut e| if e.is_empty() { None } else { Some(e.swap_remove(0)) }),
-            Err(_) => None,
-        }
-    } else { None };
-
-    let (expanded_fts, graph_entities_sync) = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let alias_expanded = search::expand_query_with_entities(&conn, &expanded.fts_keywords);
-        let (graph_expanded, graph_ents) = search::expand_query_with_graph(&conn, &alias_expanded);
-        (graph_expanded, graph_ents)
-    };
-    let _ = &graph_entities_sync; // used later for graph context
-
-    let date_from_sync = expanded.date_from.clone();
-    let stories = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        if expanded.sub_queries.is_empty() {
-            search::hybrid_search_with_hyde(&conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(), 25, query_type, date_from_sync.as_deref())
-                .map_err(|e| e.to_string())?
-        } else {
-            let mut all_stories: Vec<search::ScoredStory> = Vec::new();
-            let mut seen_ids = std::collections::HashSet::new();
-            let primary = search::hybrid_search_with_hyde(&conn, &expanded_fts, query_embedding.as_deref(), hyde_embedding.as_deref(), 15, query_type, date_from_sync.as_deref())
-                .map_err(|e| e.to_string())?;
-            for story in primary { if seen_ids.insert(story.story_id) { all_stories.push(story); } }
-            for sub_q in &expanded.sub_queries {
-                let sub_expanded = search::expand_query_with_entities(&conn, sub_q);
-                let sub_results = search::hybrid_search_with_hyde(&conn, &sub_expanded, None, None, 10, query_type, date_from_sync.as_deref())
-                    .map_err(|e| e.to_string())?;
-                for story in sub_results { if seen_ids.insert(story.story_id) { all_stories.push(story); } }
-            }
-            all_stories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            all_stories.truncate(25);
-            all_stories
-        }
-    };
-
-    // 3.5. Voyage rerank (falls back to Haiku, then to original order)
-    let stories = if stories.len() > 6 {
-        let reranked = search::voyage_rerank(&expanded_fts, stories.clone(), 10).await;
-        if reranked.len() == stories.len() && reranked.first().map(|s| s.story_id) == stories.first().map(|s| s.story_id) {
-            reranking::llm_rerank(&api_key, &expanded_fts, stories, 10).await
-        } else {
-            reranked
-        }
-    } else {
-        stories
-    };
-
-    // 4. Gather intelligence context (filtered by query relevance)
-    let keywords = extract_keywords(&message);
-
-    let (entity_context, signal_context, causal_context, contrarian_context, pattern_context, predictions_context, profile_str) = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-
-        // Entity context: find entities mentioned in the query
-        let entity_ctx = match entities::search_entities(&conn, &message) {
-            Ok(ents) => {
-                let mut pairs = Vec::new();
-                for ent in ents.into_iter().take(5) {
-                    // Limit to last 5 mentions per entity to avoid context bloat
-                    let mut mentions = entities::get_entity_mentions(&conn, ent.id).unwrap_or_default();
-                    if mentions.len() > 5 {
-                        mentions = mentions.into_iter().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
-                    }
-                    pairs.push((ent, mentions));
-                }
-                conversation::format_entity_context(&pairs)
-            }
-            Err(_) => String::new(),
-        };
-
-        // Signal context: only signals relevant to the query (not global top)
-        let signal_ctx = match signals::get_top_accelerating(&conn, 15) {
-            Ok(sigs) => {
-                let filtered: Vec<_> = if keywords.is_empty() {
-                    sigs.into_iter().take(5).collect()
-                } else {
-                    sigs.into_iter()
-                        .filter(|s| keywords_match_text(&s.topic, &keywords))
-                        .take(5)
-                        .collect()
-                };
-                conversation::format_signal_context(&filtered)
-            }
-            Err(_) => String::new(),
-        };
-
-        // Causal chains for the topic (already filtered by trigger)
-        let causal_ctx = match causality::find_causal_chains(&conn, &message, 30, 2) {
-            Ok(chains) if !chains.is_empty() => {
-                chains.iter().map(|c| {
-                    format!("When '{}' occurs, '{}' typically follows ~{:.0} days later ({}x observed, confidence: {:.0}%)",
-                        c.trigger_event, c.consequence, c.avg_delay_days, c.occurrences, c.confidence * 100.0)
-                }).collect::<Vec<_>>().join("\n")
-            }
-            _ => String::new(),
-        };
-
-        // Contrarian signals (already filtered by entity)
-        let contrarian_ctx = match contrarian::detect_contrarian(&conn, &message, 30, 0.4) {
-            Ok(Some(signal)) => {
-                format!("Consensus sentiment: {:.1} ({} stories). But {} dissenting stories suggest otherwise.",
-                    signal.consensus_sentiment, signal.total_stories, signal.dissent_count)
-            }
-            _ => String::new(),
-        };
-
-        // Cross-sector patterns: only those relevant to query
-        let pattern_ctx = match patterns::detect_cross_sector_patterns(&conn, 5, 2, 30) {
-            Ok(pats) if !pats.is_empty() => {
-                let filtered: Vec<_> = if keywords.is_empty() {
-                    pats
-                } else {
-                    pats.into_iter()
-                        .filter(|p| {
-                            keywords_match_text(&p.source_pattern, &keywords)
-                            || keywords_match_text(&p.predicted_pattern, &keywords)
-                            || keywords_match_text(&p.source_sector, &keywords)
-                            || keywords_match_text(&p.target_sector, &keywords)
-                        })
-                        .collect()
-                };
-                if filtered.is_empty() {
-                    String::new()
-                } else {
-                    filtered.iter().map(|p| {
-                        format!("Pattern from {}: '{}' → Now emerging in {}: '{}' (confidence: {:.0}%)",
-                            p.source_sector, p.source_pattern, p.target_sector, p.predicted_pattern, p.confidence * 100.0)
-                    }).collect::<Vec<_>>().join("\n")
-                }
-            }
-            _ => String::new(),
-        };
-
-        // Active predictions: try full query + individual keywords for broader recall
-        let pred_ctx = {
-            let mut all_preds = Vec::new();
-            let mut seen_titles = std::collections::HashSet::new();
-            // Full query match
-            if let Ok(preds) = predictions::get_predictions_for_topic(&conn, &message) {
-                for p in preds {
-                    if seen_titles.insert(p.title.clone()) {
-                        all_preds.push(p);
-                    }
-                }
-            }
-            // Individual keyword matches for broader recall
-            for kw in &keywords {
-                if let Ok(preds) = predictions::get_predictions_for_topic(&conn, kw) {
-                    for p in preds {
-                        if seen_titles.insert(p.title.clone()) {
-                            all_preds.push(p);
-                        }
-                    }
-                }
-            }
-            all_preds.truncate(5);
-            if all_preds.is_empty() {
-                String::new()
-            } else {
-                all_preds.iter().map(|p| {
-                    format!("[{}] {} (confidence: {:.0}%, timeframe: {}, status: {})",
-                        p.sector.as_deref().unwrap_or("general"), p.prediction, p.confidence * 100.0, p.predicted_timeframe, p.status)
-                }).collect::<Vec<_>>().join("\n")
-            }
-        };
-
-        // User profile
-        let prof = match profile::get_profile(&conn) {
-            Ok(p) => profile::profile_summary(&p),
-            Err(_) => String::new(),
-        };
-
-        (entity_ctx, signal_ctx, causal_ctx, contrarian_ctx, pattern_ctx, pred_ctx, prof)
-    };
-
-    // 4.5 Retrieval confidence + graph context (non-streaming)
-    let retrieval_confidence_sync = compute_retrieval_confidence(&stories);
-    let graph_context_sync = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let mut ent_names = Vec::new();
-        if let Ok(ents) = entities::search_entities(&conn, &message) {
-            for ent in ents.into_iter().take(5) { ent_names.push(ent.name.clone()); }
-        }
-        conversation::format_graph_context(&conn, &ent_names)
-    };
-
-    // 5. Build system prompt with prediction calibration
-    let stories_context = conversation::format_stories_context(&stories, query_type);
-    let prediction_calibration = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        match predictions::get_prediction_stats(&conn) {
-            Ok(stats) if stats.total > 0 => {
-                {
-                    let mut cal = format!("Predictions made: {} total. Validated: {} ({:.0}% accuracy). Invalidated: {}. Active: {}.",
-                        stats.total, stats.validated + stats.partially_validated,
-                        stats.accuracy_rate * 100.0, stats.invalidated, stats.active);
-                    if let Some(brier) = stats.avg_brier_score {
-                        cal.push_str(&format!(" Brier score: {:.3} (0=perfect, 0.25=random).", brier));
-                    }
-                    cal
-                }
-            }
-            _ => String::new(),
-        }
-    };
-    let mut system_prompt = conversation::build_system_prompt(
-        &profile_str,
-        &stories_context,
-        &entity_context,
-        &signal_context,
-        &causal_context,
-        &contrarian_context,
-        &pattern_context,
-        &predictions_context,
-        &prediction_calibration,
-        query_type.format_label(),
-    );
-    system_prompt.push_str(&format_retrieval_confidence(retrieval_confidence_sync, stories.len()));
-    if !graph_context_sync.is_empty() {
-        system_prompt.push_str(&format!("\n\nENTITY NETWORK:\n{}", graph_context_sync));
-    }
-
-    // 6. Load conversation history
-    let history = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        conversation::get_thread_messages(&conn, &thread.id)
-            .map_err(|e| e.to_string())?
-    };
-
-    let messages_for_llm: Vec<(String, String)> = history.iter()
-        .rev().take(10).collect::<Vec<_>>().into_iter().rev()
-        .map(|m| (m.role.clone(), m.content.clone()))
-        .collect();
-
-    // 7. Call Claude (smart model selection)
-    let llm = conversation::ClaudeConversation::from_env()
-        .map_err(|e| e.to_string())?;
-
-    let (chat_model, chat_max_tokens) = match query_type {
-        search::QueryType::Analytical | search::QueryType::Comparative => {
-            (conversation::CONVERSATION_MODEL_DEEP, 2000u32)
-        }
-        _ => (conversation::CONVERSATION_MODEL_FAST, 1200u32),
-    };
-
-    let (raw_response, llm_usage) = llm.send_message_with_model(&system_prompt, &messages_for_llm, chat_model, chat_max_tokens)
-        .await
-        .map_err(|e| format!("Claude error: {}", e))?;
-
-    // Log REAL token usage from the API response (len()/4 estimate as fallback).
-    {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let (input, output) = match llm_usage {
-            Some(u) => (u.input_tokens, u.output_tokens),
-            None => ((system_prompt.len() + message.len()) as i64 / 4, raw_response.len() as i64 / 4),
-        };
-        api_usage::log_usage(&conn, "anthropic", chat_model, "chat", input, output).ok();
-    }
-
-    // 8. Parse response
-    let source_ids = conversation::extract_story_references(&raw_response);
-    let followups = conversation::extract_followups(&raw_response);
-    let extracted_predictions = conversation::extract_predictions(&raw_response);
-    let clean_message = conversation::clean_response(&raw_response);
-
-    // 9. Find proactive connections (older similar stories)
-    let proactive = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-
-        // Use query embedding to find older related stories (deduplicated)
-        let mut connections = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
-        if let (Some(first_story), Some(qe)) = (stories.first(), &query_embedding) {
-            if let Ok(older) = embeddings::find_similar_older_than(&conn, qe, 7, 3, 0.5) {
-                for (sid, _score) in older {
-                    if !seen_ids.insert(sid) { continue; } // Skip duplicates
-                    if let Ok(mut s) = conn.prepare(
-                        "SELECT s.headline, b.date FROM stories s JOIN briefings b ON b.id = s.briefing_id WHERE s.id = ?1"
-                    ) {
-                        if let Ok(row) = s.query_row([sid], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                        }) {
-                            connections.push(conversation::ProactiveInsight {
-                                story_id: sid,
-                                headline: row.0,
-                                date: row.1,
-                                connection: format!("Related to '{}'", first_story.headline),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        connections
-    };
-
-    // 10. Generate thread title if new
-    let thread_title = if is_new_thread {
-        // Use first few words of the message as a simple title
-        let title = message.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
-        let title = if title.chars().count() > 50 {
-            format!("{}...", title.chars().take(47).collect::<String>())
-        } else {
-            title
-        };
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        conversation::update_thread_title(&conn, &thread.id, &title).ok();
-        Some(title)
-    } else {
-        thread.title.clone()
-    };
-
-    // 11. Store assistant response
-    let all_source_ids: Vec<i64> = source_ids.iter().copied()
-        .chain(stories.iter().map(|s| s.story_id))
-        .filter(|id| *id > 0) // Filter out encoded freedom story IDs (negative)
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter().collect();
-    {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        conversation::store_message(
-            &conn,
-            &thread.id,
-            "assistant",
-            &clean_message,
-            Some(&all_source_ids),
-            None,
-        ).map_err(|e| e.to_string())?;
-    }
-
-    // 12. Store any predictions made
-    if !extracted_predictions.is_empty() {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        for (pred_text, confidence, timeframe) in &extracted_predictions {
-            let pred = predictions::Prediction {
-                id: None,
-                title: pred_text.chars().take(100).collect(),
-                prediction: pred_text.clone(),
-                confidence: *confidence,
-                reasoning: format!("Generated in response to: {}", message),
-                evidence_types: vec!["conversation".to_string()],
-                evidence_story_ids: all_source_ids.clone(),
-                predicted_timeframe: timeframe.clone(),
-                sector: Some(topic.to_string()),
-                status: "active".to_string(),
-                probability_history: Vec::new(),
-                target_metric: None,
-                target_date: None,
-                source_story_ids: Vec::new(),
-                source_signal_ids: Vec::new(),
-                model_used: None,
-                resolution_method: None,
-                resolution_attempts: 0,
-                brier_score: None,
-                actual_outcome: None,
-                created_at: None,
-            };
-            predictions::store_prediction(&conn, &pred).ok();
-        }
-    }
-
-    Ok(conversation::ConversationResponse {
-        message: clean_message,
-        source_story_ids: all_source_ids,
-        suggested_followups: followups,
-        thread_topic: topic.to_string(),
-        thread_title,
-        proactive_connections: proactive,
-    })
-}
-
-/// Streaming version of chat_send. Sends text deltas as they arrive from Claude,
 /// Cancel an in-progress stream. Sets the abort flag so the streaming callback stops sending deltas.
 #[tauri::command]
 pub fn chat_cancel_stream(abort_flag: State<'_, ChatAbortFlag>) -> Result<(), String> {
@@ -492,8 +40,8 @@ pub fn chat_cancel_stream(abort_flag: State<'_, ChatAbortFlag>) -> Result<(), St
     Ok(())
 }
 
-/// then sends a Complete event with metadata (sources, followups, etc).
-/// Steps 1-6 are identical to chat_send. Step 7 streams instead of blocking.
+/// Streams text deltas as they arrive from the model, then a Complete event
+/// carrying the metadata (sources, followups, cited stories, cost).
 #[tauri::command]
 pub async fn chat_send_stream(
     db: State<'_, DbState>,
@@ -572,7 +120,7 @@ pub async fn chat_send_stream(
     let embed_fut = async {
         match embeddings::VoyageProvider::from_env() {
             Ok(provider) => {
-                match provider.embed(&[message.clone()], "query").await {
+                match provider.embed(std::slice::from_ref(&message), "query").await {
                     Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
                     _ => None,
                 }
@@ -588,7 +136,7 @@ pub async fn chat_send_stream(
     let hyde_embedding: Option<Vec<f32>> = if expanded.semantic_text != expanded.original && expanded.semantic_text.len() > 20 {
         match embeddings::VoyageProvider::from_env() {
             Ok(provider) => {
-                match provider.embed(&[expanded.semantic_text.clone()], "query").await {
+                match provider.embed(std::slice::from_ref(&expanded.semantic_text), "query").await {
                     Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
                     _ => None,
                 }
@@ -858,14 +406,21 @@ pub async fn chat_send_stream(
             _ => String::new(),
         }
     };
-    let mut system_prompt = conversation::build_system_prompt(
-        &profile_str, &stories_context, &entity_context, &signal_context,
-        &causal_context, &contrarian_context, &pattern_context, &predictions_context,
-        &prediction_calibration, query_type.format_label(),
-    );
+    let mut system_prompt = conversation::build_system_prompt(&conversation::PromptContext {
+        profile_summary: &profile_str,
+        stories_context: &stories_context,
+        entity_context: &entity_context,
+        signal_context: &signal_context,
+        causal_context: &causal_context,
+        contrarian_context: &contrarian_context,
+        pattern_context: &pattern_context,
+        predictions_context: &predictions_context,
+        prediction_calibration: &prediction_calibration,
+        query_type: query_type.format_label(),
+    });
 
     // Append retrieval confidence
-    system_prompt.push_str(&format_retrieval_confidence(&retrieval_confidence, stories.len()));
+    system_prompt.push_str(&format_retrieval_confidence(retrieval_confidence, stories.len()));
 
     // Append graph context if available
     if !graph_context.is_empty() {
@@ -916,6 +471,7 @@ pub async fn chat_send_stream(
 
     let on_event_clone = on_event.clone();
     let abort_clone = abort_flag.0.clone();
+    let abort_for_loop = abort_flag.0.clone();
     let (raw_response, llm_usage) = llm.send_message_stream(
         &system_prompt,
         &messages_for_llm,
@@ -929,6 +485,13 @@ pub async fn chat_send_stream(
                 tracing::warn!("failed to send Delta event: {}", e);
             }
         },
+        // Stops the read loop itself. Suppressing deltas alone left the request
+        // running to completion, so everything below — storing the message and
+        // emitting Complete — ran with the FULL answer and the cancelled text
+        // reappeared in the UI. With the loop broken, `raw_response` holds only
+        // what actually streamed, so the message stored and the Complete event
+        // both carry exactly what the user saw before pressing Stop.
+        move || abort_for_loop.load(std::sync::atomic::Ordering::Relaxed),
     )
     .await
     .map_err(|e| {
@@ -946,20 +509,18 @@ pub async fn chat_send_stream(
     let proactive = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let mut connections = Vec::new();
-        if let (Some(first_story), Some(qe)) = (stories.first(), &query_embedding) {
-            if let Ok(older) = embeddings::find_similar_older_than(&conn, qe, 7, 3, 0.5) {
+        if let (Some(first_story), Some(qe)) = (stories.first(), &query_embedding)
+            && let Ok(older) = embeddings::find_similar_older_than(&conn, qe, 7, 3, 0.5) {
                 for (sid, _score) in older {
-                    if let Ok(mut s) = conn.prepare("SELECT s.headline, b.date FROM stories s JOIN briefings b ON b.id = s.briefing_id WHERE s.id = ?1") {
-                        if let Ok(row) = s.query_row([sid], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                    if let Ok(mut s) = conn.prepare("SELECT s.headline, b.date FROM stories s JOIN briefings b ON b.id = s.briefing_id WHERE s.id = ?1")
+                        && let Ok(row) = s.query_row([sid], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
                             connections.push(conversation::ProactiveInsight {
                                 story_id: sid, headline: row.0, date: row.1,
                                 connection: format!("Related to '{}'", first_story.headline),
                             });
                         }
-                    }
                 }
             }
-        }
         connections
     };
 
@@ -979,9 +540,23 @@ pub async fn chat_send_stream(
         .filter(|id| *id > 0) // Filter out encoded freedom story IDs (negative)
         .collect::<std::collections::HashSet<_>>()
         .into_iter().collect();
+
+    // The stories the model actually pointed at, in the order it cited them —
+    // kept separate from the union above. The panel used to show that union, so
+    // an answer citing one story still displayed ten "Sources", which is the
+    // opposite of verifiable. Carried in metadata rather than a new column so
+    // historical messages keep working and no migration is needed.
+    let cited_story_ids: Vec<i64> = {
+        let mut seen = std::collections::HashSet::new();
+        source_ids.iter().copied()
+            .filter(|id| *id > 0 && seen.insert(*id))
+            .collect()
+    };
+    let metadata = serde_json::json!({ "cited_story_ids": cited_story_ids });
+
     let assistant_msg_id = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        conversation::store_message(&conn, &thread.id, "assistant", &clean_message, Some(&all_source_ids), None)
+        conversation::store_message(&conn, &thread.id, "assistant", &clean_message, Some(&all_source_ids), Some(&metadata))
             .map_err(|e| e.to_string())?
     };
 
@@ -1037,6 +612,7 @@ pub async fn chat_send_stream(
         message: clean_message,
         message_id: assistant_msg_id,
         source_story_ids: all_source_ids,
+        cited_story_ids,
         suggested_followups: followups,
         thread_topic: topic.to_string(),
         thread_title,
@@ -1099,11 +675,7 @@ pub fn get_chat_context(db: State<'_, DbState>) -> Result<ChatContext, String> {
         |row| row.get(0),
     ).ok();
     if let Some(headline) = hero {
-        let short = if headline.len() > 60 {
-            format!("{}...", &headline[..57])
-        } else {
-            headline
-        };
+        let short = truncate_ellipsis(&headline, 60);
         suggestions.push(ChatSuggestion {
             text: format!("Tell me more about {}", short),
             category: "story".into(),
@@ -1114,11 +686,7 @@ pub fn get_chat_context(db: State<'_, DbState>) -> Result<ChatContext, String> {
     if let Ok(preds) = predictions::get_active_predictions(&conn) {
         let preds: Vec<_> = preds.into_iter().take(2).collect();
         for pred in preds {
-            let short = if pred.title.len() > 40 {
-                format!("{}...", &pred.title[..37])
-            } else {
-                pred.title.clone()
-            };
+            let short = truncate_ellipsis(&pred.title, 40);
             suggestions.push(ChatSuggestion {
                 text: format!("Update on the prediction: {}", short),
                 category: "prediction".into(),
@@ -1263,6 +831,32 @@ const STOPWORDS: &[&str] = &[
     "does", "doing", "going", "happening", "tell", "know",
 ];
 
+/// Shorten to at most `max` characters, ending in an ellipsis when cut.
+///
+/// This exists because `&s[..n]` is a **byte** index: Rust panics unconditionally
+/// when `n` lands inside a multi-byte character, and a Tauri command's
+/// `Result<_, String>` cannot catch that — the panic kills the app. The corpus is
+/// full of the characters that trigger it: em-dashes in the financial digests,
+/// `€` throughout the Italy sector, `₹` and `→` in headlines. Ten stories in the
+/// live database sat on exactly the boundary these call sites used.
+///
+/// The budget is characters, not bytes, so an accented headline is no longer cut
+/// shorter than an ASCII one of the same visible length. Same bug class the
+/// fetcher was fixed for in `efa92f3`; that fix never reached this file.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    format!("{}...", s.chars().take(keep).collect::<String>())
+}
+
+/// Shorten to at most `max` characters with no ellipsis, for text being handed to
+/// a model rather than shown to a person. Same panic hazard as [`truncate_ellipsis`].
+fn truncate_plain(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 /// Extract meaningful lowercased keywords from text (3+ chars, no stopwords).
 fn extract_keywords(text: &str) -> Vec<String> {
     text.split_whitespace()
@@ -1276,18 +870,57 @@ fn extract_keywords(text: &str) -> Vec<String> {
 // Retrieval confidence
 // ---------------------------------------------------------------------------
 
-/// Compute retrieval confidence from the score distribution of search results.
+/// How well the archive covers this question, as told to the model.
+///
+/// This must **not** compare `score` against absolute thresholds, because that
+/// field carries two incompatible scales. On the un-reranked path it is a
+/// score-weighted RRF blend: each channel contributes at most
+/// `raw / (RRF_K + rank + 1)` — about 0.021 semantic plus 0.016 FTS — which is
+/// then mixed with recency, topping out near 0.18 for Analytical queries. When
+/// the Voyage reranker runs it overwrites the same field with a calibrated 0-1
+/// relevance. The previous thresholds (avg > 0.6 and top > 0.8) were reachable
+/// only on the second scale, so identical retrieval read HIGH or LOW depending
+/// on whether a rerank happened to fire — and on the un-reranked path HIGH was
+/// arithmetically impossible.
+///
+/// The cost of that was not cosmetic: LOW makes the system prompt instruct the
+/// model to hedge about coverage, and it trips the automatic web-search
+/// fallback. Ask Pulse was talking itself down on its best questions.
+///
+/// So confidence is judged on two scale-invariant signals instead:
+///
+/// * **agreement** — how many stories keyword *and* vector search independently
+///   surfaced. Multiplying every score by a constant cannot change this.
+/// * **density** — the mean score as a fraction of the best score. A tight
+///   cluster near the top means a body of relevant material; one strong hit
+///   trailing off into noise means thin coverage. Also invariant under scaling.
 fn compute_retrieval_confidence(stories: &[search::ScoredStory]) -> &'static str {
     if stories.is_empty() {
         return "NONE";
     }
     let count = stories.len();
-    let avg_score: f32 = stories.iter().map(|s| s.score).sum::<f32>() / count as f32;
-    let top_score = stories.first().map(|s| s.score).unwrap_or(0.0);
 
-    if count >= 8 && avg_score > 0.6 && top_score > 0.8 {
+    let top = stories
+        .iter()
+        .map(|s| s.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let avg = stories.iter().map(|s| s.score).sum::<f32>() / count as f32;
+    // Guard the degenerate cases rather than dividing by them: all-zero scores
+    // carry no density signal, so lean entirely on agreement.
+    let density = if top.is_finite() && top > 0.0 {
+        avg / top
+    } else {
+        0.0
+    };
+
+    let agreed = stories
+        .iter()
+        .filter(|s| s.match_type == search::MatchType::Both)
+        .count();
+
+    if count >= 8 && (agreed >= 2 || density >= 0.55) {
         "HIGH"
-    } else if count >= 4 && avg_score > 0.4 {
+    } else if count >= 4 && (agreed >= 1 || density >= 0.40) {
         "MODERATE"
     } else {
         "LOW"
@@ -1324,7 +957,7 @@ async fn generate_thread_title(api_key: &str, question: &str, answer: &str) -> S
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 30,
         "system": "Generate a 3-5 word title for this conversation. No quotes, no punctuation, just the topic. Examples: 'OpenAI GPT-5 Analysis', 'Miami Tech Funding', 'EU AI Regulation Impact'",
-        "messages": [{"role": "user", "content": format!("Q: {}\nA: {}", &question[..question.len().min(200)], &answer[..answer.len().min(300)])}]
+        "messages": [{"role": "user", "content": format!("Q: {}\nA: {}", truncate_plain(question, 200), truncate_plain(answer, 300))}]
     });
 
     let resp = client
@@ -1402,8 +1035,8 @@ pub fn get_feedback_stats(db: State<'_, DbState>) -> Result<serde_json::Value, S
     if let Ok(mut stmt) = conn.prepare(
         "SELECT key, reputation, boost, upvotes, downvotes FROM feedback_reputation
          WHERE kind = 'source' ORDER BY reputation DESC"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok(serde_json::json!({
                 "name": row.get::<_, String>(0)?.replace("source:", ""),
                 "reputation": row.get::<_, f64>(1)?,
@@ -1416,15 +1049,14 @@ pub fn get_feedback_stats(db: State<'_, DbState>) -> Result<serde_json::Value, S
             top_sources = all.iter().take(5).cloned().collect();
             bottom_sources = all.iter().rev().take(5).cloned().collect();
         }
-    }
 
     // Sector reputations
     let mut sectors = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT key, reputation, boost, upvotes, downvotes FROM feedback_reputation
          WHERE kind = 'sector' ORDER BY reputation DESC"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok(serde_json::json!({
                 "name": row.get::<_, String>(0)?.replace("sector:", ""),
                 "reputation": row.get::<_, f64>(1)?,
@@ -1435,7 +1067,6 @@ pub fn get_feedback_stats(db: State<'_, DbState>) -> Result<serde_json::Value, S
         }) {
             sectors = rows.flatten().collect();
         }
-    }
 
     Ok(serde_json::json!({
         "total_up": total_up,
@@ -1449,6 +1080,64 @@ pub fn get_feedback_stats(db: State<'_, DbState>) -> Result<serde_json::Value, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real headlines from the live corpus whose byte 57 falls *inside* a
+    /// multi-byte character. Under the old `&headline[..57]` each of these
+    /// killed the app, and a `Result` return type could not catch it — Rust
+    /// string-slice panics are unconditional.
+    const BOUNDARY_HEADLINES: [&str; 3] = [
+        "Westwind Capital reports $414M portfolio (50 holdings) — top: NEE, DUK",
+        "Ferrari Unveils First-Ever Electric Model, Priced Up to ₹6 Crore",
+        "Tower Semiconductor Wikipedia views spike 20% (170/day → 205/day)",
+    ];
+
+    #[test]
+    fn the_hazard_is_real_at_the_exact_index_these_call_sites_used() {
+        // Not a test of our code — a test that the bug being fixed exists. If this
+        // ever stops holding, the fixtures above have drifted and the tests below
+        // are no longer exercising the boundary case.
+        let hit = BOUNDARY_HEADLINES
+            .iter()
+            .filter(|h| std::str::from_utf8(&h.as_bytes()[..57]).is_err())
+            .count();
+        assert_eq!(hit, 3, "fixtures must sit on a multi-byte boundary at byte 57");
+    }
+
+    #[test]
+    fn truncate_ellipsis_survives_a_multibyte_cut() {
+        for h in BOUNDARY_HEADLINES {
+            let out = truncate_ellipsis(h, 60);
+            assert!(out.chars().count() <= 60, "over budget: {out}");
+            assert!(out.ends_with("..."));
+        }
+    }
+
+    #[test]
+    fn truncate_ellipsis_leaves_short_input_alone() {
+        assert_eq!(truncate_ellipsis("short", 60), "short");
+        // Exactly at the budget is not truncation.
+        let exact: String = "é".repeat(60);
+        assert_eq!(truncate_ellipsis(&exact, 60), exact);
+    }
+
+    #[test]
+    fn truncate_ellipsis_counts_characters_not_bytes() {
+        // 40 euro signs are 120 bytes but only 40 chars — under a 60-char budget
+        // this must NOT be truncated, where a byte-length check would have cut it.
+        let euros: String = "€".repeat(40);
+        assert_eq!(truncate_ellipsis(&euros, 60), euros);
+    }
+
+    #[test]
+    fn truncate_plain_survives_a_multibyte_cut() {
+        for h in BOUNDARY_HEADLINES {
+            let out = truncate_plain(h, 57);
+            assert!(out.chars().count() <= 57);
+        }
+        // The thread-title call site truncates to 200/300; a string shorter than
+        // the budget must come back whole.
+        assert_eq!(truncate_plain("¿qué?", 200), "¿qué?");
+    }
 
     #[test]
     fn test_extract_keywords() {
@@ -1525,6 +1214,93 @@ mod tests {
     fn test_retrieval_confidence_none() {
         let stories: Vec<search::ScoredStory> = vec![];
         assert_eq!(compute_retrieval_confidence(&stories), "NONE");
+    }
+
+    // --- retrieval confidence at the scale production actually produces --------
+    //
+    // The two tests above pass with `score: 0.9`, which the merge path can never
+    // emit. `merge_results` contributes at most `raw/(RRF_K + rank + 1)` per
+    // channel — 1.3/61 semantic plus 1.0/61 FTS ≈ 0.038 — and that is then
+    // blended with recency as `alpha*rrf + (1-alpha)*recency`, topping out near
+    // 0.18 for Analytical queries. The old thresholds (avg > 0.6, top > 0.8) were
+    // therefore unreachable, so Ask Pulse told the model its archive coverage was
+    // weak on exactly the query types where it was strongest.
+
+    fn scored(n: usize, score_of: impl Fn(usize) -> f32, mt: search::MatchType) -> Vec<search::ScoredStory> {
+        (0..n)
+            .map(|i| search::ScoredStory {
+                story_id: i as i64,
+                headline: format!("Story {i}"),
+                summary: String::new(),
+                key_facts: String::new(),
+                why_it_matters: String::new(),
+                sector: "ai".into(),
+                source_name: "test".into(),
+                date: "2026-08-15".into(),
+                score: score_of(i),
+                match_type: mt,
+                source: search::StorySource::Daily,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_strong_result_set_at_real_rrf_scale_is_not_called_low() {
+        // Nine tightly-clustered hits just under the RRF+recency ceiling: the
+        // archive answers this question well. The old code scored this LOW.
+        let stories = scored(9, |i| 0.182 - i as f32 * 0.004, search::MatchType::Semantic);
+        assert_eq!(compute_retrieval_confidence(&stories), "HIGH");
+    }
+
+    #[test]
+    fn confidence_is_invariant_to_the_score_scale() {
+        // The same result set arrives on two different scales depending on whether
+        // the Voyage reranker ran — it overwrites `score` with a calibrated 0-1
+        // relevance, while the un-reranked path leaves the tiny RRF blend. Both
+        // describe identical retrieval and must not disagree about confidence.
+        let rrf = scored(9, |i| 0.182 - i as f32 * 0.004, search::MatchType::Semantic);
+        let voyage = scored(9, |i| (0.182 - i as f32 * 0.004) * 5.0, search::MatchType::Semantic);
+        assert_eq!(
+            compute_retrieval_confidence(&rrf),
+            compute_retrieval_confidence(&voyage),
+            "confidence must not depend on which scale the scores happen to be on"
+        );
+    }
+
+    #[test]
+    fn one_strong_hit_trailing_into_noise_is_low_confidence() {
+        // A dominant top result with a long tail of near-misses means the archive
+        // holds *one* relevant story, which is thin coverage however many rows come
+        // back with it. Density is what separates this from the clustered case
+        // above; the two sets have the same count and the same top score.
+        //
+        // Telling the model to hedge here is correct — this is the case the
+        // confidence signal exists to catch.
+        let stories = scored(9, |i| if i == 0 { 0.18 } else { 0.02 }, search::MatchType::Semantic);
+        assert_eq!(compute_retrieval_confidence(&stories), "LOW");
+    }
+
+    #[test]
+    fn density_and_not_count_is_what_separates_thin_from_broad_coverage() {
+        // Same count, same top score, same match type — only the shape differs.
+        let broad = scored(9, |i| 0.182 - i as f32 * 0.004, search::MatchType::Semantic);
+        let thin = scored(9, |i| if i == 0 { 0.182 } else { 0.02 }, search::MatchType::Semantic);
+        assert_eq!(compute_retrieval_confidence(&broad), "HIGH");
+        assert_eq!(compute_retrieval_confidence(&thin), "LOW");
+    }
+
+    #[test]
+    fn dual_channel_agreement_carries_confidence_on_its_own() {
+        // Keyword and vector search independently surfacing the same stories is
+        // strong evidence regardless of the numbers attached.
+        let stories = scored(8, |_| 0.03, search::MatchType::Both);
+        assert_eq!(compute_retrieval_confidence(&stories), "HIGH");
+    }
+
+    #[test]
+    fn a_thin_result_set_is_still_low() {
+        let stories = scored(3, |_| 0.18, search::MatchType::Semantic);
+        assert_eq!(compute_retrieval_confidence(&stories), "LOW");
     }
 
     #[test]

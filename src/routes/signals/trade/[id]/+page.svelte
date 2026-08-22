@@ -289,10 +289,10 @@
 				<p class="text-xs text-text-secondary leading-relaxed">
 					Compound score <span class="font-mono">{sz.score.toFixed(2)}</span> lands in the
 					<span class="font-mono">{(sz.tier_pct * 100).toFixed(0)}%</span> tier
-					(&gt;0.60 &rarr; 10%, &gt;0.40 &rarr; 5%, otherwise 2% of buying power).
-					{#if sz.implied_buying_power !== null}
-						{(sz.tier_pct * 100).toFixed(0)}% of the {fmt$(sz.implied_buying_power, 0)} buying power
-						available at entry = <span class="font-mono text-text">{fmt$(sz.notional, 0)}</span>.
+					(&gt;0.60 &rarr; 10%, &gt;0.40 &rarr; 5%, otherwise 2% of the portfolio).
+					{#if sz.implied_sizing_base !== null}
+						{(sz.tier_pct * 100).toFixed(0)}% of the {fmt$(sz.implied_sizing_base, 0)}
+						the account reported at entry = <span class="font-mono text-text">{fmt$(sz.notional, 0)}</span>.
 					{:else}
 						Result: <span class="font-mono text-text">{fmt$(sz.notional, 0)}</span>{sz.clamped ? ' (clamped by the floor/cap bounds)' : ''}.
 					{/if}

@@ -127,7 +127,10 @@ export type ChatStreamEvent =
 			data: {
 				message: string;
 				message_id: string;
+				/** Everything retrieved, whether or not the answer used it. */
 				source_story_ids: number[];
+				/** Only what the answer actually cited, in citation order. */
+				cited_story_ids: number[];
 				suggested_followups: string[];
 				thread_topic: string;
 				thread_title: string | null;
@@ -434,6 +437,9 @@ export interface PendingCalibrationRow {
 	sample_size: number | null;
 	total_resolved: number;
 	status: string;
+	/** Set when this row cannot be applied. Optional so existing fixtures and
+	 *  mocks stay valid; absent or null means applicable. */
+	stale_reason?: string | null;
 }
 
 export interface CalibrationGateStatus {
@@ -528,7 +534,7 @@ export interface TradeSizing {
 	entry_floor: number;
 	entry_cap: number;
 	clamped: boolean;
-	implied_buying_power: number | null;
+	implied_sizing_base: number | null;
 	scale_in_count: number;
 }
 
@@ -651,7 +657,18 @@ export interface BacktestMonthlyReturn {
 export interface BacktestResult {
 	config_summary: string;
 	total_signals: number;
+	/** Distinct tickers among those signals. 0 on results read back from
+	 *  history — the column isn't persisted, so 0 means unknown, not none. */
+	tickers_signalled: number;
+	/** Of those, how many ever had a price bar on a day they signalled — the only
+	 *  ones the walk could admit. A gap here means the result covers part of the
+	 *  signal's universe. Not a live-trading limit; live entries price off Alpaca. */
+	tickers_tradable: number;
+	/** Closed exits only. Positions still open when the price data ran out are
+	 *  counted in `open_at_end` — they move the equity curve but are not outcomes,
+	 *  so hit_rate, avg_return_pct and avg_holding_days all exclude them. */
 	trades_taken: number;
+	open_at_end: number;
 	trades_won: number;
 	trades_lost: number;
 	hit_rate: number;

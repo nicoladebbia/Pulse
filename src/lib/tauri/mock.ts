@@ -95,12 +95,45 @@ const mockStories: Story[] = [
 		published_at: today, created_at: today,
 		summary_depth: null, deep_summary: null, source_type: 'news', financial_metadata: null,
 	},
+	// Bulk regulatory filings. Production ships 38-462 of these per day against a fixed
+	// 120 news stories, all with importance pinned to 5 and no relevance score — the
+	// shape that made the archive render 582 cards. Included here so the archive's
+	// filings digest and the front page's exclusion of filings are exercisable in mock
+	// mode; the proportions are scaled down but the ranking properties are identical.
+	...[
+		['SEC EDGAR 4', 'Form 4: Officer reports sale of 12,000 shares'],
+		['SEC EDGAR 4', 'Form 4: Director reports acquisition of 3,500 shares'],
+		['SEC EDGAR 4', 'Form 4: 10% owner reports disposition of 45,000 shares'],
+		['SEC EDGAR 8-K', 'Form 8-K: Entry into a material definitive agreement'],
+		['SEC EDGAR 8-K', 'Form 8-K: Results of operations and financial condition'],
+		['SEC EDGAR 13F-HR', 'Form 13F-HR: Quarterly institutional holdings report'],
+		['FEC', 'Committee reports $2.4M in receipts for the reporting period'],
+		['FEC', 'Independent expenditure filed for a federal candidate'],
+		['Senate LDA', 'Lobbying registration filed for a technology client'],
+		['Federal Register', 'Notice of proposed rulemaking on data center emissions'],
+		['USASpending', 'Contract award for cloud infrastructure modernization'],
+		['Google Patents', 'Patent granted: distributed inference scheduling'],
+	].map(([source, headline], i): Story => ({
+		id: 100 + i, briefing_id: 1, sector: 'finance',
+		headline,
+		summary: 'Filed disclosure. No editorial summary is generated for bulk filings.',
+		key_facts: [],
+		why_it_matters: '',
+		what_to_watch: '',
+		importance_score: 5, relevance_score: null, relevance_reason: null,
+		is_hero: false, display_order: 100 + i,
+		original_url: 'https://example.com/filing/' + (100 + i), source_name: source,
+		published_at: today, created_at: today,
+		summary_depth: null, deep_summary: null,
+		source_type: 'financial', financial_metadata: null,
+	})),
 ];
 
 const mockBriefing: Briefing = {
 	id: 1,
 	date: today,
-	story_count: mockStories.length,
+	// News only, matching migration 032 — filings are counted separately in the archive.
+	story_count: mockStories.filter(s => s.source_type !== 'financial').length,
 	ai_count: mockStories.filter(s => s.sector === 'ai').length,
 	miami_count: mockStories.filter(s => s.sector === 'miami').length,
 	italy_count: mockStories.filter(s => s.sector === 'italy').length,

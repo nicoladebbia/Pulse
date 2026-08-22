@@ -1,0 +1,14 @@
+# Pinned, not `stable`.
+#
+# CI gates `clippy -D warnings`, so the lint SET is part of the build contract.
+# With a floating toolchain that set changes under you: this file exists because
+# a local clippy 1.94.1 reported zero warnings while the runner's 1.98.0 failed
+# the same tree on nine `unnecessary_sort_by` sites. A green local run has to
+# mean a green CI run, and that requires both sides running the same compiler.
+#
+# Bumping this is a deliberate commit: raise the version, run
+# `cargo clippy --workspace --all-targets -- -D warnings`, fix what the new
+# release flags, and land it together.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

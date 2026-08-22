@@ -1,8 +1,14 @@
-use tauri::State;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tauri::{Emitter, Manager, State};
 use serde::{Deserialize, Serialize};
 
 use crate::db::DbState;
 use crate::services::{predictions, relationships, signals};
+
+/// Guards against overlapping background signal recomputes when Trends is
+/// opened repeatedly while one is already running.
+static SIGNAL_RECOMPUTE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrendThread {
@@ -191,21 +197,40 @@ pub fn get_intelligence_counts(db: State<'_, DbState>) -> Result<IntelligenceCou
 /// Get trending entities for the Trends page.
 /// Optimized: fetches everything in minimal queries to avoid blocking the main thread.
 #[tauri::command]
-pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
+pub fn get_trends(app: tauri::AppHandle, db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
-    // Only recompute signals if stale (>1 hour since last update)
+    // If signals are stale (>1 hour since last update), recompute in the BACKGROUND
+    // instead of blocking page open behind a full re-rank. We return trends built
+    // from the current (possibly stale) signals immediately; when the recompute
+    // finishes, a 'trends-recomputed' event tells the frontend to re-fetch.
     let needs_recompute: bool = conn.query_row(
         "SELECT COALESCE(MAX(updated_at) < datetime('now', '-1 hour'), 1) FROM signals",
         [], |row| row.get(0),
     ).unwrap_or(true);
 
-    if needs_recompute {
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        match signals::recompute_signals(&conn, &today) {
-            Ok(count) => tracing::debug!("Recomputed {} signals (stale)", count),
-            Err(e) => tracing::warn!("Signal recompute failed: {}", e),
-        }
+    if needs_recompute && !SIGNAL_RECOMPUTE_RUNNING.swap(true, Ordering::SeqCst) {
+        let bg_app = app.clone();
+        std::thread::spawn(move || {
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let db = bg_app.state::<DbState>();
+            let result = match db.0.lock() {
+                Ok(conn) => signals::recompute_signals(&conn, &today),
+                Err(e) => Err(anyhow::anyhow!("db lock poisoned: {}", e)),
+            };
+            SIGNAL_RECOMPUTE_RUNNING.store(false, Ordering::SeqCst);
+            match result {
+                // Only notify when rows were actually upserted: a zero-count recompute
+                // leaves MAX(updated_at) stale, so emitting would make the frontend
+                // re-fetch → re-spawn → re-emit in an infinite loop on an empty DB.
+                Ok(count) if count > 0 => {
+                    tracing::debug!("Background signal recompute done ({} signals)", count);
+                    let _ = bg_app.emit("trends-recomputed", ());
+                }
+                Ok(_) => tracing::debug!("Background signal recompute: nothing to update"),
+                Err(e) => tracing::warn!("Background signal recompute failed: {}", e),
+            }
+        });
     }
 
     // Trends are scoped to the 4 freedom-news sectors. Financial-source entities
@@ -271,13 +296,19 @@ pub fn get_trends(db: State<'_, DbState>) -> Result<Vec<TrendThread>, String> {
     if !topic_list.is_empty() {
         // Batch story points — one query for all topics
         let placeholders: String = topic_list.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // Same 30-day window and sector filter as the ranking query above — a trend
+        // that qualified on 30d of mentions must always render with its evidence.
+        // (This was '-14 days' without a sector filter, so a topic trending on
+        // days 15-30 showed an empty story timeline.) The 14-day sparkline keeps
+        // its short window: it reads only the last 14 days of these day-counts.
         let sql = format!(
             "SELECT e.name_normalized, s.id, em.mentioned_at, s.headline, s.importance_score, s.sector
              FROM entities e
              JOIN entity_mentions em ON em.entity_id = e.id
              JOIN stories s ON s.id = em.story_id
              WHERE e.name_normalized IN ({})
-               AND em.mentioned_at >= date('now', '-14 days')
+               AND s.sector IN ('ai', 'miami', 'italy', 'tech')
+               AND em.mentioned_at >= date('now', '-30 days')
              ORDER BY em.mentioned_at DESC",
             placeholders
         );

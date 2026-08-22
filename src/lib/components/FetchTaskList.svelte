@@ -73,8 +73,11 @@
 	{/if}
 
 	{#if $fetchError}
+		<!-- The reason now carries the observed upstream error verbatim (up to 600
+		     chars) instead of a one-line guess, so it is clamped to four lines with
+		     the full text on hover and selectable for copying into a bug report. -->
 		<div class="error-row">
-			<span class="text-rose-400 text-xs">{$fetchError}</span>
+			<span class="text-rose-400 text-xs error-text" title={$fetchError}>{$fetchError}</span>
 		</div>
 	{/if}
 </div>
@@ -265,5 +268,18 @@
 
 	.error-row {
 		padding: 4px 0 4px 28px;
+	}
+
+	.error-text {
+		display: -webkit-box;
+		-webkit-line-clamp: 4;
+		line-clamp: 4;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+		/* The message quotes a raw API body, so it can contain a long unbroken
+		   token (a URL, a base64 id) that would otherwise force the sidebar wider. */
+		overflow-wrap: anywhere;
+		user-select: text;
+		cursor: text;
 	}
 </style>

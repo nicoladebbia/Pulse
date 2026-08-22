@@ -137,15 +137,14 @@ pub fn scan_all_contrarian(
 
     let mut signals = Vec::new();
     for topic in &topics {
-        if let Some(signal) = detect_contrarian(conn, topic, days, threshold)? {
-            if signal.dissent_count > 0 {
+        if let Some(signal) = detect_contrarian(conn, topic, days, threshold)?
+            && signal.dissent_count > 0 {
                 signals.push(signal);
             }
-        }
     }
 
     // Sort by dissent_count descending (most interesting first)
-    signals.sort_by(|a, b| b.dissent_count.cmp(&a.dissent_count));
+    signals.sort_by_key(|s| std::cmp::Reverse(s.dissent_count));
 
     Ok(signals)
 }
@@ -278,8 +277,8 @@ mod tests {
         let entity_id = seed_entity(&conn, "Debated Topic", &today);
 
         // 5 positive + 1 negative
-        for i in 0..5 {
-            seed_mention_with_sentiment(&conn, entity_id, sids[i], 0.7, &today);
+        for sid in sids.iter().take(5) {
+            seed_mention_with_sentiment(&conn, entity_id, *sid, 0.7, &today);
         }
         seed_mention_with_sentiment(&conn, entity_id, sids[5], -0.5, &today);
 
@@ -352,8 +351,8 @@ mod tests {
 
         // Entity A: strong positive consensus with 1 dissenter
         let ea = seed_entity(&conn, "Consensus A", &today);
-        for i in 0..4 {
-            seed_mention_with_sentiment(&conn, ea, sids[i], 0.8, &today);
+        for sid in sids.iter().take(4) {
+            seed_mention_with_sentiment(&conn, ea, *sid, 0.8, &today);
         }
         seed_mention_with_sentiment(&conn, ea, sids[4], -0.5, &today);
 

@@ -21,11 +21,10 @@ pub async fn get_portfolio(db: State<'_, DbState>) -> Result<Portfolio, String> 
         .await
         .map_err(|e| e.to_string());
     // Log Alpaca reads (1 for account + 1 for positions, regardless of ticker count)
-    if result.is_ok() {
-        if let Ok(conn) = db.0.lock() {
+    if result.is_ok()
+        && let Ok(conn) = db.0.lock() {
             crate::services::api_usage::log_usage(&conn, "alpaca", "paper_api", "portfolio", 2, 0).ok();
         }
-    }
     result
 }
 
@@ -255,9 +254,13 @@ pub fn get_backtest_history(db: State<'_, DbState>) -> Result<Vec<BacktestResult
 /// Uses an expanding window: every day it runs, it tests on ALL data from the
 /// first cross_signals row to today. So day 91 has 91 days, day 92 has 92, etc.
 ///
-/// Default parameters mirror the production trading path (compound score > 0.3,
-/// 5% position sizing, 90-day max hold) so the daily report measures what the
-/// auto-trader WOULD have done, had it been on.
+/// The entry side mirrors the production trading path (compound score > 0.3,
+/// 5% position sizing). The EXIT side does not, and cannot: the simulator only
+/// knows fixed percentages, while the live engine exits on a 3x ATR trailing
+/// stop from the high-water mark and closes half the position at a 3x ATR
+/// profit target. Neither is expressible here. Read this report as "did the
+/// entry signal pick names that moved", not "this is what the auto-trader
+/// would have returned".
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AutoBacktestStatus {
     pub ran_today: bool,
@@ -335,9 +338,23 @@ pub fn auto_backtest_if_due(db: State<'_, DbState>) -> Result<AutoBacktestStatus
         start_date,
         end_date,
         min_score: 0.30,        // matches auto_trade_on_convergence threshold
-        stop_loss_pct: -10.0,   // realistic safety stop
+        // -10% and +15% are an APPROXIMATION of a two-part exit the simulator
+        // cannot express, not a match to any live constant. Live, the binding
+        // exit is a 3x ATR trailing stop off the high-water mark; the -15% hard
+        // stop is only the floor beneath it, and for most tickers the trail
+        // fires well before -15% ever prints. -10% sits closer to where the
+        // trail actually bites than the floor would, so it stays. The +15%
+        // take-profit stands in for the 50%-of-position close at the 3x ATR
+        // profit target — the simulator has no partial exits, so it closes all.
+        stop_loss_pct: -10.0,
         take_profit_pct: 15.0,
-        max_hold_days: 90,      // matches position_management hard expiry
+        // The live engine has NO calendar expiry — the 90-day hard expiry this
+        // used to cite was deleted from position_management on 2026-07-15. 90
+        // is kept because max_hold_days also extends the price window the walk
+        // loads (start_date .. end_date + max_hold_days), so it must stay large
+        // enough to let late trades resolve. Positions it force-closes at the
+        // limit are counted separately from genuine strategy exits.
+        max_hold_days: 90,
         max_positions: 10,
         position_size_pct: 5.0, // matches the high-score tier in position_sizing
     };
@@ -345,13 +362,36 @@ pub fn auto_backtest_if_due(db: State<'_, DbState>) -> Result<AutoBacktestStatus
     let result = backtester::run_backtest(&conn, config)
         .map_err(|e| format!("auto-backtest failed: {}", e))?;
 
+    // Say what the hit rate is a hit rate OF. It is computed over closed exits
+    // only, and on this data most of the walk's positions are still open when
+    // the price history runs out — a bare "36% hit rate" invites reading it as a
+    // verdict on a much larger sample than it is.
+    let still_open = if result.open_at_end > 0 {
+        format!(" ({} still open at data end)", result.open_at_end)
+    } else {
+        String::new()
+    };
+    // And say which names it could see at all. A ticker with no price bar on a
+    // day it signalled is invisible to the walk, so the result covers only part
+    // of the signal's universe — the live trader prices off Alpaca and has no
+    // such gap, which makes this a limit of the measurement, not of the strategy.
+    let coverage = if result.tickers_tradable < result.tickers_signalled {
+        format!(
+            ". Covers {} of {} signalled tickers — the rest had no price bar on a day they signalled",
+            result.tickers_tradable, result.tickers_signalled
+        )
+    } else {
+        String::new()
+    };
     let summary = format!(
-        "Auto-backtest ran: {} trades, {:.1}% hit rate, {:+.2}% return, Sharpe {:.2}, max DD {:.1}%",
+        "Auto-backtest ran: {} closed trades{}, {:.1}% hit rate, {:+.2}% return, Sharpe {:.2}, max DD {:.1}%{}",
         result.trades_taken,
+        still_open,
         result.hit_rate,
         result.total_return_pct,
         result.sharpe_ratio,
         result.max_drawdown_pct,
+        coverage,
     );
 
     Ok(AutoBacktestStatus {
@@ -385,29 +425,41 @@ pub fn get_auto_trade_status() -> Result<AutoTradeStatus, String> {
     Ok(AutoTradeStatus { enabled, reason })
 }
 
+/// Bars older than this are not evidence about today's volatility. Must match
+/// `position_management::ATR_MAX_STALENESS_DAYS` — see the rationale there.
+const ATR_MAX_STALENESS_DAYS: i64 = 45;
+
 /// Mirror of pulse-fetcher's `position_management::compute_atr` — SMA of true
 /// ranges over `period` days from entity_prices. The fetcher crate is a binary
 /// and cannot be imported from here, so this copy must be kept in sync with
 /// crates/pulse-fetcher/src/position_management.rs.
+///
+/// This copy only *describes* the exit plan in the UI; the fetcher's copy makes
+/// the decision. They must agree exactly, or the Portfolio screen shows a
+/// trailing stop the engine will not act on.
 fn compute_atr(conn: &rusqlite::Connection, ticker: &str, period: usize) -> f64 {
+    let cutoff = (chrono::Local::now() - chrono::Duration::days(ATR_MAX_STALENESS_DAYS))
+        .format("%Y-%m-%d")
+        .to_string();
+
     let mut stmt = match conn.prepare(
         "SELECT high, low, close FROM entity_prices
-         WHERE ticker = ?1 AND high IS NOT NULL AND low IS NOT NULL
-         ORDER BY date DESC LIMIT ?2",
+         WHERE ticker = ?1 AND date >= ?2 AND high IS NOT NULL AND low IS NOT NULL
+         ORDER BY date DESC LIMIT ?3",
     ) {
         Ok(s) => s,
         Err(_) => return 0.0,
     };
 
     let candles: Vec<(f64, f64, f64)> = stmt
-        .query_map(rusqlite::params![ticker, period + 1], |row| {
+        .query_map(rusqlite::params![ticker, cutoff, period + 1], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .ok()
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
-    if candles.len() < 2 {
+    if candles.len() < period / 2 + 1 {
         return 0.0;
     }
 
@@ -487,7 +539,12 @@ pub struct TradeSizing {
     pub entry_floor: f64,
     pub entry_cap: f64,
     pub clamped: bool,
-    pub implied_buying_power: Option<f64>,
+    /// The account figure the tier percentage was applied to, back-derived from
+    /// the notional. Deliberately not named for a specific figure: entries up to
+    /// 2026-08-17 were sized off buying power, later ones off portfolio value
+    /// (see `position_sizing::entry_notional`), and a row does not record which.
+    /// All 11 trades in the live DB predate the change.
+    pub implied_sizing_base: Option<f64>,
     pub scale_in_count: i64,
 }
 
@@ -618,6 +675,10 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
 
     // Sizing derivation — mirrors position_sizing::entry_notional tiers.
     // Long-term design (2026-07-23): doubled from 1%/2%/5%, cap $10K -> $20K.
+    // The tier thresholds must stay identical to position_sizing::tier_pct: this
+    // copy only EXPLAINS a size on the Portfolio screen while the fetcher's copy
+    // decides it, so a drift here shows the user a rationale for a number the
+    // engine did not produce.
     let score = original_compound_score.unwrap_or(trade.confidence);
     let tier_pct = if score > 0.6 { 0.10 } else if score > 0.4 { 0.05 } else { 0.02 };
     let scale_ins = scale_in_count.unwrap_or(0);
@@ -625,7 +686,7 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         || (trade.position_size - 20_000.0).abs() < 0.01;
     // Scale-ins add to position_size, so back-deriving buying power from the
     // final notional is only valid for never-scaled, unclamped entries.
-    let implied_buying_power = if !clamped && scale_ins == 0 && tier_pct > 0.0 {
+    let implied_sizing_base = if !clamped && scale_ins == 0 && tier_pct > 0.0 {
         Some(trade.position_size / tier_pct)
     } else {
         None
@@ -637,7 +698,7 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         entry_floor: 50.0,
         entry_cap: 20_000.0,
         clamped,
-        implied_buying_power,
+        implied_sizing_base,
         scale_in_count: scale_ins,
     };
 
@@ -734,7 +795,12 @@ struct RationaleFacts {
 /// zero-weight number and asked to narrate it as corroborating evidence.
 const ZERO_WEIGHT_SIGNAL_KEYS: [&str; 2] = ["institutional", "supply_chain"];
 
-fn parse_signal_profile_facts(profile_json: &str) -> (Vec<(String, f64)>, Vec<(String, Option<String>)>) {
+/// The two halves of a parsed `signal_profile`: numeric `(dimension, value)`
+/// pairs, and `(dimension, stale_reason)` pairs for dimensions the profile
+/// marked stale.
+type SignalProfileFacts = (Vec<(String, f64)>, Vec<(String, Option<String>)>);
+
+fn parse_signal_profile_facts(profile_json: &str) -> SignalProfileFacts {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(profile_json) else {
         return (Vec::new(), Vec::new());
     };
@@ -977,6 +1043,11 @@ pub struct PendingCalibrationRow {
     pub sample_size: Option<i64>,
     pub total_resolved: i64,
     pub status: String,
+    /// Set when this row cannot be applied — the batch predates the current
+    /// weight vector, or it would hand weight back to a dimension zeroed in
+    /// code. `None` means the row is applicable. Surfaced here so the review UI
+    /// can say so before Apply is reached, rather than only refusing the click.
+    pub stale_reason: Option<String>,
 }
 
 /// List calibration proposals (default: only 'pending', newest batch first).
@@ -1008,9 +1079,25 @@ pub fn get_pending_calibration(
             sample_size: row.get(7)?,
             total_resolved: row.get(8)?,
             status: row.get(9)?,
+            stale_reason: None,
         })
     }).map_err(|e| e.to_string())?
     .filter_map(|r| r.ok())
+    .map(|mut r: PendingCalibrationRow| {
+        let objections =
+            pulse_weights::stale_dimensions(&[(r.dimension.clone(), r.old_weight, r.new_weight)]);
+        r.stale_reason = objections.first().map(|o| match o.reason {
+            pulse_weights::StaleReason::ResurrectsZeroed => format!(
+                "would restore {} to {:.4}, but it is zeroed in code (no working data source)",
+                o.dimension, o.batch_new
+            ),
+            pulse_weights::StaleReason::SupersededSnapshot => format!(
+                "computed from an old weight of {:.4}; the current default is {:.4}",
+                o.batch_old, o.code_default
+            ),
+        });
+        r
+    })
     .collect();
     Ok(rows)
 }
@@ -1039,19 +1126,43 @@ pub fn apply_pending_calibration(
             .map_err(|_| "No pending calibration proposal to apply".to_string())?,
     };
 
-    let rows: Vec<(String, f64)> = {
+    let proposal: Vec<(String, f64, f64)> = {
         let mut stmt = conn.prepare(
-            "SELECT dimension, new_weight FROM pending_calibration WHERE batch_id = ?1 AND status = 'pending'"
+            "SELECT dimension, old_weight, new_weight FROM pending_calibration WHERE batch_id = ?1 AND status = 'pending'"
         ).map_err(|e| e.to_string())?;
-        stmt.query_map([&batch_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        stmt.query_map([&batch_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect()
     };
 
-    if rows.is_empty() {
+    if proposal.is_empty() {
         return Err(format!("No pending rows found for batch '{}'", batch_id));
     }
+
+    // Refuse a proposal computed against a weight vector that has since been
+    // superseded. `adjust_weights` seeds every proposal from the code defaults
+    // and snapshots `old_weight` from the same place, so a snapshot that no
+    // longer matches means the whole batch was scaled off a stale baseline —
+    // and, worse, that it will hand weight back to a dimension deliberately
+    // zeroed because it has no working data source.
+    //
+    // This is not hypothetical. Five batches computed 2026-08-14..17 are pending
+    // right now, each carrying political_signal at 0.2391, patent at 0.0435 and
+    // search at 0.0543 — all three zeroed on 2026-08-17. Applying any one of
+    // them silently reverts that decision, and because every batch's new weights
+    // still sum to 1.0, no sum check notices.
+    let stale = pulse_weights::stale_dimensions(&proposal);
+    if !stale.is_empty() {
+        let msg = pulse_weights::refusal_message(&batch_id, &stale);
+        tracing::warn!("{}", msg);
+        return Err(msg);
+    }
+
+    let rows: Vec<(String, f64)> = proposal
+        .into_iter()
+        .map(|(dim, _old, new)| (dim, new))
+        .collect();
 
     let weights_json = serde_json::to_string(&rows).map_err(|e| e.to_string())?;
     let applied_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();

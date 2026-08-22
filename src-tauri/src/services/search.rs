@@ -421,7 +421,7 @@ fn like_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(i64,
 
     let results: Vec<(i64, f32)> = stmt
         .query_map(params![pattern, limit as i64], |row| {
-            Ok(row.get::<_, i64>(0)?)
+            row.get::<_, i64>(0)
         })?
         .filter_map(|r| r.ok())
         .enumerate()
@@ -503,13 +503,12 @@ pub fn merge_results(
     }
 
     // Normalize RRF scores to 0..1 (needed for recency decay compatibility)
-    if let Some(&(_, max_score, _)) = results.first() {
-        if max_score > 0.0 {
+    if let Some(&(_, max_score, _)) = results.first()
+        && max_score > 0.0 {
             for item in results.iter_mut() {
                 item.1 /= max_score;
             }
         }
-    }
 
     results
 }
@@ -609,14 +608,16 @@ pub fn recency_score(age_days: f32, half_life: f32) -> f32 {
 
 /// Apply time-decay to merged search results using story dates from the DB.
 /// Formula: final = alpha * relevance + (1 - alpha) * recency_score(age)
+/// Blend recency into the fused scores, returning the date map it had to build
+/// anyway so the caller can filter by date without a second query.
 fn apply_recency_decay(
     conn: &Connection,
-    results: &mut Vec<(i64, f32, MatchType)>,
+    results: &mut [(i64, f32, MatchType)],
     alpha: f32,
     half_life: f32,
-) -> Result<()> {
+) -> Result<std::collections::HashMap<i64, String>> {
     if results.is_empty() {
-        return Ok(());
+        return Ok(std::collections::HashMap::new());
     }
 
     // Batch-query dates for all story IDs
@@ -673,19 +674,41 @@ fn apply_recency_decay(
     let today = chrono::Local::now().date_naive();
 
     for (id, score, _) in results.iter_mut() {
-        if let Some(date_str) = date_map.get(id) {
-            if let Ok(story_date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+        if let Some(date_str) = date_map.get(id)
+            && let Ok(story_date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
                 let age_days = (today - story_date).num_days().max(0) as f32;
                 let recency = recency_score(age_days, half_life);
                 *score = alpha * *score + (1.0 - alpha) * recency;
             }
-        }
         // If date lookup/parse fails, keep original score unchanged
     }
 
     // Re-sort by new scores
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(())
+    Ok(date_map)
+}
+
+/// Drop candidates older than `from` while the candidate pool is still full.
+///
+/// The date filter used to run *after* the pool had been truncated to `limit`,
+/// which meant the top N were chosen by score across the entire archive and only
+/// then checked against the requested window. Ask "what happened with X since
+/// January" about a topic whose biggest events predate January and the in-range
+/// stories — ranked below those — were already gone. The filter shrank the answer
+/// instead of shaping the search.
+///
+/// A candidate whose date could not be resolved is kept: a missing date is a
+/// lookup failure, not evidence the story falls outside the window, and silently
+/// dropping it would be the same class of bug in the other direction.
+fn retain_from_date(
+    results: &mut Vec<(i64, f32, MatchType)>,
+    date_map: &std::collections::HashMap<i64, String>,
+    from: &str,
+) {
+    results.retain(|(id, _, _)| match date_map.get(id) {
+        Some(d) => d.as_str() >= from,
+        None => true,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -721,8 +744,8 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
         let pattern = format!("%{}%", clean);
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT name FROM entities WHERE name_normalized LIKE ?1 LIMIT 3"
-        ) {
-            if let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
+        )
+            && let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
                 for name in rows.flatten() {
                     let lower_name = name.to_lowercase();
                     if !lower_query.contains(&lower_name) && name.len() > 2
@@ -732,15 +755,14 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
                     }
                 }
             }
-        }
 
         // Also look up via entity_aliases table (tickers, acronyms)
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT e.name FROM entity_aliases ea
              JOIN entities e ON e.id = ea.entity_id
              WHERE LOWER(ea.alias) = ?1 LIMIT 3"
-        ) {
-            if let Ok(rows) = stmt.query_map(params![clean], |row| row.get::<_, String>(0)) {
+        )
+            && let Ok(rows) = stmt.query_map(params![clean], |row| row.get::<_, String>(0)) {
                 for name in rows.flatten() {
                     let lower_name = name.to_lowercase();
                     if !lower_query.contains(&lower_name)
@@ -750,15 +772,14 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
                     }
                 }
             }
-        }
 
         // Reverse: if query contains entity name, find its aliases/tickers
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT ea.alias FROM entity_aliases ea
              JOIN entities e ON e.id = ea.entity_id
              WHERE e.name_normalized LIKE ?1 LIMIT 3"
-        ) {
-            if let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
+        )
+            && let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
                 for alias in rows.flatten() {
                     let lower_alias = alias.to_lowercase();
                     if !lower_query.contains(&lower_alias)
@@ -768,7 +789,6 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
                     }
                 }
             }
-        }
     }
 
     if expansions.is_empty() {
@@ -877,8 +897,26 @@ pub fn hybrid_search_with_hyde(
 
     // 5. Apply recency decay (non-fatal — keeps original scores on error)
     let (alpha, half_life) = query_type.recency_params();
-    if let Err(e) = apply_recency_decay(conn, &mut merged, alpha, half_life) {
-        tracing::warn!("Recency decay failed (non-fatal): {}", e);
+    let date_map = match apply_recency_decay(conn, &mut merged, alpha, half_life) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Recency decay failed (non-fatal): {}", e);
+            std::collections::HashMap::new()
+        }
+    };
+
+    // 5.5. Apply the date filter BEFORE truncating. Running it afterwards meant
+    // the top `limit` were picked by score across the whole archive and only then
+    // checked against the window, so in-range stories ranked below out-of-range
+    // ones were already discarded. Uses the date map recency decay just built, so
+    // this costs no extra query.
+    if let Some(from) = date_from {
+        let before = merged.len();
+        retain_from_date(&mut merged, &date_map, from);
+        tracing::info!(
+            "Date filter >= {}: {} of {} candidates in range (applied pre-truncation)",
+            from, merged.len(), before
+        );
     }
 
     // 6. Load full story data for top results
@@ -963,7 +1001,11 @@ pub fn hybrid_search_with_hyde(
         stories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    // 7. Apply date filter if specified
+    // 7. Date filter, second pass. Step 5.5 already did the load-bearing work on
+    // the full candidate pool; this catches only the stragglers whose date could
+    // not be resolved from the batch lookup there and so were deliberately kept.
+    // Now that each story is loaded we have its real date, so a genuinely
+    // out-of-range one still goes.
     if let Some(from) = date_from {
         stories.retain(|s| s.date.as_str() >= from);
     }
@@ -1139,6 +1181,69 @@ async fn voyage_rerank_inner(
 mod tests {
     use super::*;
     use crate::db::test_helpers::*;
+
+    // -----------------------------------------------------------------------
+    // Date filtering — must happen while the candidate pool is still full
+    // -----------------------------------------------------------------------
+
+    /// A candidate pool plus its id -> date sidecar, the pair every date-filter
+    /// test feeds in together.
+    type DatedPool = (Vec<(i64, f32, MatchType)>, HashMap<i64, String>);
+
+    fn dated(pairs: &[(i64, f32, &str)]) -> DatedPool {
+        let results = pairs.iter().map(|(id, s, _)| (*id, *s, MatchType::Both)).collect();
+        let map = pairs.iter().map(|(id, _, d)| (*id, d.to_string())).collect();
+        (results, map)
+    }
+
+    #[test]
+    fn in_range_stories_ranked_below_out_of_range_ones_survive() {
+        // The exact defect: "what happened with X since June" where X's biggest
+        // coverage predates June. Filtering after a truncation to 2 would keep the
+        // two March stories and return nothing in range.
+        let (mut results, map) = dated(&[
+            (1, 0.90, "2026-03-01"),
+            (2, 0.80, "2026-03-02"),
+            (3, 0.20, "2026-07-04"),
+            (4, 0.10, "2026-07-05"),
+        ]);
+        retain_from_date(&mut results, &map, "2026-06-01");
+        let ids: Vec<i64> = results.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![3, 4]);
+
+        // And the ordering that used to destroy them: truncate first, filter after.
+        let (before, map2) = dated(&[
+            (1, 0.90, "2026-03-01"),
+            (2, 0.80, "2026-03-02"),
+            (3, 0.20, "2026-07-04"),
+            (4, 0.10, "2026-07-05"),
+        ]);
+        let mut truncated_first: Vec<_> = before.into_iter().take(2).collect();
+        retain_from_date(&mut truncated_first, &map2, "2026-06-01");
+        assert!(
+            truncated_first.is_empty(),
+            "filtering after truncation loses every in-range story — this is what was fixed"
+        );
+    }
+
+    #[test]
+    fn a_candidate_with_no_resolvable_date_is_kept_not_guessed() {
+        // A missing date is a failed lookup, not evidence of being out of range.
+        // Step 7 re-checks it once the story is loaded and its real date is known.
+        let (mut results, mut map) = dated(&[(1, 0.9, "2026-07-01"), (2, 0.8, "2026-01-01")]);
+        map.remove(&2);
+        retain_from_date(&mut results, &map, "2026-06-01");
+        let ids: Vec<i64> = results.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn the_boundary_date_is_inclusive() {
+        let (mut results, map) = dated(&[(1, 0.9, "2026-06-01"), (2, 0.8, "2026-05-31")]);
+        retain_from_date(&mut results, &map, "2026-06-01");
+        let ids: Vec<i64> = results.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![1]);
+    }
 
     // -----------------------------------------------------------------------
     // Recency scoring tests

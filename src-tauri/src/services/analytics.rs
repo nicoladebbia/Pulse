@@ -208,6 +208,26 @@ pub fn compute_analytics(conn: &Connection) -> Result<PortfolioAnalytics, String
 // ---------------------------------------------------------------------------
 
 fn get_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
+    // A closed trade with a price but no exit date is malformed. It is excluded
+    // below rather than coerced to "", but excluding it SILENTLY would be the same
+    // class of bug, so count it and say so.
+    let malformed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM paper_trades
+             WHERE status IN ('closed', 'stopped_out', 'expired')
+               AND exit_price IS NOT NULL AND pnl_pct IS NOT NULL
+               AND (exit_date IS NULL OR exit_date = '')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if malformed > 0 {
+        tracing::warn!(
+            "{} closed trade(s) have an exit price but no exit date — excluded from analytics",
+            malformed
+        );
+    }
+
     let mut stmt = conn.prepare(
         "SELECT pt.ticker, pt.entry_date, pt.exit_date, pt.entry_price, pt.exit_price,
                 pt.position_size, pt.pnl_pct, pt.signal_profile, e.sector
@@ -215,6 +235,7 @@ fn get_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
          LEFT JOIN entities e ON e.id = pt.entity_id
          WHERE pt.status IN ('closed', 'stopped_out', 'expired')
            AND pt.exit_price IS NOT NULL AND pt.pnl_pct IS NOT NULL
+           AND pt.exit_date IS NOT NULL AND pt.exit_date != ''
          ORDER BY pt.exit_date ASC"
     ).map_err(|e| e.to_string())?;
 
@@ -229,7 +250,12 @@ fn get_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
         Ok(ClosedTrade {
             ticker: row.get(0)?,
             entry_date: row.get(1)?,
-            exit_date: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            // Non-null by the WHERE clause above. This was
+            // `Option<String>::unwrap_or_default()`, which turned a missing exit
+            // date into "" — a value that then silently dropped the trade from the
+            // holding-period average (parse fails inside a filter_map) and rendered
+            // as a blank date in the UI.
+            exit_date: row.get(2)?,
             entry_price,
             exit_price,
             position_size,
@@ -310,12 +336,11 @@ fn compute_signal_attribution(trades: &[ClosedTrade]) -> Vec<SignalAttribution> 
         let mut loss_vals = Vec::new();
 
         for t in trades {
-            if let Some(val) = parse_signal_value(&t.signal_profile, dim) {
-                if val > 0.01 { // Only count if signal was present
+            if let Some(val) = parse_signal_value(&t.signal_profile, dim)
+                && val > 0.01 { // Only count if signal was present
                     if t.pnl_pct > 0.0 { win_vals.push(val); }
                     else { loss_vals.push(val); }
                 }
-            }
         }
 
         let avg_on_wins = if win_vals.is_empty() { 0.0 }
@@ -362,7 +387,7 @@ fn compute_sector_exposure(trades: &[ClosedTrade]) -> Vec<SectorExposure> {
         }
     }).collect();
 
-    result.sort_by(|a, b| b.trade_count.cmp(&a.trade_count));
+    result.sort_by_key(|r| std::cmp::Reverse(r.trade_count));
     result
 }
 
@@ -472,11 +497,19 @@ pub fn get_or_generate_journal(conn: &Connection, trade_id: i64) -> Result<Trade
     let journal = if let Some(existing) = existing {
         existing
     } else {
-        let generated = generate_journal_text(
-            &ticker, entity_name.as_deref(), &entry_date, exit_date.as_deref(),
-            entry_price, exit_price, position_size, pnl_pct, pnl,
-            &status, &signal_breakdown,
-        );
+        let generated = generate_journal_text(&JournalInputs {
+            ticker: &ticker,
+            entity_name: entity_name.as_deref(),
+            entry_date: &entry_date,
+            exit_date: exit_date.as_deref(),
+            entry_price,
+            exit_price,
+            position_size,
+            pnl_pct,
+            pnl,
+            status: &status,
+            signals: &signal_breakdown,
+        });
         // Store it
         conn.execute(
             "UPDATE paper_trades SET trade_journal = ?1 WHERE id = ?2",
@@ -504,13 +537,40 @@ fn parse_signal_breakdown(profile: &str) -> Vec<SignalEntry> {
     }).collect()
 }
 
-fn generate_journal_text(
-    ticker: &str, entity_name: Option<&str>,
-    entry_date: &str, exit_date: Option<&str>,
-    entry_price: f64, exit_price: Option<f64>,
-    position_size: f64, pnl_pct: Option<f64>, pnl: Option<f64>,
-    status: &str, signals: &[SignalEntry],
-) -> String {
+/// The trade a journal entry narrates.
+///
+/// Previously eleven positional parameters with three same-typed adjacent
+/// pairs (`ticker`/`entity_name`, `entry_date`/`exit_date`,
+/// `pnl_pct`/`pnl`) — swapping either member of a pair compiled cleanly and
+/// produced a plausible-looking but wrong narrative.
+struct JournalInputs<'a> {
+    ticker: &'a str,
+    entity_name: Option<&'a str>,
+    entry_date: &'a str,
+    exit_date: Option<&'a str>,
+    entry_price: f64,
+    exit_price: Option<f64>,
+    position_size: f64,
+    pnl_pct: Option<f64>,
+    pnl: Option<f64>,
+    status: &'a str,
+    signals: &'a [SignalEntry],
+}
+
+fn generate_journal_text(t: &JournalInputs<'_>) -> String {
+    let JournalInputs {
+        ticker,
+        entity_name,
+        entry_date,
+        exit_date,
+        entry_price,
+        exit_price,
+        position_size,
+        pnl_pct,
+        pnl,
+        status,
+        signals,
+    } = *t;
     let mut parts = Vec::new();
     let name = entity_name.unwrap_or(ticker);
 
@@ -543,12 +603,18 @@ fn generate_journal_text(
         };
 
         // SEV2: the DB has no close_reason column, so we can only state the reason the STATUS
-        // actually encodes. stopped_out/expired were written by the old exit engine and carry a
-        // real reason. A plain 'closed' row is a manual close with the reason NOT recorded — do
+        // actually encodes. stopped_out was written by the exit engine and carries a real
+        // reason. A plain 'closed' row is a manual close with the reason NOT recorded — do
         // not invent "signal decay"/"profit target" (fabricated claims the data can't support).
+        //
+        // 'expired' used to read "the 90-day holding limit was reached". There is no such
+        // limit: the calendar expiry was removed from position_management on 2026-07-15 and
+        // nothing has written this status since. No row in the live ledger carries it, but an
+        // older database might, and telling its owner a deleted rule closed their position is
+        // exactly the fabrication the note above forbids.
         let exit_reason = match status {
             "stopped_out" => "the trailing stop was hit",
-            "expired" => "the 90-day holding limit was reached",
+            "expired" => "the retired calendar-expiry engine closed it (that rule no longer exists)",
             _ => "it was closed manually (exit reason not recorded)",
         };
 

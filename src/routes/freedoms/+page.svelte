@@ -3,7 +3,7 @@
 	import type { FreedomsBriefing, FreedomStory } from '$lib/tauri/types';
 	import { FREEDOM_CONFIG, FREEDOM_ORDER } from '$lib/config';
 	import { isTauri, mockFreedomsBriefing } from '$lib/tauri/mock';
-	import { safeInvoke } from '$lib/tauri/commands';
+	import { localDateStr, shiftDateStr, isSameOrBefore } from '$lib/date';
 
 	let briefing = $state<FreedomsBriefing | null>(null);
 	let isLoading = $state(true);
@@ -13,26 +13,25 @@
 
 	const freedoms = FREEDOM_ORDER.map(id => FREEDOM_CONFIG[id]);
 
+	// All four of these used to build their date with toISOString(), which is UTC.
+	// The backend writes and queries local dates, so after 20:00 in Miami the page
+	// thought tomorrow had begun: "Today" stopped matching, and one click of
+	// "← Previous day" re-rendered today's briefing labelled "Yesterday".
 	function todayStr(): string {
-		const d = new Date();
-		return d.toISOString().slice(0, 10);
+		return localDateStr();
 	}
 
 	function formatDisplayDate(dateStr: string): string {
-		const d = new Date(dateStr + 'T12:00:00');
 		const today = todayStr();
 		if (dateStr === today) return 'Today';
-		const yesterday = new Date();
-		yesterday.setDate(yesterday.getDate() - 1);
-		if (dateStr === yesterday.toISOString().slice(0, 10)) return 'Yesterday';
+		if (dateStr === shiftDateStr(today, -1)) return 'Yesterday';
+		const d = new Date(dateStr + 'T12:00:00');
 		return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 	}
 
 	function shiftDate(days: number) {
-		const d = new Date(selectedDate + 'T12:00:00');
-		d.setDate(d.getDate() + days);
-		const newDate = d.toISOString().slice(0, 10);
-		if (newDate > todayStr()) return;
+		const newDate = shiftDateStr(selectedDate, days);
+		if (!isSameOrBefore(newDate, todayStr())) return;
 		selectedDate = newDate;
 		loadFreedoms();
 	}
@@ -58,11 +57,22 @@
 			isLoading = false;
 			return;
 		}
-		const result = selectedDate === todayStr()
-			? await safeInvoke<FreedomsBriefing>('get_today_freedoms')
-			: await safeInvoke<FreedomsBriefing>('get_freedoms_by_date', { date: selectedDate });
-		briefing = result;
-		if (result === null) error = 'Failed to load freedoms';
+		// The backend returns Result<Option<FreedomsBriefing>>: null means "no
+		// freedoms briefing was written for this day", a rejection means the query
+		// itself failed. safeInvoke collapses both to null, so every day the
+		// pipeline never ran showed "Failed to load freedoms / Try again" and the
+		// written-for-purpose empty state below was unreachable template. Catch
+		// here instead, so a missing day and a broken query say different things.
+		const isTodaysDate = selectedDate === todayStr();
+		const cmd = isTodaysDate ? 'get_today_freedoms' : 'get_freedoms_by_date';
+		try {
+			const ipc = (window as any).__TAURI_INTERNALS__;
+			briefing = await ipc.invoke(cmd, isTodaysDate ? {} : { date: selectedDate });
+		} catch (e) {
+			console.error(`[invoke ${cmd} failed]`, e);
+			briefing = null;
+			error = 'Failed to load freedoms';
+		}
 		isLoading = false;
 	}
 
@@ -223,7 +233,7 @@
 									</div>
 								{/if}
 							{:else}
-								<p class="text-sm text-text-muted italic flex-1">No stories today</p>
+								<p class="text-sm text-text-muted italic flex-1">No stories {isToday ? 'today' : 'this day'}</p>
 							{/if}
 
 							<!-- Bottom tagline -->

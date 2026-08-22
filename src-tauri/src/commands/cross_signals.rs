@@ -3,6 +3,28 @@ use serde::{Deserialize, Serialize};
 use crate::db::DbState;
 use crate::services::cross_signals::{self, CrossSignal};
 
+/// One `cross_signals` row as the convergence query reads it, in SELECT order:
+/// `(id, entity_name, ticker, compound_score, insider, institutional, news,
+///  government, search, patent, supply, political, source_diversity,
+///  convergence_detected, signal_profile)`.
+type ConvergenceRow = (
+    i64,
+    String,
+    Option<String>,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    i64,
+    bool,
+    Option<String>,
+);
+
 /// Get entities with the strongest cross-signal scores.
 /// Cross-signals are computed during the daily pipeline run — never recompute from the UI.
 #[tauri::command]
@@ -91,6 +113,51 @@ pub fn get_entity_prices(db: State<'_, DbState>, limit: Option<usize>) -> Result
     Ok(prices)
 }
 
+/// Store one refreshed quote without destroying what the row already knows.
+///
+/// The refresh owns the close and the change columns — that is what it went to
+/// fetch. It does **not** own the day's range: a settled daily candle written by
+/// `pulse-fetcher`'s backfill is a better high/low than an intraday quote's, so
+/// an existing value is kept and the quote only fills a gap.
+///
+/// `INSERT OR REPLACE` could not express that. It deletes the conflicting row
+/// and inserts a new one, so every unlisted column reverts to NULL — the range
+/// included. Measured 2026-08-17: 330 rows over 31 tickers in the trailing 45
+/// days held a close with no range, and `pulse-fetcher`'s candle backfill used
+/// `INSERT OR IGNORE`, which could never repair them. This is the writer that
+/// made the holes; that was the writer that could not fill them.
+#[allow(clippy::too_many_arguments)]
+fn write_refreshed_quote(
+    conn: &rusqlite::Connection,
+    entity_id: i64,
+    ticker: &str,
+    today: &str,
+    close: f64,
+    open: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
+    change_1d: Option<f64>,
+    change_7d: Option<f64>,
+    change_30d: Option<f64>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO entity_prices
+           (entity_id, ticker, date, open, close, high, low, change_1d, change_7d, change_30d)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(ticker, date) DO UPDATE SET
+             close      = excluded.close,
+             change_1d  = excluded.change_1d,
+             change_7d  = excluded.change_7d,
+             change_30d = excluded.change_30d,
+             open       = COALESCE(open, excluded.open),
+             high       = COALESCE(high, excluded.high),
+             low        = COALESCE(low, excluded.low)",
+        rusqlite::params![
+            entity_id, ticker, today, open, close, high, low, change_1d, change_7d, change_30d
+        ],
+    )
+}
+
 /// Refresh prices for top tickers from Finnhub. Called on signals page load.
 #[tauri::command]
 pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
@@ -137,8 +204,23 @@ pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
             _ => continue,
         };
 
+        // `h`, `l` and `o` are in every Finnhub quote payload and were simply
+        // not being read. Dropping them was not neutral: the write below used
+        // INSERT OR REPLACE, so each refresh replaced a full candle with a
+        // close-only row and erased the day's range. ATR is computed from that
+        // range, and this loop refreshes open positions FIRST — so the tickers
+        // whose exit levels depend on ATR were the ones being blinded.
         #[derive(serde::Deserialize)]
-        struct Q { c: f64, pc: f64 }
+        struct Q {
+            c: f64,
+            pc: f64,
+            #[serde(default)]
+            h: Option<f64>,
+            #[serde(default)]
+            l: Option<f64>,
+            #[serde(default)]
+            o: Option<f64>,
+        }
         let quote: Q = match resp.json().await {
             Ok(q) => q,
             Err(_) => continue,
@@ -164,10 +246,9 @@ pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
                 [&ticker], |row| row.get(0),
             ).ok().and_then(|past: f64| if past > 0.0 { Some(((quote.c - past) / past) * 100.0) } else { None });
 
-            conn.execute(
-                "INSERT OR REPLACE INTO entity_prices (entity_id, ticker, date, close, change_1d, change_7d, change_30d)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![entity_id, ticker, today, quote.c, change_1d, change_7d, change_30d],
+            write_refreshed_quote(
+                &conn, *entity_id, ticker, &today, quote.c,
+                quote.o, quote.h, quote.l, change_1d, change_7d, change_30d,
             ).ok();
             updated += 1;
         }
@@ -299,7 +380,7 @@ pub fn get_signal_evidence(db: State<'_, DbState>, limit: Option<usize>) -> Resu
         )
         .map_err(|e| e.to_string())?;
 
-    let rows: Vec<(i64, String, Option<String>, f64, f64, f64, f64, f64, f64, f64, f64, f64, i64, bool, Option<String>)> = stmt
+    let rows: Vec<ConvergenceRow> = stmt
         .query_map([limit as i64], |row| {
             Ok((
                 row.get(0)?, row.get::<_, String>(1).unwrap_or_default(),
@@ -512,4 +593,97 @@ pub fn get_source_health(db: State<'_, DbState>) -> Result<Vec<SourceHealth>, St
     }
 
     Ok(health)
+}
+
+#[cfg(test)]
+mod refresh_write_tests {
+    use super::write_refreshed_quote;
+
+    fn db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entity_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id INTEGER, ticker TEXT NOT NULL, date TEXT NOT NULL,
+                open REAL, close REAL NOT NULL, high REAL, low REAL, volume INTEGER,
+                change_1d REAL, change_7d REAL, change_30d REAL,
+                UNIQUE(ticker, date));",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn range(conn: &rusqlite::Connection) -> (Option<f64>, Option<f64>, f64) {
+        conn.query_row(
+            "SELECT high, low, close FROM entity_prices WHERE ticker = 'ARM' AND date = '2026-08-17'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn refreshing_a_price_does_not_erase_the_candle_range() {
+        // The bug, exactly: a candle exists for today, the signals page loads,
+        // the refresh fires, and ATR loses its input. ARM was the ticker this
+        // was first noticed on, holding a $4k position with no usable range.
+        let conn = db();
+        conn.execute(
+            "INSERT INTO entity_prices (ticker, date, open, close, high, low)
+             VALUES ('ARM', '2026-08-17', 140.0, 142.0, 148.0, 139.0)",
+            [],
+        )
+        .unwrap();
+
+        write_refreshed_quote(&conn, 1, "ARM", "2026-08-17", 143.5, None, None, None, Some(1.0), None, None)
+            .unwrap();
+
+        let (high, low, close) = range(&conn);
+        assert_eq!(high, Some(148.0), "the settled high must survive a quote refresh");
+        assert_eq!(low, Some(139.0), "…and so must the low");
+        assert_eq!(close, 143.5, "while the refreshed close does land — that is the point of the call");
+    }
+
+    #[test]
+    fn a_quote_that_carries_a_range_fills_an_empty_one() {
+        // Forward repair: the 330 rangeless rows already in the DB get a range
+        // the next time the signals page refreshes them, without waiting for a
+        // backfill run.
+        let conn = db();
+        conn.execute(
+            "INSERT INTO entity_prices (ticker, date, close) VALUES ('ARM', '2026-08-17', 142.0)",
+            [],
+        )
+        .unwrap();
+
+        write_refreshed_quote(
+            &conn, 1, "ARM", "2026-08-17", 143.5,
+            Some(140.0), Some(149.0), Some(138.0), Some(1.0), None, None,
+        )
+        .unwrap();
+
+        let (high, low, _) = range(&conn);
+        assert_eq!(high, Some(149.0));
+        assert_eq!(low, Some(138.0));
+    }
+
+    #[test]
+    fn the_change_columns_are_always_overwritten() {
+        // These belong to the refresh — a stale change_7d is worse than none,
+        // so unlike the range they must not be COALESCE-protected.
+        let conn = db();
+        write_refreshed_quote(&conn, 1, "ARM", "2026-08-17", 142.0, None, None, None, Some(9.9), Some(9.9), Some(9.9))
+            .unwrap();
+        write_refreshed_quote(&conn, 1, "ARM", "2026-08-17", 143.0, None, None, None, Some(1.1), Some(2.2), Some(3.3))
+            .unwrap();
+
+        let (c1, c7, c30): (Option<f64>, Option<f64>, Option<f64>) = conn
+            .query_row(
+                "SELECT change_1d, change_7d, change_30d FROM entity_prices WHERE ticker = 'ARM'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((c1, c7, c30), (Some(1.1), Some(2.2), Some(3.3)));
+    }
 }

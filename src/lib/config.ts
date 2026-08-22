@@ -46,10 +46,10 @@ export const FREEDOM_CONFIG = {
 	whoop: {
 		id: 'whoop', key: 'whoop_stories' as const,
 		label: 'Whoop', subtitle: 'Your wearable',
-		icon: '◐', color: 'var(--color-freedom-health)', dim: 'var(--color-freedom-health-dim)',
+		icon: '◐', color: 'var(--color-freedom-whoop)', dim: 'var(--color-freedom-whoop-dim)',
 		tagline: 'Whoop product, app, data, HRV, recovery science',
 		description: 'Intelligence on Whoop hardware, app updates, features, HRV and recovery research, and the wearable ecosystem.',
-		motif: 'linear-gradient(180deg, var(--color-freedom-health-dim) 0%, transparent 40%)',
+		motif: 'linear-gradient(180deg, var(--color-freedom-whoop-dim) 0%, transparent 40%)',
 	},
 } as const;
 

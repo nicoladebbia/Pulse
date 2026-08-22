@@ -13,6 +13,14 @@
 		onAsk?: (s: string) => void;
 	} = $props();
 
+	// What the answer actually cited, as opposed to everything retrieved. Written
+	// into metadata by the backend, so it survives a thread reload; messages from
+	// before that change simply have none and fall back to the retrieved list.
+	const citedStoryIds = $derived.by(() => {
+		const raw = (message.metadata as Record<string, unknown> | null)?.cited_story_ids;
+		return Array.isArray(raw) ? raw.filter((n): n is number => typeof n === 'number') : [];
+	});
+
 	// Feedback state
 	let feedbackRating = $state<'up' | 'down' | null>(null);
 	let showReasonInput = $state(false);
@@ -273,7 +281,7 @@
 			{/if}
 
 			{#if message.sources?.length}
-				<ChatSources storyIds={message.sources} />
+				<ChatSources storyIds={message.sources} citedIds={citedStoryIds} />
 			{/if}
 
 			<!-- Search source badge -->

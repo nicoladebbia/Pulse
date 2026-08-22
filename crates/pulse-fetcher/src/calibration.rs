@@ -1,44 +1,35 @@
 use rusqlite::Connection;
 use std::path::Path;
 
-/// Automated signal calibration system (Phase 8).
-///
-/// After each pipeline run:
-/// 1. Evaluate open paper trades against current prices
-/// 2. Compute Brier scores for resolved predictions
-/// 3. Track which signal dimensions predict actual outcomes
-/// 4. Propose a reweight based on empirical hit rates — written to
-///    `pending_calibration` for manual approval, NOT applied automatically
-///    (2026-07-23, Task 3.3 — see `adjust_weights` doc comment for why)
-/// 5. Flag dead signals (consistently < 50% hit rate) for review
-///
-/// Runs as pipeline Phase 14 (after cross-signal detection).
+// Automated signal calibration system (Phase 8).
+//
+// After each pipeline run:
+// 1. Evaluate open paper trades against current prices
+// 2. Compute Brier scores for resolved predictions
+// 3. Track which signal dimensions predict actual outcomes
+// 4. Propose a reweight based on empirical hit rates — written to
+//    `pending_calibration` for manual approval, NOT applied automatically
+//    (2026-07-23, Task 3.3 — see `adjust_weights` doc comment for why)
+// 5. Flag dead signals (consistently < 50% hit rate) for review
+//
+// Runs as pipeline Phase 14 (after cross-signal detection).
 
-/// Calibration weights stored in DB for persistence across runs.
-/// Zeroed dimensions (no data source) excluded from compound score.
-/// Active weights sum to 1.0.
-/// Single source of truth — pipeline.rs::load_calibrated_weights derives its
-/// positional array from this instead of hand-duplicating the numbers.
-pub(crate) const DEFAULT_WEIGHTS: &[(&str, f64)] = &[
-    ("insider_signal", 0.2391),
-    ("institutional_flow", 0.0),    // ZEROED 2026-06-05: substring-match bug (ticker "X" = 61 funds); restore when fixed
-    ("news_momentum", 0.2391),
-    ("government_signal", 0.1848),
-    ("search_trend", 0.0543),       // Wikipedia Pageviews as proxy (offline/stale; low weight)
-    ("patent_signal", 0.0435),
-    ("supply_chain", 0.0),          // ZEROED 2026-06-05: market-wide constant, no per-entity discriminative power
-    ("political_signal", 0.2391),
-];
+/// The compound-score weight vector now lives in the `pulse-weights` crate, so
+/// that `src-tauri` can read it without depending on this one. Re-exported here
+/// because everything in this module already refers to it by this path, and
+/// because this is where the rationale for each zeroed dimension is looked for.
+pub(crate) use pulse_weights::DEFAULT_WEIGHTS;
 
 /// Run the full calibration pipeline.
 pub async fn run_calibration(db_path: &Path) -> anyhow::Result<CalibrationReport> {
     let conn = Connection::open(db_path)?;
     let today = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
-    let mut report = CalibrationReport::default();
-
-    // 1. Evaluate open paper trades against current prices
-    report.positions_evaluated = evaluate_open_positions(&conn, &today).await?;
+    let mut report = CalibrationReport {
+        // 1. Evaluate open paper trades against current prices
+        positions_evaluated: evaluate_open_positions(&conn, &today).await?,
+        ..Default::default()
+    };
 
     // 2. Compute Brier scores for predictions
     report.brier_scores_updated = compute_brier_scores(&conn)?;
@@ -398,3 +389,58 @@ fn compute_confidence_calibration(conn: &Connection) -> anyhow::Result<Vec<(f64,
 // Trade journal auto-generation on close moved to position_management.rs
 // (2026-07-15) — it now fires from the single exit authority (Phase 13.6),
 // since calibration is measure-only and no longer closes trades.
+
+#[cfg(test)]
+mod weight_tests {
+    use super::DEFAULT_WEIGHTS;
+
+    /// The compound score is a weighted average that nothing renormalises at
+    /// runtime, so this sum IS the scale every gate is quoted against. Let it
+    /// drift and `compound >= 0.40` silently means something different without
+    /// any gate changing — which is exactly the failure that motivated the
+    /// 2026-08-17 reweight in the first place.
+    #[test]
+    fn weights_sum_to_one() {
+        let sum: f64 = DEFAULT_WEIGHTS.iter().map(|(_, w)| w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-3,
+            "DEFAULT_WEIGHTS sum to {sum}, not 1.0 — every gate is now quoted against the wrong scale"
+        );
+    }
+
+    #[test]
+    fn a_zeroed_dimension_is_exactly_zero() {
+        // Not "small". A dark dimension left at a small weight still drags the
+        // score toward zero for every entity; the point of zeroing is that its
+        // share moves to a dimension that can actually earn it.
+        // search_trend left this list 2026-08-22 — the Wikipedia title
+        // normalisation restored it. The rest are still dark.
+        for dim in ["institutional_flow", "supply_chain", "political_signal", "patent_signal"] {
+            let w = DEFAULT_WEIGHTS.iter().find(|(k, _)| *k == dim).map(|(_, v)| *v);
+            assert_eq!(w, Some(0.0), "{dim} is documented as dark but carries weight {w:?}");
+        }
+    }
+
+    #[test]
+    fn every_live_dimension_carries_weight() {
+        // The mirror of the above: if a dimension is not in the dark list it
+        // must be earning its share, or the sum invariant is being satisfied by
+        // a dimension nobody is scoring.
+        for dim in ["insider_signal", "news_momentum", "government_signal", "search_trend"] {
+            let w = DEFAULT_WEIGHTS.iter().find(|(k, _)| *k == dim).map(|(_, v)| *v).unwrap_or(0.0);
+            assert!(w > 0.0, "{dim} is treated as live but carries no weight");
+        }
+    }
+
+    #[test]
+    fn the_live_dimensions_keep_their_relative_ordering() {
+        // Redistribution must be proportional. If a future edit rebalances by
+        // hand and accidentally reorders insider/news against government, the
+        // score changes meaning even though the sum still checks out.
+        let w = |k: &str| DEFAULT_WEIGHTS.iter().find(|(n, _)| *n == k).map(|(_, v)| *v).unwrap();
+        assert!((w("insider_signal") - w("news_momentum")).abs() < 1e-6,
+            "insider and news were equal by design (0.2391 each) and must stay equal");
+        assert!(w("insider_signal") > w("government_signal"),
+            "government was the smaller of the three live weights and must stay smaller");
+    }
+}

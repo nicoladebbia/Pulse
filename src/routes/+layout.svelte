@@ -7,7 +7,23 @@
 	import { isTauri } from '$lib/tauri/mock';
 	import { autoBacktestIfDue } from '$lib/tauri/commands';
 	import { startGlobalPolling, stopPolling } from '$lib/stores/fetch';
+	import { page } from '$app/stores';
+	import { trackSurfaceView } from '$lib/engagement';
 	let { children } = $props();
+
+	// One view tracker for all 11 surfaces. Instrumenting each +page.svelte would
+	// have been eleven edits that the twelfth route silently misses; the route id
+	// is the surface name, so a new page is measured the moment it exists.
+	// Guarded on the id because this $effect re-runs for any $page change (a query
+	// param, a nav that lands back on the same route), and a view recorded twice is
+	// indistinguishable from a visit that really happened twice.
+	let lastSurface: string | null = null;
+	$effect(() => {
+		const routeId = $page.route.id;
+		if (routeId === lastSurface) return;
+		lastSurface = routeId;
+		trackSurfaceView(routeId);
+	});
 
 	// NOTE: use $effect, NOT onMount. With this app's SvelteKit config (ssr=false +
 	// prerender=true) the +layout onMount does not fire — the whole codebase drives

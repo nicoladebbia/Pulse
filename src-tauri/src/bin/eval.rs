@@ -118,7 +118,6 @@ struct QueryResult {
     expected_count: usize,
     found_count: usize,
     _hits: Vec<(usize, String)>,    // (rank, headline) of found expected stories
-    misses: Vec<String>,            // expected headlines not in top-k
     miss_diagnosis: Vec<(String, Option<usize>)>, // (headline, rank-in-full-pool or None)
     miss_modes: Vec<MissModeDiag>,  // per-miss FTS/sem/vocab breakdown
     top_results: Vec<(f64, String, bool)>, // (score, headline, is_relevant)
@@ -184,7 +183,7 @@ fn diagnose_misses(misses: &[String], full_results: &[search::ScoredStory]) -> V
 /// - `fts_rank`: rank of the expected story in pure FTS results (None = vocab miss / not retrieved)
 /// - `sem_rank`: rank in pure semantic-only results (None = embedding distance too far)
 /// - `vocab_overlap`: does the doc body contain ANY token from the expanded query?
-///                    False → query and doc share no surface vocabulary.
+///   False → query and doc share no surface vocabulary.
 #[derive(Debug, Clone)]
 struct MissModeDiag {
     headline: String,
@@ -348,18 +347,40 @@ fn is_relevant(headline: &str, expected: &[String]) -> bool {
 // Search runner
 // ---------------------------------------------------------------------------
 
-fn run_search(
-    conn: &Connection,
-    query: &str,
+/// The retrieval knobs, all read straight off the CLI args.
+///
+/// They used to be five positional parameters — three of them adjacent bools,
+/// where a transposition compiled cleanly and quietly evaluated a different
+/// ablation than the one printed in the report header.
+struct SearchOpts {
     k: usize,
     no_graph: bool,
     no_entity_expand: bool,
     no_rerank: bool,
     candidate_pool: usize,
+}
+
+impl SearchOpts {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            k: args.k,
+            no_graph: args.no_graph,
+            no_entity_expand: args.no_entity_expand,
+            no_rerank: args.no_rerank,
+            candidate_pool: args.candidate_pool,
+        }
+    }
+}
+
+fn run_search(
+    conn: &Connection,
+    query: &str,
+    opts: &SearchOpts,
     query_embedding: Option<&[f32]>,
     hyde_embedding: Option<&[f32]>,
     rt: &tokio::runtime::Runtime,
 ) -> Result<Vec<search::ScoredStory>> {
+    let SearchOpts { k, no_graph, no_entity_expand, no_rerank, candidate_pool } = *opts;
     // Step 1: Entity alias expansion
     let expanded = if no_entity_expand {
         query.to_string()
@@ -489,8 +510,8 @@ fn parse_hyde_response(text: &str, queries: &[String], cache_path: &std::path::P
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
-        if let Some(rest) = trimmed.strip_prefix('[') {
-            if let Some(bracket_end) = rest.find(']') {
+        if let Some(rest) = trimmed.strip_prefix('[')
+            && let Some(bracket_end) = rest.find(']') {
                 let tag = &rest[..bracket_end];
                 let num_str: String = tag.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(num) = num_str.parse::<usize>() {
@@ -503,7 +524,6 @@ fn parse_hyde_response(text: &str, queries: &[String], cache_path: &std::path::P
                     }
                 }
             }
-        }
     }
 
     let hyde_texts: Vec<String> = per_query.iter()
@@ -602,10 +622,7 @@ fn run_judge_mode(conn: &Connection, args: &Args, rt: &tokio::runtime::Runtime) 
         }
         println!("{}", "-".repeat(70));
 
-        let results = run_search(
-            conn, query, args.k, args.no_graph, args.no_entity_expand,
-            args.no_rerank, args.candidate_pool, None, None, rt,
-        )?;
+        let results = run_search(conn, query, &SearchOpts::from_args(args), None, None, rt)?;
 
         if results.is_empty() {
             println!("  (no results found)");
@@ -835,7 +852,7 @@ fn run_eval(conn: &Connection, args: &Args, rt: &tokio::runtime::Runtime) -> Res
         vec![None; queries.len()]
     } else {
         // If rewrite produced semantic_text, embed it directly. Otherwise generate fresh HyDE.
-        let hyde_texts: Vec<String> = rewrites.iter().enumerate().map(|(i, exp)| {
+        let hyde_texts: Vec<String> = rewrites.iter().map(|exp| {
             if exp.semantic_text != exp.original && exp.semantic_text.len() > 20 {
                 exp.semantic_text.clone()
             } else {
@@ -890,11 +907,7 @@ fn run_eval(conn: &Connection, args: &Args, rt: &tokio::runtime::Runtime) -> Res
         let full_pool = run_search(
             conn,
             search_query,
-            args.k,
-            args.no_graph,
-            args.no_entity_expand,
-            args.no_rerank,
-            args.candidate_pool,
+            &SearchOpts::from_args(args),
             query_embeddings[i].as_deref(),
             hyde_embeddings[i].as_deref(),
             rt,
@@ -951,7 +964,6 @@ fn run_eval(conn: &Connection, args: &Args, rt: &tokio::runtime::Runtime) -> Res
             expected_count: case.expected_headlines.len(),
             found_count: found,
             _hits: hits,
-            misses,
             miss_diagnosis,
             miss_modes,
             top_results,
@@ -1113,11 +1125,10 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn resolve_db_path(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
+    if path.starts_with("~/")
+        && let Some(home) = dirs::home_dir() {
             return home.join(&path[2..]);
         }
-    }
     PathBuf::from(path)
 }
 

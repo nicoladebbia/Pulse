@@ -34,6 +34,10 @@ pub const MIGRATION_026: &str = include_str!("../../../migrations/026_drop_still
 pub const MIGRATION_027: &str = include_str!("../../../migrations/027_ai_trade_rationale.sql");
 pub const MIGRATION_028: &str = include_str!("../../../migrations/028_pending_calibration.sql");
 pub const MIGRATION_029: &str = include_str!("../../../migrations/029_ticker_eligibility_cache.sql");
+pub const MIGRATION_030: &str = include_str!("../../../migrations/030_repair_prediction_citations.sql");
+pub const MIGRATION_031: &str = include_str!("../../../migrations/031_drop_dead_tables_and_prune_usage.sql");
+pub const MIGRATION_032: &str = include_str!("../../../migrations/032_story_count_excludes_filings.sql");
+pub const MIGRATION_033: &str = include_str!("../../../migrations/033_engagement_events.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -350,11 +354,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
         // Step 3: Recreate entities table with expanded entity types
         let mut needs_entity_rebuild = false;
-        if let Ok(mut stmt) = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'") {
-            if let Ok(sql) = stmt.query_row([], |row| row.get::<_, String>(0)) {
+        if let Ok(mut stmt) = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'")
+            && let Ok(sql) = stmt.query_row([], |row| row.get::<_, String>(0)) {
                 needs_entity_rebuild = !sql.contains("insider_trade");
             }
-        }
 
         if needs_entity_rebuild {
             conn.execute_batch(
@@ -527,7 +530,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     // Migration 18: Entity resolution
     if !applied.contains(&18) {
         conn.execute_batch(MIGRATION_018)?;
-        if !column_exists(&conn, "entities", "canonical_id")? {
+        if !column_exists(conn, "entities", "canonical_id")? {
             conn.execute_batch("ALTER TABLE entities ADD COLUMN canonical_id INTEGER REFERENCES entity_canonical(id);")?;
             conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_entities_canonical ON entities(canonical_id);")?;
         }
@@ -537,16 +540,16 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     // Migration 19: Position management
     if !applied.contains(&19) {
         conn.execute_batch(MIGRATION_019)?;
-        if !column_exists(&conn, "paper_trades", "high_water_mark")? {
+        if !column_exists(conn, "paper_trades", "high_water_mark")? {
             conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN high_water_mark REAL;")?;
         }
-        if !column_exists(&conn, "paper_trades", "trailing_stop")? {
+        if !column_exists(conn, "paper_trades", "trailing_stop")? {
             conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN trailing_stop REAL;")?;
         }
-        if !column_exists(&conn, "paper_trades", "original_compound_score")? {
+        if !column_exists(conn, "paper_trades", "original_compound_score")? {
             conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN original_compound_score REAL;")?;
         }
-        if !column_exists(&conn, "paper_trades", "scale_in_count")? {
+        if !column_exists(conn, "paper_trades", "scale_in_count")? {
             conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN scale_in_count INTEGER DEFAULT 0;")?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (19)", [])?;
@@ -558,7 +561,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     if !applied.contains(&21) {
-        if !column_exists(&conn, "paper_trades", "trade_journal")? {
+        if !column_exists(conn, "paper_trades", "trade_journal")? {
             conn.execute_batch(MIGRATION_021)?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (21)", [])?;
@@ -566,7 +569,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
     if !applied.contains(&22) {
         // Idempotent guard: only run if the v2 column doesn't yet exist.
-        if !column_exists(&conn, "insights", "target_metric")? {
+        if !column_exists(conn, "insights", "target_metric")? {
             conn.execute_batch(MIGRATION_022)?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (22)", [])?;
@@ -633,6 +636,42 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_029)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (29)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 30: strip prediction citations that stored a positional index instead of
+    // a stories.id. 70% of stored refs pointed at an unrelated article; the write-time fix
+    // is pipeline::resolve_story_refs, this repairs the history once. Both app + fetcher.
+    if !applied.contains(&30) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_030)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (30)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 31: drop the 5 tables with zero rows AND zero code references, backfill
+    // insight_evidence from the (now repaired) source_story_ids so the app-side readers
+    // stop seeing 0 for every prediction, and put a 90-day retention policy on api_usage.
+    if !applied.contains(&31) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_031)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (31)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 32: story_count counts news only, not bulk filings
+    if !applied.contains(&32) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_032)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (32)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 33: local-only engagement events (the consumption side)
+    if !applied.contains(&33) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_033)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (33)", [])?;
         tx.commit()?;
     }
 
