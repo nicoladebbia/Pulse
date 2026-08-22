@@ -30,6 +30,15 @@ pub const TOP_TIER_PCT: f64 = 0.10;
 /// the_top_tier` fails if someone raises one without the other.
 pub const MAX_PER_TICKER_PCT: f64 = TOP_TIER_PCT;
 
+// Checked by the COMPILER, not merely by `cargo test`: a cap below the top tier
+// vetoes the tier it exists to bound, which is exactly what shipped between
+// 2026-07-23 and its fix. As a #[test] assertion this only failed once someone
+// ran the suite; as a const assertion the build refuses to produce a binary.
+const _: () = assert!(
+    MAX_PER_TICKER_PCT >= TOP_TIER_PCT,
+    "a cap below the top tier vetoes the tier it is supposed to bound"
+);
+
 /// Tier the compound score into a portfolio-percentage allocation.
 /// Long-term design (2026-07-23): doubled from 1%/2%/5% — fewer, bigger,
 /// longer-held positions fit a conviction-based long-term approach better
@@ -232,10 +241,6 @@ mod tests {
         // The whole defect in one assertion. Between 2026-07-23 and this commit
         // the top tier was 0.10 and the cap 0.05, so the highest-conviction
         // signals were the only ones the concentration check could never admit.
-        assert!(
-            MAX_PER_TICKER_PCT >= TOP_TIER_PCT,
-            "a cap below the top tier vetoes the tier it is supposed to bound"
-        );
         for score in [0.0, 0.3, 0.41, 0.5, 0.61, 0.9, 1.0] {
             assert!(
                 tier_pct(score) <= MAX_PER_TICKER_PCT,

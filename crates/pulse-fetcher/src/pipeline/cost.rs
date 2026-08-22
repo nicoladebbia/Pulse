@@ -95,6 +95,11 @@ pub(crate) const EMBEDDING_COVERAGE_DROP_PCT: f64 = 2.0;
 /// ~2x a healthy day (measured $0.24-$0.37, Jul 25 - Aug 14 2026).
 pub(crate) const ABNORMAL_DAY_USD: f64 = 0.75;
 
+// Compile-time, not test-time: if ABNORMAL_DAY_USD ever reaches half the default
+// cap, nothing between a normal day and the hard abort would warn at all, and the
+// first sign of a runaway loop would be the abort itself.
+const _: () = assert!(ABNORMAL_DAY_USD < DEFAULT_DAILY_COST_CAP_USD * 0.5);
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum CapVerdict {
     Ok,
@@ -157,7 +162,6 @@ mod cost_cap_tests {
             cap_verdict(0.90, DEFAULT_DAILY_COST_CAP_USD),
             CapVerdict::Warn { threshold: ABNORMAL_DAY_USD }
         );
-        assert!(ABNORMAL_DAY_USD < DEFAULT_DAILY_COST_CAP_USD * 0.5);
     }
 
     /// With a tight override the cap-relative half still governs, so a small cap keeps
