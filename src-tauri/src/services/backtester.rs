@@ -393,7 +393,19 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
         monthly_returns: monthly_returns.clone(),
     };
 
-    save_result(conn, &config_summary, total_signals, &result, hit_rate, avg_return_pct, max_drawdown_pct, sharpe_ratio, avg_holding_days)?;
+    save_result(
+        conn,
+        &config_summary,
+        total_signals,
+        &result,
+        &SavedMetrics {
+            hit_rate,
+            avg_return: avg_return_pct,
+            max_drawdown: max_drawdown_pct,
+            sharpe: sharpe_ratio,
+            avg_hold: avg_holding_days,
+        },
+    )?;
 
     Ok(result)
 }
@@ -418,8 +430,8 @@ pub fn get_backtest_history(conn: &Connection, limit: usize) -> Result<Vec<Backt
         let details_json: Option<String> = row.get(9)?;
 
         // Try new shape first.
-        if let Some(json) = &details_json {
-            if let Ok(blob) = serde_json::from_str::<DetailsBlob>(json) {
+        if let Some(json) = &details_json
+            && let Ok(blob) = serde_json::from_str::<DetailsBlob>(json) {
                 // Recompute the realized statistics from the stored trades rather
                 // than reading the stored columns. Rows written before `data_end`
                 // was excluded hold a hit rate, average return and average hold
@@ -452,7 +464,6 @@ pub fn get_backtest_history(conn: &Connection, limit: usize) -> Result<Vec<Backt
                     monthly_returns: blob.monthly_returns,
                 });
             }
-        }
 
         // Legacy fallback: trades-only payload, no compounding, flat 100k equity.
         let legacy_trades: Vec<BacktestTrade> = details_json
@@ -568,7 +579,7 @@ fn close_trade(pos: &OpenPosition, exit_date: &str, exit_price: f64, pnl_pct: f6
 // Sum of unrealized P&L across all open positions on a given date.
 fn mark_to_market(
     open: &HashMap<String, OpenPosition>,
-    prices: &HashMap<String, HashMap<String, (f64, f64, f64)>>,
+    prices: &PriceTable,
     date: &str,
 ) -> f64 {
     let mut total = 0.0;
@@ -585,7 +596,7 @@ fn mark_to_market(
 }
 
 fn latest_bar(
-    prices: &HashMap<String, HashMap<String, (f64, f64, f64)>>,
+    prices: &PriceTable,
     ticker: &str,
     not_after: &str,
 ) -> Option<(String, f64)> {
@@ -643,19 +654,22 @@ fn get_signal_candidates(conn: &Connection, config: &BacktestConfig) -> Result<V
     Ok(candidates)
 }
 
-// Returns a nested map: ticker -> date -> (close, high, low).
+/// ticker -> date -> `(close, high, low)`. High and low are COALESCEd to close
+/// for close-only rows, so all three are always populated.
+type PriceTable = HashMap<String, HashMap<String, (f64, f64, f64)>>;
+
 fn load_prices(
     conn: &Connection,
     tickers: &[String],
     start: &str,
     end: &str,
-) -> Result<HashMap<String, HashMap<String, (f64, f64, f64)>>, String> {
+) -> Result<PriceTable, String> {
     if tickers.is_empty() {
         return Ok(HashMap::new());
     }
     // Build `?,?,?` placeholders. We cap batch size so we don't blow past
     // SQLITE_MAX_VARIABLE_NUMBER on pathological runs. 500 tickers is plenty.
-    let mut out: HashMap<String, HashMap<String, (f64, f64, f64)>> = HashMap::new();
+    let mut out: PriceTable = HashMap::new();
     // COALESCE high/low to close: the daily quote-only fetch writes close-only rows,
     // and the Alpaca candle backfill uses INSERT OR IGNORE (won't overwrite them) —
     // without this, row.get::<_,f64> on a NULL high/low errors and the whole day
@@ -755,11 +769,27 @@ fn compute_monthly_returns(curve: &[EquityPoint], trades: &[BacktestTrade]) -> V
     out
 }
 
+/// The five realized statistics persisted alongside a backtest run.
+///
+/// They were five adjacent `f64` parameters, so any transposition — sharpe
+/// into max_drawdown, avg_return into hit_rate — compiled and silently wrote
+/// a row whose summary columns disagreed with its own details blob.
+struct SavedMetrics {
+    hit_rate: f64,
+    avg_return: f64,
+    max_drawdown: f64,
+    sharpe: f64,
+    avg_hold: f64,
+}
+
 fn save_result(
-    conn: &Connection, config_summary: &str, total_signals: usize,
-    result: &BacktestResult, hit_rate: f64, avg_return: f64,
-    max_drawdown: f64, sharpe: f64, avg_hold: f64,
+    conn: &Connection,
+    config_summary: &str,
+    total_signals: usize,
+    result: &BacktestResult,
+    metrics: &SavedMetrics,
 ) -> Result<(), String> {
+    let SavedMetrics { hit_rate, avg_return, max_drawdown, sharpe, avg_hold } = *metrics;
     let blob = DetailsBlob {
         trades: result.trades.clone(),
         starting_equity: result.starting_equity,

@@ -120,7 +120,7 @@ pub async fn chat_send_stream(
     let embed_fut = async {
         match embeddings::VoyageProvider::from_env() {
             Ok(provider) => {
-                match provider.embed(&[message.clone()], "query").await {
+                match provider.embed(std::slice::from_ref(&message), "query").await {
                     Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
                     _ => None,
                 }
@@ -136,7 +136,7 @@ pub async fn chat_send_stream(
     let hyde_embedding: Option<Vec<f32>> = if expanded.semantic_text != expanded.original && expanded.semantic_text.len() > 20 {
         match embeddings::VoyageProvider::from_env() {
             Ok(provider) => {
-                match provider.embed(&[expanded.semantic_text.clone()], "query").await {
+                match provider.embed(std::slice::from_ref(&expanded.semantic_text), "query").await {
                     Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
                     _ => None,
                 }
@@ -406,14 +406,21 @@ pub async fn chat_send_stream(
             _ => String::new(),
         }
     };
-    let mut system_prompt = conversation::build_system_prompt(
-        &profile_str, &stories_context, &entity_context, &signal_context,
-        &causal_context, &contrarian_context, &pattern_context, &predictions_context,
-        &prediction_calibration, query_type.format_label(),
-    );
+    let mut system_prompt = conversation::build_system_prompt(&conversation::PromptContext {
+        profile_summary: &profile_str,
+        stories_context: &stories_context,
+        entity_context: &entity_context,
+        signal_context: &signal_context,
+        causal_context: &causal_context,
+        contrarian_context: &contrarian_context,
+        pattern_context: &pattern_context,
+        predictions_context: &predictions_context,
+        prediction_calibration: &prediction_calibration,
+        query_type: query_type.format_label(),
+    });
 
     // Append retrieval confidence
-    system_prompt.push_str(&format_retrieval_confidence(&retrieval_confidence, stories.len()));
+    system_prompt.push_str(&format_retrieval_confidence(retrieval_confidence, stories.len()));
 
     // Append graph context if available
     if !graph_context.is_empty() {
@@ -502,20 +509,18 @@ pub async fn chat_send_stream(
     let proactive = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let mut connections = Vec::new();
-        if let (Some(first_story), Some(qe)) = (stories.first(), &query_embedding) {
-            if let Ok(older) = embeddings::find_similar_older_than(&conn, qe, 7, 3, 0.5) {
+        if let (Some(first_story), Some(qe)) = (stories.first(), &query_embedding)
+            && let Ok(older) = embeddings::find_similar_older_than(&conn, qe, 7, 3, 0.5) {
                 for (sid, _score) in older {
-                    if let Ok(mut s) = conn.prepare("SELECT s.headline, b.date FROM stories s JOIN briefings b ON b.id = s.briefing_id WHERE s.id = ?1") {
-                        if let Ok(row) = s.query_row([sid], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                    if let Ok(mut s) = conn.prepare("SELECT s.headline, b.date FROM stories s JOIN briefings b ON b.id = s.briefing_id WHERE s.id = ?1")
+                        && let Ok(row) = s.query_row([sid], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
                             connections.push(conversation::ProactiveInsight {
                                 story_id: sid, headline: row.0, date: row.1,
                                 connection: format!("Related to '{}'", first_story.headline),
                             });
                         }
-                    }
                 }
             }
-        }
         connections
     };
 
@@ -1030,8 +1035,8 @@ pub fn get_feedback_stats(db: State<'_, DbState>) -> Result<serde_json::Value, S
     if let Ok(mut stmt) = conn.prepare(
         "SELECT key, reputation, boost, upvotes, downvotes FROM feedback_reputation
          WHERE kind = 'source' ORDER BY reputation DESC"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok(serde_json::json!({
                 "name": row.get::<_, String>(0)?.replace("source:", ""),
                 "reputation": row.get::<_, f64>(1)?,
@@ -1044,15 +1049,14 @@ pub fn get_feedback_stats(db: State<'_, DbState>) -> Result<serde_json::Value, S
             top_sources = all.iter().take(5).cloned().collect();
             bottom_sources = all.iter().rev().take(5).cloned().collect();
         }
-    }
 
     // Sector reputations
     let mut sectors = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT key, reputation, boost, upvotes, downvotes FROM feedback_reputation
          WHERE kind = 'sector' ORDER BY reputation DESC"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok(serde_json::json!({
                 "name": row.get::<_, String>(0)?.replace("sector:", ""),
                 "reputation": row.get::<_, f64>(1)?,
@@ -1063,7 +1067,6 @@ pub fn get_feedback_stats(db: State<'_, DbState>) -> Result<serde_json::Value, S
         }) {
             sectors = rows.flatten().collect();
         }
-    }
 
     Ok(serde_json::json!({
         "total_up": total_up,

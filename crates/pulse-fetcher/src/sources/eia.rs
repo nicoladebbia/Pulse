@@ -135,7 +135,7 @@ async fn fetch_petroleum(client: &reqwest::Client, api_key: &str) -> anyhow::Res
 
         articles.push(RawArticle {
             title,
-            url: format!("https://www.eia.gov/petroleum/"),
+            url: "https://www.eia.gov/petroleum/".to_string(),
             source_name: "EIA".to_string(),
             source_url: "https://api.eia.gov".to_string(),
             published_at: Some(period.to_string()),

@@ -448,8 +448,7 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
     for (topic, sector, w7, w30, w90, days_active) in &window_rows {
         let rate_7d = *w7 as f64 / 7.0;
         let rate_30d = *w30 as f64 / 30.0;
-        let acc = if *w30 == 0 { if *w7 > 0 { 10.0 } else { 0.0 } }
-            else if rate_30d < 0.001 { if *w7 > 0 { 10.0 } else { 0.0 } }
+        let acc = if *w30 == 0 || rate_30d < 0.001 { if *w7 > 0 { 10.0 } else { 0.0 } }
             else { rate_7d / rate_30d };
 
         let total = (*w30).max(*w7);
@@ -457,8 +456,7 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
             else if total >= 14 && *days_active >= 10 { "dominant" }
             else if total >= 7 && *days_active >= 5 { "hot" }
             else if acc < 0.8 && total >= 3 { "fading" }
-            else if total >= 3 || *days_active >= 2 { "rising" }
-            else if *w7 > 0 { "rising" }
+            else if total >= 3 || *days_active >= 2 || *w7 > 0 { "rising" }
             else { "dormant" };
 
         let inserted = tx.execute(
@@ -545,6 +543,28 @@ pub(crate) fn normalize_signal(value: f64, scale: f64) -> f64 {
 /// table — it has no history layer, so a backfill run must call
 /// `recompute_signals_pipeline(conn, as_of)` immediately before this for the
 /// same `as_of`, per date, in ascending order.
+/// One `signals` row as compute_cross_signals reads it, in SELECT order:
+/// `(topic, sector, window_7d, window_30d, acceleration, source_diversity,
+///  insider_volume, institutional_flow, contract_value, patent_rate,
+///  search_delta, import_volume_delta, regulatory_sentiment, lobbying_spend_delta)`.
+/// The destructuring below depends on this order — change both together.
+type SignalRow = (
+    String,
+    Option<String>,
+    i64,
+    i64,
+    f64,
+    i64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+);
+
 pub(crate) fn compute_cross_signals(db_path: &Path, as_of: &str) -> anyhow::Result<usize> {
     let conn = rusqlite::Connection::open(db_path)?;
     let today = as_of;
@@ -569,7 +589,7 @@ pub(crate) fn compute_cross_signals(db_path: &Path, as_of: &str) -> anyhow::Resu
          ORDER BY s.window_30d DESC"
     )?;
 
-    let rows: Vec<(String, Option<String>, i64, i64, f64, i64, f64, f64, f64, f64, f64, f64, f64, f64)> = stmt
+    let rows: Vec<SignalRow> = stmt
         .query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
                 row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
@@ -611,7 +631,13 @@ pub(crate) fn compute_cross_signals(db_path: &Path, as_of: &str) -> anyhow::Resu
         let supply_norm = normalize_signal(*import_delta, 30.0);
         let political_norm = normalize_signal(*lobby_delta, 100_000.0);
 
-        // Weighted compound score
+        // Weighted compound score.
+        //
+        // NOT `.clamp(0.0, 1.0)`, which clippy suggests: clamp PROPAGATES NaN,
+        // while max-then-min flattens it to 0.0. A NaN compound would poison
+        // every downstream sort (see the partial_cmp rule in CLAUDE.md), so the
+        // flattening is the point, not an accident.
+        #[allow(clippy::manual_clamp)]
         let compound = (insider_norm * weights[0]
             + inst_norm * weights[1]
             + news_norm * weights[2]
@@ -620,7 +646,8 @@ pub(crate) fn compute_cross_signals(db_path: &Path, as_of: &str) -> anyhow::Resu
             + patent_norm * weights[5]
             + supply_norm * weights[6]
             + political_norm * weights[7])
-            .max(0.0).min(1.0);
+        .max(0.0)
+        .min(1.0);
 
         // Convergence votes. A dimension that contributes nothing to `compound`
         // must not be allowed to swing the gate either — that rule was already

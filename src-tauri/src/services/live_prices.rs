@@ -8,7 +8,6 @@ use tauri::{AppHandle, Emitter};
 /// Finnhub WebSocket streaming for real-time price updates.
 /// Free tier: 1 connection, real-time US stock trades, ~50 symbols max.
 /// Does NOT count against the 60 calls/min REST limit.
-
 const WS_URL: &str = "wss://ws.finnhub.io/";
 
 // ---------------------------------------------------------------------------
@@ -52,6 +51,12 @@ pub struct StreamStatus {
 pub struct LivePriceState {
     shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
     status: Mutex<StreamStatus>,
+}
+
+impl Default for LivePriceState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LivePriceState {
@@ -221,9 +226,9 @@ async fn connect_and_stream(
             msg = read.next() => {
                 match msg {
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                        if let Ok(parsed) = serde_json::from_str::<FinnhubWsMessage>(&text) {
-                            if parsed.msg_type == "trade" {
-                                if let Some(trades) = parsed.data {
+                        if let Ok(parsed) = serde_json::from_str::<FinnhubWsMessage>(&text)
+                            && parsed.msg_type == "trade"
+                                && let Some(trades) = parsed.data {
                                     for trade in trades {
                                         latest_prices.insert(trade.s.clone(), PriceUpdate {
                                             symbol: trade.s,
@@ -233,8 +238,6 @@ async fn connect_and_stream(
                                         });
                                     }
                                 }
-                            }
-                        }
 
                         // Emit batched updates every 2 seconds
                         if last_emit.elapsed() >= std::time::Duration::from_secs(2) && !latest_prices.is_empty() {

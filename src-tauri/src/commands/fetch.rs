@@ -41,12 +41,11 @@ pub async fn trigger_manual_fetch() -> Result<String, String> {
     // now, and the fetcher it would spawn exits immediately on the single-instance lock —
     // leaving write_starting()'s record to go stale and paint a false "interrupted" over
     // a healthy run. Defer to whoever is already running.
-    if let Ok(status) = get_fetch_status() {
-        if status.running {
+    if let Ok(status) = get_fetch_status()
+        && status.running {
             FETCHING.store(false, Ordering::SeqCst);
             return Err("Fetch already in progress".to_string());
         }
-    }
 
     // Find the fetcher binary (release or debug)
     let fetcher_path = {

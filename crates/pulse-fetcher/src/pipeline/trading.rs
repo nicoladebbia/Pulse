@@ -726,11 +726,10 @@ pub(crate) async fn latest_filled_sell(
                 .and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok());
             let qty = o.get("filled_qty")
                 .and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok());
-            if let (Some(p), Some(q)) = (price, qty) {
-                if p > 0.0 {
+            if let (Some(p), Some(q)) = (price, qty)
+                && p > 0.0 {
                     return Some((p, q));
                 }
-            }
         }
     }
     None

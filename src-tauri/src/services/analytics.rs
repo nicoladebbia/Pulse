@@ -336,12 +336,11 @@ fn compute_signal_attribution(trades: &[ClosedTrade]) -> Vec<SignalAttribution> 
         let mut loss_vals = Vec::new();
 
         for t in trades {
-            if let Some(val) = parse_signal_value(&t.signal_profile, dim) {
-                if val > 0.01 { // Only count if signal was present
+            if let Some(val) = parse_signal_value(&t.signal_profile, dim)
+                && val > 0.01 { // Only count if signal was present
                     if t.pnl_pct > 0.0 { win_vals.push(val); }
                     else { loss_vals.push(val); }
                 }
-            }
         }
 
         let avg_on_wins = if win_vals.is_empty() { 0.0 }
@@ -498,11 +497,19 @@ pub fn get_or_generate_journal(conn: &Connection, trade_id: i64) -> Result<Trade
     let journal = if let Some(existing) = existing {
         existing
     } else {
-        let generated = generate_journal_text(
-            &ticker, entity_name.as_deref(), &entry_date, exit_date.as_deref(),
-            entry_price, exit_price, position_size, pnl_pct, pnl,
-            &status, &signal_breakdown,
-        );
+        let generated = generate_journal_text(&JournalInputs {
+            ticker: &ticker,
+            entity_name: entity_name.as_deref(),
+            entry_date: &entry_date,
+            exit_date: exit_date.as_deref(),
+            entry_price,
+            exit_price,
+            position_size,
+            pnl_pct,
+            pnl,
+            status: &status,
+            signals: &signal_breakdown,
+        });
         // Store it
         conn.execute(
             "UPDATE paper_trades SET trade_journal = ?1 WHERE id = ?2",
@@ -530,13 +537,40 @@ fn parse_signal_breakdown(profile: &str) -> Vec<SignalEntry> {
     }).collect()
 }
 
-fn generate_journal_text(
-    ticker: &str, entity_name: Option<&str>,
-    entry_date: &str, exit_date: Option<&str>,
-    entry_price: f64, exit_price: Option<f64>,
-    position_size: f64, pnl_pct: Option<f64>, pnl: Option<f64>,
-    status: &str, signals: &[SignalEntry],
-) -> String {
+/// The trade a journal entry narrates.
+///
+/// Previously eleven positional parameters with three same-typed adjacent
+/// pairs (`ticker`/`entity_name`, `entry_date`/`exit_date`,
+/// `pnl_pct`/`pnl`) — swapping either member of a pair compiled cleanly and
+/// produced a plausible-looking but wrong narrative.
+struct JournalInputs<'a> {
+    ticker: &'a str,
+    entity_name: Option<&'a str>,
+    entry_date: &'a str,
+    exit_date: Option<&'a str>,
+    entry_price: f64,
+    exit_price: Option<f64>,
+    position_size: f64,
+    pnl_pct: Option<f64>,
+    pnl: Option<f64>,
+    status: &'a str,
+    signals: &'a [SignalEntry],
+}
+
+fn generate_journal_text(t: &JournalInputs<'_>) -> String {
+    let JournalInputs {
+        ticker,
+        entity_name,
+        entry_date,
+        exit_date,
+        entry_price,
+        exit_price,
+        position_size,
+        pnl_pct,
+        pnl,
+        status,
+        signals,
+    } = *t;
     let mut parts = Vec::new();
     let name = entity_name.unwrap_or(ticker);
 

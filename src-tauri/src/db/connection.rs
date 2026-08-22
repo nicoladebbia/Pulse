@@ -354,11 +354,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
         // Step 3: Recreate entities table with expanded entity types
         let mut needs_entity_rebuild = false;
-        if let Ok(mut stmt) = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'") {
-            if let Ok(sql) = stmt.query_row([], |row| row.get::<_, String>(0)) {
+        if let Ok(mut stmt) = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'")
+            && let Ok(sql) = stmt.query_row([], |row| row.get::<_, String>(0)) {
                 needs_entity_rebuild = !sql.contains("insider_trade");
             }
-        }
 
         if needs_entity_rebuild {
             conn.execute_batch(
@@ -531,7 +530,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     // Migration 18: Entity resolution
     if !applied.contains(&18) {
         conn.execute_batch(MIGRATION_018)?;
-        if !column_exists(&conn, "entities", "canonical_id")? {
+        if !column_exists(conn, "entities", "canonical_id")? {
             conn.execute_batch("ALTER TABLE entities ADD COLUMN canonical_id INTEGER REFERENCES entity_canonical(id);")?;
             conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_entities_canonical ON entities(canonical_id);")?;
         }
@@ -541,16 +540,16 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     // Migration 19: Position management
     if !applied.contains(&19) {
         conn.execute_batch(MIGRATION_019)?;
-        if !column_exists(&conn, "paper_trades", "high_water_mark")? {
+        if !column_exists(conn, "paper_trades", "high_water_mark")? {
             conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN high_water_mark REAL;")?;
         }
-        if !column_exists(&conn, "paper_trades", "trailing_stop")? {
+        if !column_exists(conn, "paper_trades", "trailing_stop")? {
             conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN trailing_stop REAL;")?;
         }
-        if !column_exists(&conn, "paper_trades", "original_compound_score")? {
+        if !column_exists(conn, "paper_trades", "original_compound_score")? {
             conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN original_compound_score REAL;")?;
         }
-        if !column_exists(&conn, "paper_trades", "scale_in_count")? {
+        if !column_exists(conn, "paper_trades", "scale_in_count")? {
             conn.execute_batch("ALTER TABLE paper_trades ADD COLUMN scale_in_count INTEGER DEFAULT 0;")?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (19)", [])?;
@@ -562,7 +561,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     if !applied.contains(&21) {
-        if !column_exists(&conn, "paper_trades", "trade_journal")? {
+        if !column_exists(conn, "paper_trades", "trade_journal")? {
             conn.execute_batch(MIGRATION_021)?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (21)", [])?;
@@ -570,7 +569,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
     if !applied.contains(&22) {
         // Idempotent guard: only run if the v2 column doesn't yet exist.
-        if !column_exists(&conn, "insights", "target_metric")? {
+        if !column_exists(conn, "insights", "target_metric")? {
             conn.execute_batch(MIGRATION_022)?;
         }
         conn.execute("INSERT INTO schema_migrations (version) VALUES (22)", [])?;

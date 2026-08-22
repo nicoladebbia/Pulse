@@ -1,18 +1,18 @@
 use rusqlite::Connection;
 use std::path::Path;
 
-/// Automated signal calibration system (Phase 8).
-///
-/// After each pipeline run:
-/// 1. Evaluate open paper trades against current prices
-/// 2. Compute Brier scores for resolved predictions
-/// 3. Track which signal dimensions predict actual outcomes
-/// 4. Propose a reweight based on empirical hit rates — written to
-///    `pending_calibration` for manual approval, NOT applied automatically
-///    (2026-07-23, Task 3.3 — see `adjust_weights` doc comment for why)
-/// 5. Flag dead signals (consistently < 50% hit rate) for review
-///
-/// Runs as pipeline Phase 14 (after cross-signal detection).
+// Automated signal calibration system (Phase 8).
+//
+// After each pipeline run:
+// 1. Evaluate open paper trades against current prices
+// 2. Compute Brier scores for resolved predictions
+// 3. Track which signal dimensions predict actual outcomes
+// 4. Propose a reweight based on empirical hit rates — written to
+//    `pending_calibration` for manual approval, NOT applied automatically
+//    (2026-07-23, Task 3.3 — see `adjust_weights` doc comment for why)
+// 5. Flag dead signals (consistently < 50% hit rate) for review
+//
+// Runs as pipeline Phase 14 (after cross-signal detection).
 
 /// The compound-score weight vector now lives in the `pulse-weights` crate, so
 /// that `src-tauri` can read it without depending on this one. Re-exported here
@@ -25,10 +25,11 @@ pub async fn run_calibration(db_path: &Path) -> anyhow::Result<CalibrationReport
     let conn = Connection::open(db_path)?;
     let today = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
-    let mut report = CalibrationReport::default();
-
-    // 1. Evaluate open paper trades against current prices
-    report.positions_evaluated = evaluate_open_positions(&conn, &today).await?;
+    let mut report = CalibrationReport {
+        // 1. Evaluate open paper trades against current prices
+        positions_evaluated: evaluate_open_positions(&conn, &today).await?,
+        ..Default::default()
+    };
 
     // 2. Compute Brier scores for predictions
     report.brier_scores_updated = compute_brier_scores(&conn)?;

@@ -1056,8 +1056,7 @@ fn recompute_signals(conn: &rusqlite::Connection, today: &str) -> anyhow::Result
             else if total >= 14 && *days_active >= 10 { "dominant" }
             else if total >= 7 && *days_active >= 5 { "hot" }
             else if acceleration < 0.8 && total >= 3 { "fading" }
-            else if total >= 3 || *days_active >= 2 { "rising" }
-            else if *w7 > 0 { "rising" }
+            else if total >= 3 || *days_active >= 2 || *w7 > 0 { "rising" }
             else { "dormant" };
 
         conn.execute(

@@ -259,19 +259,40 @@ pub fn classify_topic(message: &str) -> &'static str {
 // Context assembly
 // ---------------------------------------------------------------------------
 
+/// Every context block that goes into the system prompt.
+///
+/// These were ten positional `&str` parameters. Since they are all the same
+/// type, swapping any two compiled silently and simply mislabelled a section
+/// in the prompt — invisible in a diff and invisible at runtime. Named fields
+/// make the swap a compile error.
+#[derive(Default)]
+pub struct PromptContext<'a> {
+    pub profile_summary: &'a str,
+    pub stories_context: &'a str,
+    pub entity_context: &'a str,
+    pub signal_context: &'a str,
+    pub causal_context: &'a str,
+    pub contrarian_context: &'a str,
+    pub pattern_context: &'a str,
+    pub predictions_context: &'a str,
+    pub prediction_calibration: &'a str,
+    pub query_type: &'a str,
+}
+
 /// Build the system prompt with all intelligence context.
-pub fn build_system_prompt(
-    profile_summary: &str,
-    stories_context: &str,
-    entity_context: &str,
-    signal_context: &str,
-    causal_context: &str,
-    contrarian_context: &str,
-    pattern_context: &str,
-    predictions_context: &str,
-    prediction_calibration: &str,
-    query_type: &str,
-) -> String {
+pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
+    let PromptContext {
+        profile_summary,
+        stories_context,
+        entity_context,
+        signal_context,
+        causal_context,
+        contrarian_context,
+        pattern_context,
+        predictions_context,
+        prediction_calibration,
+        query_type,
+    } = *ctx;
     let format_instruction = match query_type {
         "breaking" => "FORMAT: Lead with the headline — what just happened. Then context: why it matters, who's affected. Keep it tight and urgent. End with what to watch next.",
         "analytical" => "FORMAT: Bottom line first (no preamble). Then ## headers for deep analysis. Cite specific stories and signals with evidence. End with what to watch.",
@@ -485,15 +506,14 @@ pub fn format_graph_context(
             &name.trim().to_lowercase(),
             3.0,
             5,
-        ) {
-            if !related.is_empty() {
+        )
+            && !related.is_empty() {
                 let rels: Vec<String> = related
                     .iter()
                     .map(|(rname, strength)| format!("{} ({}x)", rname, *strength as i64))
                     .collect();
                 lines.push(format!("{} — most often mentioned with: {}", name, rels.join(", ")));
             }
-        }
     }
     lines.join("\n")
 }
@@ -1439,18 +1459,18 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_contains_sections() {
-        let prompt = build_system_prompt(
-            "Tech founder profile",
-            "Story context here",
-            "Entity context here",
-            "Signal context here",
-            "Causal context here",
-            "Contrarian context here",
-            "Pattern context here",
-            "Predictions context here",
-            "Predictions made: 10 total. Validated: 7 (70% accuracy).",
-            "general",
-        );
+        let prompt = build_system_prompt(&PromptContext {
+            profile_summary: "Tech founder profile",
+            stories_context: "Story context here",
+            entity_context: "Entity context here",
+            signal_context: "Signal context here",
+            causal_context: "Causal context here",
+            contrarian_context: "Contrarian context here",
+            pattern_context: "Pattern context here",
+            predictions_context: "Predictions context here",
+            prediction_calibration: "Predictions made: 10 total. Validated: 7 (70% accuracy).",
+            query_type: "general",
+        });
 
         assert!(prompt.contains("You are Pulse"));
         assert!(prompt.contains("Tech founder profile"));

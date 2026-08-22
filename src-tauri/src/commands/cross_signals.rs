@@ -3,6 +3,28 @@ use serde::{Deserialize, Serialize};
 use crate::db::DbState;
 use crate::services::cross_signals::{self, CrossSignal};
 
+/// One `cross_signals` row as the convergence query reads it, in SELECT order:
+/// `(id, entity_name, ticker, compound_score, insider, institutional, news,
+///  government, search, patent, supply, political, source_diversity,
+///  convergence_detected, signal_profile)`.
+type ConvergenceRow = (
+    i64,
+    String,
+    Option<String>,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    i64,
+    bool,
+    Option<String>,
+);
+
 /// Get entities with the strongest cross-signal scores.
 /// Cross-signals are computed during the daily pipeline run — never recompute from the UI.
 #[tauri::command]
@@ -358,7 +380,7 @@ pub fn get_signal_evidence(db: State<'_, DbState>, limit: Option<usize>) -> Resu
         )
         .map_err(|e| e.to_string())?;
 
-    let rows: Vec<(i64, String, Option<String>, f64, f64, f64, f64, f64, f64, f64, f64, f64, i64, bool, Option<String>)> = stmt
+    let rows: Vec<ConvergenceRow> = stmt
         .query_map([limit as i64], |row| {
             Ok((
                 row.get(0)?, row.get::<_, String>(1).unwrap_or_default(),

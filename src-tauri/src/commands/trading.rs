@@ -21,11 +21,10 @@ pub async fn get_portfolio(db: State<'_, DbState>) -> Result<Portfolio, String> 
         .await
         .map_err(|e| e.to_string());
     // Log Alpaca reads (1 for account + 1 for positions, regardless of ticker count)
-    if result.is_ok() {
-        if let Ok(conn) = db.0.lock() {
+    if result.is_ok()
+        && let Ok(conn) = db.0.lock() {
             crate::services::api_usage::log_usage(&conn, "alpaca", "paper_api", "portfolio", 2, 0).ok();
         }
-    }
     result
 }
 
@@ -796,7 +795,12 @@ struct RationaleFacts {
 /// zero-weight number and asked to narrate it as corroborating evidence.
 const ZERO_WEIGHT_SIGNAL_KEYS: [&str; 2] = ["institutional", "supply_chain"];
 
-fn parse_signal_profile_facts(profile_json: &str) -> (Vec<(String, f64)>, Vec<(String, Option<String>)>) {
+/// The two halves of a parsed `signal_profile`: numeric `(dimension, value)`
+/// pairs, and `(dimension, stale_reason)` pairs for dimensions the profile
+/// marked stale.
+type SignalProfileFacts = (Vec<(String, f64)>, Vec<(String, Option<String>)>);
+
+fn parse_signal_profile_facts(profile_json: &str) -> SignalProfileFacts {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(profile_json) else {
         return (Vec::new(), Vec::new());
     };

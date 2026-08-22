@@ -45,16 +45,14 @@ pub fn run() {
                 .map_err(|e| format!("failed to initialize database: {e}"))?;
 
             // Startup maintenance: migrate prediction dates and expire stale predictions
-            if let Ok(migrated) = services::predictions::migrate_prediction_dates(&conn) {
-                if migrated > 0 {
+            if let Ok(migrated) = services::predictions::migrate_prediction_dates(&conn)
+                && migrated > 0 {
                     eprintln!("Migrated {} prediction dates to ISO format", migrated);
                 }
-            }
-            if let Ok(expired) = services::predictions::expire_stale_predictions(&conn) {
-                if expired > 0 {
+            if let Ok(expired) = services::predictions::expire_stale_predictions(&conn)
+                && expired > 0 {
                     eprintln!("Expired {} stale predictions", expired);
                 }
-            }
 
             app.manage(db::DbState(std::sync::Mutex::new(conn)));
             app.manage(ChatAbortFlag(Arc::new(AtomicBool::new(false))));
@@ -137,14 +135,12 @@ pub fn run() {
             // does not compile anywhere else at all, which is what kept CI from
             // running a single one of the 427 tests on a Linux runner.
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
-                if !has_visible_windows {
-                    if let Some(window) = app.get_webview_window("main") {
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event
+                && !has_visible_windows
+                    && let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
                     }
-                }
-            }
 
             // Both bindings are used only by the macOS arm above.
             #[cfg(not(target_os = "macos"))]

@@ -531,11 +531,10 @@ pub async fn check_ticker_universe_eligibility(
         {
             Ok(resp) if resp.status().is_success() => {
                 finnhub_profile_ok = true;
-                if let Ok(profile) = resp.json::<FinnhubProfile>().await {
-                    if profile.market_cap > 0.0 {
+                if let Ok(profile) = resp.json::<FinnhubProfile>().await
+                    && profile.market_cap > 0.0 {
                         market_cap = Some(profile.market_cap);
                     }
-                }
             }
             Ok(resp) => {
                 tracing::warn!("Universe gate: Finnhub profile2 for {} returned status {}", ticker, resp.status());
@@ -551,11 +550,10 @@ pub async fn check_ticker_universe_eligibility(
         {
             Ok(resp) if resp.status().is_success() => {
                 finnhub_quote_ok = true;
-                if let Ok(quote) = resp.json::<FinnhubQuote>().await {
-                    if quote.c > 0.0 {
+                if let Ok(quote) = resp.json::<FinnhubQuote>().await
+                    && quote.c > 0.0 {
                         last_price = Some(quote.c);
                     }
-                }
             }
             Ok(resp) => {
                 tracing::warn!("Universe gate: Finnhub quote for {} returned status {}", ticker, resp.status());

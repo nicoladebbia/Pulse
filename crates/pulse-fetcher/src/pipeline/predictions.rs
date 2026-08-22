@@ -733,11 +733,10 @@ pub(crate) fn resolve_story_refs(model_refs: &[i64], presented_ids: &[i64]) -> R
             out.dropped += 1;
             None
         };
-        if let Some(id) = resolved {
-            if !out.ids.contains(&id) {
+        if let Some(id) = resolved
+            && !out.ids.contains(&id) {
                 out.ids.push(id);
             }
-        }
     }
     out
 }

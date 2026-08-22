@@ -181,7 +181,7 @@ fn load_briefing(conn: &rusqlite::Connection, date: &str) -> Result<Option<Brief
     log(&format!("Loaded {} stories successfully", stories.len()));
 
     let hero_story = stories.iter().find(|s| s.is_hero).cloned();
-    let connections = load_connections(&conn, briefing.id);
+    let connections = load_connections(conn, briefing.id);
 
     Ok(Some(BriefingWithStories {
         briefing,

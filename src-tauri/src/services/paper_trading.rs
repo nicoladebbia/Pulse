@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 /// API: https://paper-api.alpaca.markets/v2
 /// Free paper trading, real-time simulation.
 /// Env vars: ALPACA_API_KEY, ALPACA_SECRET_KEY
-
 const PAPER_BASE_URL: &str = "https://paper-api.alpaca.markets/v2";
 
 // ---------------------------------------------------------------------------

@@ -81,23 +81,20 @@ fn validate(input: &EngagementInput) -> Result<(), String> {
     if input.surface.is_empty() || input.surface.len() > MAX_FIELD_LEN {
         return Err(format!("surface must be 1..={MAX_FIELD_LEN} chars"));
     }
-    if let Some(s) = &input.sector {
-        if s.len() > MAX_FIELD_LEN {
+    if let Some(s) = &input.sector
+        && s.len() > MAX_FIELD_LEN {
             return Err("sector too long".into());
         }
-    }
     // `detail` is for small structured facts, not content. The cap is what stops
     // a caller from ever passing a headline or a chat message through it.
-    if let Some(d) = &input.detail {
-        if d.len() > MAX_FIELD_LEN {
+    if let Some(d) = &input.detail
+        && d.len() > MAX_FIELD_LEN {
             return Err("detail too long — it is for counters, not content".into());
         }
-    }
-    if let Some(ms) = input.dwell_ms {
-        if ms < 0 {
+    if let Some(ms) = input.dwell_ms
+        && ms < 0 {
             return Err("dwell_ms cannot be negative".into());
         }
-    }
     Ok(())
 }
 

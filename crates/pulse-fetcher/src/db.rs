@@ -335,11 +335,10 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
 
         // Step 3: Recreate entities table with expanded entity types
         let mut needs_entity_rebuild = false;
-        if let Ok(mut stmt) = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'") {
-            if let Ok(sql) = stmt.query_row([], |row| row.get::<_, String>(0)) {
+        if let Ok(mut stmt) = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'")
+            && let Ok(sql) = stmt.query_row([], |row| row.get::<_, String>(0)) {
                 needs_entity_rebuild = !sql.contains("insider_trade");
             }
-        }
 
         if needs_entity_rebuild {
             conn.execute_batch(

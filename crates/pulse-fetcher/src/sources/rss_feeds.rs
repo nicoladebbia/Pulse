@@ -203,11 +203,10 @@ async fn fetch_single(
         let pub_date = entry.published.or(entry.updated);
 
         // Skip old articles if we have a date
-        if let Some(dt) = pub_date {
-            if dt < cutoff {
+        if let Some(dt) = pub_date
+            && dt < cutoff {
                 continue;
             }
-        }
 
         let title = entry.title.as_ref().map(|t| t.content.clone()).unwrap_or_default();
         let link = entry

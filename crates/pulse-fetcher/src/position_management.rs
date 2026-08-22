@@ -43,15 +43,15 @@ fn persist_state(result: rusqlite::Result<usize>, what: &str, trade_id: i64) -> 
 
 use rusqlite::Connection;
 
-/// Position management: ATR-based trailing stops, profit targets, signal decay.
-///
-/// Long-term design (2026-07-23): no calendar-based max hold — a position is
-/// held indefinitely until a stop, target, or signal decay closes it. The
-/// trailing stop is flat (does not tighten with age) so short-term volatility
-/// doesn't shake out a long-term thesis.
-/// - Trailing stop at 3x ATR below high-water mark (flat, no time-based tightening)
-/// - Profit target at 3x ATR from entry (close 50%)
-/// - Signal decay: close if convergence score drops below threshold
+// Position management: ATR-based trailing stops, profit targets, signal decay.
+//
+// Long-term design (2026-07-23): no calendar-based max hold — a position is
+// held indefinitely until a stop, target, or signal decay closes it. The
+// trailing stop is flat (does not tighten with age) so short-term volatility
+// doesn't shake out a long-term thesis.
+// - Trailing stop at 3x ATR below high-water mark (flat, no time-based tightening)
+// - Profit target at 3x ATR from entry (close 50%)
+// - Signal decay: close if convergence score drops below threshold
 
 /// What to do with a position.
 ///
@@ -404,9 +404,8 @@ pub fn generate_trade_journal(
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&profile) {
         let dims = ["insider", "institutional", "news", "government", "search", "patent", "supply_chain", "political"];
         for dim in dims {
-            if let Some(val) = parsed.get(dim).and_then(|v| v.as_f64()) {
-                if val > 0.05 { top_signals.push((dim.to_string(), val)); }
-            }
+            if let Some(val) = parsed.get(dim).and_then(|v| v.as_f64())
+                && val > 0.05 { top_signals.push((dim.to_string(), val)); }
         }
     }
     top_signals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

@@ -76,8 +76,8 @@ pub fn load_recent_hashes(conn: &rusqlite::Connection, days: i64) -> (HashSet<St
         "SELECT s.url_hash, s.original_title FROM stories s
          JOIN briefings b ON b.id = s.briefing_id
          WHERE b.date >= date('now', ?1)"
-    ) {
-        if let Ok(rows) = stmt.query_map([&offset], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([&offset], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         }) {
             for row in rows.flatten() {
@@ -85,15 +85,14 @@ pub fn load_recent_hashes(conn: &rusqlite::Connection, days: i64) -> (HashSet<St
                 titles.push(normalize_title(&row.1));
             }
         }
-    }
 
     // Load from freedom_stories table
     if let Ok(mut stmt) = conn.prepare(
         "SELECT fs.url_hash, fs.original_title FROM freedom_stories fs
          JOIN briefings b ON b.id = fs.briefing_id
          WHERE b.date >= date('now', ?1)"
-    ) {
-        if let Ok(rows) = stmt.query_map([&offset], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([&offset], |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -108,7 +107,6 @@ pub fn load_recent_hashes(conn: &rusqlite::Connection, days: i64) -> (HashSet<St
                 }
             }
         }
-    }
 
     tracing::info!("Loaded {} historical URL hashes and {} titles for cross-day dedup", url_hashes.len(), titles.len());
     (url_hashes, titles)

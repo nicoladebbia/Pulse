@@ -421,7 +421,7 @@ fn like_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(i64,
 
     let results: Vec<(i64, f32)> = stmt
         .query_map(params![pattern, limit as i64], |row| {
-            Ok(row.get::<_, i64>(0)?)
+            row.get::<_, i64>(0)
         })?
         .filter_map(|r| r.ok())
         .enumerate()
@@ -503,13 +503,12 @@ pub fn merge_results(
     }
 
     // Normalize RRF scores to 0..1 (needed for recency decay compatibility)
-    if let Some(&(_, max_score, _)) = results.first() {
-        if max_score > 0.0 {
+    if let Some(&(_, max_score, _)) = results.first()
+        && max_score > 0.0 {
             for item in results.iter_mut() {
                 item.1 /= max_score;
             }
         }
-    }
 
     results
 }
@@ -613,7 +612,7 @@ pub fn recency_score(age_days: f32, half_life: f32) -> f32 {
 /// anyway so the caller can filter by date without a second query.
 fn apply_recency_decay(
     conn: &Connection,
-    results: &mut Vec<(i64, f32, MatchType)>,
+    results: &mut [(i64, f32, MatchType)],
     alpha: f32,
     half_life: f32,
 ) -> Result<std::collections::HashMap<i64, String>> {
@@ -675,13 +674,12 @@ fn apply_recency_decay(
     let today = chrono::Local::now().date_naive();
 
     for (id, score, _) in results.iter_mut() {
-        if let Some(date_str) = date_map.get(id) {
-            if let Ok(story_date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+        if let Some(date_str) = date_map.get(id)
+            && let Ok(story_date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
                 let age_days = (today - story_date).num_days().max(0) as f32;
                 let recency = recency_score(age_days, half_life);
                 *score = alpha * *score + (1.0 - alpha) * recency;
             }
-        }
         // If date lookup/parse fails, keep original score unchanged
     }
 
@@ -746,8 +744,8 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
         let pattern = format!("%{}%", clean);
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT name FROM entities WHERE name_normalized LIKE ?1 LIMIT 3"
-        ) {
-            if let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
+        )
+            && let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
                 for name in rows.flatten() {
                     let lower_name = name.to_lowercase();
                     if !lower_query.contains(&lower_name) && name.len() > 2
@@ -757,15 +755,14 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
                     }
                 }
             }
-        }
 
         // Also look up via entity_aliases table (tickers, acronyms)
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT e.name FROM entity_aliases ea
              JOIN entities e ON e.id = ea.entity_id
              WHERE LOWER(ea.alias) = ?1 LIMIT 3"
-        ) {
-            if let Ok(rows) = stmt.query_map(params![clean], |row| row.get::<_, String>(0)) {
+        )
+            && let Ok(rows) = stmt.query_map(params![clean], |row| row.get::<_, String>(0)) {
                 for name in rows.flatten() {
                     let lower_name = name.to_lowercase();
                     if !lower_query.contains(&lower_name)
@@ -775,15 +772,14 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
                     }
                 }
             }
-        }
 
         // Reverse: if query contains entity name, find its aliases/tickers
         if let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT ea.alias FROM entity_aliases ea
              JOIN entities e ON e.id = ea.entity_id
              WHERE e.name_normalized LIKE ?1 LIMIT 3"
-        ) {
-            if let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
+        )
+            && let Ok(rows) = stmt.query_map(params![pattern], |row| row.get::<_, String>(0)) {
                 for alias in rows.flatten() {
                     let lower_alias = alias.to_lowercase();
                     if !lower_query.contains(&lower_alias)
@@ -793,7 +789,6 @@ pub fn expand_query_with_entities(conn: &Connection, query: &str) -> String {
                     }
                 }
             }
-        }
     }
 
     if expansions.is_empty() {
@@ -1191,7 +1186,11 @@ mod tests {
     // Date filtering — must happen while the candidate pool is still full
     // -----------------------------------------------------------------------
 
-    fn dated(pairs: &[(i64, f32, &str)]) -> (Vec<(i64, f32, MatchType)>, HashMap<i64, String>) {
+    /// A candidate pool plus its id -> date sidecar, the pair every date-filter
+    /// test feeds in together.
+    type DatedPool = (Vec<(i64, f32, MatchType)>, HashMap<i64, String>);
+
+    fn dated(pairs: &[(i64, f32, &str)]) -> DatedPool {
         let results = pairs.iter().map(|(id, s, _)| (*id, *s, MatchType::Both)).collect();
         let map = pairs.iter().map(|(id, _, d)| (*id, d.to_string())).collect();
         (results, map)

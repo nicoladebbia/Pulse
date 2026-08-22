@@ -7,7 +7,6 @@ use serde::Deserialize;
 ///
 /// SEC requires User-Agent with name+email. Rate limit: 10 req/sec.
 /// No API key needed.
-
 const SEC_USER_AGENT: &str = "Pulse/1.0 (pulse-app@example.com)";
 
 // --- Form 4: Insider Trades ---
@@ -835,11 +834,10 @@ async fn fetch_13f_infotable_map(
                 || lower.contains("informationtable")
                 || (lower.ends_with(".xml") && !lower.contains("primary_doc"));
 
-            if is_infotable {
-                if let Some((accession, filename)) = id.split_once(':') {
+            if is_infotable
+                && let Some((accession, filename)) = id.split_once(':') {
                     map.insert(accession.to_string(), filename.to_string());
                 }
-            }
         }
     }
 

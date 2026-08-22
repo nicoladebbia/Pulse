@@ -170,13 +170,14 @@ fn agency_to_sector(agency: &str) -> String {
     let lower = agency.to_lowercase();
     if lower.contains("securities") || lower.contains("sec") || lower.contains("treasury") {
         "finance".to_string()
+    // Health/FDA/NIH agencies bucket to "tech" alongside FCC/commerce/patent
+    // because the news sectors are ai/miami/italy/tech + finance — there is no
+    // health NEWS sector (health exists only as a freedoms category).
     } else if lower.contains("fda")
         || lower.contains("food")
         || lower.contains("health")
         || lower.contains("nih")
-    {
-        "tech".to_string()
-    } else if lower.contains("fcc")
+        || lower.contains("fcc")
         || lower.contains("commerce")
         || lower.contains("patent")
         || lower.contains("technology")

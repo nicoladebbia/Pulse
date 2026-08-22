@@ -228,7 +228,8 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                 tracing::warn!("Pre-curation failed (non-fatal): {}", e);
                 pre_curate_fell_back = true;
                 // Sector-balanced cap: ensure each sector is represented
-                let fallback = if news_articles.len() > 150 {
+                
+                if news_articles.len() > 150 {
                     tracing::info!("Sector-balanced cap from {} to ~150 articles", news_articles.len());
                     let sectors = ["ai", "miami", "italy", "tech"];
                     let mut balanced = Vec::with_capacity(150);
@@ -256,8 +257,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                     balanced
                 } else {
                     news_articles
-                };
-                fallback
+                }
             }
         }
     } else {
@@ -360,9 +360,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Dedicated connections pass: the 4-task analyze prompt under-delivers
     // connections (measured 0-2/run). A single-task call over the curated list
     // complies much better. Run whenever analyze produced <3; keep the longer list.
-    if !analysis_degraded && analysis.connections.len() < 3 {
-        if let Ok(api_key) = std::env::var("GROQ_API_KEY") {
-            if let Ok(client) = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf())) {
+    if !analysis_degraded && analysis.connections.len() < 3
+        && let Ok(api_key) = std::env::var("GROQ_API_KEY")
+            && let Ok(client) = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf())) {
                 match client.find_connections(&analysis.curated_stories).await {
                     Ok(conns) if conns.len() > analysis.connections.len() => {
                         tracing::info!("Connections upgraded {} -> {} via dedicated pass", analysis.connections.len(), conns.len());
@@ -372,8 +372,6 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                     Err(e) => tracing::warn!("Dedicated connections pass failed (non-fatal): {}", e),
                 }
             }
-        }
-    }
 
     // Log sector distribution in curated stories
     {
@@ -439,7 +437,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                 Ok(p) => {
                     let count = p.iter().filter(|x| x.is_some()).count();
                     tracing::info!("Generated {} contextual prefixes", count);
-                    let prefix_batches = ((analysis.curated_stories.len() + 9) / 10) as i64;
+                    let prefix_batches = analysis.curated_stories.len().div_ceil(10) as i64;
                     log_usage(db_path, "anthropic", "claude-haiku", "contextual_prefixes", prefix_batches * 2500, prefix_batches * 500);
                     Some(p)
                 }
@@ -525,7 +523,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
             entities_extracted += count as i64;
             tracing::info!("Extracted {} entity mentions", count);
             // ~2000 tokens in, ~500 out per batch of 30 stories; ~3 batches for 80 stories
-            let batches = ((analysis.curated_stories.len() + 29) / 30) as i64;
+            let batches = analysis.curated_stories.len().div_ceil(30) as i64;
             log_usage(db_path, "anthropic", "claude-haiku", "entity_extraction", batches * 2000, batches * 500);
         }
         Err(e) => tracing::warn!("Entity extraction failed (non-fatal): {}", e),
@@ -894,14 +892,13 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
              WHERE run_date < ?1 ORDER BY run_date DESC LIMIT 1",
             [&today],
             |r| r.get(0),
-        ) {
-            if prev - emb_pct > EMBEDDING_COVERAGE_DROP_PCT {
+        )
+            && prev - emb_pct > EMBEDDING_COVERAGE_DROP_PCT {
                 degradations.push(format!(
                     "embedding coverage dropped {:.1}pp since the last run ({:.1}% -> {:.1}%)",
                     prev - emb_pct, prev, emb_pct
                 ));
             }
-        }
         if !analysis_degraded {
             // analyze succeeded — but on which provider? No anthropic row today
             // means the Haiku path silently fell back to Groq 70B.
@@ -991,11 +988,10 @@ fn clean_theme_output(raw: &str) -> String {
 
     // Remove surrounding quotes (straight, smart, single)
     let quote_chars: &[char] = &['"', '\u{201C}', '\u{201D}', '\'', '\u{2018}', '\u{2019}'];
-    if let (Some(first), Some(last)) = (s.chars().next(), s.chars().last()) {
-        if quote_chars.contains(&first) && quote_chars.contains(&last) && s.len() > 1 {
+    if let (Some(first), Some(last)) = (s.chars().next(), s.chars().last())
+        && quote_chars.contains(&first) && quote_chars.contains(&last) && s.len() > 1 {
             s = s.trim_matches(quote_chars).to_string();
         }
-    }
 
     // Strip markdown bold/italic
     s = s.replace("**", "").replace("__", "");
@@ -1046,14 +1042,13 @@ fn clean_theme_output(raw: &str) -> String {
         "following", "below",
         "most important story",
     ];
-    if let Some(colon_pos) = s.find(':') {
-        if colon_pos <= 200 {
+    if let Some(colon_pos) = s.find(':')
+        && colon_pos <= 200 {
             let pre = &s[..colon_pos].to_lowercase();
             if META_SIGNALS.iter().any(|sig| pre.contains(sig)) {
                 s = s[colon_pos + 1..].trim_start_matches([' ', '-', '—', '\n']).to_string();
             }
         }
-    }
 
     // Fallback: static prefix match for preambles that don't end in a colon
     let preambles = [
@@ -1178,8 +1173,8 @@ async fn generate_deep_summaries(db_path: &std::path::Path) -> anyhow::Result<us
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                if let Ok(parsed) = resp.json::<serde_json::Value>().await {
-                    if let Some(text) = parsed["content"][0]["text"].as_str() {
+                if let Ok(parsed) = resp.json::<serde_json::Value>().await
+                    && let Some(text) = parsed["content"][0]["text"].as_str() {
                         conn.execute(
                             "UPDATE stories SET summary_depth = 'deep', deep_summary = ?1 WHERE id = ?2",
                             rusqlite::params![text, story_id],
@@ -1187,7 +1182,6 @@ async fn generate_deep_summaries(db_path: &std::path::Path) -> anyhow::Result<us
                         count += 1;
                         tracing::info!("Deep summary for story {} ({} chars)", story_id, text.len());
                     }
-                }
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -1523,7 +1517,7 @@ async fn extract_entities_from_stories(db_path: &Path, analysis: &crate::claude:
     let mut total_stored = 0;
 
     // Process stories in batches of 15
-    let entity_batches = (analysis.curated_stories.len() + 29) / 30;
+    let entity_batches = analysis.curated_stories.len().div_ceil(30);
     for (batch_start, chunk) in analysis.curated_stories.chunks(30).enumerate().map(|(i, c)| (i * 30, c)) {
         // Heartbeat: keep the progress file fresh so a long entity pass isn't misread as
         // interrupted, and so the bar visibly advances within stage 9.
@@ -1612,25 +1606,23 @@ Focus on MOST important entities (max 5 per story). Prioritize companies, key pe
                 }
 
                 // Insert entity_mention linking entity to story
-                if let Some(story_id) = ent.story_id {
-                    if story_id > 0 {
+                if let Some(story_id) = ent.story_id
+                    && story_id > 0 {
                         let entity_id: Option<i64> = conn.query_row(
                             "SELECT id FROM entities WHERE name_normalized = ?1 AND entity_type = ?2",
                             rusqlite::params![nn, et],
                             |row| row.get(0),
                         ).ok();
 
-                        if let Some(eid) = entity_id {
-                            if let Err(e) = conn.execute(
+                        if let Some(eid) = entity_id
+                            && let Err(e) = conn.execute(
                                 "INSERT INTO entity_mentions (entity_id, story_id, sentiment, context, mentioned_at)
                                  VALUES (?1, ?2, ?3, ?4, ?5)",
                                 rusqlite::params![eid, story_id, ent.sentiment, ent.context, today],
                             ) {
                                 tracing::warn!("entity_mention insert failed for '{}': {}", ent.name, e);
                             }
-                        }
                     }
-                }
 
                 total_stored += 1;
             }
@@ -1661,8 +1653,7 @@ Focus on MOST important entities (max 5 per story). Prioritize companies, key pe
             else if total >= 14 && *days_active >= 10 { "dominant" }
             else if total >= 7 && *days_active >= 5 { "hot" }
             else if acc < 0.8 && total >= 3 { "fading" }
-            else if total >= 3 || *days_active >= 2 { "rising" }
-            else if *w7 > 0 { "rising" }
+            else if total >= 3 || *days_active >= 2 || *w7 > 0 { "rising" }
             else { "dormant" };
         if let Err(e) = conn.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
@@ -1985,7 +1976,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     for bucket in by_sector.values_mut() {
         bucket.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
         bucket.truncate(PER_SECTOR_CAP);
-        sorted.extend(bucket.drain(..));
+        sorted.append(bucket);
     }
     sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
     tracing::info!("Freedoms: curator input = {} stories (stratified, max {}/sector)", sorted.len(), PER_SECTOR_CAP);
@@ -2167,11 +2158,10 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
 fn extract_json_str(text: &str) -> &str {
     let trimmed = text.trim();
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
+    if let Some(start) = trimmed.find('{')
+        && let Some(end) = trimmed.rfind('}') {
             return &trimmed[start..=end];
         }
-    }
     trimmed
 }
 
@@ -2598,18 +2588,17 @@ fn generate_financial_fts_fields(article: &crate::sources::RawArticle) -> (Vec<S
             if let Some(party) = meta.get("party").and_then(|v| v.as_str()) {
                 facts.push(format!("Party: {}", party));
             }
-            why = format!("Large political donations can signal industry lobbying priorities and regulatory expectations");
+            why = "Large political donations can signal industry lobbying priorities and regulatory expectations".to_string();
             watch = format!("Monitor related regulatory actions and policy changes affecting {}'s industry", contributor);
         }
         s if s.contains("LDA") || s.contains("Senate") => {
             let client = meta.get("client").and_then(|v| v.as_str()).unwrap_or("Unknown");
             let registrant = meta.get("registrant").and_then(|v| v.as_str()).unwrap_or("Unknown");
             facts.push(format!("Lobbying: {} via {}", client, registrant));
-            if let Some(issues) = meta.get("issues").and_then(|v| v.as_str()) {
-                if !issues.is_empty() { facts.push(format!("Issues: {}", issues)); }
-            }
+            if let Some(issues) = meta.get("issues").and_then(|v| v.as_str())
+                && !issues.is_empty() { facts.push(format!("Issues: {}", issues)); }
             why = format!("{} is lobbying — indicates they're trying to influence policy that affects their business", client);
-            watch = format!("Track related legislation and regulatory actions in lobbied areas");
+            watch = "Track related legislation and regulatory actions in lobbied areas".to_string();
         }
         "FRED" => {
             let series = meta.get("series_name").and_then(|v| v.as_str()).unwrap_or("indicator");
@@ -2619,7 +2608,7 @@ fn generate_financial_fts_fields(article: &crate::sources::RawArticle) -> (Vec<S
             if let Some(v) = value { facts.push(format!("Current value: {:.2}", v)); }
             if let Some(c) = change { facts.push(format!("Change: {:.1}%", c)); }
             why = format!("{} is a key macro indicator — changes affect market sentiment and Fed policy expectations", series);
-            watch = format!("Monitor for trend continuation and divergence from market expectations");
+            watch = "Monitor for trend continuation and divergence from market expectations".to_string();
         }
         "EIA" => {
             let value = meta.get("value").and_then(|v| v.as_f64());
@@ -2687,8 +2676,8 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
         let entities: Vec<(&str, &str, f64)> = match source_name.as_str() {
             s if s.contains("EDGAR") => {
                 let mut ents = Vec::new();
-                if let Some(name) = meta.get("entity_name").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = meta.get("entity_name").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         let etype = match meta.get("filing_type").and_then(|v| v.as_str()).unwrap_or("") {
                             "4" => "insider_trade",
                             "8-K" => "material_event",
@@ -2697,28 +2686,25 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
                         };
                         ents.push((name, etype, 0.0));
                     }
-                }
                 // Also extract from display_names array
                 if let Some(names) = meta.get("display_names").and_then(|v| v.as_array()) {
                     for n in names.iter().take(3) {
-                        if let Some(name) = n.as_str() {
-                            if !name.is_empty() && ents.iter().all(|(e, _, _)| *e != name) {
+                        if let Some(name) = n.as_str()
+                            && !name.is_empty() && ents.iter().all(|(e, _, _)| *e != name) {
                                 ents.push((name, "company", 0.0));
                             }
-                        }
                     }
                 }
                 ents
             }
             s if s.contains("USASpending") => {
                 let mut ents = Vec::new();
-                if let Some(name) = meta.get("recipient").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = meta.get("recipient").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         ents.push((name, "contract_award", 0.5));
                     }
-                }
-                if let Some(name) = meta.get("agency").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = meta.get("agency").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         // Was typed "company" — a federal agency (e.g. "Department of
                         // Transportation") is never ticker-eligible or tradeable, but that type
                         // let it INTO populate_tickers_limited's eligible set and let it
@@ -2730,26 +2716,22 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
                         // Task 5, 2026-07-24 — found via the 290-NULL-ticker candidate audit.)
                         ents.push((name, "regulatory_action", 0.0));
                     }
-                }
                 ents
             }
             "FEC" => {
                 let mut ents = Vec::new();
-                if let Some(name) = meta.get("recipient").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = meta.get("recipient").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         ents.push((name, "person", 0.0));
                     }
-                }
-                if let Some(name) = meta.get("contributor").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = meta.get("contributor").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         ents.push((name, "person", 0.0));
                     }
-                }
-                if let Some(name) = meta.get("employer").and_then(|v| v.as_str()) {
-                    if !name.is_empty() && name != "SELF-EMPLOYED" && name != "NOT EMPLOYED" && name != "RETIRED" {
+                if let Some(name) = meta.get("employer").and_then(|v| v.as_str())
+                    && !name.is_empty() && name != "SELF-EMPLOYED" && name != "NOT EMPLOYED" && name != "RETIRED" {
                         ents.push((name, "company", 0.0));
                     }
-                }
                 ents
             }
             s if s.contains("LDA") || s.contains("Senate") => {
@@ -2766,43 +2748,38 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
                 // the ticker-mapping and now-more-obviously-not-a-company bucket. (See
                 // USASpending block above for the sibling bug/fix.
                 // calibration-backtest-universe Task 5, 2026-07-24.)
-                if let Some(name) = meta.get("client").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = meta.get("client").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         ents.push((name, "company", 0.0));
                     }
-                }
-                if let Some(name) = meta.get("registrant").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = meta.get("registrant").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         ents.push((name, "lobbying_disclosure", 0.0));
                     }
-                }
                 ents
             }
             "USPTO" | "Google Patents" => {
                 let mut ents = Vec::new();
-                if let Some(name) = meta.get("assignee").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = meta.get("assignee").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         ents.push((name, "patent_cluster", 0.3));
                     }
-                }
                 ents
             }
             "Wikipedia Pageviews" => {
                 let mut ents = Vec::new();
-                if let Some(name) = meta.get("entity_name").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = meta.get("entity_name").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         ents.push((name, "company", 0.0)); // Use 'company' — matches CHECK constraint
                     }
-                }
                 ents
             }
             "EIA" => {
                 let mut ents = Vec::new();
-                if let Some(product) = meta.get("product").and_then(|v| v.as_str()) {
-                    if !product.is_empty() {
+                if let Some(product) = meta.get("product").and_then(|v| v.as_str())
+                    && !product.is_empty() {
                         ents.push((product, "topic", 0.0)); // Use 'topic' — matches CHECK constraint
                     }
-                }
                 ents
             }
             s if s.contains("Federal Register") => {
@@ -3213,12 +3190,12 @@ mod freedom_hero_tests {
                  WHERE is_hero = 1 ORDER BY display_order",
             )
             .unwrap();
-        let rows = stmt
+        
+        stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        rows
+            .unwrap()
     }
 
     #[test]

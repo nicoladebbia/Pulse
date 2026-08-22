@@ -247,8 +247,8 @@ pub(crate) fn populate_tickers_limited(db_path: &Path, limit: usize) -> anyhow::
                         // ("1901440"). Strip leading zeros so the lookup actually
                         // matches — without this, 0 of ~1,500 CIK-bearing entities map.
                         let cik_norm = cik_digits.trim_start_matches('0').to_string();
-                        if !cik_norm.is_empty() {
-                            if let Some((ticker, cik)) = cik_map.get(&cik_norm) {
+                        if !cik_norm.is_empty()
+                            && let Some((ticker, cik)) = cik_map.get(&cik_norm) {
                                 // CIK match = a government-registered identifier embedded in the
                                 // entity name. Strongest possible signal → TOP of the ladder (0.98),
                                 // above story-metadata (0.75) and every fuzzy name match.
@@ -260,7 +260,6 @@ pub(crate) fn populate_tickers_limited(db_path: &Path, limit: usize) -> anyhow::
                                 mapped += 1;
                                 found = true;
                             }
-                        }
                     }
                     if found { continue; }
 
@@ -293,22 +292,19 @@ pub(crate) async fn download_sec_tickers_async() -> anyhow::Result<std::collecti
     let cache_dir = dirs::home_dir().unwrap_or_default().join(".pulse");
     let cache_path = cache_dir.join("sec_tickers.json");
 
-    if cache_path.exists() {
-        if let Ok(metadata) = std::fs::metadata(&cache_path) {
-            if let Ok(modified) = metadata.modified() {
+    if cache_path.exists()
+        && let Ok(metadata) = std::fs::metadata(&cache_path)
+            && let Ok(modified) = metadata.modified() {
                 let age = std::time::SystemTime::now().duration_since(modified).unwrap_or_default();
                 if age < std::time::Duration::from_secs(7 * 86400) {
                     // Cache hit
-                    if let Ok(data) = std::fs::read_to_string(&cache_path) {
-                        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, (String, String)>>(&data) {
+                    if let Ok(data) = std::fs::read_to_string(&cache_path)
+                        && let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, (String, String)>>(&data) {
                             tracing::info!("SEC tickers: loaded {} from cache (age: {}h)", map.len(), age.as_secs() / 3600);
                             return Ok(map);
                         }
-                    }
                 }
             }
-        }
-    }
 
     let url = "https://www.sec.gov/files/company_tickers.json";
     let client = reqwest::Client::builder()
@@ -323,14 +319,12 @@ pub(crate) async fn download_sec_tickers_async() -> anyhow::Result<std::collecti
 
     if !resp.status().is_success() {
         // Try cache even if expired
-        if cache_path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&cache_path) {
-                if let Ok(map) = serde_json::from_str(&data) {
+        if cache_path.exists()
+            && let Ok(data) = std::fs::read_to_string(&cache_path)
+                && let Ok(map) = serde_json::from_str(&data) {
                     tracing::warn!("SEC tickers: API returned {}, using stale cache", resp.status());
                     return Ok(map);
                 }
-            }
-        }
         anyhow::bail!("SEC company_tickers.json returned {}", resp.status());
     }
 
@@ -537,8 +531,8 @@ pub(crate) fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
         }
 
         // 2. Try ticker match
-        if matched_canonical_id.is_none() {
-            if let Some(t) = ticker {
+        if matched_canonical_id.is_none()
+            && let Some(t) = ticker {
                 for (cid, _, c_ticker, _) in &existing_canonicals {
                     if c_ticker.as_deref() == Some(t.as_str()) {
                         matched_canonical_id = Some(*cid);
@@ -546,7 +540,6 @@ pub(crate) fn resolve_entities(db_path: &Path) -> anyhow::Result<usize> {
                     }
                 }
             }
-        }
 
         // 3. Try normalized name match against existing canonicals
         if matched_canonical_id.is_none() {

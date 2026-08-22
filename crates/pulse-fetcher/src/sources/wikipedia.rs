@@ -7,7 +7,6 @@ use super::RawArticle;
 /// Strategy: For entities with tickers (public companies), fetch their Wikipedia page views.
 /// Compare last 7 days vs prior 30-day average. A spike in page views correlates with
 /// search interest and often precedes price moves.
-
 pub async fn fetch(db_path: &std::path::Path) -> anyhow::Result<Vec<RawArticle>> {
     let conn = rusqlite::Connection::open(db_path)?;
 
@@ -106,13 +105,12 @@ pub(crate) fn title_candidates(entity_name: &str) -> Vec<String> {
     .to_string();
 
     // 2. A trailing state qualifier rides on the last word: `INC/RI`.
-    if let Some(last) = name.split_whitespace().next_back() {
-        if let Some((head, _)) = last.split_once('/') {
+    if let Some(last) = name.split_whitespace().next_back()
+        && let Some((head, _)) = last.split_once('/') {
             let head = head.to_string();
             let without = name[..name.len() - last.len()].trim_end().to_string();
             name = if head.is_empty() { without } else { format!("{without} {head}") };
         }
-    }
 
     // 3. Peel legal suffixes off the tail, repeatedly — `Bakkt, Inc.` and
     //    `CEMEX SAB DE CV` both need more than one pass.
@@ -314,7 +312,7 @@ async fn fetch_pageviews(entities: &[(String, String)]) -> anyhow::Result<Vec<Ra
                 entity_name, views_delta_pct
             ),
             sector: "finance".to_string(),
-            feed_id: pageview_feed_id(&ticker, &today_str),
+            feed_id: pageview_feed_id(ticker, &today_str),
             language: "en".to_string(),
             source_type: "financial".to_string(),
             financial_metadata: Some(serde_json::to_string(&metadata).unwrap_or_default()),

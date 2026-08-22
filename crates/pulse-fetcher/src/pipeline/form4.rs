@@ -229,15 +229,13 @@ pub(crate) async fn enrich_form4_stories(db_path: &Path) -> anyhow::Result<usize
                         if let Ok(xml_resp) = client.get(&full_url)
                             .header("User-Agent", "Pulse/1.0 (pulse-app@example.com)")
                             .send().await
-                        {
-                            if xml_resp.status().is_success() {
+                            && xml_resp.status().is_success() {
                                 let text = xml_resp.text().await.unwrap_or_default();
                                 if text.contains("<ownershipDocument") {
                                     found_xml = Some(text);
                                     break;
                                 }
                             }
-                        }
                     }
                 }
                 found_xml

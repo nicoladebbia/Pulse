@@ -381,10 +381,9 @@ fn read_idea(row: &rusqlite::Row) -> rusqlite::Result<ProjectIdea> {
 
 fn extract_json(text: &str) -> String {
     let trimmed = text.trim();
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
+    if let Some(start) = trimmed.find('{')
+        && let Some(end) = trimmed.rfind('}') {
             return trimmed[start..=end].to_string();
         }
-    }
     trimmed.to_string()
 }

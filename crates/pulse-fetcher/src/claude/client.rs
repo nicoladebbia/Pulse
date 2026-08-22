@@ -346,14 +346,13 @@ impl GroqClient {
     /// One row per actual call (not per phase) — retries and parse-fail repeats are billed
     /// separately by Groq, and this matches that.
     fn log_call(&self, model: &str, endpoint: &str, usage: &Usage) {
-        if let Some(ref path) = self.db_path {
-            if let Ok(conn) = rusqlite::Connection::open(path) {
+        if let Some(ref path) = self.db_path
+            && let Ok(conn) = rusqlite::Connection::open(path) {
                 crate::db::log_api_usage(
                     &conn, "groq", model, endpoint,
                     usage.prompt_tokens, usage.completion_tokens,
                 );
             }
-        }
     }
 
     pub async fn call(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
@@ -661,15 +660,14 @@ impl GroqClient {
             let response: serde_json::Value = resp.json().await
                 .map_err(|e| anyhow::anyhow!("Anthropic response parse error: {}", e))?;
 
-            if let Some(ref path) = self.db_path {
-                if let Ok(conn) = rusqlite::Connection::open(path) {
+            if let Some(ref path) = self.db_path
+                && let Ok(conn) = rusqlite::Connection::open(path) {
                     crate::db::log_api_usage(
                         &conn, "anthropic", model, endpoint,
                         response["usage"]["input_tokens"].as_i64().unwrap_or(0),
                         response["usage"]["output_tokens"].as_i64().unwrap_or(0),
                     );
                 }
-            }
 
             // Distinguish truncation from model non-compliance: a max_tokens stop
             // means the JSON is syntactically cut off — bail with a clear reason
@@ -727,8 +725,8 @@ impl GroqClient {
                 }
                 Err(e) => {
                     // Try lenient parse: fill missing fields with defaults
-                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                        if let Some(obj) = val.as_object_mut() {
+                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&json_str)
+                        && let Some(obj) = val.as_object_mut() {
                             obj.entry("importance_score").or_insert(serde_json::json!(5));
                             obj.entry("sentiment").or_insert(serde_json::json!("neutral"));
                             obj.entry("novelty").or_insert(serde_json::json!("incremental"));
@@ -749,7 +747,6 @@ impl GroqClient {
                                 });
                             }
                         }
-                    }
                     last_err = Some(e.into());
                     continue;
                 }
@@ -1094,19 +1091,6 @@ fn extract_json_array(text: &str) -> String {
     trimmed.to_string()
 }
 
-/// Turn a parsed analyze response + the analyze INPUT `stories` array into an
-/// `AnalysisResult`, remapping every model index onto the final curated array.
-///
-/// Two things this fixes, both load-bearing:
-///  1. Empty curation (the `missing field curation` non-compliance case) → derive the
-///     curated set from importance so the briefing still curates, while KEEPING the
-///     connections/relevance the model returned.
-///  2. The model's connection/relevance/trend indices reference the INPUT array, but
-///     the persist path resolves them positionally against `curated_stories`. Each
-///     index is translated to the story's position in `curated_stories` (matched by
-///     URL, the stable identity). Before this, an input index like 15 was read as
-///     curated position 15 — landing inside the sector-grouped block and producing the
-///     same-sector "cross-sector" connections seen in the DB (ai↔ai, miami↔miami).
 /// Input-story ids the model's relevance_scores skipped. Ids outside
 /// `0..total` are model garbage and do NOT mark a story as scored.
 fn missing_relevance_ids(scored: &[AnalysisRelevance], total: usize) -> Vec<usize> {
@@ -1137,6 +1121,19 @@ fn merge_retry_scores(
     recovered
 }
 
+/// Turn a parsed analyze response + the analyze INPUT `stories` array into an
+/// `AnalysisResult`, remapping every model index onto the final curated array.
+///
+/// Two things this fixes, both load-bearing:
+///  1. Empty curation (the `missing field curation` non-compliance case) → derive the
+///     curated set from importance so the briefing still curates, while KEEPING the
+///     connections/relevance the model returned.
+///  2. The model's connection/relevance/trend indices reference the INPUT array, but
+///     the persist path resolves them positionally against `curated_stories`. Each
+///     index is translated to the story's position in `curated_stories` (matched by
+///     URL, the stable identity). Before this, an input index like 15 was read as
+///     curated position 15 — landing inside the sector-grouped block and producing the
+///     same-sector "cross-sector" connections seen in the DB (ai↔ai, miami↔miami).
 fn build_analysis_result(parsed: AnalysisResponse, stories: &[SummarizedStory]) -> AnalysisResult {
     let mut curated_input_indices: Vec<usize> = Vec::new();
     curated_input_indices.extend(&parsed.curation.ai);
@@ -1246,11 +1243,10 @@ fn build_analysis_result(parsed: AnalysisResponse, stories: &[SummarizedStory]) 
 /// Extract JSON from a response that might have markdown code fences
 fn extract_json(text: &str) -> String {
     let trimmed = text.trim();
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
+    if let Some(start) = trimmed.find('{')
+        && let Some(end) = trimmed.rfind('}') {
             return trimmed[start..=end].to_string();
         }
-    }
     trimmed.to_string()
 }
 
