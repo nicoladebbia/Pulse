@@ -188,6 +188,47 @@ pub fn evaluate_position(
     PositionAction::Hold
 }
 
+/// How old a `cross_signals` row may be and still count as this ticker's
+/// current reading.
+///
+/// Signals recompute daily, so one missed day must not read as decay — but a
+/// ticker that has dropped out of the topic set for three days genuinely has no
+/// current signal, and the old query had no bound at all: it would happily
+/// return a reading from months earlier as "current".
+const SIGNAL_STALE_AFTER_DAYS: i64 = 3;
+
+/// Whether an open position's entry thesis has decayed.
+///
+/// Split out from the queries so the three-way decision is testable, because
+/// the interesting case is not arithmetic — it is telling "this ticker went
+/// quiet" apart from "the pipeline produced nothing for anyone".
+///
+/// `latest_fresh` is `None` when this ticker has no reading inside the staleness
+/// window. That is real decay: `unwrap_or(0.0)` in the original already encoded
+/// the intent that no signal means zero, it just never noticed that a
+/// months-old row is no signal.
+///
+/// `pipeline_ran_recently` is the guard that makes the above safe. Pulse's fetch
+/// pipeline dies for days at a time — Groq IP blocks (2026-07-03..12,
+/// 2026-08-08..13) and the model decommission that produced no briefing from
+/// 2026-08-16 to 2026-08-22. During those windows NO ticker has a fresh row.
+/// Without this flag, the first run after an outage would read every open
+/// position as fully decayed and liquidate the entire book on the strength of
+/// the pipeline being broken. An outage is missing information, not a sell
+/// signal, so decay abstains until the pipeline is producing again.
+pub(crate) fn signal_has_decayed(
+    original_score: f64,
+    latest_fresh: Option<f64>,
+    pipeline_ran_recently: bool,
+) -> bool {
+    if !pipeline_ran_recently {
+        return false;
+    }
+    // Signal has decayed if score dropped to less than 30% of original
+    // OR below absolute minimum of 0.05
+    latest_fresh.unwrap_or(0.0) < (original_score * 0.3).max(0.05)
+}
+
 /// Check if the convergence signal has decayed for an open position.
 /// Returns true if the position should be closed due to signal loss.
 pub fn check_signal_decay(
@@ -195,20 +236,37 @@ pub fn check_signal_decay(
     ticker: &str,
     original_score: f64,
 ) -> bool {
-    // Look up current cross-signal score for this ticker
-    let current_score: f64 = conn
+    let window = format!("-{} days", SIGNAL_STALE_AFTER_DAYS);
+
+    // This ticker's current reading, or None if its freshest row is stale.
+    let latest_fresh: Option<f64> = conn
         .query_row(
-            "SELECT COALESCE(cs.compound_score, 0) FROM cross_signals cs
-             WHERE cs.ticker = ?1
+            "SELECT cs.compound_score FROM cross_signals cs
+             WHERE cs.ticker = ?1 AND cs.computed_at >= date('now', ?2)
              ORDER BY cs.computed_at DESC LIMIT 1",
-            [ticker],
+            rusqlite::params![ticker, &window],
             |row| row.get(0),
         )
-        .unwrap_or(0.0);
+        .ok();
 
-    // Signal has decayed if score dropped to less than 30% of original
-    // OR below absolute minimum of 0.05
-    current_score < (original_score * 0.3).max(0.05)
+    // Did the pipeline compute anything at all for anyone in that window?
+    let pipeline_ran_recently: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM cross_signals WHERE computed_at >= date('now', ?1))",
+            rusqlite::params![&window],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !pipeline_ran_recently {
+        tracing::warn!(
+            "Signal decay: abstaining for {} — no cross_signals computed in the last {} days, \
+             so a missing reading means the pipeline is down, not that the thesis died",
+            ticker, SIGNAL_STALE_AFTER_DAYS
+        );
+    }
+
+    signal_has_decayed(original_score, latest_fresh, pipeline_ran_recently)
 }
 
 /// Write a human-readable trade journal entry on close.
@@ -409,5 +467,116 @@ mod tests {
         // Original score 0.1 → decay if current < 0.05 (absolute minimum)
         let threshold = (0.1 * 0.3_f64).max(0.05);
         assert!((threshold - 0.05).abs() < 0.001);
+    }
+}
+
+#[cfg(test)]
+mod signal_decay_tests {
+    use super::{check_signal_decay, signal_has_decayed};
+    use rusqlite::Connection;
+
+    const ORIG: f64 = 0.3408; // AIRI's stored entry score; threshold is 0.1022
+
+    #[test]
+    fn a_healthy_current_signal_holds_the_position() {
+        assert!(!signal_has_decayed(ORIG, Some(0.32), true));
+    }
+
+    #[test]
+    fn a_collapsed_current_signal_closes_it() {
+        assert!(signal_has_decayed(ORIG, Some(0.05), true));
+    }
+
+    /// The half the old query got wrong. A ticker with no reading inside the
+    /// window has no signal, and no signal is decay — `unwrap_or(0.0)` always
+    /// meant that, it just never noticed a months-old row was not a reading.
+    #[test]
+    fn a_ticker_that_went_quiet_has_decayed() {
+        assert!(signal_has_decayed(ORIG, None, true));
+    }
+
+    /// The half that makes the above safe to ship. Pulse's pipeline dies for
+    /// days at a time; on the first run after an outage every position looks
+    /// fully decayed at once. Liquidating the book because the fetcher broke is
+    /// worse than holding through it.
+    #[test]
+    fn an_outage_never_liquidates_the_book() {
+        assert!(!signal_has_decayed(ORIG, None, false));
+        // Even a genuinely collapsed reading is not acted on mid-outage, because
+        // during an outage we cannot tell a real reading from a stale one.
+        assert!(!signal_has_decayed(ORIG, Some(0.01), false));
+    }
+
+    /// The 0.05 floor governs when 30% of the original is below it, so a trade
+    /// entered on a weak signal cannot be held forever by a proportional rule.
+    #[test]
+    fn the_absolute_floor_governs_a_weak_entry() {
+        // 30% of 0.10 is 0.03, under the 0.05 floor — so 0.04 must still close.
+        assert!(signal_has_decayed(0.10, Some(0.04), true));
+        assert!(!signal_has_decayed(0.10, Some(0.06), true));
+    }
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cross_signals (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT,
+                 compound_score REAL NOT NULL, computed_at TEXT);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn row(conn: &Connection, ticker: &str, score: f64, days_ago: i64) {
+        conn.execute(
+            "INSERT INTO cross_signals (ticker, compound_score, computed_at)
+             VALUES (?1, ?2, date('now', ?3))",
+            rusqlite::params![ticker, score, format!("-{} days", days_ago)],
+        )
+        .unwrap();
+    }
+
+    /// AIRI's live shape on 2026-08-22: its newest row was 39 days old and the
+    /// old query read it as current, holding a -6.96% position on a signal from
+    /// before the trade's own entry month. Other tickers ARE fresh here, so the
+    /// outage guard does not apply and decay is free to fire.
+    #[test]
+    fn a_month_old_row_is_not_a_current_reading() {
+        let conn = db();
+        row(&conn, "AIRI", 0.3408, 39);
+        row(&conn, "OTHER", 0.42, 0); // pipeline is demonstrably alive
+        assert!(
+            check_signal_decay(&conn, "AIRI", ORIG),
+            "a 39-day-old row must not hold a position open"
+        );
+    }
+
+    /// Same stale row, but now nothing is fresh for anyone — the 2026-08-16..22
+    /// outage. The identical input must produce the opposite decision.
+    #[test]
+    fn the_same_stale_row_abstains_when_the_pipeline_is_down() {
+        let conn = db();
+        row(&conn, "AIRI", 0.3408, 39);
+        assert!(
+            !check_signal_decay(&conn, "AIRI", ORIG),
+            "with no fresh rows for any ticker, a missing reading means the pipeline is down"
+        );
+    }
+
+    /// One missed day is not decay — signals recompute daily and the window has
+    /// deliberate slack.
+    #[test]
+    fn a_one_day_gap_is_tolerated() {
+        let conn = db();
+        row(&conn, "AAA", 0.30, 1);
+        assert!(!check_signal_decay(&conn, "AAA", ORIG));
+    }
+
+    /// An entirely empty table is the cold-start case: no pipeline history at
+    /// all must not be read as every position having decayed.
+    #[test]
+    fn an_empty_table_abstains() {
+        let conn = db();
+        assert!(!check_signal_decay(&conn, "AAA", ORIG));
     }
 }
