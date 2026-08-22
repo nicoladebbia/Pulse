@@ -15,6 +15,7 @@
 	} from '$lib/tauri/types';
 	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
 	import { parseTradeReason, fmtReasonSignals } from '$lib/trade-reason';
+	import { splitCalibrationBatches } from '$lib/calibration';
 
 	let signals = $state<CrossSignal[]>([]);
 	let convergence = $state<CrossSignal[]>([]);
@@ -59,6 +60,7 @@
 	let calibrationActing = $state<string | null>(null);
 	let calibrationError = $state<string | null>(null);
 	let calibrationStatus = $state<string | null>(null);
+	let calibration = $derived(splitCalibrationBatches(pendingCalibration));
 
 	$effect(() => {
 		if (loaded) return;
@@ -289,6 +291,32 @@
 		}
 	}
 
+	// The 2026-08-22 reweight superseded 18 batches at once. Each one is a dead
+	// card with a Reject button, and clearing them one at a time is 18 confirms.
+	// Partial failure is reported with the count that DID land, so the message
+	// never claims more than happened.
+	async function handleRejectSuperseded() {
+		const ids = calibration.superseded.map((b) => b.batch_id);
+		if (!ids.length) return;
+		if (!confirm(`Reject ${ids.length} superseded batches? Live weights stay unchanged.`)) return;
+		calibrationActing = 'superseded';
+		calibrationError = null;
+		calibrationStatus = null;
+		let done = 0;
+		try {
+			for (const id of ids) {
+				await rejectPendingCalibration(id);
+				done++;
+			}
+			calibrationStatus = `Rejected ${done} superseded batch${done === 1 ? '' : 'es'} — live weights untouched.`;
+		} catch (e: any) {
+			calibrationError = `Rejected ${done} of ${ids.length}, then failed: ${String(e?.message ?? e)}`;
+		} finally {
+			await reloadPendingCalibration();
+			calibrationActing = null;
+		}
+	}
+
 	async function toggleTradeJournal(tradeId: number) {
 		if (expandedTradeId === tradeId) { expandedTradeId = null; return; }
 		expandedTradeId = tradeId;
@@ -497,16 +525,6 @@
 		if (e.key === 'c') { activeTab = 'portfolio'; showCalibration = !showCalibration; }
 	}
 
-	function calibrationBatches(rows: PendingCalibrationRow[]): { batch_id: string; computed_at: string; total_resolved: number; dims: PendingCalibrationRow[] }[] {
-		const byBatch = new Map<string, PendingCalibrationRow[]>();
-		for (const r of rows) {
-			if (!byBatch.has(r.batch_id)) byBatch.set(r.batch_id, []);
-			byBatch.get(r.batch_id)!.push(r);
-		}
-		return Array.from(byBatch.entries())
-			.map(([batch_id, dims]) => ({ batch_id, computed_at: dims[0].computed_at, total_resolved: dims[0].total_resolved, dims }))
-			.sort((a, b) => b.computed_at.localeCompare(a.computed_at));
-	}
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -1103,7 +1121,7 @@
 			<!-- Calibration Review -->
 			<button onclick={() => showCalibration = !showCalibration}
 				class="w-full text-left mb-5 flex items-center justify-between px-4 py-2.5 bg-bg-card border border-border rounded-xl hover:border-ai/30 transition-colors">
-				<span class="text-xs font-semibold text-text-muted uppercase tracking-wider">Calibration Review {pendingCalibration.length > 0 ? `(${calibrationBatches(pendingCalibration).length} pending)` : ''}</span>
+				<span class="text-xs font-semibold text-text-muted uppercase tracking-wider">Calibration Review {calibration.actionable.length ? `(${calibration.actionable.length} pending)` : ''}{calibration.superseded.length ? ` (${calibration.superseded.length} superseded)` : ''}</span>
 				<span class="text-xs text-text-muted">{showCalibration ? '▾' : '▸'} <kbd class="text-[10px] px-1 py-0.5 bg-bg rounded border border-border ml-1">c</kbd></span>
 			</button>
 
@@ -1122,8 +1140,20 @@
 						</p>
 					</div>
 				{:else}
+					{#if calibration.superseded.length > 1}
+						<div class="bg-bg-card border border-border rounded-xl px-4 py-3 mb-3 flex items-center justify-between gap-3">
+							<p class="text-xs text-text-muted">
+								{calibration.superseded.length} batches were computed against a weight vector that has since
+								changed. None of them can be applied.
+							</p>
+							<button onclick={handleRejectSuperseded} disabled={calibrationActing !== null}
+								class="px-3 py-1.5 shrink-0 bg-rose-500/10 text-rose-400 border border-rose-500/25 rounded-lg text-xs font-medium hover:bg-rose-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+								{calibrationActing === 'superseded' ? 'Rejecting…' : `Reject all ${calibration.superseded.length}`}
+							</button>
+						</div>
+					{/if}
 					<div class="space-y-3 mb-5">
-						{#each calibrationBatches(pendingCalibration) as batch}
+						{#each calibration.all as batch}
 							{@const staleDims = batch.dims.filter((d) => d.stale_reason)}
 							<div class="bg-bg-card border {staleDims.length ? 'border-rose-500/30' : 'border-amber-500/25'} rounded-xl p-4">
 								<div class="flex items-center justify-between mb-3">
@@ -1156,12 +1186,12 @@
 									{/each}
 								</div>
 								<div class="flex gap-2">
-									<button onclick={() => handleApplyCalibration(batch.batch_id)} disabled={calibrationActing === batch.batch_id || staleDims.length > 0}
+									<button onclick={() => handleApplyCalibration(batch.batch_id)} disabled={calibrationActing !== null || staleDims.length > 0}
 										title={staleDims.length ? 'This batch is superseded and cannot be applied' : ''}
 										class="px-3 py-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/25 rounded-lg text-xs font-medium hover:bg-emerald-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
 										{calibrationActing === batch.batch_id ? 'Applying...' : staleDims.length ? 'Cannot apply — superseded' : 'Apply to live weights'}
 									</button>
-									<button onclick={() => handleRejectCalibration(batch.batch_id)} disabled={calibrationActing === batch.batch_id}
+									<button onclick={() => handleRejectCalibration(batch.batch_id)} disabled={calibrationActing !== null}
 										class="px-3 py-1.5 bg-rose-500/10 text-rose-400 border border-rose-500/25 rounded-lg text-xs font-medium hover:bg-rose-500/20 transition-colors disabled:opacity-50">
 										Reject
 									</button>
