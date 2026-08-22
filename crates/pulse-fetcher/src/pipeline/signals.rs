@@ -111,6 +111,46 @@ pub(crate) fn run_backfill_signals(
 /// shrink decision (2026-07-23 calibration-backtest-universe plan).
 /// institutional_flow's 90-day window (Stage 10) is intentionally left at a
 /// hardcoded 90 — it's zeroed in DEFAULT_WEIGHTS and out of scope for backfill.
+/// What happened to one topic's pair of signal writes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SignalWrite {
+    /// Both statements ran and the UPDATE matched the row.
+    Written,
+    /// Both ran, but the UPDATE matched NO row — the dimensions were never
+    /// stored, so every one of them reads as zero downstream.
+    NoRowMatched,
+    /// A statement returned an error.
+    Failed,
+}
+
+/// Classify a topic's two writes.
+///
+/// Both statements used `.ok()`, which discards the Result outright: a failed
+/// INSERT or UPDATE still fell through to `count += 1`, so the pipeline reported
+/// having written rows it had not. The UPDATE is the one that stores
+/// `search_trend_delta` and the other seven dimensions, and a dimension that was
+/// never stored is indistinguishable downstream from a dimension that was
+/// genuinely zero — invisible by construction, exactly like the pageview dedup bug.
+pub(crate) fn classify_write(inserted: Option<usize>, updated: Option<usize>) -> SignalWrite {
+    match (inserted, updated) {
+        (Some(_), Some(n)) if n > 0 => SignalWrite::Written,
+        (Some(_), Some(_)) => SignalWrite::NoRowMatched,
+        _ => SignalWrite::Failed,
+    }
+}
+
+/// Run a signals write, warning on failure instead of discarding it.
+/// Returns rows affected, or None if the statement errored.
+fn wrote(result: rusqlite::Result<usize>, what: &str, topic: &str) -> Option<usize> {
+    match result {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!("signals {} failed for topic '{}': {}", what, topic, e);
+            None
+        }
+    }
+}
+
 pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &str, window_days: i64) -> anyhow::Result<usize> {
     use std::collections::HashMap;
     let window_clause = format!("-{} days", window_days);
@@ -403,6 +443,7 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
     // (upsert windows + update metrics). All metric lookups are O(1).
     let tx = conn.unchecked_transaction()?;
     let mut count = 0usize;
+    let mut failed = 0usize;
 
     for (topic, sector, w7, w30, w90, days_active) in &window_rows {
         let rate_7d = *w7 as f64 / 7.0;
@@ -420,7 +461,7 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
             else if *w7 > 0 { "rising" }
             else { "dormant" };
 
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO signals (topic, sector, window_7d, window_30d, window_90d, acceleration, trajectory, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
              ON CONFLICT(topic, sector) DO UPDATE SET
@@ -428,7 +469,8 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
                  window_90d = excluded.window_90d, acceleration = excluded.acceleration,
                  trajectory = excluded.trajectory, updated_at = datetime('now')",
             rusqlite::params![topic, sector, w7, w30, w90, acc, traj],
-        ).ok();
+        );
+        let inserted = wrote(inserted, "INSERT", topic);
 
         let k = key(topic, sector);
         let diversity = diversity_map.get(&k).copied().unwrap_or(0.0) as i64;
@@ -450,20 +492,40 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
         // Revisit once forward paper-trading data accumulates enough volume.
         let reg_composite = reg_count + (event_boost * 3.0);
 
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE signals SET source_diversity = ?1, insider_buy_volume = ?2, contract_value = ?3,
                  lobbying_spend_delta = ?4, regulatory_sentiment = ?5, patent_filing_rate = ?6,
                  institutional_flow = ?7, search_trend_delta = ?8, import_volume_delta = ?9
              WHERE topic = ?10 AND (sector = ?11 OR (?11 IS NULL AND sector IS NULL))",
             rusqlite::params![diversity, insider_vol, contract_val, lobby_spend, reg_composite, patent_count,
                               inst_flow, search_delta, import_delta, topic, sector],
-        ).ok();
+        );
+        let updated = wrote(updated, "dimension UPDATE", topic);
 
-        count += 1;
+        match classify_write(inserted, updated) {
+            SignalWrite::Written => count += 1,
+            SignalWrite::NoRowMatched => {
+                tracing::warn!(
+                    "signals dimension UPDATE matched no row for topic '{}' — its eight dimensions \
+                     will read as zero downstream, which is indistinguishable from a quiet day",
+                    topic
+                );
+                failed += 1;
+            }
+            SignalWrite::Failed => failed += 1,
+        }
     }
 
     tx.commit()?;
     conn.execute_batch("DROP TABLE IF EXISTS temp_topic_map;").ok();
+
+    if failed > 0 {
+        tracing::warn!(
+            "recompute_signals_pipeline: {} of {} topics did not store their dimensions",
+            failed,
+            failed + count
+        );
+    }
 
     Ok(count)
 }
@@ -866,5 +928,30 @@ mod calibrated_weights_tests {
             load_calibrated_weights(&db_with_override(Some("[[\"insider_signal\"]]"))),
             pulse_weights::default_vector()
         );
+    }
+}
+
+#[cfg(test)]
+mod signal_write_tests {
+    use super::{classify_write, SignalWrite};
+
+    /// The bug: `.ok()` discarded the Result, so a failed write still counted.
+    #[test]
+    fn a_failed_statement_is_never_counted_as_written() {
+        assert_eq!(classify_write(None, Some(1)), SignalWrite::Failed);
+        assert_eq!(classify_write(Some(1), None), SignalWrite::Failed);
+        assert_eq!(classify_write(None, None), SignalWrite::Failed);
+    }
+
+    /// The subtler half: the UPDATE can succeed and match nothing. Every
+    /// dimension then reads as zero, which looks identical to a quiet day.
+    #[test]
+    fn an_update_that_matches_no_row_is_not_written() {
+        assert_eq!(classify_write(Some(1), Some(0)), SignalWrite::NoRowMatched);
+    }
+
+    #[test]
+    fn both_statements_landing_is_the_only_written_case() {
+        assert_eq!(classify_write(Some(1), Some(1)), SignalWrite::Written);
     }
 }

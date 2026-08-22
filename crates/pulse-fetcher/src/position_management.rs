@@ -1,3 +1,46 @@
+/// Outcome of persisting one piece of position state.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StateWrite {
+    Persisted,
+    /// The statement ran but matched no `paper_trades` row.
+    NoRowMatched,
+    Failed,
+}
+
+/// Classify a position-state UPDATE.
+///
+/// Both call sites used `.ok()`, which throws the Result away. For the trailing
+/// stop that is the difference between a protected position and an unprotected
+/// one: the caller computes a new stop, the write fails, the stored stop stays
+/// where it was, and nothing anywhere says so. `Ok(0)` is just as bad as `Err` —
+/// it means the trade row was not matched, so the state was never persisted.
+pub(crate) fn classify_state_write(result: &rusqlite::Result<usize>) -> StateWrite {
+    match result {
+        Ok(0) => StateWrite::NoRowMatched,
+        Ok(_) => StateWrite::Persisted,
+        Err(_) => StateWrite::Failed,
+    }
+}
+
+/// Run a position-state UPDATE, warning instead of discarding the Result.
+fn persist_state(result: rusqlite::Result<usize>, what: &str, trade_id: i64) -> bool {
+    match classify_state_write(&result) {
+        StateWrite::Persisted => true,
+        StateWrite::NoRowMatched => {
+            tracing::warn!(
+                "{} UPDATE matched no paper_trades row (id={}) — position state NOT persisted",
+                what, trade_id
+            );
+            false
+        }
+        StateWrite::Failed => {
+            let e = result.unwrap_err();
+            tracing::warn!("{} UPDATE failed for trade {}: {}", what, trade_id, e);
+            false
+        }
+    }
+}
+
 use rusqlite::Connection;
 
 /// Position management: ATR-based trailing stops, profit targets, signal decay.
@@ -145,11 +188,14 @@ pub fn evaluate_position(
 
     // Update high-water mark in DB
     if current_price > hwm - 0.001 {
-        conn.execute(
-            "UPDATE paper_trades SET high_water_mark = ?1 WHERE id = ?2",
-            rusqlite::params![current_price, trade_id],
-        )
-        .ok();
+        persist_state(
+            conn.execute(
+                "UPDATE paper_trades SET high_water_mark = ?1 WHERE id = ?2",
+                rusqlite::params![current_price, trade_id],
+            ),
+            "high_water_mark",
+            trade_id,
+        );
     }
 
     // Flat trailing stop — does not tighten with age (long-term design:
@@ -158,11 +204,14 @@ pub fn evaluate_position(
     let trailing_stop = hwm - (atr * atr_mult);
 
     // Update trailing_stop in DB
-    conn.execute(
-        "UPDATE paper_trades SET trailing_stop = ?1 WHERE id = ?2",
-        rusqlite::params![trailing_stop, trade_id],
-    )
-    .ok();
+    persist_state(
+        conn.execute(
+            "UPDATE paper_trades SET trailing_stop = ?1 WHERE id = ?2",
+            rusqlite::params![trailing_stop, trade_id],
+        ),
+        "trailing_stop",
+        trade_id,
+    );
 
     // Check trailing stop
     if current_price <= trailing_stop {
@@ -701,5 +750,28 @@ mod signal_decay_tests {
     fn a_cold_start_is_never_healthy() {
         assert!(!pipeline_output_is_healthy(1000, &[]));
         assert!(!pipeline_output_is_healthy(0, &[0, 0]));
+    }
+}
+
+#[cfg(test)]
+mod state_write_tests {
+    use super::{classify_state_write, StateWrite};
+
+    #[test]
+    fn an_error_is_a_failure_not_a_success() {
+        let err: rusqlite::Result<usize> = Err(rusqlite::Error::QueryReturnedNoRows);
+        assert_eq!(classify_state_write(&err), StateWrite::Failed);
+    }
+
+    /// The one `.ok()` could never have surfaced even in principle: the statement
+    /// succeeds and changes nothing, so the stop stays where it was.
+    #[test]
+    fn a_statement_that_matched_no_row_did_not_persist_the_state() {
+        assert_eq!(classify_state_write(&Ok(0)), StateWrite::NoRowMatched);
+    }
+
+    #[test]
+    fn one_row_updated_is_persisted() {
+        assert_eq!(classify_state_write(&Ok(1)), StateWrite::Persisted);
     }
 }
