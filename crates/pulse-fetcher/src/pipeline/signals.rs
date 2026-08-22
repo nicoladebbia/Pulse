@@ -670,7 +670,7 @@ pub(crate) fn positive_dimensions(norms: &[f64; 8], weights: &[f64; 8]) -> usize
 /// than a second hand-typed copy of the same 8 numbers — the two had already
 /// drifted apart once (calibration-backtest-universe audit).
 ///
-/// 2026-08-22: the overlay is now clamped. A stored override is applied ON TOP
+/// 2026-08-22: the overlay is now checked. A stored override is applied ON TOP
 /// of the defaults, so without a clamp one `calibrated_weights` row pins its
 /// dimensions on forever and silently outranks any later decision to zero one in
 /// code. Five proposals computed before the 2026-08-17 reweight are sitting in
@@ -698,14 +698,14 @@ pub(crate) fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
     };
 
     let resolved = pulse_weights::resolve_overrides(&pairs);
-    if !resolved.clamped.is_empty() {
+    if resolved.was_rejected() {
         tracing::warn!(
-            "calibrated_weights tried to give weight to {} dimension(s) that are \
-             zeroed in code and were clamped back to 0.0: {}. The stored override \
-             predates the current weight vector — reject the pending calibration \
-             batch and let a fresh one compute.",
-            resolved.clamped.len(),
-            resolved.clamped.join(", ")
+            "calibrated_weights was DISCARDED WHOLE and the code defaults are in \
+             force, because {}. Keeping its other dimensions would leave a vector \
+             that no longer sums to 1.0, silently tightening every fixed gate that \
+             reads the compound score. Reject the pending calibration batch and let \
+             a fresh one compute.",
+            resolved.rejection_reason()
         );
     }
     resolved.weights
@@ -805,6 +805,11 @@ mod calibrated_weights_tests {
     /// the pure function the unit tests already cover.
     const THE_STALE_BATCH_AS_WRITTEN: &str = r#"[["insider_signal",0.284473527662106],["institutional_flow",0.0],["news_momentum",0.189649018441404],["government_signal",0.219869125520524],["search_trend",0.0646044021415824],["patent_signal",0.0517549077929804],["supply_chain",0.0],["political_signal",0.189649018441404]]"#;
 
+    /// A clean override — only live dimensions, still summing to 1.0. This one
+    /// IS honoured; the discard below must not degrade into "ignore every
+    /// override".
+    const A_CLEAN_OVERRIDE: &str = r#"[["insider_signal",0.30],["news_momentum",0.30],["government_signal",0.40]]"#;
+
     #[test]
     fn a_stale_override_cannot_resurrect_a_zeroed_dimension() {
         let w = load_calibrated_weights(&db_with_override(Some(THE_STALE_BATCH_AS_WRITTEN)));
@@ -814,14 +819,25 @@ mod calibrated_weights_tests {
         assert_eq!(w[7], 0.0, "political_signal must stay dark");
     }
 
-    /// The other half: the live dimensions in that same blob ARE honoured. The
-    /// clamp must not degrade into "ignore the override entirely".
+    /// The whole blob is discarded, not repaired in place. Keeping its three
+    /// live dimensions and zeroing the rest yields a vector summing to 0.694
+    /// while the `>= 0.40` convergence gate stays fixed — a silent 31%
+    /// tightening, strictly worse than the override never existing.
     #[test]
-    fn the_live_dimensions_of_an_override_are_still_applied() {
+    fn a_stale_override_is_discarded_whole_not_partially_applied() {
         let w = load_calibrated_weights(&db_with_override(Some(THE_STALE_BATCH_AS_WRITTEN)));
-        assert!((w[0] - 0.284473527662106).abs() < 1e-12, "insider was {}", w[0]);
-        assert!((w[2] - 0.189649018441404).abs() < 1e-12, "news was {}", w[2]);
-        assert!((w[3] - 0.219869125520524).abs() < 1e-12, "government was {}", w[3]);
+        assert_eq!(w, pulse_weights::default_vector());
+        let sum: f64 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-3, "weights summed to {sum}");
+    }
+
+    /// The other half: a well-formed override IS honoured.
+    #[test]
+    fn a_clean_override_is_still_applied() {
+        let w = load_calibrated_weights(&db_with_override(Some(A_CLEAN_OVERRIDE)));
+        assert!((w[0] - 0.30).abs() < 1e-12, "insider was {}", w[0]);
+        assert!((w[2] - 0.30).abs() < 1e-12, "news was {}", w[2]);
+        assert!((w[3] - 0.40).abs() < 1e-12, "government was {}", w[3]);
     }
 
     #[test]

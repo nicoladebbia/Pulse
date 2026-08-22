@@ -109,10 +109,38 @@ pub fn default_vector() -> [f64; 8] {
 /// any dimensions whose override was refused.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedWeights {
+    /// Always a vector that sums to 1.0 — either the overlay, or the code
+    /// defaults if the overlay was rejected.
     pub weights: [f64; 8],
     /// Dimensions the override tried to give weight to that are zeroed in code.
-    /// Non-empty means the stored override is stale and something should say so.
-    pub clamped: Vec<String>,
+    pub rejected: Vec<String>,
+    /// `Some(sum)` if the overlay did not sum to 1.0. Set independently of
+    /// `rejected` — an override can be well-intentioned and still arithmetically
+    /// unusable.
+    pub bad_sum: Option<f64>,
+}
+
+impl ResolvedWeights {
+    /// True if the stored override was discarded and `weights` is the defaults.
+    pub fn was_rejected(&self) -> bool {
+        !self.rejected.is_empty() || self.bad_sum.is_some()
+    }
+
+    /// One line naming every reason the override was refused, for the log.
+    pub fn rejection_reason(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.rejected.is_empty() {
+            parts.push(format!(
+                "it gives weight to {} dimension(s) zeroed in code ({})",
+                self.rejected.len(),
+                self.rejected.join(", ")
+            ));
+        }
+        if let Some(sum) = self.bad_sum {
+            parts.push(format!("its weights sum to {sum:.4}, not 1.0"));
+        }
+        parts.join("; ")
+    }
 }
 
 /// Overlay a stored `calibrated_weights` override on the code defaults.
@@ -121,27 +149,55 @@ pub struct ResolvedWeights {
 /// weight to a dimension the code has zeroed.** A zero in `DEFAULT_WEIGHTS` is
 /// not a tuning choice, it is a statement that the dimension has no working data
 /// source — `patent_signal` was nonzero in 0 of 16,871 rows, Senate LDA has
-/// 403'd since 2026-08-03. Without the clamp a single stored override pins those
+/// 403'd since 2026-08-03. Without the check a single stored override pins those
 /// dimensions on forever, because the overlay is applied on top of the defaults
 /// and so silently outranks any later decision to zero one in code.
 ///
-/// The clamp is deliberately one-directional. An override may lower or raise a
-/// dimension that is alive; it may not raise one that is dead.
+/// The second invariant, and the one that is easy to forget: **the result must
+/// sum to 1.0.** Every gate that reads the compound score is a fixed constant
+/// (`>= 0.40` for convergence, `> 0.6` for the top sizing tier), so a vector
+/// summing to less is a silent tightening of all of them. Two ways to get there,
+/// both real: dropping the offending entries of a stale batch leaves 0.694, and
+/// a hand-written row that turns one live dimension down without redistributing
+/// leaves 0.639.
+///
+/// So an override that trips either invariant is discarded **whole**, never
+/// repaired dimension-by-dimension. A stale override is untrustworthy in the
+/// dimensions it did not trip on either; the defaults are known-good at 1.0.
+/// An override that respects both is applied exactly as given.
 pub fn resolve_overrides(pairs: &[(String, f64)]) -> ResolvedWeights {
     let defaults = default_vector();
     let mut weights = defaults;
-    let mut clamped = Vec::new();
+    let mut rejected = Vec::new();
     for (key, val) in pairs {
         let Some(i) = DIMENSIONS.iter().position(|d| d == key) else {
             continue;
         };
         if defaults[i].abs() < EPS && val.abs() >= EPS {
-            clamped.push(key.clone());
+            rejected.push(key.clone());
             continue;
         }
         weights[i] = *val;
     }
-    ResolvedWeights { weights, clamped }
+
+    // 1e-3, matching `calibration::weights_sum_to_one` — the defaults themselves
+    // sum to 0.9999 after four-place rounding in the redistribution.
+    let sum: f64 = weights.iter().sum();
+    let bad_sum = if (sum - 1.0).abs() < 1e-3 {
+        None
+    } else {
+        Some(sum)
+    };
+
+    let mut out = ResolvedWeights {
+        weights,
+        rejected,
+        bad_sum,
+    };
+    if out.was_rejected() {
+        out.weights = defaults;
+    }
+    out
 }
 
 /// Why one dimension of a pending calibration batch cannot be applied.
@@ -335,20 +391,96 @@ mod tests {
             ("news_momentum".to_string(), 0.30),
         ]);
         let i_pol = DIMENSIONS.iter().position(|d| *d == "political_signal").unwrap();
-        let i_news = DIMENSIONS.iter().position(|d| *d == "news_momentum").unwrap();
         assert_eq!(r.weights[i_pol], 0.0, "a dead dimension stays dead");
-        assert_eq!(r.weights[i_news], 0.30, "a live one is still tunable");
-        assert_eq!(r.clamped, vec!["political_signal".to_string()]);
+        assert_eq!(r.rejected, vec!["political_signal".to_string()]);
     }
 
-    /// The clamp is one-directional: an override may still turn a live dimension
+    /// The half that is easy to get wrong: a rejected override is discarded
+    /// WHOLE. Keeping its live dimensions and zeroing the rest would leave a
+    /// vector that no longer sums to 1.0, and every gate that reads the compound
+    /// score is a fixed constant.
+    #[test]
+    fn a_rejected_override_falls_all_the_way_back_to_the_defaults() {
+        let r = resolve_overrides(&[
+            ("political_signal".to_string(), 0.2391),
+            ("news_momentum".to_string(), 0.30),
+        ]);
+        assert_eq!(
+            r.weights,
+            default_vector(),
+            "a rejected override must not leave a half-applied vector"
+        );
+    }
+
+    /// The property that makes the above non-negotiable, asserted on the real
+    /// pending batch: whatever `resolve_overrides` returns, it sums to 1.0.
+    /// Partially clamping this blob returns 0.694 — a 31% silent tightening of
+    /// the fixed `>= 0.40` convergence gate.
+    #[test]
+    fn a_resolved_vector_always_sums_to_one() {
+        let cases: Vec<Vec<(String, f64)>> = vec![
+            vec![],
+            the_real_stale_batch()
+                .into_iter()
+                .map(|(d, _, n)| (d, n))
+                .collect(),
+            vec![
+                ("insider_signal".to_string(), 0.0),
+                ("news_momentum".to_string(), 0.7212),
+            ],
+            vec![("nonexistent_signal".to_string(), 0.9)],
+            vec![("political_signal".to_string(), 0.2391)],
+        ];
+        for case in cases {
+            let sum: f64 = resolve_overrides(&case).weights.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-3,
+                "sum was {sum} for {case:?} — a vector nobody chose"
+            );
+        }
+    }
+
+    /// The check is one-directional: an override may still turn a live dimension
     /// down, including to zero. Only raising a dead one is refused.
+    /// The check is one-directional: an override may still turn a live dimension
+    /// down, including to zero, as long as the weight is redistributed and the
+    /// vector still sums to 1.0. Only raising a dead one is refused outright.
     #[test]
     fn an_override_may_still_lower_a_live_dimension() {
+        let d = default_vector();
+        let r = resolve_overrides(&[
+            ("insider_signal".to_string(), 0.0),
+            ("news_momentum".to_string(), d[2] + d[0]),
+        ]);
+        assert!(!r.was_rejected(), "{}", r.rejection_reason());
+        assert_eq!(r.weights[0], 0.0, "insider was turned off");
+        assert!((r.weights[2] - (d[2] + d[0])).abs() < 1e-12);
+    }
+
+    /// The same edit WITHOUT redistributing is refused — it would leave 0.639
+    /// against gates that stay at 0.40 and 0.6.
+    #[test]
+    fn lowering_a_dimension_without_redistributing_is_refused() {
         let r = resolve_overrides(&[("insider_signal".to_string(), 0.0)]);
-        let i = DIMENSIONS.iter().position(|d| *d == "insider_signal").unwrap();
-        assert_eq!(r.weights[i], 0.0);
-        assert!(r.clamped.is_empty());
+        assert!(r.rejected.is_empty(), "nothing was resurrected");
+        let sum = r.bad_sum.expect("a 0.639 vector must be caught");
+        assert!((sum - 0.6393).abs() < 1e-3, "sum was {sum}");
+        assert_eq!(r.weights, default_vector(), "and it falls back");
+    }
+
+    /// And a clean override is applied as given, not thrown away — the discard
+    /// must not degrade into "ignore every override".
+    #[test]
+    fn a_clean_override_is_applied_as_given() {
+        let r = resolve_overrides(&[
+            ("insider_signal".to_string(), 0.30),
+            ("news_momentum".to_string(), 0.30),
+            ("government_signal".to_string(), 0.40),
+        ]);
+        assert!(r.rejected.is_empty());
+        assert_eq!(r.weights[0], 0.30);
+        assert_eq!(r.weights[2], 0.30);
+        assert_eq!(r.weights[3], 0.40);
     }
 
     #[test]
