@@ -197,6 +197,35 @@ pub fn evaluate_position(
 /// return a reading from months earlier as "current".
 const SIGNAL_STALE_AFTER_DAYS: i64 = 3;
 
+/// The share of a normal day's signal output the recent window must reach before
+/// a missing reading may be believed.
+///
+/// Deliberately low. This is a catastrophe detector, not a quality bar: it must
+/// fire on "the pipeline is broken", not on "today was quiet". Erring low means
+/// occasionally holding a position a day longer; erring high means selling the
+/// book because the fetcher had a bad morning.
+const MIN_HEALTHY_OUTPUT_FRACTION: f64 = 0.25;
+
+/// Whether the pipeline is producing enough signal output to believe an absence.
+///
+/// `history` is one row count per day the pipeline wrote anything in the last 30
+/// days; the median of those is "a normal day". An existence check is not enough
+/// — a degraded run that writes 20 rows where 500 is normal satisfies it while
+/// leaving almost every ticker unscored, and every unscored open position then
+/// reads as fully decayed.
+///
+/// With no history at all (cold start, fresh DB) this returns false: nothing is
+/// known about normal, so nothing may be concluded from an absence.
+pub(crate) fn pipeline_output_is_healthy(recent_rows: i64, history: &[i64]) -> bool {
+    let mut days: Vec<i64> = history.iter().copied().filter(|&c| c > 0).collect();
+    if days.is_empty() {
+        return false;
+    }
+    days.sort_unstable();
+    let median = days[days.len() / 2] as f64;
+    recent_rows as f64 >= median * MIN_HEALTHY_OUTPUT_FRACTION
+}
+
 /// Whether an open position's entry thesis has decayed.
 ///
 /// Split out from the queries so the three-way decision is testable, because
@@ -249,20 +278,43 @@ pub fn check_signal_decay(
         )
         .ok();
 
-    // Did the pipeline compute anything at all for anyone in that window?
-    let pipeline_ran_recently: bool = conn
+    // Did the pipeline produce a NORMAL amount of output in that window?
+    //
+    // Existence is not enough. A degraded run reaches the cross-signals stage
+    // with few topics and writes tens of rows where a healthy day writes
+    // hundreds — which is exactly the shape of the 2026-08-17..22 outage, where
+    // `stories` kept trickling in at 1–46/day against a normal 205–911. Under an
+    // existence check that reads as "pipeline ran", and every open position whose
+    // ticker missed the cut gets `latest_fresh = None` and is sold. That is the
+    // whole-book liquidation this guard exists to prevent, produced by the guard.
+    let recent_rows: i64 = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM cross_signals WHERE computed_at >= date('now', ?1))",
+            "SELECT COUNT(*) FROM cross_signals WHERE computed_at >= date('now', ?1)",
             rusqlite::params![&window],
             |row| row.get(0),
         )
-        .unwrap_or(false);
+        .unwrap_or(0);
+    let history: Vec<i64> = conn
+        .prepare(
+            "SELECT COUNT(*) FROM cross_signals
+             WHERE computed_at >= date('now', '-30 days')
+             GROUP BY date(computed_at)",
+        )
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |row| row.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let pipeline_ran_recently = pipeline_output_is_healthy(recent_rows, &history);
 
     if !pipeline_ran_recently {
         tracing::warn!(
-            "Signal decay: abstaining for {} — no cross_signals computed in the last {} days, \
-             so a missing reading means the pipeline is down, not that the thesis died",
-            ticker, SIGNAL_STALE_AFTER_DAYS
+            "Signal decay: abstaining for {} — only {} cross_signals rows in the last {} days, \
+             so a missing reading means the pipeline is degraded, not that the thesis died",
+            ticker, recent_rows, SIGNAL_STALE_AFTER_DAYS
         );
     }
 
@@ -472,7 +524,7 @@ mod tests {
 
 #[cfg(test)]
 mod signal_decay_tests {
-    use super::{check_signal_decay, signal_has_decayed};
+    use super::{check_signal_decay, pipeline_output_is_healthy, signal_has_decayed};
     use rusqlite::Connection;
 
     const ORIG: f64 = 0.3408; // AIRI's stored entry score; threshold is 0.1022
@@ -578,5 +630,76 @@ mod signal_decay_tests {
     fn an_empty_table_abstains() {
         let conn = db();
         assert!(!check_signal_decay(&conn, "AAA", ORIG));
+    }
+
+    fn bulk(conn: &Connection, days_ago: i64, n: usize) {
+        for i in 0..n {
+            row(conn, &format!("T{}_{}", days_ago, i), 0.42, days_ago);
+        }
+    }
+
+    /// The mutation the existence check could not survive. A DEGRADED run — the
+    /// exact shape of 2026-08-17..22, where stories trickled at 1-46/day against
+    /// a normal 205-911 — reaches the cross-signals stage and writes 20 rows
+    /// where 500 is normal. `EXISTS` reads that as "the pipeline ran", every open
+    /// position outside those 20 tickers scores as fully decayed, and the exit
+    /// engine sells the whole book. Volume, not existence, is the discriminator.
+    #[test]
+    fn a_degraded_run_does_not_liquidate_the_book() {
+        let conn = db();
+        for d in 4..30 {
+            bulk(&conn, d, 500);
+        }
+        bulk(&conn, 0, 20); // today: 4% of a normal day
+        assert!(
+            !check_signal_decay(&conn, "AIRI", ORIG),
+            "20 rows against a 500-row norm is a broken pipeline, not 480 dead theses"
+        );
+    }
+
+    /// The other side of the same discriminator: a full-volume run really does
+    /// mean a ticker missing from it has no signal, and decay must still fire.
+    /// Without this the guard could be satisfied by never firing at all.
+    #[test]
+    fn a_healthy_run_still_decays_a_ticker_it_omitted() {
+        let conn = db();
+        for d in 4..30 {
+            bulk(&conn, d, 500);
+        }
+        bulk(&conn, 0, 500);
+        assert!(
+            check_signal_decay(&conn, "AIRI", ORIG),
+            "a ticker absent from a full run genuinely has no signal"
+        );
+    }
+
+    /// A quiet-but-real day sits between the two. The bar is deliberately low —
+    /// a quarter of a normal day — because this is a catastrophe detector, not a
+    /// quality bar, and holding a position one day too long is the cheap error.
+    #[test]
+    fn the_bar_is_a_quarter_of_a_normal_day() {
+        let history: Vec<i64> = vec![500; 26];
+        assert!(!pipeline_output_is_healthy(124, &history));
+        assert!(pipeline_output_is_healthy(125, &history));
+    }
+
+    /// The median ignores days the pipeline wrote nothing, so a stretch of
+    /// outage days cannot drag the baseline down until a broken run looks normal.
+    #[test]
+    fn outage_days_do_not_lower_the_baseline() {
+        let mut history: Vec<i64> = vec![0; 20];
+        history.extend(vec![400; 10]);
+        assert!(
+            !pipeline_output_is_healthy(50, &history),
+            "zero-days must not be averaged in as normal"
+        );
+    }
+
+    /// No history at all means nothing is known about normal, so nothing may be
+    /// concluded from an absence.
+    #[test]
+    fn a_cold_start_is_never_healthy() {
+        assert!(!pipeline_output_is_healthy(1000, &[]));
+        assert!(!pipeline_output_is_healthy(0, &[0, 0]));
     }
 }
