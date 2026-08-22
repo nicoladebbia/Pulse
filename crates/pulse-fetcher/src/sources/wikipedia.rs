@@ -314,7 +314,7 @@ async fn fetch_pageviews(entities: &[(String, String)]) -> anyhow::Result<Vec<Ra
                 entity_name, views_delta_pct
             ),
             sector: "finance".to_string(),
-            feed_id: format!("wikipedia_{}", ticker.to_lowercase()),
+            feed_id: pageview_feed_id(&ticker, &today_str),
             language: "en".to_string(),
             source_type: "financial".to_string(),
             financial_metadata: Some(serde_json::to_string(&metadata).unwrap_or_default()),
@@ -326,6 +326,26 @@ async fn fetch_pageviews(entities: &[(String, String)]) -> anyhow::Result<Vec<Ra
 
     tracing::info!("Wikipedia Pageviews: {} significant changes detected", articles.len());
     Ok(articles)
+}
+
+/// Dedup key for one company's pageview story on one day.
+///
+/// `financial_dedup` is keyed `(source_type, source_id)` where source_type is this
+/// feed_id and source_id is the article url — and its lookup has NO date bound, nor
+/// does anything in the codebase ever DELETE from it (17,298 rows reaching back to
+/// 2026-04-14 as of 2026-08-22). For SEC filings that is correct: a filing is a
+/// one-time event and must never be re-emitted.
+///
+/// A pageview story is the opposite — it is a DAILY DELTA ("views spike 171% over
+/// the past week"), and tomorrow's delta is a different fact about the same page.
+/// Because the Wikipedia url is constant per company, the unbounded key meant each
+/// company could emit a pageview story exactly ONCE, EVER. Putting the day in the
+/// key makes the dedup mean "once per company per day", which is what the story is.
+///
+/// This also releases the 94 companies already burned under the old key format:
+/// their stored rows say `wikipedia_bkkt`, and no future lookup asks for that again.
+fn pageview_feed_id(ticker: &str, day: &str) -> String {
+    format!("wikipedia_{}_{}", ticker.to_lowercase(), day)
 }
 
 /// True when `title` has already produced an article this run.
@@ -443,5 +463,40 @@ mod dedup_tests {
             assert!(!already_emitted(&mut seen, t), "{t} is distinct and must emit");
         }
         assert_eq!(seen.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod feed_id_tests {
+    use super::pageview_feed_id;
+
+    /// The bug this pins: with the day absent from the key, `financial_dedup`
+    /// suppressed a company's pageview story permanently after its first sighting,
+    /// because the Wikipedia url never changes and the lookup has no date bound.
+    #[test]
+    fn the_same_company_gets_a_different_key_on_a_different_day() {
+        assert_ne!(
+            pageview_feed_id("BKKT", "2026-08-22"),
+            pageview_feed_id("BKKT", "2026-08-23"),
+            "a daily delta must not be deduped against yesterday's delta"
+        );
+    }
+
+    /// Within one day it must still collapse — two runs on the same date (a forced
+    /// re-run) should not store the same delta twice.
+    #[test]
+    fn the_same_company_on_the_same_day_gets_the_same_key() {
+        assert_eq!(
+            pageview_feed_id("BKKT", "2026-08-22"),
+            pageview_feed_id("bkkt", "2026-08-22")
+        );
+    }
+
+    #[test]
+    fn distinct_companies_never_share_a_key() {
+        assert_ne!(
+            pageview_feed_id("BKKT", "2026-08-22"),
+            pageview_feed_id("SNAP", "2026-08-22")
+        );
     }
 }
