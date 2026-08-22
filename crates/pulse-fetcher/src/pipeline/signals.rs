@@ -560,17 +560,27 @@ pub(crate) fn compute_cross_signals(db_path: &Path, as_of: &str) -> anyhow::Resu
             + political_norm * weights[7])
             .max(0.0).min(1.0);
 
-        // Convergence: 3+ signals > 0.3 AND source_diversity >= 3
-        // institutional_flow and supply_chain are excluded here — both are
-        // zero-weighted in `compound` (weights[1]/weights[6], known bugs: the
-        // substring-match false-positive and the market-wide constant), so
-        // they must not be allowed to swing the convergence gate either.
-        // Measured 2026-07-23: 363/1130 real candidates had institutional_flow
-        // > 0.3, and 3 of those relied on it as the deciding vote (only 1 other
-        // real dim also > 0.3) — including META on 2026-04-27.
-        let positive = [insider_norm, news_norm, gov_norm,
-            search_norm, patent_norm, political_norm]
-            .iter().filter(|&&v| v > 0.3).count();
+        // Convergence votes. A dimension that contributes nothing to `compound`
+        // must not be allowed to swing the gate either — that rule was already
+        // here for institutional_flow and supply_chain (the substring-match
+        // false-positive and the market-wide constant, both zeroed 2026-06-05),
+        // but it was enforced by HAND-LISTING the survivors, so zeroing three
+        // more dimensions on 2026-08-17 left them still voting.
+        //
+        // Measured over the 30 days to 2026-08-17: of 42 rows that converged on
+        // the vote branch, ZERO survive when only live dimensions may vote —
+        // every single one was carried by a dimension worth 0.0 in the score.
+        // (The earlier hand-listed version was itself measured on 2026-07-23:
+        // 363/1130 candidates had institutional_flow > 0.3, 3 of them as the
+        // deciding vote, including META on 2026-04-27.)
+        //
+        // Derived from `weights` rather than restated, so zeroing a dimension
+        // silences its vote automatically and this can never drift again.
+        let positive = positive_dimensions(
+            &[insider_norm, inst_norm, news_norm, gov_norm,
+              search_norm, patent_norm, supply_norm, political_norm],
+            &weights,
+        );
         // Convergence: 2+ signals > 0.3 AND diversity >= 2, OR very high compound score
         let convergence = (positive >= 2 && *src_diversity >= 2) || compound >= 0.40;
 
@@ -633,6 +643,24 @@ pub(crate) fn compute_cross_signals(db_path: &Path, as_of: &str) -> anyhow::Resu
     Ok(count)
 }
 
+/// How many dimensions vote for convergence.
+///
+/// A dimension votes only if it both reads above the threshold AND carries
+/// weight in the compound score. The second half is the point: `convergence` is
+/// `(positive >= 2 && diversity >= 2) || compound >= 0.40`, so without it a row
+/// can be marked converged on the strength of dimensions contributing exactly
+/// nothing to its score — and the entry query gates on `convergence_detected`.
+///
+/// `norms` and `weights` are both in the canonical order
+/// `[insider, institutional, news, government, search, patent, supply, political]`.
+pub(crate) fn positive_dimensions(norms: &[f64; 8], weights: &[f64; 8]) -> usize {
+    norms
+        .iter()
+        .zip(weights.iter())
+        .filter(|&(&v, &w)| w > 0.0 && v > 0.3)
+        .count()
+}
+
 /// Load calibrated weights from DB, or return defaults.
 /// Matches the weight order: [insider, institutional, news, government, search, patent, supply_chain, political]
 pub(crate) fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
@@ -690,4 +718,69 @@ pub(crate) fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
     }
 
     defaults
+}
+
+#[cfg(test)]
+mod convergence_vote_tests {
+    use super::positive_dimensions;
+
+    /// Canonical order: insider, institutional, news, government, search,
+    /// patent, supply, political.
+    const LIVE: [f64; 8] = [0.3606, 0.0, 0.3606, 0.2787, 0.0, 0.0, 0.0, 0.0];
+
+    #[test]
+    fn a_zero_weighted_dimension_does_not_vote() {
+        // political reads a perfect 1.0 and search is strong — both worth 0.0.
+        let norms = [0.0, 0.0, 0.0, 0.0, 0.9, 0.0, 0.0, 1.0];
+        assert_eq!(
+            positive_dimensions(&norms, &LIVE),
+            0,
+            "a dimension contributing nothing to the score must not carry the gate"
+        );
+    }
+
+    /// The AIRI shape: news + government, both live. Convergence here is real.
+    #[test]
+    fn live_dimensions_still_vote() {
+        let norms = [0.0, 0.0, 0.331, 0.704, 0.0, 0.0, 0.0, 1.0];
+        assert_eq!(positive_dimensions(&norms, &LIVE), 2);
+    }
+
+    /// The rule this replaced was hand-listed and excluded exactly two
+    /// dimensions. Deriving from weights must reproduce that exclusion.
+    #[test]
+    fn the_originally_excluded_pair_is_still_excluded() {
+        let norms = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]; // institutional + supply only
+        assert_eq!(positive_dimensions(&norms, &LIVE), 0);
+    }
+
+    /// 0.3 is the threshold, and it is exclusive — a dimension sitting exactly
+    /// on it does not vote. Guards against a `>=` slip changing gate behaviour.
+    #[test]
+    fn the_threshold_is_exclusive() {
+        let mut norms = [0.0; 8];
+        norms[0] = 0.3;
+        assert_eq!(positive_dimensions(&norms, &LIVE), 0);
+        norms[0] = 0.3001;
+        assert_eq!(positive_dimensions(&norms, &LIVE), 1);
+    }
+
+    /// Restoring a dimension's weight must restore its vote with no other edit —
+    /// that is the whole reason this derives from `weights` instead of a list.
+    #[test]
+    fn restoring_a_weight_restores_its_vote() {
+        let norms = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]; // political only
+        assert_eq!(positive_dimensions(&norms, &LIVE), 0);
+        let mut restored = LIVE;
+        restored[7] = 0.2391;
+        assert_eq!(positive_dimensions(&norms, &restored), 1);
+    }
+
+    /// Every dimension live and strong — the count must not silently cap.
+    #[test]
+    fn all_live_dimensions_can_vote_at_once() {
+        let norms = [0.9; 8];
+        let all = [0.125; 8];
+        assert_eq!(positive_dimensions(&norms, &all), 8);
+    }
 }
