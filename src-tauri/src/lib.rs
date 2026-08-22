@@ -130,7 +130,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error building Pulse")
         .run(|app, event| {
-            // Handle macOS dock click — focus existing window instead of creating new one
+            // Handle macOS dock click — focus existing window instead of creating new one.
+            //
+            // `RunEvent::Reopen` is a macOS-only variant, so this arm has to be
+            // cfg-gated to match the comment above it. Without the gate the crate
+            // does not compile anywhere else at all, which is what kept CI from
+            // running a single one of the 427 tests on a Linux runner.
+            #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
                 if !has_visible_windows {
                     if let Some(window) = app.get_webview_window("main") {
@@ -139,5 +145,9 @@ pub fn run() {
                     }
                 }
             }
+
+            // Both bindings are used only by the macOS arm above.
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
         });
 }
