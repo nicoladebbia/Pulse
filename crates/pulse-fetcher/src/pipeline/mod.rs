@@ -1412,13 +1412,33 @@ fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddi
     }
 
     // 3. Apply relevance scores
+    //
+    // An out-of-range story_idx means the model invented a story number. That was
+    // dropped silently by a bare `if let Some`, so a run where the LLM hallucinated
+    // half its indices looked identical to a clean one — the stories simply kept
+    // their default relevance and nothing said why.
+    let mut hallucinated = 0usize;
     for score in &analysis.relevance_scores {
         if let Some(&db_id) = story_db_ids.get(score.story_idx) {
             tx.execute(
                 "UPDATE stories SET relevance_score = ?1, relevance_reason = ?2 WHERE id = ?3",
                 rusqlite::params![score.relevance, score.reason, db_id],
             )?;
+        } else {
+            hallucinated += 1;
+            tracing::warn!(
+                "LLM hallucinated story_idx {} (only {} stories) — relevance score dropped",
+                score.story_idx,
+                story_db_ids.len()
+            );
         }
+    }
+    if hallucinated > 0 {
+        tracing::warn!(
+            "{} of {} relevance scores referenced a story that does not exist",
+            hallucinated,
+            analysis.relevance_scores.len()
+        );
     }
 
     // 4. Insert cross-connections

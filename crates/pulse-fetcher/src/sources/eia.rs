@@ -17,6 +17,19 @@ struct EiaData {
     total: Option<serde_json::Value>,
 }
 
+/// Parse an EIA `value` field, distinguishing "absent or unparseable" (None)
+/// from a genuine zero (`Some(0.0)`).
+///
+/// This used to be `.unwrap_or(0.0)` followed by `if value == 0.0 { continue }`,
+/// so a schema change or a malformed row was indistinguishable from a real zero
+/// price and vanished without a word. EIA returns the value as a STRING, so the
+/// str-parse arm is the normal path, not a fallback.
+fn eia_value(entry: &serde_json::Value) -> Option<f64> {
+    entry
+        .get("value")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+}
+
 pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
     let api_key = match std::env::var("EIA_API_KEY") {
         Ok(k) if !k.is_empty() => k,
@@ -83,12 +96,19 @@ async fn fetch_petroleum(client: &reqwest::Client, api_key: &str) -> anyhow::Res
 
     for entry in &entries {
         let product = entry.get("product-name").and_then(|v| v.as_str()).unwrap_or("Unknown");
-        // EIA returns value as string, not number
-        let value = entry.get("value")
-            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-            .unwrap_or(0.0);
         let period = entry.get("period").and_then(|v| v.as_str()).unwrap_or("unknown");
         let product_id = entry.get("product").and_then(|v| v.as_str()).unwrap_or("UNK");
+
+        // Parse BEFORE claiming the product's slot. seen_products is "latest per
+        // product", so a malformed row that took the slot first would suppress a
+        // perfectly good later row for the same product.
+        let Some(value) = eia_value(entry) else {
+            tracing::warn!(
+                "EIA petroleum row for product '{}' ({}) has no parseable `value` field — skipping",
+                product_id, period
+            );
+            continue;
+        };
 
         // Only take latest per product
         if !seen_products.insert(product_id.to_string()) {
@@ -162,11 +182,17 @@ async fn fetch_natgas(client: &reqwest::Client, api_key: &str) -> anyhow::Result
     let mut articles = Vec::new();
 
     if let Some(entry) = entries.first() {
-        // EIA returns value as string, not number
-        let value = entry.get("value")
-            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-            .unwrap_or(0.0);
         let period = entry.get("period").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let value = match eia_value(entry) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "EIA natural-gas row ({}) has no parseable `value` field — skipping",
+                    period
+                );
+                return Ok(articles);
+            }
+        };
 
         if value > 0.0 {
             let title = format!("Natural Gas Futures at ${:.2}/MMBtu ({})", value, period);
@@ -199,4 +225,34 @@ async fn fetch_natgas(client: &reqwest::Client, api_key: &str) -> anyhow::Result
     }
 
     Ok(articles)
+}
+
+#[cfg(test)]
+mod eia_value_tests {
+    use super::eia_value;
+    use serde_json::json;
+
+    #[test]
+    fn a_string_value_is_the_normal_path() {
+        assert_eq!(eia_value(&json!({"value": "3.42"})), Some(3.42));
+    }
+
+    #[test]
+    fn a_numeric_value_also_parses() {
+        assert_eq!(eia_value(&json!({"value": 3.42})), Some(3.42));
+    }
+
+    /// The whole point: a real zero and a missing field must not look alike.
+    /// `.unwrap_or(0.0)` made them identical, and the caller then dropped both.
+    #[test]
+    fn a_genuine_zero_is_not_confused_with_an_absent_field() {
+        assert_eq!(eia_value(&json!({"value": "0"})), Some(0.0));
+        assert_eq!(eia_value(&json!({"period": "2026-08"})), None);
+    }
+
+    #[test]
+    fn an_unparseable_value_is_absent_not_zero() {
+        assert_eq!(eia_value(&json!({"value": "n/a"})), None);
+        assert_eq!(eia_value(&json!({"value": null})), None);
+    }
 }
