@@ -208,6 +208,26 @@ pub fn compute_analytics(conn: &Connection) -> Result<PortfolioAnalytics, String
 // ---------------------------------------------------------------------------
 
 fn get_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
+    // A closed trade with a price but no exit date is malformed. It is excluded
+    // below rather than coerced to "", but excluding it SILENTLY would be the same
+    // class of bug, so count it and say so.
+    let malformed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM paper_trades
+             WHERE status IN ('closed', 'stopped_out', 'expired')
+               AND exit_price IS NOT NULL AND pnl_pct IS NOT NULL
+               AND (exit_date IS NULL OR exit_date = '')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if malformed > 0 {
+        tracing::warn!(
+            "{} closed trade(s) have an exit price but no exit date — excluded from analytics",
+            malformed
+        );
+    }
+
     let mut stmt = conn.prepare(
         "SELECT pt.ticker, pt.entry_date, pt.exit_date, pt.entry_price, pt.exit_price,
                 pt.position_size, pt.pnl_pct, pt.signal_profile, e.sector
@@ -215,6 +235,7 @@ fn get_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
          LEFT JOIN entities e ON e.id = pt.entity_id
          WHERE pt.status IN ('closed', 'stopped_out', 'expired')
            AND pt.exit_price IS NOT NULL AND pt.pnl_pct IS NOT NULL
+           AND pt.exit_date IS NOT NULL AND pt.exit_date != ''
          ORDER BY pt.exit_date ASC"
     ).map_err(|e| e.to_string())?;
 
@@ -229,7 +250,12 @@ fn get_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
         Ok(ClosedTrade {
             ticker: row.get(0)?,
             entry_date: row.get(1)?,
-            exit_date: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            // Non-null by the WHERE clause above. This was
+            // `Option<String>::unwrap_or_default()`, which turned a missing exit
+            // date into "" — a value that then silently dropped the trade from the
+            // holding-period average (parse fails inside a filter_map) and rendered
+            // as a blank date in the UI.
+            exit_date: row.get(2)?,
             entry_price,
             exit_price,
             position_size,
