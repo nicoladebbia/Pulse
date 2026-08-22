@@ -1,6 +1,6 @@
 mod cost;
 mod form4;
-mod notify;
+pub(crate) mod notify;
 mod signals;
 mod tickers;
 mod trading;

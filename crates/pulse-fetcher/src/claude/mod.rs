@@ -89,16 +89,24 @@ fn failure_cause(err: &str) -> Option<&'static str> {
     if has("json_validate_failed") {
         return Some("the model returned invalid JSON and the re-rolls did not clear it");
     }
-    if has("401") || has("invalid_api_key") || has("invalid api key") {
+    // Status arms match the reason PHRASE, never the bare digits. A bare
+    // `has("500")` fires on "requested 1500 tokens" and `has("401")` on a request
+    // id like `req_1787401498674` — a confidently-wrong diagnosis, which is the
+    // exact thing this function was written to delete. `client.rs` bails with
+    // `Groq API error {status}: {body}` and `StatusCode` Displays as
+    // `503 Service Unavailable`, so the phrase is always there when the status is.
+    if has("unauthorized") || has("invalid_api_key") || has("invalid api key") {
         return Some("the API key was rejected (401)");
     }
-    if has("403") {
+    if has("forbidden") {
         return Some("HTTP 403 — the source IP is blocked (this is the VPN/network case)");
     }
-    if has("429") || has("rate_limit") || has("rate limit") {
+    if has("too many requests") || has("rate_limit") || has("rate limit") {
         return Some("rate limited (429)");
     }
-    if has("500") || has("502") || has("503") || has("internal server error") || has("bad gateway") {
+    if has("internal server error") || has("bad gateway") || has("service unavailable")
+        || has("gateway timeout")
+    {
         return Some("the provider returned a 5xx — upstream fault, not ours");
     }
     if has("error sending request") || has("timed out") || has("timeout") || has("dns") || has("connect") {
@@ -407,6 +415,59 @@ mod failure_diagnosis_tests {
         .unwrap();
         assert!(!msg.contains('\n'), "got: {msg:?}");
         assert!(!msg.chars().any(|c| c.is_control()), "got: {msg:?}");
+    }
+
+    /// A bare-digit matcher is itself the bug this commit exists to delete: the
+    /// status arms must not fire on digits that appear inside some OTHER number.
+    /// `client.rs` bails with `Groq API error {status}: {body}` and `StatusCode`
+    /// Displays as `403 Forbidden` / `503 Service Unavailable`, so the reason
+    /// phrase is the thing to match.
+    #[test]
+    fn a_token_count_containing_500_is_not_a_5xx() {
+        let cause = failure_cause(
+            r#"Groq API error 400 Bad Request: {"error":{"message":"Please reduce the length; you requested 1500 tokens"}}"#,
+        );
+        assert!(
+            cause.is_none() || !cause.unwrap().contains("5xx"),
+            "got: {cause:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_id_containing_401_is_not_a_rejected_key() {
+        let cause = failure_cause(
+            r#"Groq API error 400 Bad Request: {"id":"req_1787401498674","error":{"message":"bad input"}}"#,
+        );
+        assert!(
+            cause.is_none() || !cause.unwrap().contains("401"),
+            "got: {cause:?}"
+        );
+    }
+
+    #[test]
+    fn a_created_timestamp_containing_429_is_not_a_rate_limit() {
+        let cause = failure_cause(
+            r#"Groq API error 400 Bad Request: {"created":1787429000,"error":{"message":"bad input"}}"#,
+        );
+        assert!(
+            cause.is_none() || !cause.unwrap().contains("rate"),
+            "got: {cause:?}"
+        );
+    }
+
+    /// And the true positives must survive the tightening.
+    #[test]
+    fn the_real_status_lines_still_classify() {
+        for (err, want) in [
+            ("Groq API error 401 Unauthorized: {}", "401"),
+            ("Groq API error 429 Too Many Requests: {}", "rate limited"),
+            ("Groq API error 503 Service Unavailable: {}", "5xx"),
+            ("Groq API error 502 Bad Gateway: {}", "5xx"),
+            ("Groq API error 500 Internal Server Error: {}", "5xx"),
+        ] {
+            let cause = failure_cause(err).unwrap_or("<unclassified>");
+            assert!(cause.contains(want), "{err} -> {cause}");
+        }
     }
 
     #[test]

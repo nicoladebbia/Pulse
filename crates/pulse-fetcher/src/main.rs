@@ -144,9 +144,27 @@ async fn main() -> anyhow::Result<()> {
             // from the launchd context without waiting for an actual outage.
             // (Proved the fire-and-exit timing bug + the .status() fix on 2026-06-22.)
             tracing::info!("Firing test failure + degraded notifications (blocking delivery)...");
-            notify_failure("TEST: this is what a failed daily run looks like.");
-            crate::pipeline::notify_degraded_test("TEST: this is what a degraded run looks like.");
-            tracing::info!("Test notifications fired");
+            // Fire the REAL message shape, not a benign string. Since 2026-08-22 the
+            // abort embeds a verbatim upstream API body — braces, colons, double
+            // quotes, backticks — into an `osascript display notification "..."`
+            // literal. Whether AppleScript parses that is external to this process,
+            // so no unit test can answer it; this mode is the only place it gets
+            // exercised. A benign placeholder here would pass while the real banner
+            // silently failed to appear during an actual outage.
+            let realistic = format!(
+                "TEST: No news stories could be summarized. {} Aborting so a later slot retries.",
+                crate::claude::dominant_failure(
+                    &vec![
+                        r#"Groq API error 404 Not Found: {"error":{"message":"The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}"#.to_string();
+                        130
+                    ],
+                    130,
+                )
+                .unwrap_or_default()
+            );
+            notify_failure(&realistic);
+            crate::pipeline::notify_degraded_test(&realistic);
+            tracing::info!("Test notifications fired with the real message shape ({} chars)", realistic.chars().count());
         }
         "backfill-embeddings" => {
             // Hour gate FIRST — before the lock, before any DB read. launchd wakes this
@@ -425,13 +443,13 @@ fn notify_failure(summary: &str) {
     // gets killed before notificationd delivers the banner. Measured 2026-06-22:
     // fire-and-exit dropped the banner silently; blocking delivers it.
     // best-effort; never let a notification failure mask the real error.
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(format!(
+    crate::pipeline::notify::run_osascript(
+        &format!(
             r#"display notification "{}" with title "Pulse fetch FAILED" sound name "Basso""#,
             summary.replace('"', "'").replace('\\', "")
-        ))
-        .status();
+        ),
+        "failure",
+    );
 }
 
 /// Preflight silent-skip staleness alarm. Skipping one blocked slot is expected;
