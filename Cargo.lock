@@ -2959,6 +2959,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "pulse-pricing",
+ "pulse-weights",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -2986,6 +2987,7 @@ dependencies = [
  "futures",
  "libc",
  "pulse-pricing",
+ "pulse-weights",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -3009,6 +3011,10 @@ dependencies = [
  "serde_json",
  "tracing",
 ]
+
+[[package]]
+name = "pulse-weights"
+version = "0.1.0"
 
 [[package]]
 name = "quick-xml"

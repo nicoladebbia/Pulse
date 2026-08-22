@@ -1109,7 +1109,7 @@
 
 			{#if showCalibration}
 				{#if calibrationStatus}<div class="bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-3 mb-3"><p class="text-xs text-emerald-400">{calibrationStatus}</p></div>{/if}
-				{#if calibrationError}<div class="bg-rose-500/10 border border-rose-500/20 rounded-xl p-3 mb-3"><p class="text-xs text-rose-400">{calibrationError}</p></div>{/if}
+				{#if calibrationError}<div class="bg-rose-500/10 border border-rose-500/20 rounded-xl p-3 mb-3"><p class="text-xs text-rose-400 whitespace-pre-line">{calibrationError}</p></div>{/if}
 
 				{#if pendingCalibration.length === 0}
 					<div class="bg-bg-card border border-border rounded-xl p-4 mb-5">
@@ -1124,11 +1124,26 @@
 				{:else}
 					<div class="space-y-3 mb-5">
 						{#each calibrationBatches(pendingCalibration) as batch}
-							<div class="bg-bg-card border border-amber-500/25 rounded-xl p-4">
+							{@const staleDims = batch.dims.filter((d) => d.stale_reason)}
+							<div class="bg-bg-card border {staleDims.length ? 'border-rose-500/30' : 'border-amber-500/25'} rounded-xl p-4">
 								<div class="flex items-center justify-between mb-3">
 									<span class="text-xs font-mono text-text-muted">{batch.computed_at} · n={batch.total_resolved} resolved trades</span>
-									<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-amber-500/15 text-amber-400 uppercase tracking-wider">Pending</span>
+									{#if staleDims.length}
+										<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-rose-500/15 text-rose-400 uppercase tracking-wider">Superseded</span>
+									{:else}
+										<span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-amber-500/15 text-amber-400 uppercase tracking-wider">Pending</span>
+									{/if}
 								</div>
+								{#if staleDims.length}
+									<div class="bg-rose-500/10 border border-rose-500/20 rounded-lg p-2.5 mb-3">
+										<p class="text-xs text-rose-400 mb-1">Computed against a weight vector that has since changed. Applying it would undo that change — reject it and let a fresh proposal compute.</p>
+										<ul class="text-[11px] text-rose-400/80 space-y-0.5">
+											{#each staleDims as d}
+												<li class="font-mono">{d.dimension} — {d.stale_reason}</li>
+											{/each}
+										</ul>
+									</div>
+								{/if}
 								<div class="space-y-1.5 mb-3">
 									{#each batch.dims as d}
 										{@const delta = d.new_weight - d.old_weight}
@@ -1141,9 +1156,10 @@
 									{/each}
 								</div>
 								<div class="flex gap-2">
-									<button onclick={() => handleApplyCalibration(batch.batch_id)} disabled={calibrationActing === batch.batch_id}
-										class="px-3 py-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/25 rounded-lg text-xs font-medium hover:bg-emerald-500/20 transition-colors disabled:opacity-50">
-										{calibrationActing === batch.batch_id ? 'Applying...' : 'Apply to live weights'}
+									<button onclick={() => handleApplyCalibration(batch.batch_id)} disabled={calibrationActing === batch.batch_id || staleDims.length > 0}
+										title={staleDims.length ? 'This batch is superseded and cannot be applied' : ''}
+										class="px-3 py-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/25 rounded-lg text-xs font-medium hover:bg-emerald-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+										{calibrationActing === batch.batch_id ? 'Applying...' : staleDims.length ? 'Cannot apply — superseded' : 'Apply to live weights'}
 									</button>
 									<button onclick={() => handleRejectCalibration(batch.batch_id)} disabled={calibrationActing === batch.batch_id}
 										class="px-3 py-1.5 bg-rose-500/10 text-rose-400 border border-rose-500/25 rounded-lg text-xs font-medium hover:bg-rose-500/20 transition-colors disabled:opacity-50">

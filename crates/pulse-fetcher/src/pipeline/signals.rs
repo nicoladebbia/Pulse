@@ -662,62 +662,53 @@ pub(crate) fn positive_dimensions(norms: &[f64; 8], weights: &[f64; 8]) -> usize
 }
 
 /// Load calibrated weights from DB, or return defaults.
-/// Matches the weight order: [insider, institutional, news, government, search, patent, supply_chain, political]
+///
+/// Order is `pulse_weights::DIMENSIONS`:
+/// [insider, institutional, news, government, search, patent, supply, political]
+///
+/// 2026-07-23: derived from the shared constant (single source of truth) rather
+/// than a second hand-typed copy of the same 8 numbers — the two had already
+/// drifted apart once (calibration-backtest-universe audit).
+///
+/// 2026-08-22: the overlay is now clamped. A stored override is applied ON TOP
+/// of the defaults, so without a clamp one `calibrated_weights` row pins its
+/// dimensions on forever and silently outranks any later decision to zero one in
+/// code. Five proposals computed before the 2026-08-17 reweight are sitting in
+/// `pending_calibration` right now carrying `political_signal` at 0.2391; the
+/// Tauri command refuses them, but this is the enforcement point that also
+/// covers a row already written, or one written by hand from the sqlite3 CLI.
 pub(crate) fn load_calibrated_weights(conn: &rusqlite::Connection) -> [f64; 8] {
-    // [insider, institutional, news, government, search, patent, supply, political]
-    // institutional_flow (idx 1) and supply_chain (idx 6) are ZEROED: diagnosis
-    // (2026-06-05) found supply_chain is a market-wide constant with no per-entity
-    // discriminative power, and institutional_flow fires on a substring-match bug
-    // (ticker "X" matched 61 funds) — both were injecting noise / dilution. Their
-    // 0.08 is redistributed proportionally across the 6 live signals so weights
-    // still sum to 1.0. Restore when those signals are fixed (see findings).
-    //
-    // 2026-07-23: derived from calibration::DEFAULT_WEIGHTS (single source of
-    // truth) instead of a second hand-typed copy of the same 8 numbers — the
-    // two had already drifted apart once (calibration-backtest-universe audit).
-    let default_weight = |key: &str| -> f64 {
-        crate::calibration::DEFAULT_WEIGHTS.iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| *v)
-            .unwrap_or(0.0)
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT value FROM user_profile WHERE key = 'calibrated_weights'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(json_str) = json else {
+        return pulse_weights::default_vector();
     };
-    let defaults = [
-        default_weight("insider_signal"),
-        default_weight("institutional_flow"),
-        default_weight("news_momentum"),
-        default_weight("government_signal"),
-        default_weight("search_trend"),
-        default_weight("patent_signal"),
-        default_weight("supply_chain"),
-        default_weight("political_signal"),
-    ];
+    let Ok(pairs) = serde_json::from_str::<Vec<(String, f64)>>(&json_str) else {
+        tracing::warn!(
+            "calibrated_weights row is not the expected [(name, weight)] JSON — \
+             falling back to code defaults"
+        );
+        return pulse_weights::default_vector();
+    };
 
-    let json: Option<String> = conn.query_row(
-        "SELECT value FROM user_profile WHERE key = 'calibrated_weights'",
-        [], |row| row.get(0),
-    ).ok();
-
-    if let Some(json_str) = json {
-        if let Ok(pairs) = serde_json::from_str::<Vec<(String, f64)>>(&json_str) {
-            let mut w = defaults;
-            for (key, val) in &pairs {
-                match key.as_str() {
-                    "insider_signal" => w[0] = *val,
-                    "institutional_flow" => w[1] = *val,
-                    "news_momentum" => w[2] = *val,
-                    "government_signal" => w[3] = *val,
-                    "search_trend" => w[4] = *val,
-                    "patent_signal" => w[5] = *val,
-                    "supply_chain" => w[6] = *val,
-                    "political_signal" => w[7] = *val,
-                    _ => {}
-                }
-            }
-            return w;
-        }
+    let resolved = pulse_weights::resolve_overrides(&pairs);
+    if !resolved.clamped.is_empty() {
+        tracing::warn!(
+            "calibrated_weights tried to give weight to {} dimension(s) that are \
+             zeroed in code and were clamped back to 0.0: {}. The stored override \
+             predates the current weight vector — reject the pending calibration \
+             batch and let a fresh one compute.",
+            resolved.clamped.len(),
+            resolved.clamped.join(", ")
+        );
     }
-
-    defaults
+    resolved.weights
 }
 
 #[cfg(test)]
@@ -782,5 +773,76 @@ mod convergence_vote_tests {
         let norms = [0.9; 8];
         let all = [0.125; 8];
         assert_eq!(positive_dimensions(&norms, &all), 8);
+    }
+}
+
+#[cfg(test)]
+mod calibrated_weights_tests {
+    use super::load_calibrated_weights;
+    use rusqlite::Connection;
+
+    fn db_with_override(json: Option<&str>) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE user_profile (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        if let Some(j) = json {
+            conn.execute(
+                "INSERT INTO user_profile (key, value) VALUES ('calibrated_weights', ?1)",
+                [j],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// The exact JSON `apply_pending_calibration` would have written from batch
+    /// `cal-1786920614-928938000`, one of the five sitting in the live DB. Not a
+    /// synthetic fixture — this is the payload the guard exists to survive, and
+    /// it exercises the whole path (stored blob -> parse -> overlay) rather than
+    /// the pure function the unit tests already cover.
+    const THE_STALE_BATCH_AS_WRITTEN: &str = r#"[["insider_signal",0.284473527662106],["institutional_flow",0.0],["news_momentum",0.189649018441404],["government_signal",0.219869125520524],["search_trend",0.0646044021415824],["patent_signal",0.0517549077929804],["supply_chain",0.0],["political_signal",0.189649018441404]]"#;
+
+    #[test]
+    fn a_stale_override_cannot_resurrect_a_zeroed_dimension() {
+        let w = load_calibrated_weights(&db_with_override(Some(THE_STALE_BATCH_AS_WRITTEN)));
+        // [insider, institutional, news, government, search, patent, supply, political]
+        assert_eq!(w[4], 0.0, "search_trend must stay dark");
+        assert_eq!(w[5], 0.0, "patent_signal must stay dark");
+        assert_eq!(w[7], 0.0, "political_signal must stay dark");
+    }
+
+    /// The other half: the live dimensions in that same blob ARE honoured. The
+    /// clamp must not degrade into "ignore the override entirely".
+    #[test]
+    fn the_live_dimensions_of_an_override_are_still_applied() {
+        let w = load_calibrated_weights(&db_with_override(Some(THE_STALE_BATCH_AS_WRITTEN)));
+        assert!((w[0] - 0.284473527662106).abs() < 1e-12, "insider was {}", w[0]);
+        assert!((w[2] - 0.189649018441404).abs() < 1e-12, "news was {}", w[2]);
+        assert!((w[3] - 0.219869125520524).abs() < 1e-12, "government was {}", w[3]);
+    }
+
+    #[test]
+    fn no_row_means_the_code_defaults() {
+        assert_eq!(
+            load_calibrated_weights(&db_with_override(None)),
+            pulse_weights::default_vector()
+        );
+    }
+
+    /// A corrupt blob must fall back to the defaults, not panic — this runs
+    /// inside the fetch pipeline where a panic kills the run.
+    #[test]
+    fn a_malformed_override_falls_back_instead_of_panicking() {
+        assert_eq!(
+            load_calibrated_weights(&db_with_override(Some("{not json"))),
+            pulse_weights::default_vector()
+        );
+        assert_eq!(
+            load_calibrated_weights(&db_with_override(Some("[[\"insider_signal\"]]"))),
+            pulse_weights::default_vector()
+        );
     }
 }

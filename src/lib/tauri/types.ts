@@ -437,6 +437,9 @@ export interface PendingCalibrationRow {
 	sample_size: number | null;
 	total_resolved: number;
 	status: string;
+	/** Set when this row cannot be applied. Optional so existing fixtures and
+	 *  mocks stay valid; absent or null means applicable. */
+	stale_reason?: string | null;
 }
 
 export interface CalibrationGateStatus {

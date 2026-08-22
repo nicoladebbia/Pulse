@@ -1039,6 +1039,11 @@ pub struct PendingCalibrationRow {
     pub sample_size: Option<i64>,
     pub total_resolved: i64,
     pub status: String,
+    /// Set when this row cannot be applied — the batch predates the current
+    /// weight vector, or it would hand weight back to a dimension zeroed in
+    /// code. `None` means the row is applicable. Surfaced here so the review UI
+    /// can say so before Apply is reached, rather than only refusing the click.
+    pub stale_reason: Option<String>,
 }
 
 /// List calibration proposals (default: only 'pending', newest batch first).
@@ -1070,9 +1075,25 @@ pub fn get_pending_calibration(
             sample_size: row.get(7)?,
             total_resolved: row.get(8)?,
             status: row.get(9)?,
+            stale_reason: None,
         })
     }).map_err(|e| e.to_string())?
     .filter_map(|r| r.ok())
+    .map(|mut r: PendingCalibrationRow| {
+        let objections =
+            pulse_weights::stale_dimensions(&[(r.dimension.clone(), r.old_weight, r.new_weight)]);
+        r.stale_reason = objections.first().map(|o| match o.reason {
+            pulse_weights::StaleReason::ResurrectsZeroed => format!(
+                "would restore {} to {:.4}, but it is zeroed in code (no working data source)",
+                o.dimension, o.batch_new
+            ),
+            pulse_weights::StaleReason::SupersededSnapshot => format!(
+                "computed from an old weight of {:.4}; the current default is {:.4}",
+                o.batch_old, o.code_default
+            ),
+        });
+        r
+    })
     .collect();
     Ok(rows)
 }
@@ -1101,19 +1122,43 @@ pub fn apply_pending_calibration(
             .map_err(|_| "No pending calibration proposal to apply".to_string())?,
     };
 
-    let rows: Vec<(String, f64)> = {
+    let proposal: Vec<(String, f64, f64)> = {
         let mut stmt = conn.prepare(
-            "SELECT dimension, new_weight FROM pending_calibration WHERE batch_id = ?1 AND status = 'pending'"
+            "SELECT dimension, old_weight, new_weight FROM pending_calibration WHERE batch_id = ?1 AND status = 'pending'"
         ).map_err(|e| e.to_string())?;
-        stmt.query_map([&batch_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        stmt.query_map([&batch_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect()
     };
 
-    if rows.is_empty() {
+    if proposal.is_empty() {
         return Err(format!("No pending rows found for batch '{}'", batch_id));
     }
+
+    // Refuse a proposal computed against a weight vector that has since been
+    // superseded. `adjust_weights` seeds every proposal from the code defaults
+    // and snapshots `old_weight` from the same place, so a snapshot that no
+    // longer matches means the whole batch was scaled off a stale baseline —
+    // and, worse, that it will hand weight back to a dimension deliberately
+    // zeroed because it has no working data source.
+    //
+    // This is not hypothetical. Five batches computed 2026-08-14..17 are pending
+    // right now, each carrying political_signal at 0.2391, patent at 0.0435 and
+    // search at 0.0543 — all three zeroed on 2026-08-17. Applying any one of
+    // them silently reverts that decision, and because every batch's new weights
+    // still sum to 1.0, no sum check notices.
+    let stale = pulse_weights::stale_dimensions(&proposal);
+    if !stale.is_empty() {
+        let msg = pulse_weights::refusal_message(&batch_id, &stale);
+        tracing::warn!("{}", msg);
+        return Err(msg);
+    }
+
+    let rows: Vec<(String, f64)> = proposal
+        .into_iter()
+        .map(|(dim, _old, new)| (dim, new))
+        .collect();
 
     let weights_json = serde_json::to_string(&rows).map_err(|e| e.to_string())?;
     let applied_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
