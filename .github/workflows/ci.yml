@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A private repo bills Actions minutes, so superseded runs are cancelled rather
+# than left to finish. Pushing three times to a PR should cost one run, not three.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend (svelte-check + vitest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # svelte-check needs the generated .svelte-kit types, which `pnpm check`
+      # produces itself via `svelte-kit sync`.
+      - name: Type check
+        run: pnpm check
+
+      - name: Unit tests
+        run: pnpm test
+
+  rust:
+    name: Rust (cargo test --workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `pulse` crate links Tauri, which pkg-configs against webkit at build
+      # time — so these are needed even though CI never opens a window. Without
+      # them only the three plain crates would compile and roughly half the
+      # suite would silently not run.
+      #
+      # Ubuntu 24.04 ships webkit2gtk 4.1; the 4.0 package does not exist there.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            build-essential \
+            file
+
+      # Rust is preinstalled on the runner, so no toolchain action is needed.
+      - uses: Swatinem/rust-cache@v2
+
+      # tauri-build reads the frontend dist path from tauri.conf.json. The tests
+      # never load the frontend, but the build script wants the directory to
+      # exist, so this is cheaper than a full `pnpm build`.
+      - name: Create the frontend dist placeholder
+        run: mkdir -p build
+
+      # No secrets and no network: the only test that makes live calls is
+      # marked `#[ignore = "makes live network calls"]`, and default `cargo test`
+      # skips it. rusqlite is `features = ["bundled"]`, so SQLite is compiled
+      # from source rather than needing a system library.
+      - name: Test
+        run: cargo test --workspace --locked
