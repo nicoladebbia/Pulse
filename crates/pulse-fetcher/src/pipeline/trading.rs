@@ -70,6 +70,72 @@ pub(crate) async fn poll_fill(
     None
 }
 
+/// Open positions whose signal has strengthened enough to add to.
+///
+/// Extracted from the entry pipeline so the join itself can be tested — it was
+/// wrong in two ways that only a query-level test can catch, and both had
+/// already cost money on trade 25 (AIRI).
+///
+/// **It matched any cross_signals row ever written for the ticker.** The join
+/// was `ON cs.ticker = pt.ticker` with no recency bound, so a stale peak
+/// qualified forever. AIRI's April rows (0.5606) cleared the `orig * 1.2`
+/// threshold of a position opened in *July* — a signal from three months before
+/// the trade existed. The `entry` query above never had this bug: it bounds
+/// candidates to `computed_at >= date('now', '-1 day')`.
+///
+/// **`LIMIT 3` bounds rows, not rows per trade.** With one open position and
+/// three qualifying history rows, the same trade came back three times and the
+/// loop scaled into it three times in a single pass. The
+/// `COALESCE(scale_in_count, 0) < 1` guard cannot stop that: it is evaluated
+/// once, when the query runs, before any increment. AIRI carries
+/// `scale_in_count = 3` against a guard that permits one — that count is the
+/// bug's signature, not a historical artifact.
+///
+/// Both are fixed the way the entry query already did it: one row per ticker
+/// (the freshest), and that row must be current.
+///
+/// Returns `(trade_id, ticker, original_score, current_score, entry_price, position_size)`.
+fn find_scale_in_candidates(
+    conn: &rusqlite::Connection,
+) -> Vec<(i64, String, f64, f64, f64, f64)> {
+    conn.prepare(
+        // The third column is COALESCEd, not raw: `original_compound_score` is
+        // nullable, and a NULL there made `row.get::<_, f64>(2)` fail, which
+        // `filter_map(Result::ok)` then swallowed — silently dropping a trade
+        // that the WHERE clause (which does COALESCE) had already qualified.
+        "SELECT pt.id, pt.ticker,
+                COALESCE(pt.original_compound_score, pt.confidence),
+                cs.compound_score, pt.entry_price, pt.position_size
+         FROM paper_trades pt
+         JOIN cross_signals cs ON cs.id = (
+                 SELECT c2.id FROM cross_signals c2
+                 WHERE c2.ticker = pt.ticker
+                 ORDER BY c2.computed_at DESC, c2.compound_score DESC
+                 LIMIT 1
+             )
+         WHERE pt.status = 'open'
+           AND pt.pnl_pct > 0.0
+           AND COALESCE(pt.scale_in_count, 0) < 1
+           AND cs.computed_at >= date('now', '-1 day')
+           AND cs.compound_score > COALESCE(pt.original_compound_score, pt.confidence) * 1.2
+           AND cs.convergence_detected = 1
+         ORDER BY cs.compound_score DESC
+         LIMIT 3"
+    ).ok()
+    .map(|mut stmt| {
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?,
+            ))
+        })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
 /// Auto-execute paper trades when convergence signals are detected.
 /// Only trades entities with tickers, not already held, with convergence_detected = true.
 ///
@@ -490,31 +556,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     }
 
     // Scale-in: check if existing positions have strengthening signals
-    let scale_in_candidates: Vec<(i64, String, f64, f64, f64, f64)> = conn.prepare(
-        "SELECT pt.id, pt.ticker, pt.original_compound_score, cs.compound_score,
-                pt.entry_price, pt.position_size
-         FROM paper_trades pt
-         JOIN cross_signals cs ON cs.ticker = pt.ticker
-         WHERE pt.status = 'open'
-           AND pt.pnl_pct > 0.0
-           AND COALESCE(pt.scale_in_count, 0) < 1
-           AND cs.compound_score > COALESCE(pt.original_compound_score, pt.confidence) * 1.2
-           AND cs.convergence_detected = 1
-         ORDER BY cs.compound_score DESC
-         LIMIT 3"
-    ).ok()
-    .map(|mut stmt| {
-        stmt.query_map([], |row| {
-            Ok((
-                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                row.get(4)?, row.get(5)?,
-            ))
-        })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
-            .unwrap_or_default()
-    })
-    .unwrap_or_default();
+    let scale_in_candidates = find_scale_in_candidates(&conn);
 
     for (trade_id, ticker, _old_score, new_score, held_entry, held_notional) in &scale_in_candidates {
         let scale_notional = match crate::position_sizing::scale_in_notional(buying_power) {
@@ -1080,4 +1122,172 @@ pub(crate) async fn snapshot_portfolio(db_path: &Path) -> anyhow::Result<bool> {
     );
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod scale_in_tests {
+    use super::find_scale_in_candidates;
+    use rusqlite::Connection;
+
+    /// The two tables the join touches, with the real UNIQUE index on
+    /// cross_signals — without it a fixture can write two rows for the same
+    /// entity and day, which the live schema forbids.
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE paper_trades (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 ticker TEXT NOT NULL, entry_price REAL NOT NULL,
+                 position_size REAL NOT NULL, confidence REAL NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'open',
+                 pnl_pct REAL, original_compound_score REAL,
+                 scale_in_count INTEGER DEFAULT 0);
+             CREATE TABLE cross_signals (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 entity_id INTEGER, ticker TEXT, compound_score REAL NOT NULL,
+                 convergence_detected INTEGER DEFAULT 0,
+                 computed_at TEXT DEFAULT (datetime('now')));
+             CREATE UNIQUE INDEX idx_cs ON cross_signals(entity_id, date(computed_at));",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// One open, profitable, never-scaled position — the shape that qualifies.
+    fn open_trade(conn: &Connection, ticker: &str, orig: f64) {
+        conn.execute(
+            "INSERT INTO paper_trades
+               (ticker, entry_price, position_size, confidence, status,
+                pnl_pct, original_compound_score, scale_in_count)
+             VALUES (?1, 10.0, 1000.0, ?2, 'open', 5.0, ?2, 0)",
+            rusqlite::params![ticker, orig],
+        )
+        .unwrap();
+    }
+
+    /// `days_ago` of 0 is today. Each row needs its own entity_id to coexist
+    /// with another row for the same ticker on the same day.
+    fn signal(conn: &Connection, entity_id: i64, ticker: &str, score: f64, days_ago: i64) {
+        conn.execute(
+            "INSERT INTO cross_signals
+               (entity_id, ticker, compound_score, convergence_detected, computed_at)
+             VALUES (?1, ?2, ?3, 1, date('now', ?4))",
+            rusqlite::params![entity_id, ticker, score, format!("-{} days", days_ago)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_fresh_strengthening_signal_still_scales_in() {
+        let conn = db();
+        open_trade(&conn, "AAA", 0.30);
+        signal(&conn, 1, "AAA", 0.50, 0); // 0.50 > 0.30 * 1.2
+        let got = find_scale_in_candidates(&conn);
+        assert_eq!(got.len(), 1, "the case the feature exists for must still fire");
+        assert_eq!(got[0].1, "AAA");
+        assert!((got[0].2 - 0.30).abs() < 1e-9, "original score");
+        assert!((got[0].3 - 0.50).abs() < 1e-9, "current score");
+    }
+
+    /// The AIRI bug, first half: April's peak triggering a July position.
+    #[test]
+    fn a_stale_peak_cannot_trigger_a_scale_in() {
+        let conn = db();
+        open_trade(&conn, "AIRI", 0.3408);
+        // The real rows that fired it: three months old, far above the
+        // 0.3408 * 1.2 = 0.409 threshold.
+        signal(&conn, 1, "AIRI", 0.5606, 90);
+        signal(&conn, 1, "AIRI", 0.5605, 91);
+        assert!(
+            find_scale_in_candidates(&conn).is_empty(),
+            "a signal older than the position must not qualify it"
+        );
+    }
+
+    /// A ticker with a stale peak AND a current-but-weak reading must read as
+    /// weak. Without the freshest-row-only join, the peak still wins the join
+    /// and the recency bound alone would not save it.
+    #[test]
+    fn the_freshest_reading_wins_even_when_an_older_one_is_stronger() {
+        let conn = db();
+        open_trade(&conn, "AIRI", 0.3408);
+        signal(&conn, 1, "AIRI", 0.5606, 90); // stale peak, would qualify
+        signal(&conn, 1, "AIRI", 0.3200, 0); // today, below threshold
+        assert!(
+            find_scale_in_candidates(&conn).is_empty(),
+            "today's weak reading is the truth; the old peak is not"
+        );
+    }
+
+    /// The AIRI bug, second half: `LIMIT 3` bounds rows, not rows per trade,
+    /// so one position consumed all three slots and was bought three times in
+    /// a single pass. `scale_in_count < 1` cannot stop it — the guard is read
+    /// once, before any increment.
+    #[test]
+    fn one_trade_cannot_occupy_every_scale_in_slot() {
+        let conn = db();
+        open_trade(&conn, "AIRI", 0.3408);
+        // Three qualifying rows, all current: two aliases today plus
+        // yesterday's. Every one clears 0.409.
+        signal(&conn, 1, "AIRI", 0.5606, 0);
+        signal(&conn, 2, "AIRI", 0.5605, 0);
+        signal(&conn, 1, "AIRI", 0.5602, 1);
+        let got = find_scale_in_candidates(&conn);
+        assert_eq!(
+            got.len(),
+            1,
+            "one open position is one scale-in candidate, not one per signal row"
+        );
+    }
+
+    /// Distinct positions still compete for the three slots — the dedup is per
+    /// trade, not a global cap of one.
+    fn three_tickers(conn: &Connection) {
+        for (i, t) in ["AAA", "BBB", "CCC"].iter().enumerate() {
+            open_trade(conn, t, 0.30);
+            signal(conn, i as i64 + 1, t, 0.50, 0);
+        }
+    }
+
+    #[test]
+    fn separate_positions_each_get_a_slot() {
+        let conn = db();
+        three_tickers(&conn);
+        assert_eq!(find_scale_in_candidates(&conn).len(), 3);
+    }
+
+    #[test]
+    fn a_trade_that_already_scaled_in_is_excluded() {
+        let conn = db();
+        open_trade(&conn, "AAA", 0.30);
+        signal(&conn, 1, "AAA", 0.50, 0);
+        conn.execute("UPDATE paper_trades SET scale_in_count = 1", [])
+            .unwrap();
+        assert!(find_scale_in_candidates(&conn).is_empty());
+    }
+
+    #[test]
+    fn a_losing_position_is_not_added_to() {
+        let conn = db();
+        open_trade(&conn, "AAA", 0.30);
+        signal(&conn, 1, "AAA", 0.50, 0);
+        conn.execute("UPDATE paper_trades SET pnl_pct = -6.96", [])
+            .unwrap();
+        assert!(find_scale_in_candidates(&conn).is_empty());
+    }
+
+    /// `original_compound_score` is nullable. The old projection read it as a
+    /// bare f64, so a NULL turned into an Err that `filter_map` discarded —
+    /// dropping a trade the WHERE clause had qualified via COALESCE.
+    #[test]
+    fn a_trade_with_no_stored_original_score_falls_back_to_confidence() {
+        let conn = db();
+        open_trade(&conn, "AAA", 0.30);
+        conn.execute("UPDATE paper_trades SET original_compound_score = NULL", [])
+            .unwrap();
+        signal(&conn, 1, "AAA", 0.50, 0);
+        let got = find_scale_in_candidates(&conn);
+        assert_eq!(got.len(), 1, "confidence is the documented fallback");
+        assert!((got[0].2 - 0.30).abs() < 1e-9, "fallback value is returned, not NULL");
+    }
 }
