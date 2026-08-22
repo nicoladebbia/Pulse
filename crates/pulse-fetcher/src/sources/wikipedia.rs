@@ -22,13 +22,22 @@ pub async fn fetch(db_path: &std::path::Path) -> anyhow::Result<Vec<RawArticle>>
     // at ~150ms/entity, so 300 entities is ~45s, well within budget.
     let entities: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT ec.canonical_name, et.ticker
+            // GROUP BY the company, NOT (company, ticker). Grouping by ticker
+            // returns one row per share class — GOOG and GOOGL, T and T-PA — and
+            // both rows carry the SAME canonical_name, so they produce identical
+            // title candidates, identical HTTP calls and an identical story. The
+            // batch dedup downstream cannot collapse them because feed_id embeds
+            // the ticker, so its (feed_id, url) key differs while the url does not.
+            // Measured 2026-08-22: 9 of 300 slots were duplicates.
+            // MIN(ticker) picks the common share class in practice (suffixed
+            // variants sort after the base symbol) and is at worst deterministic.
+            "SELECT ec.canonical_name, MIN(et.ticker)
              FROM entity_canonical ec
              JOIN entities e ON e.canonical_id = ec.id
              JOIN entity_tickers et ON et.entity_id = e.id
              LEFT JOIN entity_mentions em ON em.entity_id = e.id
              WHERE et.ticker IS NOT NULL
-             GROUP BY ec.canonical_name, et.ticker
+             GROUP BY ec.canonical_name
              ORDER BY MAX(em.mentioned_at) DESC
              LIMIT 300"
         )?;
@@ -40,12 +49,12 @@ pub async fn fetch(db_path: &std::path::Path) -> anyhow::Result<Vec<RawArticle>>
     if entities.is_empty() {
         // Fallback: try entities table directly (same recency ordering as above)
         let mut stmt = conn.prepare(
-            "SELECT e.name, et.ticker
+            "SELECT e.name, MIN(et.ticker)
              FROM entities e
              JOIN entity_tickers et ON et.entity_id = e.id
              LEFT JOIN entity_mentions em ON em.entity_id = e.id
              WHERE et.ticker IS NOT NULL
-             GROUP BY e.name, et.ticker
+             GROUP BY e.name
              ORDER BY MAX(em.mentioned_at) DESC
              LIMIT 300"
         )?;
@@ -189,6 +198,7 @@ async fn fetch_pageviews(entities: &[(String, String)]) -> anyhow::Result<Vec<Ra
     let today_str = today.format("%Y-%m-%d").to_string();
 
     let mut articles = Vec::new();
+    let mut seen_pages: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (entity_name, ticker) in entities {
         let title_variants = title_candidates(entity_name);
@@ -221,6 +231,17 @@ async fn fetch_pageviews(entities: &[(String, String)]) -> anyhow::Result<Vec<Ra
         let Some((resp, wiki_title)) = found_resp else {
             continue;
         };
+
+        // Residual collision: two distinct company names resolving to one page
+        // (a rename, an acquisition, a subsidiary). The query fix above cannot
+        // see this because the names differ; only the resolved title reveals it.
+        if already_emitted(&mut seen_pages, &wiki_title) {
+            tracing::debug!(
+                "Wikipedia: {} resolves to {}, already emitted this run — skipping duplicate",
+                entity_name, wiki_title
+            );
+            continue;
+        }
 
         let body: serde_json::Value = match resp.json().await {
             Ok(b) => b,
@@ -307,6 +328,21 @@ async fn fetch_pageviews(entities: &[(String, String)]) -> anyhow::Result<Vec<Ra
     Ok(articles)
 }
 
+/// True when `title` has already produced an article this run.
+///
+/// Several SEC entity rows collapse onto one Wikipedia page — a ticker row and a
+/// CIK row for the same company, or two CIKs after a reorganisation. Each would
+/// emit an identical story: 2026-06-27 stored 6 rows for a single page, and
+/// `stories.url_hash` is a plain index, not UNIQUE, so nothing downstream stops
+/// it. Normalising titles made collisions MORE likely, not less.
+///
+/// Deliberately keyed on the title that actually RESOLVED, never on the candidate
+/// list: "Bakkt Holdings" and "Bakkt" share a candidate but may be distinct pages,
+/// and skipping on a candidate match would silently drop a real signal.
+fn already_emitted(seen: &mut std::collections::HashSet<String>, title: &str) -> bool {
+    !seen.insert(title.to_string())
+}
+
 #[cfg(test)]
 mod title_tests {
     use super::title_candidates;
@@ -382,5 +418,30 @@ mod title_tests {
                 "{raw} -> {got:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::already_emitted;
+    use std::collections::HashSet;
+
+    #[test]
+    fn the_first_sighting_of_a_page_is_emitted_and_the_second_is_not() {
+        let mut seen = HashSet::new();
+        assert!(!already_emitted(&mut seen, "Bakkt"), "first sighting must emit");
+        assert!(already_emitted(&mut seen, "Bakkt"), "second sighting must be suppressed");
+    }
+
+    /// The inverted-boolean mutation: `seen.insert()` returns true when the value
+    /// was NEW, so dropping the `!` suppresses every FIRST sighting and emits every
+    /// duplicate — exactly backwards, and silent.
+    #[test]
+    fn distinct_pages_are_all_emitted() {
+        let mut seen = HashSet::new();
+        for t in ["Bakkt", "Bakkt_Holdings", "Mattel", "Snap_Inc."] {
+            assert!(!already_emitted(&mut seen, t), "{t} is distinct and must emit");
+        }
+        assert_eq!(seen.len(), 4);
     }
 }
