@@ -6,6 +6,7 @@
 	import { expandedStoryId } from '$lib/stores/briefing';
 	import type { TrendThread } from '$lib/tauri/types';
 	import { trackCitationClick } from '$lib/engagement';
+	import PredictionsPanel from '$lib/components/predictions/PredictionsPanel.svelte';
 
 	let threads = $state<TrendThread[]>([]);
 	let isLoading = $state(true);
@@ -14,6 +15,11 @@
 	let sectorFilter = $state<string>('all');
 	let sortBy = $state<'hottest' | 'fastest' | 'connected'>('hottest');
 	let refreshing = $state(false);
+
+	// Predictions used to be its own route. It is a view of the same intelligence the
+	// radar shows — the radar's own cards already link to it — so it lives here as a
+	// tab instead of a ninth sidebar entry.
+	let view = $state<'radar' | 'predictions'>('radar');
 
 	$effect(() => {
 		if (loaded) return;
@@ -152,13 +158,38 @@
 	<!-- Header -->
 	<div class="flex items-center justify-between">
 		<div>
-			<h2 class="text-xl font-semibold text-text">Trend Radar</h2>
-			<p class="text-xs text-text-muted mt-0.5">Entities gaining momentum across your archive</p>
+			<h2 class="text-xl font-semibold text-text">
+				{view === 'radar' ? 'Trend Radar' : 'Predictions'}
+			</h2>
+			<p class="text-xs text-text-muted mt-0.5">
+				{view === 'radar'
+					? 'Entities gaining momentum across your archive'
+					: 'AI-generated forecasts tracked against reality'}
+			</p>
 		</div>
-		{#if refreshing}
+		{#if refreshing && view === 'radar'}
 			<span class="text-[10px] text-text-muted animate-pulse">updating signals…</span>
 		{/if}
 	</div>
+
+	<!-- View switch -->
+	<div class="inline-flex rounded-lg border border-border p-0.5">
+		{#each [{ v: 'radar' as const, label: 'Radar' }, { v: 'predictions' as const, label: 'Predictions' }] as tab}
+			<button
+				class="text-xs px-3 py-1.5 rounded-md transition-colors {view === tab.v
+					? 'bg-bg-card-hover text-text'
+					: 'text-text-secondary hover:text-text'}"
+				aria-pressed={view === tab.v}
+				onclick={() => (view = tab.v)}
+			>
+				{tab.label}
+			</button>
+		{/each}
+	</div>
+
+{#if view === 'predictions'}
+	<PredictionsPanel />
+{:else}
 
 	<!-- Sector filters + Sort -->
 	<div class="flex items-center justify-between gap-3">
@@ -309,12 +340,12 @@
 						{#if thread.prediction}
 							<div class="mt-2 flex items-center gap-1.5">
 								<span class="text-[9px] text-violet-400">⊕</span>
-								<a
-									href="/predictions"
-									class="text-[10px] text-violet-400/80 hover:text-violet-400 transition-colors"
+								<button
+									class="text-[10px] text-violet-400/80 hover:text-violet-400 transition-colors text-left"
+									onclick={() => (view = 'predictions')}
 								>
 									Prediction: {thread.prediction.title} ({Math.round(thread.prediction.confidence * 100)}%)
-								</a>
+								</button>
 							</div>
 						{/if}
 					</div>
@@ -362,4 +393,5 @@
 			</div>
 		</div>
 	{/if}
+{/if}
 </div>
