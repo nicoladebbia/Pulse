@@ -153,6 +153,21 @@ pub(crate) enum ResolutionOutcome {
 
 /// Resolve a ticker-grounded prediction using entity_prices.
 /// target_metric is JSON {ticker, operator, value, unit, baseline_date?}
+/// Build a substring LIKE pattern that matches `keyword` LITERALLY.
+///
+/// `%` and `_` are LIKE wildcards. The previous code escaped quotes but not
+/// these, so a keyword containing `%` matched any run of characters and one
+/// containing `_` matched any single character — quietly widening the evidence
+/// set a prediction is resolved against. Backslash is escaped FIRST, and the
+/// query pairs this with `ESCAPE '\\'`.
+fn like_pattern(keyword: &str) -> String {
+    let escaped = keyword
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
 pub(crate) fn resolve_market_prediction(
     conn: &rusqlite::Connection,
     tm: &serde_json::Value,
@@ -240,8 +255,12 @@ pub(crate) async fn resolve_llm_prediction(
         .take(4)
         .collect();
 
-    let like_clause = keywords.iter()
-        .map(|k| format!("LOWER(headline) LIKE '%{}%'", k.replace('\'', "''")))
+    // Bound parameters, not interpolated literals. Manual `''` doubling blocked
+    // injection, but it left % and _ — LIKE's own wildcards — untouched, so a
+    // keyword containing either silently matched far more headlines than it
+    // should and the prediction resolved against evidence it never asked for.
+    let like_clause = (0..keywords.len())
+        .map(|i| format!("LOWER(headline) LIKE ?{} ESCAPE '\\'", i + 1))
         .collect::<Vec<_>>()
         .join(" OR ");
 
@@ -251,9 +270,12 @@ pub(crate) async fn resolve_llm_prediction(
         format!("SELECT headline, summary FROM stories WHERE DATE(created_at) >= date('now', '-7 days') AND ({}) ORDER BY created_at DESC LIMIT 10", like_clause)
     };
 
+    let patterns: Vec<String> = keywords.iter().map(|k| like_pattern(k)).collect();
     let mut stmt = conn.prepare(&query)?;
     let stories: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map(rusqlite::params_from_iter(patterns.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -1165,5 +1187,31 @@ mod citation_tests {
         let r = resolve_story_refs(&[0, 1, 44923], &[]);
         assert!(r.ids.is_empty());
         assert_eq!(r.dropped, 3);
+    }
+}
+
+#[cfg(test)]
+mod like_pattern_tests {
+    use super::like_pattern;
+
+    #[test]
+    fn an_ordinary_keyword_is_wrapped_for_substring_matching() {
+        assert_eq!(like_pattern("tariff"), "%tariff%");
+    }
+
+    /// The bug: these are LIKE wildcards, so an unescaped one matches far more
+    /// than the keyword and the prediction resolves against evidence it never
+    /// asked for.
+    #[test]
+    fn wildcards_in_the_keyword_are_escaped_to_match_literally() {
+        assert_eq!(like_pattern("100%"), r"%100\%%");
+        assert_eq!(like_pattern("q1_2026"), r"%q1\_2026%");
+    }
+
+    /// Backslash must be escaped FIRST, or it would double the escapes added
+    /// for % and _ afterwards.
+    #[test]
+    fn a_literal_backslash_is_escaped_before_the_wildcards() {
+        assert_eq!(like_pattern(r"a\b"), r"%a\\b%");
     }
 }
