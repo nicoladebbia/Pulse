@@ -1085,7 +1085,7 @@ async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult, db
 
     // Build compact input: top 5 stories by importance + connections
     let mut sorted = analysis.curated_stories.clone();
-    sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.importance_score));
     sorted.truncate(5);
 
     let mut input = String::new();
@@ -1974,11 +1974,11 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     }
     let mut sorted: Vec<crate::claude::SummarizedStory> = Vec::new();
     for bucket in by_sector.values_mut() {
-        bucket.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
+        bucket.sort_by_key(|s| std::cmp::Reverse(s.importance_score));
         bucket.truncate(PER_SECTOR_CAP);
         sorted.append(bucket);
     }
-    sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.importance_score));
     tracing::info!("Freedoms: curator input = {} stories (stratified, max {}/sector)", sorted.len(), PER_SECTOR_CAP);
 
     let mut user_msg = String::new();

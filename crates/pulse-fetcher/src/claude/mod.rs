@@ -160,7 +160,7 @@ pub(crate) fn dominant_failure(errors: &[String], attempted: usize) -> Option<St
         .take(200)
         .collect();
 
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
     let headline = match counts.first() {
         Some((cause, n)) => format!("{n}\u{00d7} {cause}"),
         None => format!("{unclassified}\u{00d7} an error this build does not recognise"),
@@ -237,7 +237,7 @@ pub async fn analyze_cross_sector(stories: &[SummarizedStory], db_path: &std::pa
 
     // Sector-balanced selection: ensure each sector has at least 35 stories in the 160-story input
     let mut sorted = stories.to_vec();
-    sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.importance_score));
 
     let sectors = ["ai", "miami", "italy", "tech"];
     let mut balanced = Vec::with_capacity(160);
@@ -280,7 +280,7 @@ pub async fn analyze_cross_sector(stories: &[SummarizedStory], db_path: &std::pa
 /// still lands, just without the cross-sector-connections feature for that day.
 pub fn degraded_analysis(stories: &[SummarizedStory]) -> AnalysisResult {
     let mut sorted = stories.to_vec();
-    sorted.sort_by(|a, b| b.importance_score.cmp(&a.importance_score));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.importance_score));
 
     let sectors = ["ai", "miami", "italy", "tech"];
     let mut balanced = Vec::with_capacity(160);

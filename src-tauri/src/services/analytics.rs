@@ -387,7 +387,7 @@ fn compute_sector_exposure(trades: &[ClosedTrade]) -> Vec<SectorExposure> {
         }
     }).collect();
 
-    result.sort_by(|a, b| b.trade_count.cmp(&a.trade_count));
+    result.sort_by_key(|r| std::cmp::Reverse(r.trade_count));
     result
 }
 

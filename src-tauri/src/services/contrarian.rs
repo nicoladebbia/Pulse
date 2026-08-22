@@ -144,7 +144,7 @@ pub fn scan_all_contrarian(
     }
 
     // Sort by dissent_count descending (most interesting first)
-    signals.sort_by(|a, b| b.dissent_count.cmp(&a.dissent_count));
+    signals.sort_by_key(|s| std::cmp::Reverse(s.dissent_count));
 
     Ok(signals)
 }

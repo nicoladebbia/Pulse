@@ -69,7 +69,10 @@ jobs:
             build-essential \
             file
 
-      # Rust is preinstalled on the runner, so no toolchain action is needed.
+      # No toolchain action: rustup is preinstalled and honours
+      # rust-toolchain.toml, so the runner uses the same pinned compiler this
+      # repo is developed against. That pin is what makes the clippy gate below
+      # mean anything — see the file's own comment.
       - uses: Swatinem/rust-cache@v2
 
       # tauri-build reads the frontend dist path from tauri.conf.json. The tests
@@ -99,6 +102,11 @@ jobs:
       # same build cache, so a lint failure surfaces without waiting out the
       # suite. `-D warnings` because a warning nobody has to fix is a warning
       # nobody fixes — the workspace is at zero as of this commit.
+      #
+      # `-D warnings` only holds against a FIXED lint set, which is why
+      # rust-toolchain.toml pins the compiler. Without the pin a clippy release
+      # that promotes a lint to default-on turns this red on a PR that changed
+      # nothing.
       #
       # NOT gated here: `cargo fmt --check`. The tree is ~1300 hunks from
       # rustfmt's output; gating it would mean one reformat commit that
