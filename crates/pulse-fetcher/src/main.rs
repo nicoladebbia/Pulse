@@ -483,7 +483,11 @@ fn notify_if_stale(db_path: &std::path::Path) {
 ///
 ///   Senate LDA    — 403 Forbidden on EVERY run since 2026-08-03, 14 days,
 ///                   logged only as `SOURCE HEALTH: ... LDA` at warn level.
-///                   political_signal is tied for the LARGEST weight at 0.2391.
+///                   political_signal was then tied for the LARGEST weight; it
+///                   was zeroed on 2026-08-17 once the block proved unfixable,
+///                   so this alert now reports it at 0% — still worth saying,
+///                   because it is the only standing signal that the source is
+///                   broken and the weight is owed back.
 ///   Google Patents— no stored story since 2026-06-01, 77 days, while the
 ///                   endpoint itself answers and the fetch logs successes.
 ///
@@ -495,14 +499,20 @@ fn notify_if_stale(db_path: &std::path::Path) {
 /// would still be silent about today's two-week hole.
 ///
 /// FRED is absent on purpose — it feeds supply_chain, which is zero-weighted.
-const SIGNAL_SOURCES: &[(&str, &str, f64, i64)] = &[
-    // (source_name in `stories`, dimension it feeds, weight, max quiet days)
-    ("SEC EDGAR 4", "insider_signal", 0.2391, 7),
-    ("Senate LDA", "political_signal", 0.2391, 7),
-    ("USASpending", "government_signal", 0.1848, 7),
-    ("Federal Register", "government_signal", 0.1848, 7),
-    ("Wikipedia Pageviews", "search_trend", 0.0543, 14),
-    ("Google Patents", "patent_signal", 0.0435, 21),
+///
+/// The weight is NOT stored here. It was, and within a day of the 2026-08-17
+/// reweight this table would have told the user that a dead Senate LDA cost them
+/// "24% of the score" when the answer had become 0% — the same hand-copied-number
+/// drift that `load_calibrated_weights` was already refactored to avoid. It is
+/// read from `calibration::DEFAULT_WEIGHTS` at call time instead.
+const SIGNAL_SOURCES: &[(&str, &str, i64)] = &[
+    // (source_name in `stories`, dimension it feeds, max quiet days)
+    ("SEC EDGAR 4", "insider_signal", 7),
+    ("Senate LDA", "political_signal", 7),
+    ("USASpending", "government_signal", 7),
+    ("Federal Register", "government_signal", 7),
+    ("Wikipedia Pageviews", "search_trend", 14),
+    ("Google Patents", "patent_signal", 21),
 ];
 
 /// A source that has stopped producing stories takes its signal dimension to
@@ -547,7 +557,14 @@ fn notify_stale_signal_sources(db_path: &std::path::Path) {
 /// of them are current.
 fn stale_signal_sources(conn: &rusqlite::Connection) -> Vec<String> {
     let mut dead: Vec<String> = Vec::new();
-    for (source, dimension, weight, max_quiet_days) in SIGNAL_SOURCES {
+    let weight_of = |dim: &str| -> f64 {
+        crate::calibration::DEFAULT_WEIGHTS
+            .iter()
+            .find(|(k, _)| *k == dim)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
+    };
+    for (source, dimension, max_quiet_days) in SIGNAL_SOURCES {
         let days: Option<i64> = conn
             .query_row(
                 "SELECT CAST(julianday('now') - julianday(MAX(date(created_at))) AS INTEGER)
@@ -562,6 +579,12 @@ fn stale_signal_sources(conn: &rusqlite::Connection) -> Vec<String> {
         // day forever without telling the user anything new.
         let Some(days) = days else { continue };
         if days > *max_quiet_days {
+            // A dimension already zeroed reads "0% of the score", which is the
+            // honest thing to say: the outage is real but it is no longer
+            // costing anything, because its weight was moved to a source that
+            // still reports. Suppressing the alert instead would lose the only
+            // standing reminder that the source is still broken.
+            let weight = weight_of(dimension);
             dead.push(format!(
                 "{source} ({dimension}, {:.0}% of the score) — {days}d quiet",
                 weight * 100.0
@@ -1092,7 +1115,7 @@ mod stale_source_tests {
 
     #[test]
     fn every_current_source_is_silent() {
-        let rows: Vec<(&str, i64)> = SIGNAL_SOURCES.iter().map(|(s, _, _, _)| (*s, 0)).collect();
+        let rows: Vec<(&str, i64)> = SIGNAL_SOURCES.iter().map(|(s, _, _)| (*s, 0)).collect();
         assert!(stale_signal_sources(&db(&rows)).is_empty());
     }
 
@@ -1102,7 +1125,7 @@ mod stale_source_tests {
         // every other source was within three days. Fourteen days of silence in
         // the joint-largest-weighted dimension, and nothing said so.
         let mut rows: Vec<(&str, i64)> =
-            SIGNAL_SOURCES.iter().map(|(s, _, _, _)| (*s, 2)).collect();
+            SIGNAL_SOURCES.iter().map(|(s, _, _)| (*s, 2)).collect();
         for r in rows.iter_mut() {
             if r.0 == "Senate LDA" {
                 r.1 = 14;
@@ -1153,9 +1176,13 @@ mod stale_source_tests {
     }
 
     #[test]
-    fn every_weighted_dimension_has_a_source_watching_it() {
-        // The point of the table is coverage. If a dimension carries weight and
-        // no row here watches its source, this check cannot see it die.
+    fn every_dimension_fed_by_a_named_source_has_a_watcher() {
+        // The point of the table is coverage, and it does NOT key off weight.
+        // Three of these dimensions are zero-weighted as of 2026-08-17; watching
+        // them is how we find out they came back, which is the precondition for
+        // giving them their weight again. Keying the table on weight would have
+        // deleted the watcher at exactly the moment it became the only record
+        // that the source is still broken.
         for dim in [
             "insider_signal",
             "news_momentum",
@@ -1164,7 +1191,7 @@ mod stale_source_tests {
             "patent_signal",
             "political_signal",
         ] {
-            let watched = SIGNAL_SOURCES.iter().any(|(_, d, _, _)| *d == dim);
+            let watched = SIGNAL_SOURCES.iter().any(|(_, d, _)| *d == dim);
             if dim == "news_momentum" {
                 // news_momentum is computed over Pulse's own story windows rather
                 // than one named source, so a single source_name cannot stand for

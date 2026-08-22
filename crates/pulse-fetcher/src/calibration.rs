@@ -20,15 +20,53 @@ use std::path::Path;
 /// Single source of truth — pipeline.rs::load_calibrated_weights derives its
 /// positional array from this instead of hand-duplicating the numbers.
 pub(crate) const DEFAULT_WEIGHTS: &[(&str, f64)] = &[
-    ("insider_signal", 0.2391),
+    ("insider_signal", 0.3606),
     ("institutional_flow", 0.0),    // ZEROED 2026-06-05: substring-match bug (ticker "X" = 61 funds); restore when fixed
-    ("news_momentum", 0.2391),
-    ("government_signal", 0.1848),
-    ("search_trend", 0.0543),       // Wikipedia Pageviews as proxy (offline/stale; low weight)
-    ("patent_signal", 0.0435),
+    ("news_momentum", 0.3606),
+    ("government_signal", 0.2787),
+    ("search_trend", 0.0),          // ZEROED 2026-08-17: see below. FIXABLE — Wikimedia Pageviews verified live
+    ("patent_signal", 0.0),         // ZEROED 2026-08-17: no entity has scored non-zero in 16,871 rows
     ("supply_chain", 0.0),          // ZEROED 2026-06-05: market-wide constant, no per-entity discriminative power
-    ("political_signal", 0.2391),
+    ("political_signal", 0.0),      // ZEROED 2026-08-17: Senate LDA 403 since 2026-08-03, see below
 ];
+
+/// Why three more dimensions were zeroed on 2026-08-17, and why that RAISES scores.
+///
+/// A dark dimension is not neutral. It contributes `0.0 * weight`, which is
+/// arithmetically identical to a real measurement of zero, so the compound score
+/// is dragged down by the dark weight while the gates that read it —
+/// `compound >= 0.40` for convergence, `> 0.6` for the top sizing tier — stay
+/// fixed. Measured on the live DB: with political (0.2391), patent (0.0435) and
+/// search (0.0543) dark, only 0.6631 of the weight could still be earned, so
+/// clearing 0.40 required 60% of what was achievable where the design asked for
+/// 40%. The gate had silently tightened by about a third, and nobody chose that.
+///
+/// Redistributing their 0.3369 proportionally across the three dimensions that
+/// still carry data restores the designed strictness. It is a recalibration back
+/// to intent, not a loosening — but it is not cosmetic either: on the 30 days to
+/// 2026-08-17 it moves convergence at the 0.40 gate from 100 rows to 219, and the
+/// top sizing tier from 0 to 2, and `AUTO_TRADE_ENABLED` is true.
+///
+/// Evidence for each, from `cross_signals` over the 30 days to 2026-08-17
+/// (16,871 rows):
+///
+/// - `political_signal` — Senate LDA has 403'd on every run since 2026-08-03.
+///   The cause is an Akamai edge policy covering every senate.gov host, which
+///   reproduces from any network and ignores an API token, so it cannot be fixed
+///   here. Stage 5 reads a 90-day window, so this one is still nonzero for ~18%
+///   of rows and decays to exactly 0.0 around 2026-11-01. Zeroing it now simply
+///   stops that decay from quietly re-tightening the gate week by week.
+/// - `patent_signal` — nonzero in **0** rows. Google Patents still fetches
+///   (20 articles on 2026-08-16) but stores no new stories, so the dimension has
+///   been dark for longer than the LDA outage.
+/// - `search_trend` — nonzero in 1–3 rows per day out of ~500. This is the one
+///   that is genuinely **fixable**: Wikimedia Pageviews answered a live probe
+///   (Nvidia 2024-06-01 = 11,432 views, daily granularity, no auth). Restoring it
+///   is a backfill job, and its weight should come back with it.
+///
+/// Restore any of these the same way `institutional_flow` and `supply_chain` are
+/// meant to be restored: fix the source first, confirm non-zero rows appear, then
+/// put the weight back and re-normalise. `weights_sum_to_one` guards the sum.
 
 /// Run the full calibration pipeline.
 pub async fn run_calibration(db_path: &Path) -> anyhow::Result<CalibrationReport> {
@@ -398,3 +436,56 @@ fn compute_confidence_calibration(conn: &Connection) -> anyhow::Result<Vec<(f64,
 // Trade journal auto-generation on close moved to position_management.rs
 // (2026-07-15) — it now fires from the single exit authority (Phase 13.6),
 // since calibration is measure-only and no longer closes trades.
+
+#[cfg(test)]
+mod weight_tests {
+    use super::DEFAULT_WEIGHTS;
+
+    /// The compound score is a weighted average that nothing renormalises at
+    /// runtime, so this sum IS the scale every gate is quoted against. Let it
+    /// drift and `compound >= 0.40` silently means something different without
+    /// any gate changing — which is exactly the failure that motivated the
+    /// 2026-08-17 reweight in the first place.
+    #[test]
+    fn weights_sum_to_one() {
+        let sum: f64 = DEFAULT_WEIGHTS.iter().map(|(_, w)| w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-3,
+            "DEFAULT_WEIGHTS sum to {sum}, not 1.0 — every gate is now quoted against the wrong scale"
+        );
+    }
+
+    #[test]
+    fn a_zeroed_dimension_is_exactly_zero() {
+        // Not "small". A dark dimension left at a small weight still drags the
+        // score toward zero for every entity; the point of zeroing is that its
+        // share moves to a dimension that can actually earn it.
+        for dim in ["institutional_flow", "supply_chain", "political_signal", "patent_signal", "search_trend"] {
+            let w = DEFAULT_WEIGHTS.iter().find(|(k, _)| *k == dim).map(|(_, v)| *v);
+            assert_eq!(w, Some(0.0), "{dim} is documented as dark but carries weight {w:?}");
+        }
+    }
+
+    #[test]
+    fn every_live_dimension_carries_weight() {
+        // The mirror of the above: if a dimension is not in the dark list it
+        // must be earning its share, or the sum invariant is being satisfied by
+        // a dimension nobody is scoring.
+        for dim in ["insider_signal", "news_momentum", "government_signal"] {
+            let w = DEFAULT_WEIGHTS.iter().find(|(k, _)| *k == dim).map(|(_, v)| *v).unwrap_or(0.0);
+            assert!(w > 0.0, "{dim} is treated as live but carries no weight");
+        }
+    }
+
+    #[test]
+    fn the_live_dimensions_keep_their_relative_ordering() {
+        // Redistribution must be proportional. If a future edit rebalances by
+        // hand and accidentally reorders insider/news against government, the
+        // score changes meaning even though the sum still checks out.
+        let w = |k: &str| DEFAULT_WEIGHTS.iter().find(|(n, _)| *n == k).map(|(_, v)| *v).unwrap();
+        assert!((w("insider_signal") - w("news_momentum")).abs() < 1e-6,
+            "insider and news were equal by design (0.2391 each) and must stay equal");
+        assert!(w("insider_signal") > w("government_signal"),
+            "government was the smaller of the three live weights and must stay smaller");
+    }
+}
