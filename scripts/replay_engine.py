@@ -47,6 +47,34 @@ WEIGHTS = {
     "political": 0.2391,
 }
 
+# Dimensions that carry weight above but that `pulse_historical.db` cannot supply a
+# value for. The compound sum uses `profile.get(k, 0)`, so an absent key contributes
+# zero with no error — a weight can be live in WEIGHTS and dead in the arithmetic.
+# `search` alone is 5.43% of the vector. Listing them here makes the hole explicit
+# and lets `_check_profile_covers_weights` fail loudly if a NEW weighted dimension is
+# added without data, instead of silently scoring every entity a little lower.
+#
+# `political` and `patent` are NOT here: they are present in the profile and set to a
+# hardcoded 0.0, which is a different (and visible) thing.
+UNAVAILABLE_IN_HISTORICAL = {"search", "institutional", "supply_chain"}
+
+
+def _check_profile_covers_weights(profile: dict) -> None:
+    """Raise if a weighted dimension is neither computed nor declared unavailable.
+
+    Purely a guard — it never changes the compound, so stored `backtest_results`
+    stay comparable across runs.
+    """
+    weighted = {k for k, w in WEIGHTS.items() if w > 0}
+    missing = weighted - set(profile) - UNAVAILABLE_IN_HISTORICAL
+    if missing:
+        raise ValueError(
+            "replay WEIGHTS assigns weight to "
+            + ", ".join(sorted(missing))
+            + " but the profile has no value for them, so they contribute 0 silently. "
+            "Compute them, or add them to UNAVAILABLE_IN_HISTORICAL to say so out loud."
+        )
+
 # Normalization scales — must match pipeline.rs
 SCALES = {
     "insider": 1_000_000.0,
@@ -246,6 +274,7 @@ def compute_signals_for_ticker(conn: sqlite3.Connection, ticker: str, as_of_date
     }
 
     # Compound score
+    _check_profile_covers_weights(profile)
     compound = sum(profile.get(k, 0) * w for k, w in WEIGHTS.items())
     compound = max(0.0, min(1.0, compound))
 
