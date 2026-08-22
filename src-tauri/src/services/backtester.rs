@@ -393,7 +393,7 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
         monthly_returns: monthly_returns.clone(),
     };
 
-    save_result(conn, &config_summary, total_signals, &result, hit_rate, avg_return_pct, max_drawdown_pct, sharpe_ratio, avg_holding_days);
+    save_result(conn, &config_summary, total_signals, &result, hit_rate, avg_return_pct, max_drawdown_pct, sharpe_ratio, avg_holding_days)?;
 
     Ok(result)
 }
@@ -759,7 +759,7 @@ fn save_result(
     conn: &Connection, config_summary: &str, total_signals: usize,
     result: &BacktestResult, hit_rate: f64, avg_return: f64,
     max_drawdown: f64, sharpe: f64, avg_hold: f64,
-) {
+) -> Result<(), String> {
     let blob = DetailsBlob {
         trades: result.trades.clone(),
         starting_equity: result.starting_equity,
@@ -770,7 +770,11 @@ fn save_result(
         equity_curve: result.equity_curve.clone(),
         monthly_returns: result.monthly_returns.clone(),
     };
-    let details = serde_json::to_string(&blob).unwrap_or_default();
+    // An empty details blob is what the trade-detail view reads, so storing ""
+    // would persist a backtest row that renders as having made no trades. Better
+    // to fail the run than to save a result that lies about itself.
+    let details = serde_json::to_string(&blob)
+        .map_err(|e| format!("failed to serialize backtest details: {e}"))?;
     let parts: Vec<&str> = config_summary.split(" | ").collect();
     let date_part = parts.last().unwrap_or(&"");
     let dates: Vec<&str> = date_part.split(" to ").collect();
@@ -783,7 +787,13 @@ fn save_result(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![config_summary, start, end, total_signals as i64,
             hit_rate, avg_return, max_drawdown, sharpe, avg_hold, details],
-    ).ok();
+    )
+    // Was `.ok()`. The whole point of this function is to persist the run; a
+    // discarded error meant the backtest "succeeded" and was simply absent from
+    // history afterwards, with nothing to explain the gap.
+    .map_err(|e| format!("failed to save backtest result: {e}"))?;
+
+    Ok(())
 }
 
 fn empty_result(config: &BacktestConfig) -> BacktestResult {
@@ -917,7 +927,15 @@ mod coverage_tests {
              CREATE TABLE entity_tickers (entity_id INTEGER, ticker TEXT);
              CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT);
              CREATE TABLE entity_prices (
-                 ticker TEXT, date TEXT, open REAL, close REAL, high REAL, low REAL);",
+                 ticker TEXT, date TEXT, open REAL, close REAL, high REAL, low REAL);
+             -- The run persists its result, and this fixture omitted the table.
+             -- save_result used `.ok()`, so the INSERT failed on EVERY run of this
+             -- test and the test passed anyway. Making the persist fail loudly is
+             -- what surfaced it.
+             CREATE TABLE backtest_results (
+                 id INTEGER PRIMARY KEY, signal_profile TEXT, start_date TEXT, end_date TEXT,
+                 total_signals INTEGER, hit_rate REAL, avg_return REAL, max_drawdown REAL,
+                 sharpe_ratio REAL, avg_holding_days REAL, details TEXT);",
         )
         .expect("schema");
         conn

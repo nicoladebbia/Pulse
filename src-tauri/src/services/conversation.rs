@@ -154,8 +154,17 @@ pub fn store_message(
     metadata: Option<&serde_json::Value>,
 ) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let sources_json = sources.map(|s| serde_json::to_string(s).unwrap_or_default());
-    let metadata_json = metadata.map(|m| serde_json::to_string(m).unwrap_or_default());
+    // `.unwrap_or_default()` here stored an EMPTY STRING on failure, which the
+    // chat UI reads back as "this message had no sources" — a citation silently
+    // lost rather than an error surfaced.
+    let sources_json = sources
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to serialize chat message sources")?;
+    let metadata_json = metadata
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to serialize chat message metadata")?;
 
     conn.execute(
         "INSERT INTO chat_messages (id, thread_id, role, content, sources, metadata, created_at)
