@@ -95,6 +95,18 @@ jobs:
           cp target/debug/pulse-fetcher \
             "src-tauri/binaries/pulse-fetcher-$(rustc -vV | awk '/^host:/{print $2}')"
 
+      # Clippy runs BEFORE the tests: it is the cheaper signal and it shares the
+      # same build cache, so a lint failure surfaces without waiting out the
+      # suite. `-D warnings` because a warning nobody has to fix is a warning
+      # nobody fixes — the workspace is at zero as of this commit.
+      #
+      # NOT gated here: `cargo fmt --check`. The tree is ~1300 hunks from
+      # rustfmt's output; gating it would mean one reformat commit that
+      # rewrites the blame of every file in the repo. That is its own change,
+      # not a rider on a CI setup.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
       # No secrets and no network: the only test that makes live calls is
       # marked `#[ignore = "makes live network calls"]`, and default `cargo test`
       # skips it. rusqlite is `features = ["bundled"]`, so SQLite is compiled
