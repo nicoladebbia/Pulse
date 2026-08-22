@@ -78,6 +78,23 @@ jobs:
       - name: Create the frontend dist placeholder
         run: mkdir -p build
 
+      # tauri.conf.json declares `externalBin: binaries/pulse-fetcher`, and Tauri
+      # resolves that PER TARGET TRIPLE. The repo tracks the darwin-aarch64 copy,
+      # so on a linux-x86_64 runner tauri-build fails with
+      # `resource path binaries/pulse-fetcher-x86_64-unknown-linux-gnu doesn't exist`
+      # before a single test runs. Build it for whatever triple this runner is,
+      # using the same `rustc -vV` detection as scripts/build-sidecar.sh.
+      #
+      # Debug, not release: CI never executes the sidecar, tauri-build only needs
+      # the file to exist, and pulse-fetcher has to compile for its own tests
+      # anyway — so this costs a copy rather than a second build.
+      - name: Build the sidecar for this runner's target triple
+        run: |
+          cargo build -p pulse-fetcher --locked
+          mkdir -p src-tauri/binaries
+          cp target/debug/pulse-fetcher \
+            "src-tauri/binaries/pulse-fetcher-$(rustc -vV | awk '/^host:/{print $2}')"
+
       # No secrets and no network: the only test that makes live calls is
       # marked `#[ignore = "makes live network calls"]`, and default `cargo test`
       # skips it. rusqlite is `features = ["bundled"]`, so SQLite is compiled
