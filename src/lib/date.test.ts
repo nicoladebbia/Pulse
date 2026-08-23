@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { localDateStr, shiftDateStr, isSameOrBefore } from './date';
+import { localDateStr, shiftDateStr, isSameOrBefore, relativeDayLabel } from './date';
 
 /**
  * These guard a defect that only appears in the evening. The Freedoms page built
@@ -84,5 +84,45 @@ describe('isSameOrBefore', () => {
 	it('orders across month and year boundaries', () => {
 		expect(isSameOrBefore('2026-09-01', '2026-10-01')).toBe(true);
 		expect(isSameOrBefore('2027-01-01', '2026-12-31')).toBe(false);
+	});
+});
+
+describe('relativeDayLabel', () => {
+	// The paid bug: Trends anchored each story at `T12:00:00` and subtracted a live
+	// `now`. Before local noon that difference is NEGATIVE, so `Math.floor` gave -1
+	// and every label shifted by a day — today rendered as "-1d ago" and yesterday
+	// as "Today". Observed live at 07:01 on 2026-08-23.
+	it('says Today for today even in the morning, when the old code said -1d ago', () => {
+		const morning = new Date(2026, 7, 23, 7, 1, 0);
+		expect(relativeDayLabel('2026-08-23', morning)).toBe('Today');
+		expect(relativeDayLabel('2026-08-22', morning)).toBe('Yesterday');
+	});
+
+	it('gives the same answers late at night as it does in the morning', () => {
+		const morning = new Date(2026, 7, 23, 0, 5, 0);
+		const night = new Date(2026, 7, 23, 23, 55, 0);
+		for (const day of ['2026-08-23', '2026-08-22', '2026-08-20', '2026-07-30']) {
+			expect(relativeDayLabel(day, morning)).toBe(relativeDayLabel(day, night));
+		}
+	});
+
+	it('counts whole days up to a week, then shows the date', () => {
+		const now = new Date(2026, 7, 23, 9, 0, 0);
+		expect(relativeDayLabel('2026-08-20', now)).toBe('3d ago');
+		expect(relativeDayLabel('2026-08-17', now)).toBe('6d ago');
+		// 7 days is where the relative form stops being easier to read than the date.
+		expect(relativeDayLabel('2026-08-16', now)).toBe('Aug 16');
+	});
+
+	it('shows a future date as a date, never as a negative day count', () => {
+		const now = new Date(2026, 7, 23, 9, 0, 0);
+		expect(relativeDayLabel('2026-08-25', now)).toBe('Aug 25');
+	});
+
+	it('survives a DST boundary, where a calendar day is 23 or 25 hours long', () => {
+		// US DST ends 2026-11-01, so 2026-11-01 local is 25 hours long.
+		const afterFallBack = new Date(2026, 10, 2, 9, 0, 0);
+		expect(relativeDayLabel('2026-11-01', afterFallBack)).toBe('Yesterday');
+		expect(relativeDayLabel('2026-11-02', afterFallBack)).toBe('Today');
 	});
 });

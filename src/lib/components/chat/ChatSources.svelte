@@ -6,6 +6,7 @@
 	import { SECTORS, type SectorId } from '$lib/config';
 	import type { StoryHeadline } from '$lib/tauri/types';
 	import { trackCitationClick } from '$lib/engagement';
+	import { relativeDayLabel } from '$lib/date';
 
 	let { storyIds, citedIds = [] }: { storyIds: number[]; citedIds?: number[] } = $props();
 
@@ -23,13 +24,7 @@
 	const validIds = $derived(showingCited ? cited : storyIds.filter(id => id > 0));
 
 	function relativeDate(dateStr: string): string {
-		const d = new Date(dateStr + 'T12:00:00');
-		const now = new Date();
-		const days = Math.floor((now.getTime() - d.getTime()) / 86400000);
-		if (days === 0) return 'Today';
-		if (days === 1) return 'Yesterday';
-		if (days < 7) return `${days}d ago`;
-		return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+		return relativeDayLabel(dateStr);
 	}
 	const displayCount = $derived(expanded ? headlines.length : Math.min(headlines.length, 4));
 
