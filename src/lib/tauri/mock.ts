@@ -1,4 +1,4 @@
-import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread } from './types';
+import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier } from './types';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -210,6 +210,31 @@ export const mockArchiveBriefings: Briefing[] = [
 ];
 
 // --- Trends mock data ---
+
+// Keyed by topic so an expand in mock mode returns THAT trend's dossier, not a
+// single shared fixture that would hide a topic-plumbing bug.
+export function mockTrendDossier(topic: string): TrendDossier {
+	const seed = topic.length;
+	return {
+		topic,
+		stories: Array.from({ length: 6 }, (_, i) => ({
+			story_id: 1000 + seed * 10 + i,
+			date: daysAgo(i * 2),
+			headline: `${topic}: development ${i + 1} in the last month`,
+			sector: (['ai', 'tech', 'miami', 'italy'] as const)[(seed + i) % 4],
+			what_to_watch: i % 2 === 0 ? `Whether ${topic} sustains this pace into next quarter.` : null,
+		})),
+		predictions: [
+			{ title: `${topic} keeps accelerating through Q4`, confidence: 0.62, status: 'active', predicted_timeframe: daysAgo(-45) },
+			{ title: `${topic} plateaus before year end`, confidence: 0.31, status: 'invalidated', predicted_timeframe: daysAgo(30) },
+		],
+		related_entities: [
+			{ name: 'OpenAI', strength: 8.2 },
+			{ name: 'Microsoft', strength: 5.4 },
+			{ name: 'Nvidia', strength: 3.1 },
+		],
+	};
+}
 
 export const mockTrends: TrendThread[] = [
 	{

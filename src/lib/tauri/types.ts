@@ -370,6 +370,31 @@ export interface TrendPrediction {
 	confidence: number;
 }
 
+/// Lazy expand-in-place detail for one trend. Deliberately not part of
+/// TrendThread: get_trends builds 15 cards at page open and this is 20 stories
+/// plus two more queries per card.
+export interface TrendDossier {
+	topic: string;
+	stories: DossierStory[];
+	predictions: DossierPrediction[];
+	related_entities: RelatedEntity[];
+}
+
+export interface DossierStory {
+	story_id: number;
+	date: string;
+	headline: string;
+	sector: string;
+	what_to_watch: string | null;
+}
+
+export interface DossierPrediction {
+	title: string;
+	confidence: number;
+	status: string;
+	predicted_timeframe: string;
+}
+
 export interface IntelligenceCounts {
 	entity_count: number;
 	active_prediction_count: number;

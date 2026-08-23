@@ -1,6 +1,6 @@
 import { invoke, Channel, type InvokeArgs } from '@tauri-apps/api/core';
 import { trackChatMessage } from '$lib/engagement';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, TrendDossier, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus } from './types';
 
 export function safeInvoke<T>(cmd: string, args?: InvokeArgs): Promise<T | null>;
 export function safeInvoke<T>(cmd: string, args: InvokeArgs | undefined, fallback: T): Promise<T>;
@@ -134,6 +134,10 @@ export async function getChatContext(): Promise<ChatContext> {
 
 export async function getTrends(): Promise<TrendThread[]> {
 	return invoke('get_trends');
+}
+
+export async function getTrendDossier(topic: string): Promise<TrendDossier> {
+	return invoke('get_trend_dossier', { topic });
 }
 
 export async function getIntelligenceCounts(): Promise<IntelligenceCounts> {

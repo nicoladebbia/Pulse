@@ -7,6 +7,10 @@
 	import type { TrendThread } from '$lib/tauri/types';
 	import { trackCitationClick } from '$lib/engagement';
 	import PredictionsPanel from '$lib/components/predictions/PredictionsPanel.svelte';
+	import { getTrendDossier } from '$lib/tauri/commands';
+	import { mockTrendDossier } from '$lib/tauri/mock';
+	import type { TrendDossier } from '$lib/tauri/types';
+	import { relativeDayLabel } from '$lib/date';
 
 	let threads = $state<TrendThread[]>([]);
 	let isLoading = $state(true);
@@ -20,6 +24,36 @@
 	// radar shows — the radar's own cards already link to it — so it lives here as a
 	// tab instead of a ninth sidebar entry.
 	let view = $state<'radar' | 'predictions'>('radar');
+
+	// Dossiers are fetched on first expand and kept, so collapsing and re-expanding
+	// costs nothing. Keyed by thread id: two trends can share a title only if the
+	// dedup in trends.rs failed, and even then they must not share a cache slot.
+	let expandedTrendId = $state<number | null>(null);
+	let dossiers = $state<Record<number, TrendDossier>>({});
+	let dossierLoading = $state<number | null>(null);
+	let dossierError = $state<Record<number, string>>({});
+
+	async function toggleDossier(id: number, topic: string) {
+		if (expandedTrendId === id) {
+			expandedTrendId = null;
+			return;
+		}
+		expandedTrendId = id;
+		if (dossiers[id]) return;
+
+		dossierLoading = id;
+		try {
+			const d = isTauri() ? await getTrendDossier(topic) : mockTrendDossier(topic);
+			dossiers = { ...dossiers, [id]: d };
+			dossierError = Object.fromEntries(Object.entries(dossierError).filter(([k]) => Number(k) !== id));
+		} catch (e: any) {
+			// A failed dossier collapses to a retryable message inside the card. It must
+			// never reject uncaught — an unhandled rejection takes the webview down.
+			dossierError = { ...dossierError, [id]: String(e?.message ?? e) };
+		} finally {
+			dossierLoading = null;
+		}
+	}
 
 	$effect(() => {
 		if (loaded) return;
@@ -131,15 +165,7 @@
 		goto('/ask');
 	}
 
-	function formatDate(dateStr: string): string {
-		const date = new Date(dateStr + 'T12:00:00');
-		const now = new Date();
-		const diffDays = Math.floor((now.getTime() - date.getTime()) / 86400000);
-		if (diffDays === 0) return 'Today';
-		if (diffDays === 1) return 'Yesterday';
-		if (diffDays < 7) return `${diffDays}d ago`;
-		return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-	}
+	const formatDate = relativeDayLabel;
 
 	function sentimentColor(val: number): string {
 		if (val > 0.2) return 'text-emerald-400';
@@ -367,7 +393,113 @@
 								</button>
 							{/each}
 						</div>
+
+						<!-- Dossier toggle. The card shows 8 story points; the dossier is the
+						     full 30-day window plus every prediction and the wider entity set. -->
+						<button
+							class="mt-2 w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-[10px]
+								text-text-muted hover:text-text hover:bg-bg-card-hover transition-colors"
+							aria-expanded={expandedTrendId === thread.id}
+							onclick={() => toggleDossier(thread.id, thread.title)}
+						>
+							<span class="transition-transform {expandedTrendId === thread.id ? 'rotate-90' : ''}">›</span>
+							{expandedTrendId === thread.id ? 'Hide dossier' : 'Open dossier'}
+						</button>
 					</div>
+
+					{#if expandedTrendId === thread.id}
+						<div class="border-t border-border bg-bg/40 px-4 py-3 space-y-4">
+							{#if dossierLoading === thread.id}
+								<p class="text-[11px] text-text-muted animate-pulse">Loading dossier…</p>
+							{:else if dossierError[thread.id]}
+								<div class="flex items-center gap-2">
+									<p class="text-[11px] text-rose-400">{dossierError[thread.id]}</p>
+									<button
+										class="text-[10px] text-ai hover:underline"
+										onclick={() => { expandedTrendId = null; toggleDossier(thread.id, thread.title); }}
+									>
+										Retry
+									</button>
+								</div>
+							{:else if dossiers[thread.id]}
+								{@const d = dossiers[thread.id]}
+
+								<!-- Full story timeline -->
+								<div>
+									<p class="text-[10px] uppercase tracking-wider text-text-muted mb-1.5">
+										Coverage · {d.stories.length} {d.stories.length === 1 ? 'story' : 'stories'} in 30 days
+									</p>
+									{#if d.stories.length > 0}
+										<div class="space-y-1">
+											{#each d.stories as story (story.story_id)}
+												<button
+													class="w-full flex items-start gap-2.5 text-left py-1 px-2 -mx-2 rounded-lg
+														hover:bg-bg-card-hover transition-colors group"
+													onclick={() => navigateToStory(story.story_id)}
+												>
+													<span class="text-[10px] text-text-muted shrink-0 w-16 pt-0.5">{formatDate(story.date)}</span>
+													<span class="w-1 h-1 rounded-full shrink-0 mt-1.5" style="background: {SECTORS[story.sector as SectorId]?.color ?? color}"></span>
+													<span class="min-w-0">
+														<span class="block text-xs text-text-secondary group-hover:text-text transition-colors">
+															{story.headline}
+														</span>
+														{#if story.what_to_watch}
+															<span class="block text-[10px] text-amber-400/70 italic mt-0.5">
+																Watch: {story.what_to_watch}
+															</span>
+														{/if}
+													</span>
+												</button>
+											{/each}
+										</div>
+									{:else}
+										<p class="text-[11px] text-text-muted">No stories in the last 30 days.</p>
+									{/if}
+								</div>
+
+								<!-- Every prediction on this topic, not just the active one on the card -->
+								{#if d.predictions.length > 0}
+									<div>
+										<p class="text-[10px] uppercase tracking-wider text-text-muted mb-1.5">Predictions</p>
+										<div class="space-y-1">
+											{#each d.predictions as p}
+												<div class="flex items-baseline gap-2">
+													<span class="text-[10px] font-mono text-violet-400 shrink-0">{Math.round(p.confidence * 100)}%</span>
+													<span class="text-xs text-text-secondary">{p.title}</span>
+													<span class="text-[10px] text-text-muted shrink-0">{p.status}</span>
+												</div>
+											{/each}
+										</div>
+									</div>
+								{/if}
+
+								{#if d.related_entities.length > 0}
+									<div>
+										<p class="text-[10px] uppercase tracking-wider text-text-muted mb-1.5">Related</p>
+										<div class="flex gap-1.5 flex-wrap">
+											{#each d.related_entities as rel}
+												<button
+													class="text-[10px] px-1.5 py-0.5 rounded bg-bg border border-border text-text-secondary
+														hover:text-text hover:border-ai/30 transition-colors"
+													onclick={() => askAbout(rel.name)}
+													title="Co-mentioned {rel.strength} times"
+												>
+													{rel.name}
+												</button>
+											{/each}
+										</div>
+									</div>
+								{/if}
+
+								<button
+									class="text-[11px] text-ai hover:underline"
+									onclick={() => askAbout(thread.title)}
+								>
+									Ask Pulse about {thread.title} →
+								</button>
+							{/if}
+						</div>
+					{/if}
 				</div>
 			{/each}
 		</div>
