@@ -38,6 +38,7 @@ pub const MIGRATION_030: &str = include_str!("../../../migrations/030_repair_pre
 pub const MIGRATION_031: &str = include_str!("../../../migrations/031_drop_dead_tables_and_prune_usage.sql");
 pub const MIGRATION_032: &str = include_str!("../../../migrations/032_story_count_excludes_filings.sql");
 pub const MIGRATION_033: &str = include_str!("../../../migrations/033_engagement_events.sql");
+pub const MIGRATION_034: &str = include_str!("../../../migrations/034_story_feedback.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -672,6 +673,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_033)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (33)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 34: curation ground truth — explicit feedback + fetch candidates
+    if !applied.contains(&34) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_034)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (34)", [])?;
         tx.commit()?;
     }
 
