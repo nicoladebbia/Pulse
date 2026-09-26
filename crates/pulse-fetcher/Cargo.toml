@@ -29,6 +29,11 @@ dirs = "6"
 dotenvy = { workspace = true }
 futures = "0.3"
 libc = "0.2"
+# research lane: arXiv Atom (arxiv: extension elements feed-rs drops) and LaTeXML HTML.
+# Both already in the lockfile transitively.
+quick-xml = "0.37"
+regex = "1"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = { workspace = true }

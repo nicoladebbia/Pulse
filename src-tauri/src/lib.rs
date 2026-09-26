@@ -20,7 +20,7 @@ pub fn run() {
                 .map_err(|e| format!("failed to get app data dir: {e}"))?;
             std::fs::create_dir_all(&app_data).ok();
 
-            let db_path = app_data.join("pulse.db");
+            let db_path = db::connection::dev_db_override().unwrap_or_else(|| app_data.join("pulse.db"));
 
             // Load .env from the project directory for API keys
             let project_env = dirs::home_dir()
@@ -38,6 +38,9 @@ pub fn run() {
                 use std::io::Write;
                 let _ = writeln!(f, "\n--- Pulse started at {} ---", chrono::Local::now());
                 let _ = writeln!(f, "DB path: {}", db_path.display());
+                if db::connection::dev_db_override().is_some() {
+                    let _ = writeln!(f, "DEV DB OVERRIDE ACTIVE (PULSE_DB_PATH): manual fetch disabled");
+                }
                 let _ = writeln!(f, "DB exists: {}", db_path.exists());
             }
 
@@ -112,6 +115,12 @@ pub fn run() {
             commands::trading::get_trade_detail,
             commands::trading::get_trade_rationale,
             commands::trading::run_backtest,
+            commands::research::get_research_papers,
+            commands::research::get_research_stats,
+            commands::research::get_research_paper,
+            commands::research::queue_paper_read,
+            commands::research::backtest_proposal,
+            commands::research::set_proposal_status,
             commands::trading::get_backtest_history,
             commands::trading::auto_backtest_if_due,
             commands::trading::get_auto_trade_status,

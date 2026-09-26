@@ -14,6 +14,7 @@
 		PendingCalibrationRow, CalibrationGateStatus
 	} from '$lib/tauri/types';
 	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
+	import ResearchTab from '$lib/components/research/ResearchTab.svelte';
 	import { parseTradeReason, fmtReasonSignals } from '$lib/trade-reason';
 	import { splitCalibrationBatches } from '$lib/calibration';
 
@@ -27,7 +28,7 @@
 	let quotas = $state<FinancialApiQuota[]>([]);
 	let isLoading = $state(true);
 	let error = $state<string | null>(null);
-	let activeTab = $state<'overview' | 'market' | 'portfolio' | 'sources'>('overview');
+	let activeTab = $state<'overview' | 'market' | 'portfolio' | 'sources' | 'research'>('overview');
 	let loaded = $state(false);
 	let expandedSignal = $state<number | null>(null);
 	let tradingTicker = $state('');
@@ -519,6 +520,7 @@
 		if (e.key === '2') activeTab = 'market';
 		if (e.key === '3') activeTab = 'portfolio';
 		if (e.key === '4') activeTab = 'sources';
+		if (e.key === '5') activeTab = 'research';
 		if (e.key === 'r') loadData();
 		if (e.key === 'a') { activeTab = 'portfolio'; showAnalytics = !showAnalytics; }
 		if (e.key === 'b') { activeTab = 'portfolio'; showBacktest = !showBacktest; }
@@ -583,6 +585,7 @@
 			{ id: 'market', label: 'Market', key: '2' },
 			{ id: 'portfolio', label: 'Portfolio', key: '3' },
 			{ id: 'sources', label: 'Sources', key: '4' },
+			{ id: 'research', label: 'Research', key: '5' },
 		] as tab}
 			<button
 				class="flex-1 py-2 px-3 text-sm rounded-md transition-colors {activeTab === tab.id ? 'bg-bg text-text font-medium shadow-sm' : 'text-text-muted hover:text-text'}"
@@ -1428,5 +1431,10 @@
 				{/each}
 			</div>
 		{/if}
+
+	<!-- ==================== RESEARCH TAB ==================== -->
+	{:else if activeTab === 'research'}
+		<ResearchTab />
+
 	{/if}
 </div>

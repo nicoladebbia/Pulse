@@ -11,6 +11,7 @@ pub(crate) mod calibration;
 pub(crate) mod position_management;
 pub(crate) mod position_sizing;
 pub(crate) mod edge_report;
+pub(crate) mod research;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -104,6 +105,15 @@ struct Args {
     /// drain a 15k backlog over a few nights without ever overlapping the daily fetch.
     #[arg(long, default_value_t = 120)]
     max_minutes: u64,
+}
+
+/// The research lane never fails the daily run: a paper that will not download
+/// or a batch API hiccup is logged and retried on the next hourly wake.
+async fn run_research_nonfatal(db_path: &std::path::Path) {
+    let opts = crate::research::RunOptions { since: None, limit: 400 };
+    if let Err(e) = crate::research::run(db_path, opts).await {
+        tracing::warn!("Research lane failed (non-fatal): {}", e);
+    }
 }
 
 #[tokio::main]
@@ -238,6 +248,9 @@ async fn main() -> anyhow::Result<()> {
                         n,
                         chrono::Local::now().format("%Y-%m-%d")
                     );
+                    // The hourly wakes after the day is fetched are where research
+                    // batches submitted earlier get collected.
+                    run_research_nonfatal(&db_path).await;
                     return Ok(());
                 }
             }
@@ -296,6 +309,25 @@ async fn main() -> anyhow::Result<()> {
             // rather than in the failure path precisely because the failure path
             // is not where this hides.
             notify_stale_signal_sources(&db_path);
+
+            run_research_nonfatal(&db_path).await;
+        }
+        "research" => {
+            // Research lane (papers -> triage -> deep read). Takes the daily fetch's
+            // lock because the daily run also calls the lane: two lanes at once could
+            // both submit the same triaged paper and pay for it twice.
+            let _instance_lock = match acquire_single_instance_lock(&db_path) {
+                Some(lock) => lock,
+                None => {
+                    tracing::info!("Another pulse-fetcher is running (it runs the research lane too) — exiting.");
+                    return Ok(());
+                }
+            };
+            crate::research::run(
+                &db_path,
+                crate::research::RunOptions { since: args.start.clone(), limit: args.limit.min(1000) },
+            )
+            .await?;
         }
         "freedoms" => {
             tracing::info!("Running Four Freedoms pipeline...");

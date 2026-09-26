@@ -19,6 +19,7 @@
     "@sveltejs/vite-plugin-svelte": "^4.0.0",
     "@tailwindcss/vite": "^4.0.0",
     "@tauri-apps/cli": "^2.0.0",
+    "@types/katex": "^0.16.8",
     "@vitest/coverage-v8": "^4.1.10",
     "svelte": "^5.0.0",
     "svelte-check": "^4.7.3",
@@ -30,6 +31,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-notification": "^2.0.0",
-    "@tauri-apps/plugin-shell": "^2.0.0"
+    "@tauri-apps/plugin-shell": "^2.0.0",
+    "katex": "^0.18.9"
   }
 }

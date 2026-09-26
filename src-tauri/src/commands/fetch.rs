@@ -33,6 +33,11 @@ pub struct FetchStatus {
 
 #[tauri::command]
 pub async fn trigger_manual_fetch() -> Result<String, String> {
+    // The fetcher resolves its own (live) DB path, so under a dev override a
+    // "manual fetch" would write the live DB and spend API money behind a copy.
+    if crate::db::connection::dev_db_override().is_some() {
+        return Err("Manual fetch is disabled while PULSE_DB_PATH points the app at a copy".to_string());
+    }
     if FETCHING.swap(true, Ordering::SeqCst) {
         return Err("Fetch already in progress".to_string());
     }

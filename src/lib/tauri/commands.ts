@@ -1,6 +1,6 @@
 import { invoke, Channel, type InvokeArgs } from '@tauri-apps/api/core';
 import { trackChatMessage } from '$lib/engagement';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest } from './types';
 
 export function safeInvoke<T>(cmd: string, args?: InvokeArgs): Promise<T | null>;
 export function safeInvoke<T>(cmd: string, args: InvokeArgs | undefined, fallback: T): Promise<T>;
@@ -275,4 +275,31 @@ export async function stopPriceStream(): Promise<void> {
 
 export async function getStreamStatus(): Promise<StreamStatus> {
 	return invoke('get_stream_status');
+}
+
+// === Research lane ===
+
+export async function getResearchPapers(limit?: number): Promise<ResearchPaperRow[]> {
+	return invoke('get_research_papers', { limit });
+}
+
+export async function getResearchStats(): Promise<ResearchStats> {
+	return invoke('get_research_stats');
+}
+
+export async function getResearchPaper(id: number): Promise<ResearchPaperDetail> {
+	return invoke('get_research_paper', { id });
+}
+
+/** Queues a skipped/failed paper; the fetcher reads it on its next hourly wake. */
+export async function queuePaperRead(id: number): Promise<void> {
+	return invoke('queue_paper_read', { id });
+}
+
+export async function backtestProposal(proposalId: number): Promise<ProposalBacktest> {
+	return invoke('backtest_proposal', { proposalId });
+}
+
+export async function setProposalStatus(proposalId: number, status: 'kept' | 'rejected' | 'proposed' | 'tested'): Promise<void> {
+	return invoke('set_proposal_status', { proposalId, status });
 }

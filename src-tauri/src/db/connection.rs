@@ -2,6 +2,16 @@ use rusqlite::{Connection, Result};
 use std::path::Path;
 use std::time::Duration;
 
+/// Dev-only database override: `PULSE_DB_PATH=/path/to/copy.db pnpm tauri dev`
+/// runs the app against a copy instead of the live DB. Compiled out of release
+/// builds, so the installed app can never pick it up from a stray environment.
+pub fn dev_db_override() -> Option<std::path::PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var_os("PULSE_DB_PATH").filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+}
+
 pub const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_schema.sql");
 pub const MIGRATION_002: &str = include_str!("../../../migrations/002_fts_indexes.sql");
 pub const MIGRATION_003: &str = include_str!("../../../migrations/003_intelligence.sql");
@@ -38,6 +48,7 @@ pub const MIGRATION_030: &str = include_str!("../../../migrations/030_repair_pre
 pub const MIGRATION_031: &str = include_str!("../../../migrations/031_drop_dead_tables_and_prune_usage.sql");
 pub const MIGRATION_032: &str = include_str!("../../../migrations/032_story_count_excludes_filings.sql");
 pub const MIGRATION_033: &str = include_str!("../../../migrations/033_engagement_events.sql");
+pub const MIGRATION_035: &str = include_str!("../../../migrations/035_research_papers.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -672,6 +683,15 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_033)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (33)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 35: research lane (papers, full text, deep reads, proposals).
+    // 34 belongs to a parallel branch; `applied.contains` makes the order irrelevant.
+    if !applied.contains(&35) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_035)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (35)", [])?;
         tx.commit()?;
     }
 

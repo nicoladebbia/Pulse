@@ -791,3 +791,102 @@ export interface CrossSignal {
 	convergence_detected: boolean;
 	computed_at: string | null;
 }
+
+// === Research lane (papers → study notes → testable proposals) ===
+
+export type ResearchStatus = 'new' | 'triaged' | 'skipped' | 'reading' | 'read' | 'failed';
+
+export interface ResearchPaperRow {
+	id: number;
+	arxiv_id: string;
+	title: string;
+	authors: string;
+	categories: string;
+	published_at: string;
+	pages: number | null;
+	status: ResearchStatus;
+	triage_score: number | null;
+	triage_reason: string | null;
+	component: string | null;
+	one_line: string | null;
+	proposal_count: number;
+	error: string | null;
+}
+
+export interface ResearchStats {
+	total: number;
+	read: number;
+	queued: number;
+	skipped: number;
+	proposals: number;
+	tested: number;
+	spent_today_usd: number;
+	spent_30d_usd: number;
+}
+
+export interface StudyNote {
+	one_line: string;
+	problem: string;
+	method: string;
+	key_equations: { latex: string; meaning: string }[];
+	data: string;
+	results: { claim: string; number: string; where: string }[];
+	robustness: string;
+	critique: { issue: string; detail: string; severity: 'low' | 'medium' | 'high' }[];
+	evidence_strength: 'strong' | 'moderate' | 'weak';
+	transfers_to_pulse: string;
+	glossary: { term: string; definition: string }[];
+}
+
+export interface WhatIfSummary {
+	signals: number;
+	trades: number;
+	open_at_end: number;
+	hit_rate: number;
+	avg_return_pct: number;
+	total_return_pct: number;
+	max_drawdown_pct: number;
+	sharpe: number;
+}
+
+export interface WhatIfResult {
+	train_window: [string, string];
+	holdout_window: [string, string];
+	train: { baseline: WhatIfSummary; variant: WhatIfSummary };
+	holdout: { baseline: WhatIfSummary; variant: WhatIfSummary };
+	verdict: 'better' | 'worse' | 'mixed' | 'inconclusive';
+	verdict_reason: string;
+	fidelity: { rows_checked: number; rows_matched: number; ok: boolean };
+	notes: string[];
+}
+
+export interface ResearchProposal {
+	id: number;
+	kind: 'param' | 'new_signal' | 'data' | 'other';
+	component: string;
+	title: string;
+	rationale: string;
+	falsifier: string;
+	delta: Record<string, unknown> | null;
+	spec_md: string | null;
+	status: 'proposed' | 'tested' | 'kept' | 'rejected';
+	result: WhatIfResult | null;
+	tested_at: string | null;
+}
+
+export interface ResearchPaperDetail {
+	paper: ResearchPaperRow;
+	abstract_text: string;
+	triage: { relevance: number; component: string; testable_here: boolean; data_feasible: boolean; reason: string } | null;
+	study: StudyNote | null;
+	read_model: string | null;
+	read_cost_usd: number | null;
+	read_at: string | null;
+	text_source: 'html' | 'pdf' | null;
+	proposals: ResearchProposal[];
+}
+
+export interface ProposalBacktest {
+	result: WhatIfResult;
+	hypotheses_tested: number;
+}

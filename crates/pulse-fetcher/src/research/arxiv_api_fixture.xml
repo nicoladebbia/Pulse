@@ -1,0 +1,74 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns="http://www.w3.org/2005/Atom">
+  <id>https://arxiv.org/api/Xi1RHxQCfS/Rhr+1DA+rT8tlt7g</id>
+  <title>arXiv Query: search_query=cat:q-fin.TR OR cat:q-fin.ST OR cat:q-fin.PM OR cat:q-fin.CP OR cat:q-fin.RM&amp;id_list=&amp;start=0&amp;max_results=300</title>
+  <updated>2026-09-24T22:26:23Z</updated>
+  <link href="https://arxiv.org/api/query?search_query=cat:q-fin.TR+OR+(cat:q-fin.ST+OR+(cat:q-fin.PM+OR+(cat:q-fin.CP+OR+cat:q-fin.RM)))&amp;start=0&amp;max_results=300&amp;id_list=" type="application/atom+xml"/>
+  <opensearch:itemsPerPage>300</opensearch:itemsPerPage>
+  <opensearch:totalResults>13255</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2609.27636v1</id>
+    <title>Multi-Agent AI Architecture for Regulated Insurers: A generic AI framework under Solvency II and the AI Act in Austria and Germany</title>
+    <updated>2026-09-23T10:00:16Z</updated>
+    <link href="https://arxiv.org/abs/2609.27636v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2609.27636v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>This paper proposes a formal multi-agent architecture for implementing enterprise AI in regulated insurance firms, integrating economic theory with institutional design. The framework synthesises three core theoretical perspectives: Arrow's risk pooling theory to formalise risk transformation under uncertainty, Nash equilibrium to model strategic interactions between decision agents, and Principal-Agent theory to address incentive alignment under information asymmetry. The insurer is modelled as a constrained optimisation entity operating under solvency, legal, ESG, and operational boundaries, with specific focus on the regulatory contexts of Austria and Germany. The architecture decomposes the firm into multiple specialised agents, each representing distinct functional domains such as capital management, underwriting, claims processing, compliance, fraud detection, and client interaction. Human-in-the-loop agents are integrated through a tiered access control system, ensuring differentiated data visibility and decision influence based on user roles. An orchestrator agent supervises inter-agent coordination, enforcing regulatory admissibility and institutional coherence under frameworks such as Solvency II, the AI Act, and the Insurance Distribution Directive. Protocol integration is based on asynchronous execution and dual-layer communication infrastructures, specifically the Model Context Protocol (MCP) and Agent-to-Agent (A2A) messaging. This structure enables the systematic design of compliant, auditable multi-agent systems aligned with the institutional logic of financial firms in Austria and Germany.</summary>
+    <category term="q-fin.GN" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.MA" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="q-fin.RM" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2026-09-23T10:00:16Z</published>
+    <arxiv:comment>15 pages, 0 figures. Published in Swissi AI Journal under CC BY 4.0</arxiv:comment>
+    <arxiv:primary_category term="q-fin.GN"/>
+    <arxiv:journal_ref>Swissi AI Journal, Volume 2025, Article SAIJ-qzvrl4bwy7y2 (2025)</arxiv:journal_ref>
+    <author>
+      <name>Walter Kurz</name>
+    </author>
+    <arxiv:doi>10.5281/zenodo.21901259</arxiv:doi>
+    <link rel="related" href="https://doi.org/10.5281/zenodo.21901259" title="doi"/>
+  </entry>
+<entry>
+    <id>http://arxiv.org/abs/2609.27654v1</id>
+    <title>FedIncome: Federated Learning for Income Estimation in Digital Lending Under Data Sovereignty Constraints</title>
+    <updated>2026-09-23T10:16:48Z</updated>
+    <link href="https://arxiv.org/abs/2609.27654v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2609.27654v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Verified income is often unavailable in digital loan applications, forcing lenders to rely on reported income and potentially leading to over-lending, overly conservative offers, or rejection of creditworthy applicants. Cross-institutional data-sharing constraints make this problem especially difficult for smaller lenders with limited training data. We introduce FedIncome, a federated learning framework for income estimation that enables institutions to train a shared model without pooling raw borrower records. Using more than one million LendingClub loans partitioned into $50$ state-level clients, we simulate a heterogeneous lending consortium. The best federated model achieves out-of-time $R^2=0.608$, compared with $0.619$ for a pooled centralised benchmark. Small-sample clients obtain an average out-of-time $R^2$ improvement of $3.8$ percentage points relative to the pooled centralised benchmark, while the fitted client-level relationship places the empirical crossover at approximately $4,790$ training observations in this setting. When pooling is infeasible and the relevant alternative is local-only training, federation improves out-of-time performance across all sample-size groups, with the largest gains for data-scarce clients. We also combine federated income estimates with state- and income-specific debt-to-income thresholds. In a retrospective decision analysis, replacing reported income with the federated estimate increases simulated approval rates with only modest changes in observed default rates. FedIncome supports collaborative learning under data-locality constraints with little aggregate loss relative to pooled training and larger gains relative to local-only estimation.</summary>
+    <category term="stat.ML" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="q-fin.ST" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2026-09-23T10:16:48Z</published>
+    <arxiv:primary_category term="stat.ML"/>
+    <author>
+      <name>Sultan Amed</name>
+    </author>
+    <author>
+      <name>Tanmay Sen</name>
+    </author>
+    <author>
+      <name>Sayantan Banerjee</name>
+    </author>
+  </entry>
+<entry>
+    <id>http://arxiv.org/abs/2609.27654v1</id>
+    <title>FedIncome: Federated Learning for Income Estimation in Digital Lending Under Data Sovereignty Constraints</title>
+    <updated>2026-09-23T10:16:48Z</updated>
+    <link href="https://arxiv.org/abs/2609.27654v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2609.27654v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Verified income is often unavailable in digital loan applications, forcing lenders to rely on reported income and potentially leading to over-lending, overly conservative offers, or rejection of creditworthy applicants. Cross-institutional data-sharing constraints make this problem especially difficult for smaller lenders with limited training data. We introduce FedIncome, a federated learning framework for income estimation that enables institutions to train a shared model without pooling raw borrower records. Using more than one million LendingClub loans partitioned into $50$ state-level clients, we simulate a heterogeneous lending consortium. The best federated model achieves out-of-time $R^2=0.608$, compared with $0.619$ for a pooled centralised benchmark. Small-sample clients obtain an average out-of-time $R^2$ improvement of $3.8$ percentage points relative to the pooled centralised benchmark, while the fitted client-level relationship places the empirical crossover at approximately $4,790$ training observations in this setting. When pooling is infeasible and the relevant alternative is local-only training, federation improves out-of-time performance across all sample-size groups, with the largest gains for data-scarce clients. We also combine federated income estimates with state- and income-specific debt-to-income thresholds. In a retrospective decision analysis, replacing reported income with the federated estimate increases simulated approval rates with only modest changes in observed default rates. FedIncome supports collaborative learning under data-locality constraints with little aggregate loss relative to pooled training and larger gains relative to local-only estimation.</summary>
+    <category term="stat.ML" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="q-fin.ST" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2026-09-23T10:16:48Z</published>
+    <arxiv:primary_category term="stat.ML"/>
+    <author>
+      <name>Sultan Amed</name>
+    </author>
+    <author>
+      <name>Tanmay Sen</name>
+    </author>
+    <author>
+      <name>Sayantan Banerjee</name>
+    </author>
+  </entry>
+</feed>

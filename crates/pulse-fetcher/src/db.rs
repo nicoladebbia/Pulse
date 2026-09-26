@@ -46,6 +46,7 @@ const MIGRATION_030: &str = include_str!("../../../migrations/030_repair_predict
 const MIGRATION_031: &str = include_str!("../../../migrations/031_drop_dead_tables_and_prune_usage.sql");
 const MIGRATION_032: &str = include_str!("../../../migrations/032_story_count_excludes_filings.sql");
 const MIGRATION_033: &str = include_str!("../../../migrations/033_engagement_events.sql");
+const MIGRATION_035: &str = include_str!("../../../migrations/035_research_papers.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -666,6 +667,15 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_033)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (33)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 35: research lane (papers, full text, deep reads, proposals).
+    // 34 belongs to a parallel branch; `applied.contains` makes the order irrelevant.
+    if !applied.contains(&35) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_035)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (35)", [])?;
         tx.commit()?;
     }
 
