@@ -153,6 +153,99 @@ pub fn blended_entry_price(
     basis.is_finite().then_some(basis)
 }
 
+/// `SIZING_MODEL=risk` switches entries and scale-ins from the score tiers to
+/// `pulse_weights::risk_sizing`. Anything else, or unset, keeps the tiers.
+pub fn risk_sizing_enabled() -> bool {
+    std::env::var("SIZING_MODEL")
+        .map(|v| v.trim().eq_ignore_ascii_case("risk"))
+        .unwrap_or(false)
+}
+
+/// Closed trades the edge gate reads: the most recent `limit` with a return.
+///
+/// Returns are per-trade `pnl_pct`, which is price-based and so unaffected by
+/// the dollar-P&L errors the ledger carried before the 2026-09 repair.
+pub fn load_edge_stats(conn: &rusqlite::Connection, limit: usize) -> pulse_weights::risk_sizing::EdgeStats {
+    let returns: Vec<f64> = conn
+        .prepare(
+            "SELECT pnl_pct FROM paper_trades
+             WHERE status IN ('closed', 'stopped_out') AND pnl_pct IS NOT NULL
+             ORDER BY exit_date DESC LIMIT ?1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([limit as i64], |row| row.get::<_, f64>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).filter(|r| r.is_finite()).collect())
+        })
+        .unwrap_or_default();
+    pulse_weights::risk_sizing::EdgeStats::from_returns(&returns)
+}
+
+/// Fraction the account sits below its high-water mark. The mark is the
+/// highest snapshot or today's value, whichever is larger; no snapshots
+/// means no drawdown.
+pub fn current_drawdown(conn: &rusqlite::Connection, portfolio_value: f64) -> f64 {
+    let hwm: f64 = conn
+        .query_row("SELECT MAX(high_water_mark) FROM portfolio_snapshots", [], |row| {
+            row.get::<_, Option<f64>>(0)
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(0.0)
+        .max(portfolio_value);
+    if hwm > 0.0 && portfolio_value > 0.0 {
+        ((hwm - portfolio_value) / hwm).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Latest close and 14-day ATR for sizing. With no close on file the ATR is
+/// meaningless, so the stop falls back to the fixed percentage: (1.0, 0.0)
+/// makes `stop_distance_pct` use `fallback_stop_pct`, which is independent of
+/// price.
+pub fn price_and_atr(conn: &rusqlite::Connection, ticker: &str) -> (f64, f64) {
+    let close: f64 = conn
+        .query_row(
+            "SELECT close FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
+            [ticker],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+    if close > 0.0 {
+        (close, crate::position_management::compute_atr(conn, ticker, 14))
+    } else {
+        (1.0, 0.0)
+    }
+}
+
+/// Sizing state for one auto-trade run. Each placed order is committed back
+/// so the next candidate in the same run sees the heat and cash it used.
+pub struct RiskBook {
+    pub params: pulse_weights::risk_sizing::RiskParams,
+    pub book: pulse_weights::risk_sizing::Book,
+    pub edge: pulse_weights::risk_sizing::EdgeStats,
+}
+
+impl RiskBook {
+    pub fn size(
+        &self,
+        conn: &rusqlite::Connection,
+        ticker: &str,
+        existing_exposure: f64,
+        unit: f64,
+    ) -> Option<pulse_weights::risk_sizing::Sized> {
+        let (price, atr) = price_and_atr(conn, ticker);
+        pulse_weights::risk_sizing::size_order(
+            &self.book, price, atr, existing_exposure, &self.edge, unit, &self.params,
+        )
+    }
+
+    pub fn commit(&mut self, sized: &pulse_weights::risk_sizing::Sized) {
+        self.book.open_risk += sized.risk;
+        self.book.buying_power = (self.book.buying_power - sized.notional).max(0.0);
+    }
+}
+
 #[cfg(test)]
 mod basis_tests {
     use super::*;
@@ -342,5 +435,93 @@ mod tests {
     fn scale_in_floored_at_50() {
         let n = scale_in_notional(500.0).unwrap();
         assert!((n - 50.0).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod risk_book_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        conn
+    }
+
+    fn trade(conn: &Connection, status: &str, pnl_pct: Option<f64>, exit_date: &str) {
+        conn.execute(
+            "INSERT INTO paper_trades (ticker, direction, entry_price, entry_date, position_size,
+                 confidence, signal_profile, status, pnl_pct, exit_date)
+             VALUES ('AAA', 'long', 10.0, '2026-09-01', 1000.0, 0.4, '{}', ?1, ?2, ?3)",
+            rusqlite::params![status, pnl_pct, exit_date],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn edge_stats_read_only_closed_trades_with_a_return() {
+        let conn = db();
+        trade(&conn, "closed", Some(5.0), "2026-09-10");
+        trade(&conn, "stopped_out", Some(-3.0), "2026-09-11");
+        trade(&conn, "open", Some(9.0), "");
+        trade(&conn, "expired", None, "2026-09-12");
+        trade(&conn, "closed", None, "2026-09-13");
+        let s = load_edge_stats(&conn, 100);
+        assert_eq!((s.trades, s.wins), (2, 1));
+    }
+
+    #[test]
+    fn edge_stats_keep_the_most_recent_trades() {
+        let conn = db();
+        trade(&conn, "closed", Some(-1.0), "2026-08-01");
+        trade(&conn, "closed", Some(4.0), "2026-09-01");
+        let s = load_edge_stats(&conn, 1);
+        assert_eq!((s.trades, s.wins), (1, 1));
+    }
+
+    #[test]
+    fn drawdown_is_measured_from_the_highest_snapshot() {
+        let conn = db();
+        assert_eq!(current_drawdown(&conn, 95_000.0), 0.0, "no snapshots, no drawdown");
+        conn.execute(
+            "INSERT INTO portfolio_snapshots (date, total_value, total_pnl, total_pnl_pct,
+                 open_positions, high_water_mark, drawdown_pct)
+             VALUES ('2026-09-28', 95000, -5000, -5, 17, 103065.75, 7.8)",
+            [],
+        )
+        .unwrap();
+        assert!((current_drawdown(&conn, 94_317.27) - (103_065.75 - 94_317.27) / 103_065.75).abs() < 1e-9);
+        assert_eq!(current_drawdown(&conn, 110_000.0), 0.0, "a new high is no drawdown");
+    }
+
+    #[test]
+    fn a_ticker_with_no_prices_sizes_to_the_fixed_stop() {
+        let conn = db();
+        let (price, atr) = price_and_atr(&conn, "NOPE");
+        let p = pulse_weights::risk_sizing::RiskParams::default();
+        assert_eq!(
+            pulse_weights::risk_sizing::stop_distance_pct(price, atr, &p),
+            p.fallback_stop_pct
+        );
+    }
+
+    #[test]
+    fn committing_an_order_uses_up_heat_and_cash() {
+        let conn = db();
+        let mut rb = RiskBook {
+            params: pulse_weights::risk_sizing::RiskParams::default(),
+            book: pulse_weights::risk_sizing::Book {
+                equity: 100_000.0, buying_power: 20_000.0, drawdown: 0.0, open_risk: 9_700.0,
+            },
+            edge: Default::default(),
+        };
+        // No prices on file: 10% fallback stop. $300 of heat left -> $3,000.
+        let s = rb.size(&conn, "NOPE", 0.0, 1.0).unwrap();
+        assert!((s.notional - 3_000.0).abs() < 1e-6);
+        rb.commit(&s);
+        assert!((rb.book.open_risk - 10_000.0).abs() < 1e-6);
+        assert!((rb.book.buying_power - 17_000.0).abs() < 1e-6);
+        assert!(rb.size(&conn, "NOPE", 0.0, 1.0).is_none(), "heat is spent");
     }
 }

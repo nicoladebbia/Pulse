@@ -285,6 +285,51 @@ async fn current_exposure(
     }
 }
 
+/// Summed stop-out risk of every position Alpaca holds, for the heat cap.
+///
+/// Each position's trailing stop comes from its open row; a position with no
+/// row or no stop yet counts at the hard stop. `None` when Alpaca cannot be
+/// read — the caller must not size against an unknown book.
+async fn open_book_risk(
+    client: &reqwest::Client,
+    alpaca_key: &str,
+    alpaca_secret: &str,
+    conn: &rusqlite::Connection,
+    params: &pulse_weights::risk_sizing::RiskParams,
+) -> Option<f64> {
+    let resp = client
+        .get("https://paper-api.alpaca.markets/v2/positions")
+        .header("APCA-API-KEY-ID", alpaca_key)
+        .header("APCA-API-SECRET-KEY", alpaca_secret)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let positions: Vec<serde_json::Value> = resp.json().await.ok()?;
+    let mut total = 0.0;
+    for pos in &positions {
+        let symbol = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+        let stop: Option<f64> = conn
+            .query_row(
+                "SELECT trailing_stop FROM paper_trades
+                 WHERE ticker = ?1 AND status = 'open' ORDER BY id DESC LIMIT 1",
+                [symbol],
+                |row| row.get::<_, Option<f64>>(0),
+            )
+            .ok()
+            .flatten();
+        total += pulse_weights::risk_sizing::position_risk(
+            order_num(pos, "qty"),
+            order_num(pos, "current_price"),
+            stop,
+            params,
+        );
+    }
+    Some(total)
+}
+
 pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     // Hard kill switch. Default = OFF. Re-enable via `AUTO_TRADE_ENABLED=true`
     // in `.env` once the auto-backtest has shown a positive expectancy across
@@ -408,6 +453,39 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     use crate::position_sizing::MAX_PER_TICKER_PCT;
     let max_per_ticker_dollars = crate::position_sizing::ticker_headroom(portfolio_value, 0.0);
 
+    // SIZING_MODEL=risk: size by stop-out risk instead of score tier. Built
+    // once per run and updated as orders go in, so later candidates see the
+    // heat and cash earlier ones used.
+    let mut risk_book = if crate::position_sizing::risk_sizing_enabled() {
+        let params = pulse_weights::risk_sizing::RiskParams::default();
+        let Some(open_risk) =
+            open_book_risk(&client, &alpaca_key, &alpaca_secret, &conn, &params).await
+        else {
+            tracing::warn!("Auto-trade: risk sizing on but Alpaca positions unreadable — no entries this run");
+            return Ok(0);
+        };
+        let rb = crate::position_sizing::RiskBook {
+            book: pulse_weights::risk_sizing::Book {
+                equity: portfolio_value,
+                buying_power,
+                drawdown: crate::position_sizing::current_drawdown(&conn, portfolio_value),
+                open_risk,
+            },
+            edge: crate::position_sizing::load_edge_stats(&conn, 100),
+            params,
+        };
+        tracing::info!(
+            "Auto-trade: risk sizing — equity ${:.0}, drawdown {:.1}% (x{:.2}), open risk ${:.0} of ${:.0} heat, edge x{:.2} over {} trades",
+            rb.book.equity, rb.book.drawdown * 100.0,
+            pulse_weights::risk_sizing::drawdown_multiplier(rb.book.drawdown, &rb.params),
+            rb.book.open_risk, rb.book.equity * rb.params.max_heat,
+            pulse_weights::risk_sizing::edge_multiplier(&rb.edge, &rb.params), rb.edge.trades
+        );
+        Some(rb)
+    } else {
+        None
+    };
+
     let now = chrono::Local::now();
     let entry_datetime = now.format("%Y-%m-%dT%H:%M:%S").to_string();
     let mut traded = 0;
@@ -491,6 +569,27 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 );
                 continue;
             }
+        };
+
+        // Under SIZING_MODEL=risk the tier notional above is replaced. Its cap
+        // check cannot have blocked: exposure is zero here (see the skip above).
+        let mut sized_risk = None;
+        let notional = match risk_book.as_ref() {
+            None => notional,
+            Some(rb) => match rb.size(&conn, ticker, existing_exposure, 1.0) {
+                Some(s) => {
+                    tracing::info!(
+                        "Auto-trade: {} ({}) risk-sized ${:.0} — risks ${:.0} to a {:.1}% stop",
+                        name, ticker, s.notional, s.risk, s.stop_pct * 100.0
+                    );
+                    sized_risk = Some(s);
+                    s.notional
+                }
+                None => {
+                    tracing::info!("Auto-trade: skipping {} ({}) — no heat, cap room or cash left for its risk", name, ticker);
+                    continue;
+                }
+            },
         };
 
         tracing::info!("Auto-trade: {} ({}) — score {:.2}, notional ${:.2}", name, ticker, score, notional);
@@ -659,6 +758,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             }
 
             tracing::info!("Auto-trade: placed order {} for {} (${:.2} @ ${:.2}, qty {:.4})", order_id, ticker, notional, filled_price, filled_qty);
+            if let (Some(rb), Some(s)) = (risk_book.as_mut(), sized_risk.as_ref()) {
+                rb.commit(s);
+            }
             traded += 1;
         } else {
             let status = resp.status();
@@ -718,6 +820,21 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 );
                 continue;
             }
+        };
+
+        let mut sized_risk = None;
+        let scale_notional = match risk_book.as_ref() {
+            None => scale_notional,
+            Some(rb) => match rb.size(&conn, ticker, scale_exposure, rb.params.scale_in_fraction) {
+                Some(s) => {
+                    sized_risk = Some(s);
+                    s.notional
+                }
+                None => {
+                    tracing::info!("Scale-in: skipping {} — no heat, cap room or cash left for its risk", ticker);
+                    continue;
+                }
+            },
         };
 
         tracing::info!("Scale-in: {} — score increased to {:.2}, adding ${:.2}", ticker, new_score, scale_notional);
@@ -792,6 +909,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                         scale_notional, ticker, order_id, held_entry
                     );
                 }
+            }
+            if let (Some(rb), Some(s)) = (risk_book.as_mut(), sized_risk.as_ref()) {
+                rb.commit(s);
             }
             traded += 1;
         }

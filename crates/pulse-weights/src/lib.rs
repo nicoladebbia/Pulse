@@ -7,6 +7,7 @@
 //! (calibration-backtest-universe audit, 2026-07-23). Same pattern, same reason
 //! as `pulse-pricing`.
 
+pub mod risk_sizing;
 pub mod strategy;
 pub use strategy::{DimensionWeight, SizingTier, StrategyDelta, StrategyParams};
 

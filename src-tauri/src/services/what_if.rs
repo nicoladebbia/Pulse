@@ -111,6 +111,9 @@ fn config(p: &StrategyParams, start: &str, end: &str) -> BacktestConfig {
         max_hold_days: p.max_hold_days,
         max_positions: p.max_positions,
         position_size_pct: 5.0, // unused: every candidate carries its tier size
+        exit_model: crate::services::backtester::ExitModel::FixedPct,
+        use_live_tiers: false,
+        risk_sizing: None,
     }
 }
 

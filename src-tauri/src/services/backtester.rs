@@ -16,6 +16,32 @@ pub struct BacktestConfig {
     pub max_hold_days: i64,    // e.g. 90
     pub max_positions: usize,  // e.g. 10
     pub position_size_pct: f64, // e.g. 5.0 (% of *current* equity — compounds)
+    /// How exits are modelled. `FixedPct` (the default) is the historical
+    /// proxy; `AtrTrail` mirrors the live trailing stop.
+    #[serde(default)]
+    pub exit_model: ExitModel,
+    /// Size each entry by the live score tiers instead of `position_size_pct`.
+    /// A candidate's own `size_pct` (the what-if path) still wins.
+    #[serde(default)]
+    pub use_live_tiers: bool,
+    /// Size each entry by stop-out risk (`pulse_weights::risk_sizing`). Takes
+    /// precedence over tiers and `position_size_pct`.
+    #[serde(default)]
+    pub risk_sizing: Option<pulse_weights::risk_sizing::RiskParams>,
+}
+
+/// Exit rules for the walk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+pub enum ExitModel {
+    /// Stop at `stop_loss_pct`, take profit at `take_profit_pct`, both off
+    /// the entry price.
+    #[default]
+    FixedPct,
+    /// The live exit: a stop `atr_mult` ATRs below the highest close since
+    /// entry, never looser than `hard_stop_pct` below entry, and a fixed -10%
+    /// while a ticker has no ATR. No take-profit — the live half close at the
+    /// profit target is not modelled, and the trail takes the whole position.
+    AtrTrail { atr_mult: f64, hard_stop_pct: f64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +152,47 @@ struct OpenPosition {
     position_value: f64, // dollar value at entry (compounded off current equity)
     compound_score: f64,
     signal_profile: String,
+    /// Highest close since entry (AtrTrail).
+    hwm: f64,
+    /// Price the position is stopped at. Only ever rises.
+    stop_price: f64,
+}
+
+/// Average true range over the `period` bars ending on or before `date`.
+/// 0.0 with fewer than `period + 1` bars — callers treat that as "no ATR",
+/// the same as the live `compute_atr`.
+fn atr_at(bars: Option<&HashMap<String, (f64, f64, f64)>>, date: &str, period: usize) -> f64 {
+    let Some(bars) = bars else { return 0.0 };
+    let mut dates: Vec<&String> = bars.keys().filter(|d| d.as_str() <= date).collect();
+    dates.sort();
+    if dates.len() < period + 1 {
+        return 0.0;
+    }
+    let window = &dates[dates.len() - period - 1..];
+    let mut sum = 0.0;
+    for pair in window.windows(2) {
+        let (prev_close, _, _) = bars[pair[0]];
+        let (_, high, low) = bars[pair[1]];
+        sum += (high - low).max((high - prev_close).abs()).max((low - prev_close).abs());
+    }
+    sum / period as f64
+}
+
+/// Where a new position's stop starts.
+fn initial_stop(model: &ExitModel, entry_price: f64, atr: f64, stop_loss_pct: f64) -> f64 {
+    match model {
+        ExitModel::FixedPct => entry_price * (1.0 + stop_loss_pct / 100.0),
+        ExitModel::AtrTrail { atr_mult, hard_stop_pct } => trail_stop(entry_price, entry_price, atr, *atr_mult, *hard_stop_pct),
+    }
+}
+
+/// The live stop rule for a high-water mark and today's ATR.
+fn trail_stop(entry_price: f64, hwm: f64, atr: f64, atr_mult: f64, hard_stop_pct: f64) -> f64 {
+    if atr > 0.0 {
+        (hwm - atr_mult * atr).max(entry_price * (1.0 - hard_stop_pct / 100.0))
+    } else {
+        entry_price * 0.90
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,13 +256,17 @@ pub(crate) fn simulate(
         .into_iter()
         .collect();
 
-    let prices = load_prices(conn, &tickers, &config.start_date, &extended_end)?;
+    // Prices start 40 days early so ATR has history on the first entries. The
+    // walk still starts at start_date.
+    let warmup_start = add_days(&config.start_date, -40).unwrap_or_else(|| config.start_date.clone());
+    let prices = load_prices(conn, &tickers, &warmup_start, &extended_end)?;
 
     // Build union of all trading dates we have prices for (any ticker).
     // We walk these in chronological order.
     let trading_dates: Vec<String> = prices
         .values()
         .flat_map(|m| m.keys().cloned())
+        .filter(|d| d.as_str() >= config.start_date.as_str())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -271,6 +342,40 @@ pub(crate) fn simulate(
             };
             let days_held = (today_naive - entry_naive).num_days();
 
+            if let ExitModel::AtrTrail { atr_mult, hard_stop_pct } = config.exit_model {
+                // Stop checked against today's low using the stop set through
+                // yesterday. A bar that opened below the stop fills at its high
+                // at best — slightly generous, since the open is not stored.
+                if low <= pos.stop_price {
+                    let exit_price = pos.stop_price.min(high);
+                    let pnl_pct = ((exit_price - pos.entry_price) / pos.entry_price) * 100.0;
+                    let pnl_dollars = pos.position_value * pnl_pct / 100.0;
+                    realized_pnl += pnl_dollars;
+                    equity += pnl_dollars;
+                    trades.push(close_trade(&pos, date, exit_price, pnl_pct, pnl_dollars, days_held, "trailing_stop"));
+                    open_positions.remove(&ticker);
+                    continue;
+                }
+                if days_held >= config.max_hold_days {
+                    let close = bar.0;
+                    let pnl_pct = ((close - pos.entry_price) / pos.entry_price) * 100.0;
+                    let pnl_dollars = pos.position_value * pnl_pct / 100.0;
+                    realized_pnl += pnl_dollars;
+                    equity += pnl_dollars;
+                    trades.push(close_trade(&pos, date, close, pnl_pct, pnl_dollars, days_held, "max_hold"));
+                    open_positions.remove(&ticker);
+                    continue;
+                }
+                // Survived today: raise the mark and the stop for tomorrow.
+                let atr = atr_at(prices.get(&ticker), date, 14);
+                if let Some(p) = open_positions.get_mut(&ticker) {
+                    p.hwm = p.hwm.max(bar.0);
+                    let next = trail_stop(p.entry_price, p.hwm, atr, atr_mult, hard_stop_pct);
+                    p.stop_price = p.stop_price.max(next);
+                }
+                continue;
+            }
+
             // Intraday stop-loss (negative pct, e.g. -10)
             let low_pct = ((low - pos.entry_price) / pos.entry_price) * 100.0;
             if low_pct <= config.stop_loss_pct {
@@ -328,8 +433,47 @@ pub(crate) fn simulate(
                 // positions to get the true "book value" we'd size against.
                 let unrealized_now = mark_to_market(&open_positions, &prices, date);
                 let sizing_equity = equity + unrealized_now;
-                let size_pct = cand.size_pct.unwrap_or(config.position_size_pct);
-                let position_value = sizing_equity * (size_pct / 100.0);
+                let entry_atr = atr_at(prices.get(&cand.ticker), date, 14);
+                let position_value = if let Some(rp) = &config.risk_sizing {
+                    // The same book the live trader reads, measured from the walk.
+                    let invested: f64 = open_positions.values().map(|p| p.position_value).sum();
+                    let peak = equity_curve.iter().map(|p| p.value).fold(starting_equity, f64::max).max(sizing_equity);
+                    let mut open_sorted: Vec<&OpenPosition> = open_positions.values().collect();
+                    open_sorted.sort_by(|a, b| a.ticker.cmp(&b.ticker));
+                    let open_risk: f64 = open_sorted.iter().map(|p| {
+                        let px = prices.get(&p.ticker).and_then(|m| m.get(date)).map(|b| b.0).unwrap_or(p.entry_price);
+                        pulse_weights::risk_sizing::position_risk(p.position_value / p.entry_price, px, Some(p.stop_price), rp)
+                    }).sum();
+                    let returns: Vec<f64> = trades.iter().filter(|t| t.exit_reason != DATA_END).map(|t| t.pnl_pct).collect();
+                    let book = pulse_weights::risk_sizing::Book {
+                        equity: sizing_equity,
+                        buying_power: (equity - invested).max(0.0),
+                        drawdown: if peak > 0.0 { (peak - sizing_equity) / peak } else { 0.0 },
+                        open_risk,
+                    };
+                    // Under fixed exits the stop is stop_loss_pct, whatever the
+                    // ATR; express it as the ATR that sizing reads back as that.
+                    let sizing_atr = match config.exit_model {
+                        ExitModel::AtrTrail { .. } => entry_atr,
+                        ExitModel::FixedPct => entry_price * (-config.stop_loss_pct / 100.0) / rp.atr_mult,
+                    };
+                    match pulse_weights::risk_sizing::size_order(
+                        &book, entry_price, sizing_atr, 0.0,
+                        &pulse_weights::risk_sizing::EdgeStats::from_returns(&returns), 1.0, rp,
+                    ) {
+                        Some(s) => s.notional,
+                        None => continue,
+                    }
+                } else {
+                    let size_pct = cand.size_pct.unwrap_or_else(|| {
+                        if config.use_live_tiers {
+                            pulse_weights::StrategyParams::live().size_pct(cand.compound_score)
+                        } else {
+                            config.position_size_pct
+                        }
+                    });
+                    sizing_equity * (size_pct / 100.0)
+                };
                 if position_value <= 0.0 { continue; }
 
                 open_positions.insert(cand.ticker.clone(), OpenPosition {
@@ -340,6 +484,8 @@ pub(crate) fn simulate(
                     position_value,
                     compound_score: cand.compound_score,
                     signal_profile: cand.signal_profile.clone(),
+                    hwm: entry_price,
+                    stop_price: initial_stop(&config.exit_model, entry_price, entry_atr, config.stop_loss_pct),
                 });
             }
         }
@@ -1054,6 +1200,9 @@ mod coverage_tests {
                 max_hold_days: 90,
                 max_positions: 10,
                 position_size_pct: 5.0,
+                exit_model: ExitModel::FixedPct,
+                use_live_tiers: false,
+                risk_sizing: None,
             },
         )
         .expect("backtest runs");
@@ -1065,5 +1214,134 @@ mod coverage_tests {
             "only PRICED had a bar on a day it signalled; UNPRICED has no price \
              data and OFFDAY never lines up"
         );
+    }
+}
+
+#[cfg(test)]
+mod exit_and_sizing_tests {
+    use super::*;
+
+    fn day(n: i64) -> String {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .expect("valid date")
+            .checked_add_signed(chrono::Duration::days(n))
+            .expect("in range")
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    /// Bars with a constant $2 range around each close.
+    fn bars(closes: &[f64]) -> HashMap<String, (f64, f64, f64)> {
+        closes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (day(i as i64), (*c, c + 1.0, c - 1.0)))
+            .collect()
+    }
+
+    fn prices(ticker: &str, closes: &[f64]) -> PriceTable {
+        HashMap::from([(ticker.to_string(), bars(closes))])
+    }
+
+    fn config(exit_model: ExitModel, risk: Option<pulse_weights::risk_sizing::RiskParams>) -> BacktestConfig {
+        BacktestConfig {
+            start_date: day(20),
+            end_date: day(60),
+            min_score: 0.3,
+            stop_loss_pct: -10.0,
+            take_profit_pct: 15.0,
+            max_hold_days: 90,
+            max_positions: 10,
+            position_size_pct: 5.0,
+            exit_model,
+            use_live_tiers: false,
+            risk_sizing: risk,
+        }
+    }
+
+    fn candidate(ticker: &str, on: i64) -> SignalCandidate {
+        SignalCandidate {
+            ticker: ticker.into(),
+            entity_name: ticker.into(),
+            compound_score: 0.5,
+            signal_date: day(on),
+            signal_profile: "{}".into(),
+            size_pct: None,
+        }
+    }
+
+    fn db_with(ticker: &str, closes: &[f64]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE entity_prices (ticker TEXT, date TEXT, close REAL, high REAL, low REAL);")
+            .unwrap();
+        for (i, c) in closes.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO entity_prices VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![ticker, day(i as i64), c, c + 1.0, c - 1.0],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    const TRAIL: ExitModel = ExitModel::AtrTrail { atr_mult: 3.0, hard_stop_pct: 15.0 };
+
+    #[test]
+    fn atr_is_the_mean_true_range_and_needs_enough_history() {
+        let p = prices("A", &[100.0; 20]);
+        assert!((atr_at(p.get("A"), &day(19), 14) - 2.0).abs() < 1e-9);
+        assert_eq!(atr_at(p.get("A"), &day(10), 14), 0.0, "11 bars is not enough for 14");
+        assert_eq!(atr_at(None, &day(19), 14), 0.0);
+    }
+
+    #[test]
+    fn the_trail_never_sits_below_the_hard_stop_and_falls_back_without_atr() {
+        assert!((trail_stop(100.0, 110.0, 2.0, 3.0, 15.0) - 104.0).abs() < 1e-9);
+        assert!((trail_stop(100.0, 100.0, 10.0, 3.0, 15.0) - 85.0).abs() < 1e-9, "3 ATR = 30 > 15% hard stop");
+        assert!((trail_stop(100.0, 120.0, 0.0, 3.0, 15.0) - 90.0).abs() < 1e-9);
+    }
+
+    /// Flat at 100 for the warmup, rally to 130, then fall. The trail ratchets
+    /// up with the rally and takes the exit on the way down, locking a gain the
+    /// fixed -10%/+15% model would have closed at +15% instead.
+    #[test]
+    fn an_atr_trail_rides_a_rally_and_exits_on_the_pullback() {
+        let mut closes = vec![100.0; 21];
+        closes.extend((1..=15).map(|i| 100.0 + 2.0 * i as f64)); // to 130
+        closes.extend((1..=15).map(|i| 130.0 - 2.0 * i as f64)); // back down
+        let conn = db_with("A", &closes);
+        let r = simulate(&conn, &config(TRAIL, None), vec![candidate("A", 20)]).unwrap();
+        let t = &r.trades[0];
+        assert_eq!(t.exit_reason, "trailing_stop");
+        // Highest close 130. Stepping $2 a day, each bar's true range reaches
+        // back to the prior close: 3, not the bar's own $2 range. Stop 130 - 9.
+        assert!((t.exit_price - 121.0).abs() < 1e-6, "exit {}", t.exit_price);
+        assert!(t.pnl_pct > 20.0);
+    }
+
+    #[test]
+    fn risk_sizing_puts_the_budget_at_the_stop() {
+        let conn = db_with("A", &[100.0; 61]);
+        let risk = pulse_weights::risk_sizing::RiskParams::default();
+        let r = simulate(&conn, &config(TRAIL, Some(risk)), vec![candidate("A", 20)]).unwrap();
+        // ATR 2 at $100 -> 6% stop; 0.5% of $100k = $500 at risk -> $8,333.
+        // Flat prices: marked at entry, so the trade closes at data end with no P&L.
+        let t = &r.trades[0];
+        assert!((t.pnl_dollars).abs() < 1e-6);
+        assert_eq!(r.trades.len(), 1);
+    }
+
+    #[test]
+    fn fixed_exits_with_risk_sizing_size_to_the_fixed_stop() {
+        // A -10% stop and a 0.5% budget -> $5,000. Price drops 20% on day 25,
+        // so the fixed stop fires and books -10% of $5,000.
+        let mut closes = vec![100.0; 25];
+        closes.extend(vec![80.0; 36]);
+        let conn = db_with("A", &closes);
+        let risk = pulse_weights::risk_sizing::RiskParams::default();
+        let r = simulate(&conn, &config(ExitModel::FixedPct, Some(risk)), vec![candidate("A", 20)]).unwrap();
+        let t = &r.trades[0];
+        assert_eq!(t.exit_reason, "stop_loss");
+        assert!((t.pnl_dollars + 500.0).abs() < 1e-6, "lost {}", t.pnl_dollars);
     }
 }

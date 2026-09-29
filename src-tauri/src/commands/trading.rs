@@ -376,6 +376,9 @@ pub fn auto_backtest_if_due(db: State<'_, DbState>) -> Result<AutoBacktestStatus
         max_hold_days: 90,
         max_positions: 10,
         position_size_pct: 5.0, // matches the high-score tier in position_sizing
+        exit_model: backtester::ExitModel::FixedPct,
+        use_live_tiers: false,
+        risk_sizing: None,
     };
 
     let result = backtester::run_backtest(&conn, config)
