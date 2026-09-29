@@ -52,6 +52,14 @@ struct Args {
     #[arg(long, default_value = "flat")]
     sizing: String,
 
+    /// With `--exit atr`: stop distance in ATRs (live: 3.0)
+    #[arg(long, default_value_t = 3.0)]
+    atr_mult: f64,
+
+    /// With `--exit atr`: hold the trail back until the position is this % above entry (live: 0)
+    #[arg(long, default_value_t = 0.0)]
+    trail_activate_pct: f64,
+
     /// With `--sizing risk`: fraction of equity risked per trade (default 0.005)
     #[arg(long)]
     risk_per_trade: Option<f64>,
@@ -86,7 +94,11 @@ fn main() -> Result<()> {
         position_size_pct: args.position_size_pct,
         exit_model: match args.exit.as_str() {
             "fixed" => ExitModel::FixedPct,
-            "atr" => ExitModel::AtrTrail { atr_mult: 3.0, hard_stop_pct: 15.0 },
+            "atr" => ExitModel::AtrTrail {
+                atr_mult: args.atr_mult,
+                hard_stop_pct: 15.0,
+                activate_pct: args.trail_activate_pct,
+            },
             other => anyhow::bail!("--exit must be fixed or atr, got {other}"),
         },
         use_live_tiers: args.sizing == "tiers",
