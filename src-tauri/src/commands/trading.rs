@@ -116,16 +116,23 @@ pub async fn execute_trade(
     let qty = (position_value / current_price).floor().max(1.0);
 
     let order = paper_trading::place_order(&ticker, qty, "buy").await.map_err(|e| e.to_string())?;
-    let filled_price = order.filled_avg_price.as_deref().and_then(|p| p.parse().ok()).unwrap_or(current_price);
+    // Outside market hours the order comes back unfilled. Record it as pending
+    // with the last close as an estimate; the fetcher settles it by order id.
+    // Written as a plain open row, the fetcher's next run found no position,
+    // took that as a sale and closed it with no P&L, orphaning the shares.
+    let fill_price: Option<f64> = order.filled_avg_price.as_deref().and_then(|p| p.parse().ok()).filter(|p: &f64| *p > 0.0);
+    let filled_price = fill_price.unwrap_or(current_price);
+    let order_status = if fill_price.is_some() { "filled" } else { "pending" };
+    let filled_qty: Option<f64> = order.filled_qty.as_deref().and_then(|q| q.parse().ok()).filter(|q: &f64| *q > 0.0);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     // Write trade to DB (re-acquire lock)
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date,
-            position_size, confidence, signal_profile, alpaca_order_id, status)
-         VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open')",
-        rusqlite::params![entity_id, ticker, filled_price, today, position_value, confidence, signal_profile, order.id],
+            position_size, confidence, signal_profile, alpaca_order_id, status, order_status, filled_qty)
+         VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9, ?10)",
+        rusqlite::params![entity_id, ticker, filled_price, today, position_value, confidence, signal_profile, order.id, order_status, filled_qty],
     ).map_err(|e| e.to_string())?;
 
     let trade_id = conn.last_insert_rowid();
@@ -147,16 +154,25 @@ pub async fn execute_trade(
 #[tauri::command]
 pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<PaperTrade, String> {
     // Gather trade info, drop lock before async Alpaca calls.
-    let (ticker, entry_price) = {
+    let (ticker, entry_price, order_status) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT ticker, entry_price FROM paper_trades
+            "SELECT ticker, entry_price, order_status FROM paper_trades
              WHERE id = ?1 AND status = 'open'",
             [trade_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, String>(2)?)),
         )
         .map_err(|_| format!("No open trade with id {}", trade_id))?
     };
+
+    // A pending buy has no shares yet. Closing it here would mark it closed and
+    // leave the shares to arrive unmanaged at the open.
+    if order_status == "pending" {
+        return Err(format!(
+            "The buy order for {} hasn't filled yet — close it after the market opens",
+            ticker
+        ));
+    }
 
     // Get the real held qty from Alpaca (DB stores dollar notional, not shares).
     let positions = paper_trading::get_positions().await.map_err(|e| e.to_string())?;
@@ -171,7 +187,7 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         conn.execute(
-            "UPDATE paper_trades SET status='closed', exit_date=?1 WHERE id=?2",
+            "UPDATE paper_trades SET status='closed', exit_date=?1, exit_reason='manual_not_held' WHERE id=?2",
             rusqlite::params![today, trade_id],
         ).map_err(|e| e.to_string())?;
         return Err(format!("{} not held on Alpaca — marked closed in DB", ticker));
@@ -200,9 +216,12 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
     let pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0;
     let pnl = (exit_price - entry_price) * held_qty;
 
+    // On top of realized_pnl: a half-closed trade has already booked that half.
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "UPDATE paper_trades SET status='closed', exit_price=?1, exit_date=?2, pnl=?3, pnl_pct=?4
+        "UPDATE paper_trades SET status='closed', exit_price=?1, exit_date=?2,
+            pnl=COALESCE(realized_pnl, 0) + ?3, realized_pnl=COALESCE(realized_pnl, 0) + ?3,
+            pnl_pct=?4, exit_reason='manual'
          WHERE id=?5",
         rusqlite::params![exit_price, now, pnl, pnl_pct, trade_id],
     ).map_err(|e| e.to_string())?;

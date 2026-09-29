@@ -1,0 +1,13 @@
+-- Migration 037: realized P&L booked while a trade is still open.
+--
+-- A profit-target half close sells half the shares and books that gain. It was
+-- written into `pnl`, but calibration rewrites `pnl` on every open trade each
+-- day with the unrealized mark, so the half's gain vanished the next morning,
+-- and the full close then overwrote `pnl` with the remaining half alone.
+--
+-- `realized_pnl` accumulates what has been sold. The daily mark and the final
+-- close both write `pnl` as realized_pnl + the P&L of the shares still held.
+--
+-- Separate from 036 because 036 was already applied to a live database before
+-- this column was added; editing it would never reach that database.
+ALTER TABLE paper_trades ADD COLUMN realized_pnl REAL;

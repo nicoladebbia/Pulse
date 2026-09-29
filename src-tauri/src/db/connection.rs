@@ -50,6 +50,8 @@ pub const MIGRATION_032: &str = include_str!("../../../migrations/032_story_coun
 pub const MIGRATION_033: &str = include_str!("../../../migrations/033_engagement_events.sql");
 pub const MIGRATION_034: &str = include_str!("../../../migrations/034_story_feedback.sql");
 pub const MIGRATION_035: &str = include_str!("../../../migrations/035_research_papers.sql");
+pub const MIGRATION_036: &str = include_str!("../../../migrations/036_trade_order_status.sql");
+pub const MIGRATION_037: &str = include_str!("../../../migrations/037_trade_realized_pnl.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -700,6 +702,24 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_035)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (35)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 36: paper_trades order_status / filled_qty / exit_reason — a
+    // pending entry is settled by order id, not closed on a position 404.
+    if !applied.contains(&36) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_036)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (36)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 37: paper_trades.realized_pnl — a half close's gain survives
+    // calibration's daily mark and the final close.
+    if !applied.contains(&37) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_037)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (37)", [])?;
         tx.commit()?;
     }
 

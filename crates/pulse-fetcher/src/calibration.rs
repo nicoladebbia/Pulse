@@ -121,8 +121,10 @@ async fn evaluate_open_positions(conn: &Connection, _today: &str) -> anyhow::Res
         let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
         let pnl_dollars = pnl_pct / 100.0 * position_size;
 
+        // On top of realized_pnl: a half-closed trade has already booked the
+        // sold half, and position_size now covers only the half still held.
         conn.execute(
-            "UPDATE paper_trades SET pnl = ?1, pnl_pct = ?2 WHERE id = ?3",
+            "UPDATE paper_trades SET pnl = COALESCE(realized_pnl, 0) + ?1, pnl_pct = ?2 WHERE id = ?3",
             rusqlite::params![pnl_dollars, pnl_pct, trade_id],
         ).ok();
         tracing::info!("Position P&L: {} — {:.1}% (${:.2})", ticker, pnl_pct, pnl_dollars);
