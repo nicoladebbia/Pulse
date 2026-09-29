@@ -112,6 +112,7 @@ pub fn run() {
             commands::trading::execute_trade,
             commands::trading::close_position,
             commands::trading::get_portfolio_analytics,
+            commands::trading::get_exit_review,
             commands::trading::get_trade_journal,
             commands::trading::get_trade_detail,
             commands::trading::get_trade_rationale,

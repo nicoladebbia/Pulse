@@ -241,6 +241,14 @@ pub fn get_portfolio_analytics(db: State<'_, DbState>) -> Result<PortfolioAnalyt
     analytics::compute_analytics(&conn)
 }
 
+/// What each closed trade's price did while open and after the exit, and a
+/// scorecard per exit reason: was closing or holding better.
+#[tauri::command]
+pub fn get_exit_review(db: State<'_, DbState>) -> Result<crate::services::exit_review::ExitReview, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::services::exit_review::compute_exit_review(&conn)
+}
+
 /// Get or generate a trade journal for a specific trade.
 #[tauri::command]
 pub fn get_trade_journal(db: State<'_, DbState>, trade_id: i64) -> Result<TradeJournal, String> {

@@ -32,3 +32,4 @@ pub mod analytics;
 pub mod backtester;
 pub mod what_if;
 pub mod live_prices;
+pub mod exit_review;
