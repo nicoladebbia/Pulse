@@ -41,7 +41,10 @@ pub enum ExitModel {
     /// entry, never looser than `hard_stop_pct` below entry, and a fixed -10%
     /// while a ticker has no ATR. No take-profit — the live half close at the
     /// profit target is not modelled, and the trail takes the whole position.
-    AtrTrail { atr_mult: f64, hard_stop_pct: f64 },
+    ///
+    /// `activate_pct` > 0 holds the trail back until the highest close is that
+    /// far above entry; until then only the hard stop applies. 0 is the live rule.
+    AtrTrail { atr_mult: f64, hard_stop_pct: f64, activate_pct: f64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,12 +185,19 @@ fn atr_at(bars: Option<&HashMap<String, (f64, f64, f64)>>, date: &str, period: u
 fn initial_stop(model: &ExitModel, entry_price: f64, atr: f64, stop_loss_pct: f64) -> f64 {
     match model {
         ExitModel::FixedPct => entry_price * (1.0 + stop_loss_pct / 100.0),
-        ExitModel::AtrTrail { atr_mult, hard_stop_pct } => trail_stop(entry_price, entry_price, atr, *atr_mult, *hard_stop_pct),
+        ExitModel::AtrTrail { atr_mult, hard_stop_pct, activate_pct } => {
+            trail_stop(entry_price, entry_price, atr, *atr_mult, *hard_stop_pct, *activate_pct)
+        }
     }
 }
 
-/// The live stop rule for a high-water mark and today's ATR.
-fn trail_stop(entry_price: f64, hwm: f64, atr: f64, atr_mult: f64, hard_stop_pct: f64) -> f64 {
+/// The live stop rule for a high-water mark and today's ATR, optionally held
+/// back to the hard stop until the mark is `activate_pct` above entry.
+fn trail_stop(entry_price: f64, hwm: f64, atr: f64, atr_mult: f64, hard_stop_pct: f64, activate_pct: f64) -> f64 {
+    let hard = entry_price * (1.0 - hard_stop_pct / 100.0);
+    if activate_pct > 0.0 && hwm < entry_price * (1.0 + activate_pct / 100.0) {
+        return hard;
+    }
     if atr > 0.0 {
         (hwm - atr_mult * atr).max(entry_price * (1.0 - hard_stop_pct / 100.0))
     } else {
@@ -342,7 +352,7 @@ pub(crate) fn simulate(
             };
             let days_held = (today_naive - entry_naive).num_days();
 
-            if let ExitModel::AtrTrail { atr_mult, hard_stop_pct } = config.exit_model {
+            if let ExitModel::AtrTrail { atr_mult, hard_stop_pct, activate_pct } = config.exit_model {
                 // Stop checked against today's low using the stop set through
                 // yesterday. A bar that opened below the stop fills at its high
                 // at best — slightly generous, since the open is not stored.
@@ -370,7 +380,7 @@ pub(crate) fn simulate(
                 let atr = atr_at(prices.get(&ticker), date, 14);
                 if let Some(p) = open_positions.get_mut(&ticker) {
                     p.hwm = p.hwm.max(bar.0);
-                    let next = trail_stop(p.entry_price, p.hwm, atr, atr_mult, hard_stop_pct);
+                    let next = trail_stop(p.entry_price, p.hwm, atr, atr_mult, hard_stop_pct, activate_pct);
                     p.stop_price = p.stop_price.max(next);
                 }
                 continue;
@@ -1284,7 +1294,7 @@ mod exit_and_sizing_tests {
         conn
     }
 
-    const TRAIL: ExitModel = ExitModel::AtrTrail { atr_mult: 3.0, hard_stop_pct: 15.0 };
+    const TRAIL: ExitModel = ExitModel::AtrTrail { atr_mult: 3.0, hard_stop_pct: 15.0, activate_pct: 0.0 };
 
     #[test]
     fn atr_is_the_mean_true_range_and_needs_enough_history() {
@@ -1296,9 +1306,15 @@ mod exit_and_sizing_tests {
 
     #[test]
     fn the_trail_never_sits_below_the_hard_stop_and_falls_back_without_atr() {
-        assert!((trail_stop(100.0, 110.0, 2.0, 3.0, 15.0) - 104.0).abs() < 1e-9);
-        assert!((trail_stop(100.0, 100.0, 10.0, 3.0, 15.0) - 85.0).abs() < 1e-9, "3 ATR = 30 > 15% hard stop");
-        assert!((trail_stop(100.0, 120.0, 0.0, 3.0, 15.0) - 90.0).abs() < 1e-9);
+        assert!((trail_stop(100.0, 110.0, 2.0, 3.0, 15.0, 0.0) - 104.0).abs() < 1e-9);
+        assert!((trail_stop(100.0, 100.0, 10.0, 3.0, 15.0, 0.0) - 85.0).abs() < 1e-9, "3 ATR = 30 > 15% hard stop");
+        assert!((trail_stop(100.0, 120.0, 0.0, 3.0, 15.0, 0.0) - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_held_back_trail_uses_only_the_hard_stop_until_activated() {
+        assert!((trail_stop(100.0, 104.0, 2.0, 3.0, 15.0, 5.0) - 85.0).abs() < 1e-9, "up 4% < 5%: hard stop");
+        assert!((trail_stop(100.0, 106.0, 2.0, 3.0, 15.0, 5.0) - 100.0).abs() < 1e-9, "up 6%: trailing");
     }
 
     /// Flat at 100 for the warmup, rally to 130, then fall. The trail ratchets
