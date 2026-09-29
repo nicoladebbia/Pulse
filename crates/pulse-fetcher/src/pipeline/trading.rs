@@ -44,30 +44,131 @@ pub(crate) async fn poll_fill(
         if order.get("status").and_then(|v| v.as_str()) != Some("filled") {
             continue;
         }
-        let num = |k: &str| {
-            order
-                .get(k)
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0)
-        };
-        let at_local = order
-            .get("filled_at")
-            .and_then(|v| v.as_str())
-            .and_then(|ft| chrono::DateTime::parse_from_rfc3339(ft).ok())
-            .map(|dt| {
-                dt.with_timezone(&chrono::Local)
-                    .format("%Y-%m-%dT%H:%M:%S")
-                    .to_string()
-            })
-            .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string());
         return Some(Fill {
-            price: num("filled_avg_price"),
-            qty: num("filled_qty"),
-            at_local,
+            price: order_num(&order, "filled_avg_price"),
+            qty: order_num(&order, "filled_qty"),
+            at_local: order_filled_at_local(&order),
         });
     }
     None
+}
+
+/// A numeric field of an Alpaca order. Alpaca sends numbers as strings.
+fn order_num(order: &serde_json::Value, key: &str) -> f64 {
+    order
+        .get(key)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// `filled_at` in local time, or now when Alpaca omits it.
+fn order_filled_at_local(order: &serde_json::Value) -> String {
+    order
+        .get("filled_at")
+        .and_then(|v| v.as_str())
+        .and_then(|ft| chrono::DateTime::parse_from_rfc3339(ft).ok())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+/// What a pending entry order's current Alpaca state means for its row.
+#[derive(Debug, PartialEq)]
+pub(crate) enum EntrySettlement {
+    /// Bought. `price` can be 0.0 when Alpaca omits it; the row then keeps
+    /// its estimate.
+    Filled { price: f64, qty: f64, at_local: String },
+    /// Accepted but not filled yet — the normal state for an order placed
+    /// overnight. Leave the row alone and look again next run.
+    Pending,
+    /// The order ended without buying anything.
+    Dead { status: String },
+}
+
+/// Classify an entry order from `GET /v2/orders/{id}`.
+///
+/// A terminal order that filled part of its quantity before it was cancelled
+/// or expired still bought shares, so it counts as filled for that part.
+pub(crate) fn classify_entry_order(order: &serde_json::Value) -> EntrySettlement {
+    let status = order.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let qty = order_num(order, "filled_qty");
+    let filled = EntrySettlement::Filled {
+        price: order_num(order, "filled_avg_price"),
+        qty,
+        at_local: order_filled_at_local(order),
+    };
+    match status {
+        "filled" => filled,
+        "canceled" | "expired" | "rejected" | "done_for_day" | "replaced" | "stopped" => {
+            if qty > 0.0 {
+                filled
+            } else {
+                EntrySettlement::Dead { status: status.to_string() }
+            }
+        }
+        _ => EntrySettlement::Pending,
+    }
+}
+
+/// Write a settlement onto a pending row. Only touches rows still pending, so
+/// running it twice is harmless.
+///
+/// A fill replaces the estimated entry with the real one: price, time, share
+/// count, and a `position_size` of what was actually spent. A dead order
+/// becomes an 'expired' row with no P&L, which every analytics query already
+/// excludes.
+pub(crate) fn apply_entry_settlement(
+    conn: &rusqlite::Connection,
+    trade_id: i64,
+    settlement: &EntrySettlement,
+    today: &str,
+) -> rusqlite::Result<usize> {
+    match settlement {
+        EntrySettlement::Filled { price, qty, at_local } => conn.execute(
+            "UPDATE paper_trades SET order_status = 'filled', filled_qty = ?1, entry_date = ?2,
+                 entry_price     = CASE WHEN ?3 > 0 THEN ?3 ELSE entry_price END,
+                 high_water_mark = CASE WHEN ?3 > 0 THEN ?3 ELSE high_water_mark END,
+                 position_size   = CASE WHEN ?3 > 0 AND ?1 > 0 THEN ?3 * ?1 ELSE position_size END
+             WHERE id = ?4 AND order_status = 'pending'",
+            rusqlite::params![qty, at_local, price, trade_id],
+        ),
+        EntrySettlement::Dead { status } => conn.execute(
+            "UPDATE paper_trades SET status = 'expired', exit_date = ?1, exit_reason = ?2
+             WHERE id = ?3 AND order_status = 'pending'",
+            rusqlite::params![today, format!("entry_order_{status}"), trade_id],
+        ),
+        EntrySettlement::Pending => Ok(0),
+    }
+}
+
+/// Close a trade in full and return the P&L booked for the shares sold now.
+///
+/// The final `pnl` is `realized_pnl` (booked by an earlier half close) plus the
+/// shares sold now. The full close used to write only the remaining half, and
+/// the half's gain was lost.
+pub(crate) fn record_full_close(
+    conn: &rusqlite::Connection,
+    trade_id: i64,
+    entry_price: f64,
+    exit_price: f64,
+    qty_sold: f64,
+    exit_at: &str,
+    reason: &str,
+) -> rusqlite::Result<f64> {
+    let pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0;
+    let pnl_now = (exit_price - entry_price) * qty_sold;
+    conn.execute(
+        "UPDATE paper_trades SET status = 'closed', exit_price = ?1, exit_date = ?2,
+             pnl = COALESCE(realized_pnl, 0) + ?3, realized_pnl = COALESCE(realized_pnl, 0) + ?3,
+             pnl_pct = ?4, exit_reason = ?5
+         WHERE id = ?6",
+        rusqlite::params![exit_price, exit_at, pnl_now, pnl_pct, reason, trade_id],
+    )?;
+    Ok(pnl_now)
 }
 
 /// Open positions whose signal has strengthened enough to add to.
@@ -114,6 +215,7 @@ fn find_scale_in_candidates(
                  LIMIT 1
              )
          WHERE pt.status = 'open'
+           AND pt.order_status = 'filled'
            AND pt.pnl_pct > 0.0
            AND COALESCE(pt.scale_in_count, 0) < 1
            AND cs.computed_at >= date('now', '-1 day')
@@ -348,6 +450,18 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let existing_exposure =
             current_exposure(&client, &alpaca_key, &alpaca_secret, ticker).await;
 
+        // Candidates already exclude tickers with an open or pending row, so
+        // shares on Alpaca here are shares no row tracks. Buying again would
+        // stack a second position on top of an unmanaged one, which is how 37
+        // untracked buys doubled positions in Aug–Sep 2026.
+        if existing_exposure > 0.0 {
+            tracing::warn!(
+                "Auto-trade: skipping {} ({}) — Alpaca holds ${:.0} that no open trade tracks; reconcile the ledger first",
+                name, ticker, existing_exposure
+            );
+            continue;
+        }
+
         // Trim to the room left rather than dropping the order. A name holding
         // 9% of the portfolio has 1% of room, and throwing away the whole signal
         // because it did not fit whole was never the intent — the cap bounds
@@ -430,10 +544,13 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             let order_resp: serde_json::Value = resp.json().await?;
             let order_id = order_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
-            // Poll for fill — market orders fill within seconds
+            // Poll for fill. During market hours this fills within seconds;
+            // overnight it stays open until 9:30 and the row is written as
+            // pending, to be settled by order id on the next run.
             let fill = poll_fill(&client, &alpaca_key, &alpaca_secret, &order_id).await;
+            let order_status = if fill.is_some() { "filled" } else { "pending" };
             if fill.is_none() {
-                tracing::warn!("Auto-trade: order {} not filled after 5s", order_id);
+                tracing::info!("Auto-trade: order {} not filled yet — recording {} as pending", order_id, ticker);
             }
             let mut filled_price = fill.as_ref().map(|f| f.price).unwrap_or(0.0);
             let filled_qty = fill.as_ref().map(|f| f.qty).unwrap_or(0.0);
@@ -530,9 +647,13 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
 
             // Record in paper_trades with position management columns
             if let Err(e) = conn.execute(
-                "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status, high_water_mark, original_compound_score)
-                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6)",
-                rusqlite::params![entity_id, ticker, filled_price, fill_time, notional, score, signal_profile.to_string(), order_id],
+                "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status, high_water_mark, original_compound_score, order_status, filled_qty)
+                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6, ?9, ?10)",
+                rusqlite::params![
+                    entity_id, ticker, filled_price, fill_time, notional, score,
+                    signal_profile.to_string(), order_id, order_status,
+                    (filled_qty > 0.0).then_some(filled_qty),
+                ],
             ) {
                 tracing::warn!("Auto-trade: failed to record trade for {}: {}", ticker, e);
             }
@@ -776,11 +897,11 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
     // exit math; original_compound_score drives signal-decay; half_closed_at
     // gates CloseHalf from re-triggering.
     #[allow(clippy::type_complexity)]
-    let open: Vec<(i64, String, f64, String, f64, Option<String>, f64)> = {
+    let open: Vec<(i64, String, f64, String, f64, Option<String>, f64, String, Option<String>)> = {
         let mut stmt = conn.prepare(
             "SELECT id, ticker, entry_price, entry_date,
                     COALESCE(original_compound_score, confidence, 0.30),
-                    half_closed_at, position_size
+                    half_closed_at, position_size, order_status, alpaca_order_id
              FROM paper_trades WHERE status = 'open'"
         )?;
         stmt.query_map([], |row| Ok((
@@ -788,6 +909,8 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             row.get::<_, f64>(4).unwrap_or(0.30),
             row.get::<_, Option<String>>(5).unwrap_or(None),
             row.get::<_, f64>(6).unwrap_or(0.0),
+            row.get::<_, String>(7).unwrap_or_else(|_| "filled".to_string()),
+            row.get::<_, Option<String>>(8).unwrap_or(None),
         )))?
         .filter_map(|r| r.ok())
         .collect()
@@ -805,7 +928,47 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
     let now_dt = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let mut actions = 0usize;
 
-    for (trade_id, ticker, entry_price, entry_date, orig_score, half_closed_at, position_size) in &open {
+    for (trade_id, ticker, entry_price, entry_date, orig_score, half_closed_at, position_size, order_status, order_id) in &open {
+        // A pending entry has no position to evaluate yet, and a 404 on the
+        // position endpoint means "not filled", not "sold". Settle it from the
+        // order itself. This is bookkeeping, not an order, so it runs in
+        // dry-run too. Exits are evaluated from the next run, on the real basis.
+        if order_status == "pending" {
+            let Some(order_id) = order_id.as_deref().filter(|id| !id.is_empty() && *id != "unknown") else {
+                tracing::warn!("Position mgmt: {} is pending with no order id — cannot settle, review", ticker);
+                continue;
+            };
+            let order: Option<serde_json::Value> = match client
+                .get(format!("https://paper-api.alpaca.markets/v2/orders/{}", order_id))
+                .header("APCA-API-KEY-ID", &alpaca_key)
+                .header("APCA-API-SECRET-KEY", &alpaca_secret)
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => r.json().await.ok(),
+                _ => None,
+            };
+            let Some(order) = order else {
+                tracing::warn!("Position mgmt: could not fetch entry order {} for {}, leaving pending", order_id, ticker);
+                continue;
+            };
+            let settlement = classify_entry_order(&order);
+            if let Err(e) = apply_entry_settlement(&conn, *trade_id, &settlement, &today) {
+                tracing::warn!("Position mgmt: failed to settle {} ({}): {}", ticker, order_id, e);
+                continue;
+            }
+            match settlement {
+                EntrySettlement::Filled { price, qty, .. } => tracing::info!(
+                    "Position mgmt: {} entry filled — {:.4} sh @ ${:.2}", ticker, qty, price
+                ),
+                EntrySettlement::Dead { status } => tracing::warn!(
+                    "Position mgmt: {} entry order ended {} with no fill — row expired", ticker, status
+                ),
+                EntrySettlement::Pending => tracing::info!("Position mgmt: {} entry still pending", ticker),
+            }
+            continue;
+        }
+
         // Ground truth from Alpaca: current_price + held qty. If Alpaca has no
         // position (already liquidated elsewhere), reconcile the DB to closed.
         let pos: Option<serde_json::Value> = match client
@@ -823,31 +986,26 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                 // in analytics — a null-P&L close gets silently dropped by the
                 // win-rate / Sharpe queries (analytics.rs filters pnl_pct NOT NULL).
                 if !dry_run {
-                    if let Some((exit_p, _)) =
+                    if let Some((exit_p, sold_qty)) =
                         latest_filled_sell(&client, &alpaca_key, &alpaca_secret, ticker).await
                     {
-                        let pnl_pct = ((exit_p - entry_price) / entry_price) * 100.0;
-                        // We don't know the exact qty that was held at fill time;
-                        // pnl_pct is exact, pnl dollars uses entry notional as a proxy:
-                        // implied shares = position_size (dollar notional) / entry_price,
-                        // times the per-share gain. Without this, pnl was left NULL/0 and
-                        // analytics silently dropped the close (pnl_pct NOT NULL filter
-                        // still passed, but win-rate $ aggregates were wrong).
-                        let pnl_dollars = (exit_p - entry_price) * (position_size / entry_price);
-                        conn.execute(
-                            "UPDATE paper_trades SET status='closed', exit_price=?1,
-                                exit_date=?2, pnl=?3, pnl_pct=?4 WHERE id=?5",
-                            rusqlite::params![exit_p, today, pnl_dollars, pnl_pct, trade_id],
-                        ).ok();
+                        // P&L from the shares that sell actually moved. The old
+                        // estimate, position_size / entry_price, was wrong whenever
+                        // the buy filled away from the estimated price.
+                        let pnl_now = record_full_close(
+                            &conn, *trade_id, *entry_price, exit_p, sold_qty, &today,
+                            "closed_between_runs",
+                        ).unwrap_or(0.0);
                         tracing::warn!(
-                            "Position mgmt: {} closed between runs — reconciled @ ${:.2} ({:+.1}%)",
-                            ticker, exit_p, pnl_pct
+                            "Position mgmt: {} closed between runs — reconciled @ ${:.2} ({:+.1}%, ${:+.2})",
+                            ticker, exit_p, ((exit_p - entry_price) / entry_price) * 100.0, pnl_now
                         );
                     } else {
                         // No fill record found — close without P&L rather than leave
                         // a phantom-open row, but log it loudly for review.
                         conn.execute(
-                            "UPDATE paper_trades SET status='closed', exit_date=?1 WHERE id=?2",
+                            "UPDATE paper_trades SET status='closed', exit_date=?1,
+                                exit_reason='reconcile_no_fill' WHERE id=?2",
                             rusqlite::params![today, trade_id],
                         ).ok();
                         tracing::warn!(
@@ -981,12 +1139,9 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         let exit_price = if fill.price > 0.0 { fill.price } else { current_price };
         if is_full {
             let pnl_pct_final = ((exit_price - entry_price) / entry_price) * 100.0;
-            let pnl_dollars = (exit_price - entry_price) * held_qty;
-            conn.execute(
-                "UPDATE paper_trades SET status='closed', exit_price=?1, exit_date=?2,
-                    pnl=?3, pnl_pct=?4 WHERE id=?5",
-                rusqlite::params![exit_price, now_dt, pnl_dollars, pnl_pct_final, trade_id],
-            ).ok();
+            let pnl_dollars = record_full_close(
+                &conn, *trade_id, *entry_price, exit_price, held_qty, &now_dt, &reason,
+            ).unwrap_or(0.0);
             // Journal the close. This is the SINGLE exit authority (Phase 13.6),
             // so it owns journal generation — calibration is measure-only and no
             // longer closes trades. Without this, the Portfolio exit-reasons
@@ -1001,13 +1156,14 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         } else {
             // Half close: mark half_closed_at, keep position open. position_size
             // is dollar-notional; halve it to reflect the reduced exposure.
-            // Record the realized gain on the SOLD half into pnl (cumulative) so
-            // analytics doesn't undercount profit-target winners; the remaining
-            // half's P&L is booked at full close.
+            // The sold half's gain goes to realized_pnl, which the daily mark
+            // and the final close both add on top of — `pnl` alone is
+            // overwritten by calibration's mark every day.
             let realized_half = (exit_price - entry_price) * close_qty;
             conn.execute(
                 "UPDATE paper_trades SET half_closed_at=?1, position_size = position_size / 2.0,
-                    pnl = COALESCE(pnl, 0) + ?2 WHERE id=?3",
+                    realized_pnl = COALESCE(realized_pnl, 0) + ?2,
+                    pnl = COALESCE(realized_pnl, 0) + ?2 WHERE id=?3",
                 rusqlite::params![now_dt, realized_half, trade_id],
             ).ok();
             tracing::info!("Position mgmt: HALF-CLOSED {} @ ${:.2} (realized ${:+.2} on half)",
@@ -1140,7 +1296,8 @@ mod scale_in_tests {
                  position_size REAL NOT NULL, confidence REAL NOT NULL,
                  status TEXT NOT NULL DEFAULT 'open',
                  pnl_pct REAL, original_compound_score REAL,
-                 scale_in_count INTEGER DEFAULT 0);
+                 scale_in_count INTEGER DEFAULT 0,
+                 order_status TEXT NOT NULL DEFAULT 'filled');
              CREATE TABLE cross_signals (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  entity_id INTEGER, ticker TEXT, compound_score REAL NOT NULL,
@@ -1288,5 +1445,165 @@ mod scale_in_tests {
         let got = find_scale_in_candidates(&conn);
         assert_eq!(got.len(), 1, "confidence is the documented fallback");
         assert!((got[0].2 - 0.30).abs() < 1e-9, "fallback value is returned, not NULL");
+    }
+
+    /// A pending buy has no shares yet, and its pnl_pct is a mark against an
+    /// estimated price. Adding to it would stack a second order on one that
+    /// has not filled.
+    #[test]
+    fn a_pending_entry_is_not_added_to() {
+        let conn = db();
+        open_trade(&conn, "AAA", 0.30);
+        signal(&conn, 1, "AAA", 0.50, 0);
+        conn.execute("UPDATE paper_trades SET order_status = 'pending'", [])
+            .unwrap();
+        assert!(find_scale_in_candidates(&conn).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::{apply_entry_settlement, classify_entry_order, record_full_close, EntrySettlement};
+    use rusqlite::Connection;
+    use serde_json::json;
+
+    /// The real schema, migrations included, so these tests also prove 036
+    /// applies on top of everything before it.
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        conn
+    }
+
+    fn insert(conn: &Connection, order_status: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO paper_trades (ticker, direction, entry_price, entry_date, position_size,
+                 confidence, signal_profile, alpaca_order_id, status, high_water_mark, order_status)
+             VALUES ('NAVN', 'long', 20.00, '2026-09-28T00:27:46', 1900.0, 0.4, '{}', 'ord-1', 'open', 20.00, ?1)",
+            [order_status],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn row(conn: &Connection, id: i64) -> (String, String, f64, f64, Option<f64>, Option<String>, Option<f64>) {
+        conn.query_row(
+            "SELECT status, order_status, entry_price, position_size, filled_qty, exit_reason, pnl
+             FROM paper_trades WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_order_waiting_for_the_open_is_still_pending() {
+        for status in ["new", "accepted", "pending_new", "partially_filled"] {
+            let order = json!({"status": status, "filled_qty": "0"});
+            assert_eq!(classify_entry_order(&order), EntrySettlement::Pending, "{status}");
+        }
+    }
+
+    #[test]
+    fn a_filled_order_reports_its_real_price_and_shares() {
+        let order = json!({"status": "filled", "filled_qty": "92.5", "filled_avg_price": "20.63",
+                           "filled_at": "2026-09-28T13:33:41Z"});
+        match classify_entry_order(&order) {
+            EntrySettlement::Filled { price, qty, .. } => {
+                assert!((price - 20.63).abs() < 1e-9);
+                assert!((qty - 92.5).abs() < 1e-9);
+            }
+            other => panic!("expected Filled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cancelled_order_that_bought_nothing_is_dead_but_a_partial_fill_counts() {
+        let dead = json!({"status": "canceled", "filled_qty": "0"});
+        assert_eq!(classify_entry_order(&dead), EntrySettlement::Dead { status: "canceled".into() });
+        let partial = json!({"status": "expired", "filled_qty": "3", "filled_avg_price": "10"});
+        assert!(matches!(classify_entry_order(&partial), EntrySettlement::Filled { .. }));
+    }
+
+    /// The regression: an overnight buy used to be closed with NULL P&L when
+    /// its position 404'd. Now the fill is written onto the same row, which
+    /// stays open.
+    #[test]
+    fn settling_a_fill_keeps_the_trade_open_on_the_real_basis() {
+        let conn = db();
+        let id = insert(&conn, "pending");
+        let fill = EntrySettlement::Filled { price: 20.63, qty: 92.5, at_local: "2026-09-28T09:33:41".into() };
+        assert_eq!(apply_entry_settlement(&conn, id, &fill, "2026-09-28").unwrap(), 1);
+        let (status, order_status, entry, size, qty, _, _) = row(&conn, id);
+        assert_eq!(status, "open");
+        assert_eq!(order_status, "filled");
+        assert!((entry - 20.63).abs() < 1e-9);
+        assert!((size - 20.63 * 92.5).abs() < 1e-6, "position_size is what was spent");
+        assert_eq!(qty, Some(92.5));
+        assert_eq!(
+            apply_entry_settlement(&conn, id, &fill, "2026-09-28").unwrap(),
+            0,
+            "settling twice changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_fill_without_a_price_keeps_the_estimate() {
+        let conn = db();
+        let id = insert(&conn, "pending");
+        let fill = EntrySettlement::Filled { price: 0.0, qty: 92.5, at_local: "2026-09-28T09:33:41".into() };
+        apply_entry_settlement(&conn, id, &fill, "2026-09-28").unwrap();
+        let (_, order_status, entry, size, _, _, _) = row(&conn, id);
+        assert_eq!(order_status, "filled");
+        assert!((entry - 20.0).abs() < 1e-9);
+        assert!((size - 1900.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_dead_order_expires_the_row_without_pnl() {
+        let conn = db();
+        let id = insert(&conn, "pending");
+        apply_entry_settlement(&conn, id, &EntrySettlement::Dead { status: "canceled".into() }, "2026-09-28").unwrap();
+        let (status, _, _, _, _, reason, pnl) = row(&conn, id);
+        assert_eq!(status, "expired");
+        assert_eq!(reason.as_deref(), Some("entry_order_canceled"));
+        assert_eq!(pnl, None);
+    }
+
+    #[test]
+    fn settlement_never_touches_a_filled_row() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        let dead = EntrySettlement::Dead { status: "canceled".into() };
+        assert_eq!(apply_entry_settlement(&conn, id, &dead, "2026-09-28").unwrap(), 0);
+        assert_eq!(row(&conn, id).0, "open");
+    }
+
+    #[test]
+    fn a_full_close_books_the_shares_sold_and_its_reason() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        let pnl = record_full_close(&conn, id, 20.0, 18.0, 90.0, "2026-09-29T10:00:00", "trailing_stop").unwrap();
+        assert!((pnl + 180.0).abs() < 1e-9);
+        let (status, _, _, _, _, reason, pnl_col) = row(&conn, id);
+        assert_eq!(status, "closed");
+        assert_eq!(reason.as_deref(), Some("trailing_stop"));
+        assert!((pnl_col.unwrap() + 180.0).abs() < 1e-9);
+    }
+
+    /// The half's gain lives in realized_pnl. The final pnl adds the rest to it
+    /// and ignores whatever daily mark `pnl` held just before the close.
+    #[test]
+    fn a_full_close_after_a_half_close_keeps_the_half_s_gain() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        conn.execute("UPDATE paper_trades SET realized_pnl = 100.0, pnl = 350.0 WHERE id = ?1", [id])
+            .unwrap();
+        record_full_close(&conn, id, 20.0, 22.0, 50.0, "2026-09-29T10:00:00", "signal_decay").unwrap();
+        let (pnl, realized): (f64, f64) = conn
+            .query_row("SELECT pnl, realized_pnl FROM paper_trades WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert!((pnl - 200.0).abs() < 1e-9, "100 from the half + 100 from the rest, not the stale 350 mark");
+        assert!((realized - 200.0).abs() < 1e-9);
     }
 }
