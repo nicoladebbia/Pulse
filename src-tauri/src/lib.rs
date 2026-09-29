@@ -82,6 +82,7 @@ pub fn run() {
             commands::freedoms::get_today_freedoms,
             commands::freedoms::get_freedoms_by_date,
             commands::trends::get_trends,
+            commands::trends::get_trend_dossier,
             commands::trends::get_story_trend_badges,
             commands::trends::get_intelligence_counts,
             commands::trends::get_story_entities,
@@ -124,6 +125,8 @@ pub fn run() {
             commands::trading::get_calibration_gate_status,
             commands::engagement::record_engagement,
             commands::engagement::get_engagement_summary,
+            commands::engagement::set_story_feedback,
+            commands::engagement::get_story_feedback,
         ])
         .build(tauri::generate_context!())
         .expect("error building Pulse")

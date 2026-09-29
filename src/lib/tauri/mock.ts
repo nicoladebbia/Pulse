@@ -1,4 +1,4 @@
-import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread } from './types';
+import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier } from './types';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -176,15 +176,65 @@ function daysAgo(n: number): string {
 	return d.toISOString().slice(0, 10);
 }
 
+const mockHeroHeadlines = [
+	'OpenAI Launches GPT-5 with Real-Time Reasoning',
+	'Miami Beach Approves $500M Tech District Expansion',
+	'Italy Leads EU Push on AI Governance Framework',
+	'Nvidia Unveils Next-Gen Consumer AI Hardware',
+	'Anthropic Closes Record Funding Round',
+];
+
+// ~40 days of archive history so the timeline's month separators and
+// incremental-reveal sentinel (15/day pages) are exercised in mock mode.
 export const mockArchiveBriefings: Briefing[] = [
 	mockBriefing,
 	{ id: 2, date: daysAgo(1), story_count: 5, ai_count: 2, miami_count: 1, italy_count: 1, tech_count: 1, status: 'complete', created_at: daysAgo(1), briefing_type: 'daily', executive_summary: 'Yesterday\'s key developments.', time_label: null, hero_headline: null },
 	{ id: 3, date: daysAgo(1), story_count: 4, ai_count: 0, miami_count: 0, italy_count: 0, tech_count: 0, status: 'complete', created_at: daysAgo(1), briefing_type: 'freedoms', executive_summary: null, time_label: null, hero_headline: null },
 	{ id: 4, date: daysAgo(2), story_count: 6, ai_count: 3, miami_count: 1, italy_count: 1, tech_count: 1, status: 'complete', created_at: daysAgo(2), briefing_type: 'daily', executive_summary: 'Two days ago highlights.', time_label: null, hero_headline: null },
 	{ id: 5, date: daysAgo(3), story_count: 4, ai_count: 1, miami_count: 1, italy_count: 1, tech_count: 1, status: 'complete', created_at: daysAgo(3), briefing_type: 'daily', executive_summary: null, time_label: null, hero_headline: null },
+	...Array.from({ length: 36 }, (_, i): Briefing => ({
+		id: 100 + i,
+		date: daysAgo(4 + i),
+		story_count: 4 + ((i * 7) % 9),
+		ai_count: 1 + (i % 3),
+		miami_count: i % 2,
+		italy_count: (i + 1) % 2,
+		tech_count: 1,
+		status: 'complete',
+		created_at: daysAgo(4 + i),
+		briefing_type: 'daily',
+		executive_summary: i % 3 === 0 ? 'A steady day across sectors with incremental developments in AI infrastructure and local policy.' : null,
+		time_label: null,
+		hero_headline: mockHeroHeadlines[i % mockHeroHeadlines.length],
+	})),
 ];
 
 // --- Trends mock data ---
+
+// Keyed by topic so an expand in mock mode returns THAT trend's dossier, not a
+// single shared fixture that would hide a topic-plumbing bug.
+export function mockTrendDossier(topic: string): TrendDossier {
+	const seed = topic.length;
+	return {
+		topic,
+		stories: Array.from({ length: 6 }, (_, i) => ({
+			story_id: 1000 + seed * 10 + i,
+			date: daysAgo(i * 2),
+			headline: `${topic}: development ${i + 1} in the last month`,
+			sector: (['ai', 'tech', 'miami', 'italy'] as const)[(seed + i) % 4],
+			what_to_watch: i % 2 === 0 ? `Whether ${topic} sustains this pace into next quarter.` : null,
+		})),
+		predictions: [
+			{ title: `${topic} keeps accelerating through Q4`, confidence: 0.62, status: 'active', predicted_timeframe: daysAgo(-45) },
+			{ title: `${topic} plateaus before year end`, confidence: 0.31, status: 'invalidated', predicted_timeframe: daysAgo(30) },
+		],
+		related_entities: [
+			{ name: 'OpenAI', strength: 8.2 },
+			{ name: 'Microsoft', strength: 5.4 },
+			{ name: 'Nvidia', strength: 3.1 },
+		],
+	};
+}
 
 export const mockTrends: TrendThread[] = [
 	{

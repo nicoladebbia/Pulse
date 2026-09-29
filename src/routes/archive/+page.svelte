@@ -19,6 +19,30 @@
 	let viewMode = $state<'list' | 'daily' | 'freedoms'>('list');
 	let dateRange = $state<'7' | '30' | 'all'>('all');
 
+	// Timeline windowing: render newest PAGE_SIZE days, reveal more as the
+	// sentinel scrolls into view. Client-side only — list_briefings returns
+	// metadata rows, so the full fetch stays cheap; this is render windowing.
+	const PAGE_SIZE = 15;
+	let visibleDays = $state(PAGE_SIZE);
+	let sentinel = $state<HTMLElement | null>(null);
+
+	$effect(() => {
+		void dateRange; // reset the window whenever the range filter changes
+		visibleDays = PAGE_SIZE;
+	});
+
+	$effect(() => {
+		if (!sentinel) return;
+		const obs = new IntersectionObserver(
+			(entries) => {
+				if (entries[0].isIntersecting) visibleDays += PAGE_SIZE;
+			},
+			{ rootMargin: '400px' }
+		);
+		obs.observe(sentinel);
+		return () => obs.disconnect();
+	});
+
 	$effect(() => {
 		if (loaded) return;
 		loaded = true;
@@ -101,6 +125,18 @@
 		});
 	}
 
+	function formatDayShort(date: string): string {
+		return new Date(date + 'T12:00:00').toLocaleDateString('en-US', {
+			weekday: 'short', month: 'short', day: 'numeric'
+		});
+	}
+
+	function monthLabel(date: string): string {
+		return new Date(date + 'T12:00:00').toLocaleDateString('en-US', {
+			month: 'long', year: 'numeric'
+		});
+	}
+
 	function isToday(date: string): boolean {
 		return date === new Date().toISOString().split('T')[0];
 	}
@@ -132,6 +168,8 @@
 		const cutoffStr = cutoff.toISOString().split('T')[0];
 		return groupedByDate.filter(([date]) => date >= cutoffStr);
 	});
+
+	const visibleTimeline = $derived(filteredByDate.slice(0, visibleDays));
 
 	// The daily view used to render EVERY story as a full card in raw display_order:
 	// 120 news plus up to 462 regulatory filings for a single day (2026-08-14), with the
@@ -310,57 +348,77 @@
 		</div>
 
 	{:else if filteredByDate.length > 0}
-		<div class="space-y-2">
-			{#each filteredByDate as [date, group]}
+		<!-- Magazine timeline: newest first, one issue block per day on a vertical rail -->
+		<div class="relative ml-2 border-l border-border/60 pl-7 space-y-8 pb-4">
+			{#each visibleTimeline as [date, group], i (date)}
 				{@const latestDaily = group.dailies[0]}
-				<div class="bg-bg-card border border-border rounded-lg overflow-hidden transition-colors hover:border-border-hover">
-					<div class="p-4">
-						<div class="flex items-center justify-between">
-							<div class="flex-1 min-w-0">
-								<div class="flex items-center gap-2">
-									<p class="text-sm font-medium text-text">{formatDate(date)}</p>
-									{#if isToday(date)}
-										<span class="text-[10px] uppercase tracking-wider bg-ai/10 text-ai px-1.5 py-0.5 rounded">Today</span>
-									{/if}
-								</div>
+				{@const newMonth = i === 0 || monthLabel(date) !== monthLabel(visibleTimeline[i - 1][0])}
 
-								<!-- Hero headline preview -->
-								{#if latestDaily?.hero_headline}
-									<p class="text-xs text-text-secondary mt-1 truncate">{latestDaily.hero_headline}</p>
-								{/if}
+				{#if newMonth}
+					<div class="relative pt-1 {i === 0 ? '' : 'mt-10'}">
+						<span class="absolute -left-[33px] top-1.5 w-3 h-3 rounded-full border-2 border-border bg-bg"></span>
+						<p class="text-[10px] uppercase tracking-[0.25em] text-text-muted">{monthLabel(date)}</p>
+					</div>
+				{/if}
 
-								<!-- Executive summary preview -->
-								{#if latestDaily?.executive_summary}
-									<p class="text-[11px] text-text-muted mt-1.5 line-clamp-2 leading-relaxed">
-										{truncateSentences(latestDaily.executive_summary, 2)}
-									</p>
-								{/if}
-							</div>
-							<div class="flex items-center gap-2 flex-wrap shrink-0 ml-4">
+				<section class="relative">
+					<span
+						class="absolute -left-[31px] top-2 w-2.5 h-2.5 rounded-full {isToday(date) ? 'bg-ai' : 'bg-border'}"
+					></span>
+
+					<!-- Day header row -->
+					<div class="flex items-baseline justify-between gap-3">
+						<div class="flex items-baseline gap-2 min-w-0">
+							<h3 class="text-sm font-semibold text-text whitespace-nowrap">{formatDayShort(date)}</h3>
+							{#if isToday(date)}
+								<span class="text-[10px] uppercase tracking-wider bg-ai/10 text-ai px-1.5 py-0.5 rounded">Today</span>
+							{/if}
+							{#if latestDaily}
+								<span class="text-[11px] text-text-muted whitespace-nowrap">{latestDaily.story_count} stories</span>
+							{/if}
+						</div>
+						<div class="flex items-center gap-1.5 shrink-0">
+							{#if group.dailies.length > 1}
 								{#each group.dailies as daily}
 									<button
-										class="text-xs px-3 py-1.5 rounded-lg border border-border hover:bg-bg-card-hover
+										class="text-[10px] px-2 py-1 rounded-md border border-border hover:bg-bg-card-hover
 											transition-colors text-text-secondary hover:text-text"
 										onclick={() => selectDaily(daily.id)}
 									>
 										{daily.time_label ?? 'Daily'} · {daily.story_count}
 									</button>
 								{/each}
-								{#if group.freedoms}
-									<button
-										class="text-xs px-3 py-1.5 rounded-lg border transition-colors hover:opacity-90"
-										style="border-color: var(--color-gold-dim); color: var(--color-gold); background: var(--color-gold-dim)"
-										onclick={() => selectFreedoms(date)}
-									>
-										Freedoms · {group.freedoms.story_count}
-									</button>
-								{/if}
-							</div>
+							{/if}
+							{#if group.freedoms}
+								<button
+									class="text-[10px] px-2 py-1 rounded-md border transition-colors hover:opacity-90"
+									style="border-color: var(--color-gold-dim); color: var(--color-gold); background: var(--color-gold-dim)"
+									onclick={() => selectFreedoms(date)}
+								>
+									Freedoms · {group.freedoms.story_count}
+								</button>
+							{/if}
 						</div>
+					</div>
 
-						<!-- Sector breakdown with labels -->
-						{#if group.dailies.length > 0 && latestDaily}
-							<div class="flex gap-2 mt-2.5">
+					<!-- Issue block: hero + summary + sectors, whole block opens the day -->
+					{#if latestDaily}
+						<button
+							class="w-full text-left mt-2 rounded-xl border border-border bg-bg-card hover:border-border-hover
+								hover:bg-bg-card-hover transition-colors p-4 group"
+							onclick={() => selectDaily(latestDaily.id)}
+						>
+							{#if latestDaily.hero_headline}
+								<p class="text-base font-medium text-text leading-snug group-hover:text-ai transition-colors">
+									{latestDaily.hero_headline}
+								</p>
+							{/if}
+							{#if latestDaily.executive_summary}
+								<p class="text-xs text-text-muted mt-2 leading-relaxed line-clamp-2">
+									{truncateSentences(latestDaily.executive_summary, 2)}
+								</p>
+							{/if}
+							<div class="flex gap-2 mt-3">
 								{#each ['ai', 'miami', 'italy', 'tech'] as sector}
 									{@const count = sector === 'ai' ? latestDaily.ai_count : sector === 'miami' ? latestDaily.miami_count : sector === 'italy' ? latestDaily.italy_count : latestDaily.tech_count}
 									{#if count > 0}
@@ -373,10 +431,21 @@
 									{/if}
 								{/each}
 							</div>
-						{/if}
-					</div>
-				</div>
+						</button>
+					{/if}
+				</section>
 			{/each}
+
+			{#if visibleDays < filteredByDate.length}
+				<!-- Auto-reveals via IntersectionObserver; the button is the always-works fallback. -->
+				<button
+					bind:this={sentinel}
+					class="w-full h-10 flex items-center justify-center text-[11px] text-text-muted hover:text-text transition-colors"
+					onclick={() => visibleDays += PAGE_SIZE}
+				>
+					Show more · {filteredByDate.length - visibleDays} day{filteredByDate.length - visibleDays !== 1 ? 's' : ''} remaining
+				</button>
+			{/if}
 		</div>
 	{:else}
 		<div class="flex items-center justify-center h-48">

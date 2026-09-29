@@ -162,21 +162,19 @@
 	}
 </script>
 
-<div class="space-y-4 pt-2">
-	<!-- Header -->
-	<div>
-		<h2 class="text-xl font-semibold text-text">Predictions</h2>
-		<p class="text-xs text-text-muted mt-0.5">AI-generated forecasts tracked against reality</p>
-		{#if predictions.length > 0}
-			{@const mostRecent = predictions.reduce((max, p) => (p.created_at && (!max || p.created_at > max)) ? p.created_at : max, '' as string | null)}
-			<div class="mt-1 flex items-center gap-2">
-				<span class="text-[10px] text-text-muted/70 font-mono">{predictions.length} tracked</span>
-				{#if mostRecent}
-					<FreshnessPill timestamp={mostRecent} label="generated" />
-				{/if}
-			</div>
-		{/if}
-	</div>
+<div class="space-y-4">
+	<!-- The page heading and subtitle are gone on purpose: this renders under a tab
+	     already labelled "Predictions", and the Trends page supplies the heading.
+	     The counters stay because they carry information a tab label cannot. -->
+	{#if predictions.length > 0}
+		{@const mostRecent = predictions.reduce((max, p) => (p.created_at && (!max || p.created_at > max)) ? p.created_at : max, '' as string | null)}
+		<div class="flex items-center gap-2">
+			<span class="text-[10px] text-text-muted/70 font-mono">{predictions.length} tracked</span>
+			{#if mostRecent}
+				<FreshnessPill timestamp={mostRecent} label="generated" />
+			{/if}
+		</div>
+	{/if}
 
 	<!-- Stats Card -->
 	{#if stats && stats.total > 0}

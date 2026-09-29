@@ -7,6 +7,7 @@
 	import { isTauri, simulateChatStream } from '$lib/tauri/mock';
 	import { page } from '$app/stores';
 	import { trackStoryOpen, trackStoryClose } from '$lib/engagement';
+	import FeedbackControl from './FeedbackControl.svelte';
 
 	let { story, onClose }: { story: Story; onClose: () => void } = $props();
 
@@ -155,9 +156,12 @@
 		>
 			{sector?.name ?? story.sector}
 		</span>
-		{#if story.relevance_score}
-			<RelevanceBadge score={story.relevance_score} />
-		{/if}
+		<div class="flex items-center gap-3">
+			<FeedbackControl storyId={story.id} labelled />
+			{#if story.relevance_score}
+				<RelevanceBadge score={story.relevance_score} />
+			{/if}
+		</div>
 	</div>
 
 	<!-- Headline -->

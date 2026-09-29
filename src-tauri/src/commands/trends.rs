@@ -83,6 +83,112 @@ fn collapse_ranked_by_topic(ranked: Vec<RankedRow>) -> Vec<(RankedRow, Vec<Strin
 }
 
 /// Get story badges (entity tags) for a batch of stories.
+/// The expand-in-place detail for one trend card: its full story timeline, every
+/// prediction attached to the topic, and its strongest related entities.
+///
+/// Deliberately NOT part of `TrendThread`. `get_trends` builds 15 cards at page
+/// open and this is 20 stories plus two more queries per card — folding it in
+/// would pay for 15 dossiers to render one.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrendDossier {
+    pub topic: String,
+    pub stories: Vec<DossierStory>,
+    pub predictions: Vec<DossierPrediction>,
+    pub related_entities: Vec<RelatedEntity>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DossierStory {
+    pub story_id: i64,
+    pub date: String,
+    pub headline: String,
+    pub sector: String,
+    pub what_to_watch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DossierPrediction {
+    pub title: String,
+    pub confidence: f32,
+    pub status: String,
+    pub predicted_timeframe: String,
+}
+
+/// Same 30-day window and sector filter as `get_trends`, so a card that qualified
+/// there always has evidence here.
+const DOSSIER_WINDOW_DAYS: &str = "-30 days";
+const DOSSIER_STORY_LIMIT: usize = 20;
+const DOSSIER_RELATED_LIMIT: usize = 8;
+
+/// The dossier query, split out from the command so it is testable without a Tauri
+/// `State`. Read-only; every predicate is indexed.
+pub(crate) fn build_dossier(conn: &rusqlite::Connection, topic: &str) -> Result<TrendDossier, String> {
+    let sql = format!(
+        "SELECT s.id, em.mentioned_at, s.headline, s.sector, s.what_to_watch
+         FROM entities e
+         JOIN entity_mentions em ON em.entity_id = e.id
+         JOIN stories s ON s.id = em.story_id
+         WHERE e.name_normalized = ?1
+           AND s.sector IN ('ai', 'miami', 'italy', 'tech')
+           AND em.mentioned_at >= date('now', '{DOSSIER_WINDOW_DAYS}')
+         ORDER BY em.mentioned_at DESC, s.id DESC"
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([topic.to_lowercase()], |row| {
+            Ok(DossierStory {
+                story_id: row.get(0)?,
+                date: row.get(1)?,
+                headline: row.get(2)?,
+                sector: row.get(3)?,
+                what_to_watch: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    // Dedup on `story_id`, never on position or headline. One story can carry several
+    // `entity_mentions` rows for the same entity, and two different stories can share a
+    // headline; the id is the only key the row itself owns, so inserting a story in the
+    // middle of the window cannot renumber anyone else's identity.
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut stories: Vec<DossierStory> = Vec::new();
+    for story in rows.flatten() {
+        if stories.len() >= DOSSIER_STORY_LIMIT {
+            break;
+        }
+        if seen.insert(story.story_id) {
+            stories.push(story);
+        }
+    }
+
+    let predictions = predictions::get_predictions_for_topic(conn, topic)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| DossierPrediction {
+            title: p.title,
+            confidence: p.confidence,
+            status: p.status,
+            predicted_timeframe: p.predicted_timeframe,
+        })
+        .collect();
+
+    let related_entities = relationships::get_related_entities(conn, topic, 2.0, DOSSIER_RELATED_LIMIT)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, strength)| RelatedEntity { name, strength })
+        .collect();
+
+    Ok(TrendDossier { topic: topic.to_string(), stories, predictions, related_entities })
+}
+
+/// Lazy detail for one trend card. Invoked on first expand, never at page open.
+#[tauri::command]
+pub fn get_trend_dossier(db: State<'_, DbState>, topic: String) -> Result<TrendDossier, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    build_dossier(&conn, &topic)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StoryTrendBadge {
     pub story_id: i64,
@@ -421,6 +527,125 @@ mod tests {
     /// the rest are filler.
     fn row(id: i64, topic: &str, sector: Option<&str>) -> RankedRow {
         (id, topic.to_string(), sector.map(|s| s.to_string()), "rising".into(), 4.286, 5, 5, 0.0)
+    }
+
+    use crate::db::test_helpers::*;
+
+    /// Seed an entity, a briefing of stories, and one `entity_mentions` row per story.
+    fn seed_topic(conn: &rusqlite::Connection, topic: &str, day: &str, headlines: &[&str]) -> Vec<i64> {
+        // No `OR IGNORE`: it would swallow a schema violation and leave the test
+        // failing later at the SELECT with a useless "no rows". `entity_type` is
+        // CHECK-constrained and both `first_seen`/`last_seen` are NOT NULL with no
+        // default — all three have to be right or this must fail loudly, here.
+        let entity_id: i64 = match conn.query_row(
+            "SELECT id FROM entities WHERE name_normalized = ?1",
+            [topic.to_lowercase()],
+            |r| r.get(0),
+        ) {
+            Ok(id) => id,
+            Err(_) => {
+                conn.execute(
+                    "INSERT INTO entities (name, name_normalized, entity_type, first_seen, last_seen)
+                     VALUES (?1, ?2, 'company', ?3, ?3)",
+                    rusqlite::params![topic, topic.to_lowercase(), day],
+                )
+                .expect("insert entity");
+                conn.last_insert_rowid()
+            }
+        };
+
+        let stories: Vec<TestStory> = headlines.iter().map(|h| TestStory::new("ai", h)).collect();
+        let (_, ids) = seed_briefing(conn, day, &stories);
+        for id in &ids {
+            conn.execute(
+                "INSERT INTO entity_mentions (entity_id, story_id, sentiment, mentioned_at)
+                 VALUES (?1, ?2, 0.0, ?3)",
+                rusqlite::params![entity_id, id, day],
+            )
+            .expect("insert mention");
+        }
+        ids
+    }
+
+    fn today_minus(days: i64) -> String {
+        (chrono::Local::now().date_naive() - chrono::Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    #[test]
+    fn a_story_mentioned_twice_appears_once_in_the_dossier() {
+        let conn = test_db();
+        let ids = seed_topic(&conn, "Anthropic", &today_minus(1), &["Claude ships"]);
+        // A second mention row for the SAME story — the shape that made a naive
+        // query return the story twice.
+        conn.execute(
+            "INSERT INTO entity_mentions (entity_id, story_id, sentiment, mentioned_at)
+             SELECT entity_id, story_id, 0.0, mentioned_at FROM entity_mentions WHERE story_id = ?1",
+            [ids[0]],
+        )
+        .unwrap();
+
+        let d = build_dossier(&conn, "Anthropic").unwrap();
+        assert_eq!(d.stories.len(), 1, "one story, two mention rows, one dossier entry");
+        assert_eq!(d.stories[0].story_id, ids[0]);
+    }
+
+    #[test]
+    fn inserting_a_story_mid_window_does_not_displace_the_identity_of_the_others() {
+        // verification.md #5: any key derived from POSITION breaks under insertion.
+        // The dossier keys on story_id, so a story landing between two existing days
+        // must join the list without changing what any other entry IS.
+        let conn = test_db();
+        let old = seed_topic(&conn, "OpenAI", &today_minus(10), &["Older story"]);
+        let new = seed_topic(&conn, "OpenAI", &today_minus(1), &["Newer story"]);
+
+        let before = build_dossier(&conn, "OpenAI").unwrap();
+        let before_ids: Vec<i64> = before.stories.iter().map(|s| s.story_id).collect();
+        assert_eq!(before_ids, vec![new[0], old[0]], "newest first");
+
+        // Insert IN THE MIDDLE of the window, not appended at either end.
+        let mid = seed_topic(&conn, "OpenAI", &today_minus(5), &["Middle story"]);
+
+        let after = build_dossier(&conn, "OpenAI").unwrap();
+        let after_ids: Vec<i64> = after.stories.iter().map(|s| s.story_id).collect();
+        assert_eq!(after_ids, vec![new[0], mid[0], old[0]], "the new row slots in by date");
+        for s in &after.stories {
+            let expected = match s.story_id {
+                id if id == new[0] => "Newer story",
+                id if id == mid[0] => "Middle story",
+                _ => "Older story",
+            };
+            assert_eq!(s.headline, expected, "each id still carries its OWN headline");
+        }
+    }
+
+    #[test]
+    fn stories_outside_the_thirty_day_window_are_excluded() {
+        let conn = test_db();
+        seed_topic(&conn, "Meta", &today_minus(45), &["Ancient story"]);
+        let inside = seed_topic(&conn, "Meta", &today_minus(3), &["Recent story"]);
+
+        let d = build_dossier(&conn, "Meta").unwrap();
+        assert_eq!(d.stories.len(), 1, "the 45-day-old story is out of window");
+        assert_eq!(d.stories[0].story_id, inside[0]);
+    }
+
+    #[test]
+    fn the_story_list_is_capped_and_an_unknown_topic_is_empty_not_an_error() {
+        let conn = test_db();
+        let headlines: Vec<String> = (0..25).map(|i| format!("Story number {i}")).collect();
+        let refs: Vec<&str> = headlines.iter().map(|h| h.as_str()).collect();
+        seed_topic(&conn, "Nvidia", &today_minus(2), &refs);
+
+        let d = build_dossier(&conn, "Nvidia").unwrap();
+        assert_eq!(d.stories.len(), DOSSIER_STORY_LIMIT, "25 seeded, 20 returned");
+
+        // A topic with no rows is a legitimate empty dossier, not a failure — the UI
+        // expands into "nothing yet" rather than an error toast.
+        let empty = build_dossier(&conn, "Nonexistent Topic").unwrap();
+        assert!(empty.stories.is_empty() && empty.predictions.is_empty());
+        assert_eq!(empty.topic, "Nonexistent Topic");
     }
 
     #[test]
