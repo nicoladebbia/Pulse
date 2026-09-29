@@ -915,3 +915,25 @@ export interface ProposalBacktest {
 	result: WhatIfResult;
 	hypotheses_tested: number;
 }
+
+export interface TradeReview {
+	id: number; ticker: string; reason: string;
+	entry_date: string; exit_date: string; entry_price: number; exit_price: number; pnl_pct: number;
+	max_gain_pct: number | null; max_loss_pct: number | null; gave_back_pct: number | null;
+	after_5d_pct: number | null; after_10d_pct: number | null; after_20d_pct: number | null;
+	best_after_pct: number | null; worst_after_pct: number | null;
+	if_held: 'stop_first' | 'target_first' | 'neither' | 'pending' | 'no_data';
+	holding_was_better: boolean | null;
+}
+
+export interface ReasonScore {
+	reason: string; trades: number; avg_pnl_pct: number;
+	avg_after_10d_pct: number | null; holding_better_pct: number | null;
+	stop_first: number; target_first: number; neither: number; pending: number;
+	avg_gave_back_pct: number | null;
+}
+
+export interface ExitReview {
+	horizon_days: number; held_stop_pct: number; held_target_pct: number;
+	by_reason: ReasonScore[]; trades: TradeReview[];
+}

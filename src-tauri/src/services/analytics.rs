@@ -466,7 +466,7 @@ pub fn get_or_generate_journal(conn: &Connection, trade_id: i64) -> Result<Trade
     let trade = conn.query_row(
         "SELECT pt.ticker, pt.entry_date, pt.exit_date, pt.entry_price, pt.exit_price,
                 pt.position_size, pt.pnl_pct, pt.pnl, pt.signal_profile, pt.status,
-                pt.confidence, e.name, pt.entity_id
+                pt.confidence, e.name, pt.entity_id, pt.exit_reason
          FROM paper_trades pt
          LEFT JOIN entities e ON e.id = pt.entity_id
          WHERE pt.id = ?1",
@@ -485,11 +485,12 @@ pub fn get_or_generate_journal(conn: &Connection, trade_id: i64) -> Result<Trade
             row.get::<_, f64>(10)?,    // confidence
             row.get::<_, Option<String>>(11)?, // entity name
             row.get::<_, i64>(12)?,    // entity_id
+            row.get::<_, Option<String>>(13)?, // exit_reason
         )),
     ).map_err(|e| e.to_string())?;
 
     let (ticker, entry_date, exit_date, entry_price, exit_price, position_size,
-         pnl_pct, pnl, signal_profile, status, _confidence, entity_name, _entity_id) = trade;
+         pnl_pct, pnl, signal_profile, status, _confidence, entity_name, _entity_id, exit_reason) = trade;
 
     // Parse signal breakdown
     let signal_breakdown = parse_signal_breakdown(&signal_profile);
@@ -508,6 +509,7 @@ pub fn get_or_generate_journal(conn: &Connection, trade_id: i64) -> Result<Trade
             pnl_pct,
             pnl,
             status: &status,
+            exit_reason: exit_reason.as_deref(),
             signals: &signal_breakdown,
         });
         // Store it
@@ -554,6 +556,9 @@ struct JournalInputs<'a> {
     pnl_pct: Option<f64>,
     pnl: Option<f64>,
     status: &'a str,
+    /// The rule that closed the trade (migration 036). Absent on rows closed
+    /// before it existed; the status wording is the fallback then.
+    exit_reason: Option<&'a str>,
     signals: &'a [SignalEntry],
 }
 
@@ -569,6 +574,7 @@ fn generate_journal_text(t: &JournalInputs<'_>) -> String {
         pnl_pct,
         pnl,
         status,
+        exit_reason: recorded_reason,
         signals,
     } = *t;
     let mut parts = Vec::new();
@@ -612,10 +618,23 @@ fn generate_journal_text(t: &JournalInputs<'_>) -> String {
         // nothing has written this status since. No row in the live ledger carries it, but an
         // older database might, and telling its owner a deleted rule closed their position is
         // exactly the fabrication the note above forbids.
-        let exit_reason = match status {
+        // Since migration 036 the exit engine records the rule; use it when present.
+        let rule = recorded_reason
+            .and_then(|r| r.split(|c: char| c.is_whitespace() || c == '(').next())
+            .unwrap_or("");
+        let exit_reason = match rule {
+            "trailing_stop" => "the trailing stop was hit",
+            "signal_decay" => "signal decay triggered an exit",
+            "profit_target" => "the profit target was reached",
+            "hard_stop_loss" => "the -15% hard stop was hit",
+            "fixed_stop_loss" => "the fixed -10% stop was hit (no ATR data)",
+            "manual" | "manual_not_held" => "it was closed manually",
+            "closed_between_runs" => "a pending exit order filled between runs",
+            _ => match status {
             "stopped_out" => "the trailing stop was hit",
             "expired" => "the retired calendar-expiry engine closed it (that rule no longer exists)",
             _ => "it was closed manually (exit reason not recorded)",
+            },
         };
 
         let pnl_str = if let Some(pnl_d) = pnl {
@@ -675,6 +694,24 @@ fn empty_analytics(open_count: usize) -> PortfolioAnalytics {
 
 #[cfg(test)]
 mod tests {
+    /// A recorded exit rule is stated; without one the status wording is kept.
+    #[test]
+    fn a_journal_states_the_recorded_exit_rule() {
+        let inputs = |status, exit_reason| super::JournalInputs {
+            ticker: "LION", entity_name: Some("Lionsgate"),
+            entry_date: "2026-09-22", exit_date: Some("2026-09-29"),
+            entry_price: 11.40, exit_price: Some(10.83), position_size: 3879.57,
+            pnl_pct: Some(-5.0), pnl: Some(-192.68), status, exit_reason, signals: &[],
+        };
+        let decay = super::generate_journal_text(&inputs("closed", Some("signal_decay (orig 0.36, pnl -5.6%)")));
+        assert!(decay.contains("because signal decay triggered an exit"), "{decay}");
+        assert!(decay.contains("Position size: $3880") && decay.contains("($-193)"), "{decay}");
+        let legacy = super::generate_journal_text(&inputs("closed", None));
+        assert!(legacy.contains("exit reason not recorded"), "{legacy}");
+        let unknown = super::generate_journal_text(&inputs("stopped_out", Some("something_new")));
+        assert!(unknown.contains("the trailing stop was hit"), "falls back to status: {unknown}");
+    }
+
     use super::*;
 
     #[test]

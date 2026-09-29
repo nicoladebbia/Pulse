@@ -271,11 +271,17 @@ fn get_trades_by_status(conn: &Connection, status: &str) -> Result<Vec<PaperTrad
     // SEV1: "closed" must include every terminal state, not just status='closed'. The DB
     // has 6 stopped_out rows that were silently hidden — two-thirds of the ledger. Any
     // non-open status (closed, stopped_out, expired) is a completed trade the user should
-    // see. "open" and other specific statuses still match exactly.
+    // see. "open" and other specific statuses still match exactly. The exception is an
+    // 'expired' row with no P&L: an entry order that died unfilled, or a row the 2026-09
+    // ledger repair merged into the trade it duplicated (exit_reason 'merged_into_<id>').
+    // Neither ever held a position, and 36 of them were crowding real trades out of the
+    // 50-row window.
     let sql = if status == "closed" {
         format!(
             "SELECT {TRADE_COLUMNS} FROM paper_trades \
-             WHERE status != 'open' ORDER BY COALESCE(exit_date, entry_date) DESC LIMIT 50"
+             WHERE status != 'open' \
+               AND NOT (status = 'expired' AND pnl_pct IS NULL) \
+             ORDER BY COALESCE(exit_date, entry_date) DESC LIMIT 50"
         )
     } else {
         format!(
@@ -292,4 +298,33 @@ fn get_trades_by_status(conn: &Connection, status: &str) -> Result<Vec<PaperTrad
     };
 
     Ok(trades)
+}
+
+#[cfg(test)]
+mod closed_trades_tests {
+    use super::get_trades_from_db;
+    use rusqlite::Connection;
+
+    #[test]
+    fn rows_that_never_held_a_position_are_not_listed_as_closed_trades() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::connection::run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            // entity_id is set: the row mapper reads it as a plain i64 (no live row is NULL).
+            "INSERT INTO entities (id, name, name_normalized, entity_type, first_seen, last_seen)
+             VALUES (1, 'A', 'a', 'company', '2026-09-01', '2026-09-01');
+             INSERT INTO paper_trades (id, entity_id, ticker, direction, entry_price, entry_date, position_size,
+                 confidence, signal_profile, status, pnl, pnl_pct, exit_date, exit_reason) VALUES
+             (1, 1, 'A', 'long', 10, '2026-09-01', 1000, 0.4, '{}', 'closed', -50, -5, '2026-09-05', 'trailing_stop'),
+             (2, 1, 'A', 'long', 10, '2026-08-31', 1000, 0.4, '{}', 'expired', NULL, NULL, '2026-08-31', 'merged_into_1'),
+             (3, 1, 'B', 'long', 10, '2026-09-01', 1000, 0.4, '{}', 'expired', NULL, NULL, '2026-09-01', 'entry_order_canceled'),
+             (4, 1, 'C', 'long', 10, '2026-05-01', 1000, 0.4, '{}', 'expired', 20, 2, '2026-08-01', NULL),
+             (5, 1, 'D', 'long', 10, '2026-09-01', 1000, 0.4, '{}', 'stopped_out', -150, -15, '2026-09-10', NULL),
+             (6, 1, 'E', 'long', 10, '2026-09-20', 1000, 0.4, '{}', 'open', NULL, NULL, NULL, NULL);",
+        )
+        .unwrap();
+        let mut ids: Vec<i64> = get_trades_from_db(&conn, "closed").unwrap().iter().map(|t| t.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 4, 5], "an expired trade that has P&L is still a trade");
+    }
 }

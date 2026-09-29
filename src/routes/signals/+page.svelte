@@ -3,13 +3,13 @@
 	import {
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
 		executeTrade, closePosition, getFinancialEvents, getSignalEvidence, getSourceHealth,
-		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getTradeJournal,
+		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getExitReview, getTradeJournal,
 		runBacktest, startPriceStream, stopPriceStream, getTradeRationale,
 		getPendingCalibration, applyPendingCalibration, rejectPendingCalibration, getCalibrationGateStatus
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
-		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics,
+		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics, ExitReview,
 		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate, TradeRationale,
 		PendingCalibrationRow, CalibrationGateStatus
 	} from '$lib/tauri/types';
@@ -38,6 +38,8 @@
 	let priceRefreshFailed = $state(false);
 	let analytics = $state<PortfolioAnalytics | null>(null);
 	let showAnalytics = $state(false);
+	let exitReview = $state<ExitReview | null>(null);
+	let showExitTrades = $state(false);
 	let expandedTradeId = $state<number | null>(null);
 	let tradeJournals = $state<Record<number, TradeJournal>>({});
 	let aiRationales = $state<Record<number, TradeRationale>>({});
@@ -169,6 +171,7 @@
 			// Load async data separately (Alpaca API call + price refresh)
 			getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
 			getPortfolioAnalytics().then(a => { analytics = a; }).catch(() => {});
+			getExitReview().then(r => { exitReview = r; }).catch(() => {});
 			getSourceHealth().then(sh => { sources = sh; }).catch(() => {});
 			getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
 			getPendingCalibration().then(rows => { pendingCalibration = rows; }).catch(() => {});
@@ -333,6 +336,24 @@
 		if (val === null) return 'text-text-muted';
 		return val >= 0 ? 'text-emerald-400' : 'text-rose-400';
 	}
+
+	function fmtPct(v: number | null): string {
+		if (v === null || v === undefined) return '—';
+		return `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
+	}
+
+	function pctColor(v: number | null): string {
+		if (v === null || v === undefined) return '';
+		return v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : '';
+	}
+
+	const ifHeldPill: Record<string, { label: string; cls: string }> = {
+		stop_first: { label: 'hit stop', cls: 'bg-rose-500/10 text-rose-400' },
+		target_first: { label: 'hit target', cls: 'bg-emerald-500/10 text-emerald-400' },
+		neither: { label: 'neither', cls: 'bg-white/5 text-text-muted' },
+		pending: { label: 'pending', cls: 'bg-white/5 text-text-muted' },
+		no_data: { label: 'no data', cls: 'bg-white/5 text-text-muted' }
+	};
 
 	function fmtChange(val: number | null): string {
 		if (val === null) return '--';
@@ -1351,6 +1372,84 @@
 						</div>
 					{/each}
 				</div>
+			{/if}
+
+			<!-- Exit Review -->
+			{#if exitReview && exitReview.trades.length > 0}
+				<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Exit Review</h2>
+				<p class="text-xs text-text-muted mb-3">Was closing or holding better? Prices after each exit, and what would have happened if held (−{exitReview.held_stop_pct}% stop / +{exitReview.held_target_pct}% target from entry, next {exitReview.horizon_days} trading days).</p>
+				<div class="bg-bg-card border border-border rounded-xl mb-4">
+					<div class="overflow-x-auto">
+						<table class="w-full text-xs tabular-nums">
+							<thead>
+								<tr class="text-text-muted text-left border-b border-border/50">
+									<th class="px-4 py-2 font-medium">Exit reason</th>
+									<th class="px-3 py-2 font-medium text-right">Trades</th>
+									<th class="px-3 py-2 font-medium text-right">Avg P&amp;L</th>
+									<th class="px-3 py-2 font-medium text-right">Price 10d later</th>
+									<th class="px-3 py-2 font-medium text-right">Holding better</th>
+									<th class="px-3 py-2 font-medium text-right">If held: stop / target / neither / pending</th>
+									<th class="px-4 py-2 font-medium text-right">Gave back</th>
+								</tr>
+							</thead>
+							<tbody class="divide-y divide-border/50">
+								{#each exitReview.by_reason as r}
+									<tr>
+										<td class="px-4 py-2 text-text">{r.reason}</td>
+										<td class="px-3 py-2 text-right text-text">{r.trades}</td>
+										<td class="px-3 py-2 text-right {pctColor(r.avg_pnl_pct)}">{fmtPct(r.avg_pnl_pct)}</td>
+										<td class="px-3 py-2 text-right {pctColor(r.avg_after_10d_pct)}">{fmtPct(r.avg_after_10d_pct)}</td>
+										<td class="px-3 py-2 text-right {r.holding_better_pct !== null && r.holding_better_pct >= 50 ? 'text-amber-400' : 'text-text'}">{r.holding_better_pct !== null ? `${r.holding_better_pct.toFixed(0)}%` : '—'}</td>
+										<td class="px-3 py-2 text-right text-text">{r.stop_first} / {r.target_first} / {r.neither} / {r.pending}</td>
+										<td class="px-4 py-2 text-right text-text">{r.avg_gave_back_pct !== null ? `${r.avg_gave_back_pct.toFixed(1)} pts` : '—'}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					</div>
+				</div>
+				<button class="text-xs text-text-muted hover:text-text mb-3" onclick={() => { showExitTrades = !showExitTrades; }}>
+					{showExitTrades ? 'Hide trades' : `Show trades (${exitReview.trades.length})`}
+				</button>
+				{#if showExitTrades}
+					<div class="bg-bg-card border border-border rounded-xl mb-6">
+						<div class="overflow-x-auto">
+							<table class="w-full text-xs tabular-nums">
+								<thead>
+									<tr class="text-text-muted text-left border-b border-border/50">
+										<th class="px-4 py-2 font-medium">Ticker</th>
+										<th class="px-3 py-2 font-medium">Exit date</th>
+										<th class="px-3 py-2 font-medium">Reason</th>
+										<th class="px-3 py-2 font-medium text-right">P&amp;L</th>
+										<th class="px-3 py-2 font-medium text-right">Best while open</th>
+										<th class="px-3 py-2 font-medium text-right">Gave back</th>
+										<th class="px-3 py-2 font-medium text-right">+5d</th>
+										<th class="px-3 py-2 font-medium text-right">+10d</th>
+										<th class="px-3 py-2 font-medium text-right">+20d</th>
+										<th class="px-4 py-2 font-medium">If held</th>
+									</tr>
+								</thead>
+								<tbody class="divide-y divide-border/50">
+									{#each exitReview.trades as t (t.id)}
+										{@const pill = ifHeldPill[t.if_held] ?? ifHeldPill.no_data}
+										<tr>
+											<td class="px-4 py-2 font-mono font-semibold text-text">{t.ticker}</td>
+											<td class="px-3 py-2 text-text-muted">{t.exit_date.slice(0, 10)}</td>
+											<td class="px-3 py-2 text-text">{t.reason}</td>
+											<td class="px-3 py-2 text-right {pctColor(t.pnl_pct)}">{fmtPct(t.pnl_pct)}</td>
+											<td class="px-3 py-2 text-right {pctColor(t.max_gain_pct)}">{fmtPct(t.max_gain_pct)}</td>
+											<td class="px-3 py-2 text-right text-text">{t.gave_back_pct !== null ? `${t.gave_back_pct.toFixed(1)} pts` : '—'}</td>
+											<td class="px-3 py-2 text-right {pctColor(t.after_5d_pct)}">{fmtPct(t.after_5d_pct)}</td>
+											<td class="px-3 py-2 text-right {pctColor(t.after_10d_pct)}">{fmtPct(t.after_10d_pct)}</td>
+											<td class="px-3 py-2 text-right {pctColor(t.after_20d_pct)}">{fmtPct(t.after_20d_pct)}</td>
+											<td class="px-4 py-2"><span class="px-1.5 py-0.5 rounded text-[10px] {pill.cls}">{pill.label}</span></td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				{/if}
 			{/if}
 
 			<!-- Manual trade -->

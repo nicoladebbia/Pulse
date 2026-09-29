@@ -11,7 +11,7 @@ use clap::Parser;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-use pulse_lib::services::backtester::{self, BacktestConfig};
+use pulse_lib::services::backtester::{self, BacktestConfig, ExitModel};
 
 #[derive(Parser, Debug)]
 #[command(name = "pulse-backtest", about = "Standalone backtest runner for Pulse")]
@@ -43,6 +43,18 @@ struct Args {
 
     #[arg(long, default_value_t = 5.0)]
     position_size_pct: f64,
+
+    /// Exit model: `fixed` (stop/take-profit %) or `atr` (live 3x ATR trail, -15% hard stop)
+    #[arg(long, default_value = "fixed")]
+    exit: String,
+
+    /// Entry sizing: `flat` (position_size_pct), `tiers` (live score tiers) or `risk` (risk_sizing defaults)
+    #[arg(long, default_value = "flat")]
+    sizing: String,
+
+    /// With `--sizing risk`: fraction of equity risked per trade (default 0.005)
+    #[arg(long)]
+    risk_per_trade: Option<f64>,
 }
 
 fn resolve_db_path(path: &str) -> PathBuf {
@@ -72,6 +84,20 @@ fn main() -> Result<()> {
         max_hold_days: args.max_hold_days,
         max_positions: args.max_positions,
         position_size_pct: args.position_size_pct,
+        exit_model: match args.exit.as_str() {
+            "fixed" => ExitModel::FixedPct,
+            "atr" => ExitModel::AtrTrail { atr_mult: 3.0, hard_stop_pct: 15.0 },
+            other => anyhow::bail!("--exit must be fixed or atr, got {other}"),
+        },
+        use_live_tiers: args.sizing == "tiers",
+        risk_sizing: match args.sizing.as_str() {
+            "risk" => Some(pulse_weights::risk_sizing::RiskParams {
+                risk_per_trade: args.risk_per_trade.unwrap_or(0.005),
+                ..Default::default()
+            }),
+            "flat" | "tiers" => None,
+            other => anyhow::bail!("--sizing must be flat, tiers or risk, got {other}"),
+        },
     };
 
     let result = backtester::run_backtest(&conn, config).map_err(|e| anyhow::anyhow!(e))?;
