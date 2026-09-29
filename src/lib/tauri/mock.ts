@@ -1,4 +1,4 @@
-import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier } from './types';
+import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest } from './types';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -566,4 +566,70 @@ export const mockTavilyQuota: TavilyQuota = {
 	limit: 1000,
 	remaining: 995,
 	warning: null,
+};
+
+// === Mock Research (browser-only preview; the app reads the real tables) ===
+
+export const mockResearchPapers: ResearchPaperRow[] = [
+	{
+		id: 1, arxiv_id: '2609.00001', title: 'Mock: Combining Alternative-Data Signals Under Sparse Evidence',
+		authors: 'A. Author, B. Author', categories: 'q-fin.PM stat.ML', published_at: '2026-09-22T10:00:00Z',
+		pages: 24, status: 'read', triage_score: 8, triage_reason: 'Directly about weighting multiple sparse signals.',
+		component: 'weights', one_line: 'Shrinking signal weights toward equal weight beats fitted weights when each signal has few events.',
+		proposal_count: 1, error: null
+	},
+	{
+		id: 2, arxiv_id: '2609.00002', title: 'Mock: Option Pricing With Rough Volatility',
+		authors: 'C. Author', categories: 'q-fin.CP', published_at: '2026-09-21T10:00:00Z',
+		pages: 31, status: 'skipped', triage_score: 1, triage_reason: 'Option pricing; the system trades no options.',
+		component: 'none', one_line: null, proposal_count: 0, error: null
+	}
+];
+
+export const mockResearchStats: ResearchStats = {
+	total: 2, read: 1, queued: 0, skipped: 1, proposals: 1, tested: 0, spent_today_usd: 0, spent_30d_usd: 0.27
+};
+
+export const mockResearchDetail: ResearchPaperDetail = {
+	paper: mockResearchPapers[0],
+	abstract_text: 'Mock abstract.',
+	triage: { relevance: 8, component: 'weights', testable_here: true, data_feasible: true, reason: 'Mock.' },
+	study: {
+		one_line: 'Shrinking weights toward $1/N$ beats fitted weights when each signal has few events.',
+		problem: 'Fitted combination weights overfit when every signal fires rarely.',
+		method: 'Shrink the fitted weight vector $w$ toward equal weights with intensity $\\lambda$.',
+		key_equations: [{ latex: 'w^{*} = (1-\\lambda)\\,\\hat{w} + \\lambda\\,\\tfrac{1}{N}\\mathbf{1}', meaning: 'Blend the estimated weights with equal weights.' }],
+		data: 'Mock data description.',
+		results: [{ claim: 'Out-of-sample Sharpe improves', number: '0.41 → 0.58', where: 'Table 3' }],
+		robustness: 'Mock robustness.',
+		critique: [{ issue: 'small_sample', detail: 'Only 9 years of data.', severity: 'medium' }],
+		evidence_strength: 'moderate',
+		transfers_to_pulse: 'Pulse fits no weights by regression, but calibration multiplies by hit rate on tiny samples — the same risk.',
+		glossary: [{ term: 'Shrinkage', definition: 'Pulling an estimate toward a simple prior to cut variance.' }]
+	},
+	read_model: 'claude-opus-5', read_cost_usd: 0.21, read_at: '2026-09-23 09:00:00', text_source: 'html',
+	proposals: [{
+		id: 1, kind: 'param', component: 'weights', title: 'Move weights halfway to equal', rationale: 'Mock.',
+		falsifier: 'Holdout Sharpe does not improve.', delta: { weights: [{ dimension: 'search_trend', weight: 0.25 }] },
+		spec_md: null, status: 'proposed', result: null, tested_at: null
+	}]
+};
+
+// Shape of a real what-if run on a DB copy (SL -6%, 2026-09-25); numbers rounded.
+const mockArm = (trades: number, hit: number, ret: number, sharpe: number) => ({
+	signals: 309, trades, open_at_end: 10, hit_rate: hit, avg_return_pct: ret / trades,
+	total_return_pct: ret, max_drawdown_pct: 1.2, sharpe
+});
+export const mockProposalBacktest: ProposalBacktest = {
+	result: {
+		train_window: ['2026-05-03', '2026-08-13'],
+		holdout_window: ['2026-08-14', '2026-09-24'],
+		train: { baseline: mockArm(38, 34.2, 1.9, 0.41), variant: mockArm(44, 27.3, 1.1, 0.22) },
+		holdout: { baseline: mockArm(12, 25.0, -0.6, -0.9), variant: mockArm(16, 18.75, -0.86, -1.48) },
+		verdict: 'inconclusive',
+		verdict_reason: 'holdout has 12 baseline and 16 variant closed trades; 20 each are needed before a difference means anything',
+		fidelity: { rows_checked: 2583, rows_matched: 2583, ok: true },
+		notes: []
+	},
+	hypotheses_tested: 1
 };

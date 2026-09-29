@@ -1,7 +1,7 @@
 mod cost;
 mod form4;
 pub(crate) mod notify;
-mod signals;
+pub(crate) mod signals;
 mod tickers;
 mod trading;
 pub(crate) use form4::{classify_ambiguous_8ks, enrich_form4_stories, fetch_targeted_form4,

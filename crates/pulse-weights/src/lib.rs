@@ -7,6 +7,9 @@
 //! (calibration-backtest-universe audit, 2026-07-23). Same pattern, same reason
 //! as `pulse-pricing`.
 
+pub mod strategy;
+pub use strategy::{DimensionWeight, SizingTier, StrategyDelta, StrategyParams};
+
 /// Canonical dimension order. Every `[f64; 8]` weight or norm array in either
 /// crate is indexed by this, so it is the one place the order is defined.
 pub const DIMENSIONS: [&str; 8] = [

@@ -106,12 +106,15 @@ struct DetailsBlob {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct SignalCandidate {
-    ticker: String,
-    entity_name: String,
-    compound_score: f64,
-    signal_date: String,
-    signal_profile: String,
+pub(crate) struct SignalCandidate {
+    pub(crate) ticker: String,
+    pub(crate) entity_name: String,
+    pub(crate) compound_score: f64,
+    pub(crate) signal_date: String,
+    pub(crate) signal_profile: String,
+    /// Position size override (% of equity). None = `config.position_size_pct`.
+    /// Set by the what-if backtester to model the live sizing tiers.
+    pub(crate) size_pct: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -141,10 +144,38 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
     }
 
     let candidates = get_signal_candidates(conn, &config)?;
+    let result = simulate(conn, &config, candidates)?;
+    if result.total_signals == 0 || result.equity_curve.is_empty() {
+        return Ok(result);
+    }
+    save_result(
+        conn,
+        &result.config_summary,
+        result.total_signals,
+        &result,
+        &SavedMetrics {
+            hit_rate: result.hit_rate,
+            avg_return: result.avg_return_pct,
+            max_drawdown: result.max_drawdown_pct,
+            sharpe: result.sharpe_ratio,
+            avg_hold: result.avg_holding_days,
+        },
+    )?;
+    Ok(result)
+}
+
+/// The calendar walk over pre-scored candidates. Pure with respect to the DB
+/// (reads prices, writes nothing) so the what-if backtester can run it many
+/// times without polluting `backtest_results`.
+pub(crate) fn simulate(
+    conn: &Connection,
+    config: &BacktestConfig,
+    candidates: Vec<SignalCandidate>,
+) -> Result<BacktestResult, String> {
     let total_signals = candidates.len();
 
     if candidates.is_empty() {
-        return Ok(empty_result(&config));
+        return Ok(empty_result(config));
     }
 
     // Preload prices for all candidate tickers across the extended window.
@@ -170,7 +201,7 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
         .collect();
 
     if trading_dates.is_empty() {
-        return Ok(empty_result(&config));
+        return Ok(empty_result(config));
     }
 
     // A ticker can only ever be admitted on a day it both signals AND has a
@@ -215,7 +246,8 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
     for date in &trading_dates {
         // (1) Process opens on *this* day — check SL, TP, then max_hold. Any
         // exit frees the slot immediately so a same-day admit can reuse it.
-        let open_tickers: Vec<String> = open_positions.keys().cloned().collect();
+        let mut open_tickers: Vec<String> = open_positions.keys().cloned().collect();
+        open_tickers.sort(); // deterministic exit order (P&L sums and the trade list)
         for ticker in open_tickers {
             let pos = match open_positions.get(&ticker) {
                 Some(p) => p.clone(),
@@ -296,7 +328,8 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
                 // positions to get the true "book value" we'd size against.
                 let unrealized_now = mark_to_market(&open_positions, &prices, date);
                 let sizing_equity = equity + unrealized_now;
-                let position_value = sizing_equity * (config.position_size_pct / 100.0);
+                let size_pct = cand.size_pct.unwrap_or(config.position_size_pct);
+                let position_value = sizing_equity * (size_pct / 100.0);
                 if position_value <= 0.0 { continue; }
 
                 open_positions.insert(cand.ticker.clone(), OpenPosition {
@@ -318,7 +351,8 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
 
     // Force-close anything still open at the last trading date with data.
     if let Some(last_date) = trading_dates.last().cloned() {
-        let still_open: Vec<String> = open_positions.keys().cloned().collect();
+        let mut still_open: Vec<String> = open_positions.keys().cloned().collect();
+        still_open.sort(); // deterministic exit order (P&L sums and the trade list)
         for ticker in still_open {
             let pos = match open_positions.remove(&ticker) {
                 Some(p) => p,
@@ -388,24 +422,10 @@ pub fn run_backtest(conn: &Connection, config: BacktestConfig) -> Result<Backtes
         avg_holding_days,
         starting_equity,
         ending_equity,
-        trades: trades.clone(),
-        equity_curve: equity_curve.clone(),
-        monthly_returns: monthly_returns.clone(),
+        trades,
+        equity_curve,
+        monthly_returns,
     };
-
-    save_result(
-        conn,
-        &config_summary,
-        total_signals,
-        &result,
-        &SavedMetrics {
-            hit_rate,
-            avg_return: avg_return_pct,
-            max_drawdown: max_drawdown_pct,
-            sharpe: sharpe_ratio,
-            avg_hold: avg_holding_days,
-        },
-    )?;
 
     Ok(result)
 }
@@ -582,8 +602,13 @@ fn mark_to_market(
     prices: &PriceTable,
     date: &str,
 ) -> f64 {
+    // Sorted, not HashMap order: float addition is not associative, so a random
+    // order made two identical runs differ in the 14th digit (and the what-if
+    // baseline-vs-noop check flaky).
+    let mut positions: Vec<&OpenPosition> = open.values().collect();
+    positions.sort_by(|a, b| a.ticker.cmp(&b.ticker));
     let mut total = 0.0;
-    for pos in open.values() {
+    for pos in positions {
         let close = prices
             .get(&pos.ticker)
             .and_then(|m| m.get(date))
@@ -645,6 +670,7 @@ fn get_signal_candidates(conn: &Connection, config: &BacktestConfig) -> Result<V
                 compound_score: row.get(2)?,
                 signal_date: row.get(3)?,
                 signal_profile: profile.to_string(),
+                size_pct: None,
             })
         },
     ).map_err(|e| e.to_string())?
