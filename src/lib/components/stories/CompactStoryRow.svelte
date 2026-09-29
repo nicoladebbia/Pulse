@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { SECTORS, type SectorId } from '$lib/config';
 	import type { Story } from '$lib/tauri/types';
+	import FeedbackControl from './FeedbackControl.svelte';
 
 	import type { StoryTrendBadge } from '$lib/tauri/types';
 
@@ -11,6 +12,7 @@
 	let sector = $derived(SECTORS[story.sector as SectorId]);
 </script>
 
+<div class="relative group/fb">
 <button
 	class="w-full flex items-center gap-3 py-2.5 px-3 hover:bg-bg-card-hover rounded-lg
 		cursor-pointer transition-colors text-left {focused ? 'bg-ai/5 ring-1 ring-ai/50' : ''}"
@@ -52,3 +54,7 @@
 		{story.source_name}
 	</span>
 </button>
+	<div class="absolute right-2 top-1/2 -translate-y-1/2">
+		<FeedbackControl storyId={story.id} />
+	</div>
+</div>

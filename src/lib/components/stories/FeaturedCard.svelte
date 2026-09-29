@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { SECTORS, type SectorId } from '$lib/config';
 	import type { Story, StoryTrendBadge } from '$lib/tauri/types';
+	import FeedbackControl from './FeedbackControl.svelte';
 
 	let { story, onExpand, focused = false, trendBadge = undefined }: {
 		story: Story; onExpand: (s: Story) => void; focused?: boolean; trendBadge?: StoryTrendBadge;
@@ -19,6 +20,7 @@
 	);
 </script>
 
+<div class="relative group/fb">
 <button
 	class="w-full text-left bg-bg-card border rounded-xl p-4 hover:bg-bg-card-hover
 		transition-all duration-200 cursor-pointer group {focused ? 'border-ai ring-1 ring-ai/50' : 'border-border'}"
@@ -59,3 +61,7 @@
 		{story.source_name}{#if timeStr} · {timeStr}{/if}
 	</div>
 </button>
+	<div class="absolute bottom-3 right-3">
+		<FeedbackControl storyId={story.id} />
+	</div>
+</div>

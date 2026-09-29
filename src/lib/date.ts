@@ -43,3 +43,28 @@ export function shiftDateStr(dateStr: string, days: number): string {
 export function isSameOrBefore(a: string, b: string): boolean {
 	return a <= b;
 }
+
+/**
+ * "Today" / "Yesterday" / "3d ago" / "Aug 16" for a `YYYY-MM-DD`.
+ *
+ * Compares CALENDAR DAYS, not timestamps. The version this replaces anchored the
+ * story at `T12:00:00` and subtracted a live `now`; before local noon that
+ * difference is negative, so `Math.floor` returned -1 and every label was a day
+ * out — today read "-1d ago" and yesterday read "Today". Observed on the Trends
+ * page at 07:01 local, and the identical code was in ChatSources.
+ *
+ * `Math.round` rather than `floor`, because a DST transition makes one calendar
+ * day 23 or 25 hours long and a floor over that lands on the wrong day. A future
+ * date falls through to the formatted form rather than a negative count.
+ */
+export function relativeDayLabel(dateStr: string, now: Date = new Date()): string {
+	const [y, m, d] = dateStr.split('-').map(Number);
+	const then = new Date(y, m - 1, d);
+	const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+	const diffDays = Math.round((today.getTime() - then.getTime()) / 86400000);
+
+	if (diffDays === 0) return 'Today';
+	if (diffDays === 1) return 'Yesterday';
+	if (diffDays > 1 && diffDays < 7) return `${diffDays}d ago`;
+	return then.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}

@@ -238,6 +238,105 @@ pub fn summarize(conn: &rusqlite::Connection, days: u32) -> rusqlite::Result<Eng
     })
 }
 
+// ── Explicit curation feedback ────────────────────────────────────────────────
+//
+// The one explicit signal about curation: a shown story "mattered" or "didn't".
+// Stored in `story_feedback` (migration 034), one row per story. Opens and read
+// time are not stored again — they are the story_open / story_close events above,
+// joined in by the `story_feedback_signals` view.
+
+const FEEDBACK_LABELS: &[&str] = &["mattered", "didnt"];
+
+/// The frontend asks for the labels of whatever is on screen in one call; an
+/// archive page is a few hundred stories, so this only guards against a runaway.
+const MAX_FEEDBACK_LOOKUP: usize = 2000;
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct StoryFeedback {
+    pub story_id: i64,
+    pub label: String,
+}
+
+/// Set (`Some`) or clear (`None`) the label on a story. The briefing id is read
+/// from the story row rather than trusted from the caller.
+pub fn set_feedback(
+    conn: &rusqlite::Connection,
+    story_id: i64,
+    label: Option<&str>,
+) -> rusqlite::Result<()> {
+    let Some(label) = label else {
+        conn.execute("DELETE FROM story_feedback WHERE story_id = ?1", [story_id])?;
+        return Ok(());
+    };
+    if !FEEDBACK_LABELS.contains(&label) {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "unknown feedback label '{label}'"
+        )));
+    }
+    let written = conn.execute(
+        "INSERT INTO story_feedback (story_id, briefing_id, label)
+         SELECT id, briefing_id, ?2 FROM stories WHERE id = ?1
+         ON CONFLICT(story_id) DO UPDATE SET
+             label = excluded.label,
+             updated_at = datetime('now')",
+        rusqlite::params![story_id, label],
+    )?;
+    if written == 0 {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "no story with id {story_id}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn get_feedback(
+    conn: &rusqlite::Connection,
+    story_ids: &[i64],
+) -> rusqlite::Result<Vec<StoryFeedback>> {
+    if story_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if story_ids.len() > MAX_FEEDBACK_LOOKUP {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "at most {MAX_FEEDBACK_LOOKUP} story ids per lookup"
+        )));
+    }
+    // One bound parameter regardless of list length: the ids travel as a JSON array.
+    let ids = serde_json::to_string(story_ids).map_err(|e| {
+        rusqlite::Error::InvalidParameterName(e.to_string())
+    })?;
+    let mut stmt = conn.prepare(
+        "SELECT story_id, label FROM story_feedback
+         WHERE story_id IN (SELECT value FROM json_each(?1))
+         ORDER BY story_id",
+    )?;
+    let rows = stmt.query_map([ids], |r| {
+        Ok(StoryFeedback { story_id: r.get(0)?, label: r.get(1)? })
+    })?;
+    rows.collect()
+}
+
+/// Label a story. Called on a tap, so unlike `record_engagement` the frontend
+/// does look at the result — it reverts its optimistic state on error.
+#[tauri::command]
+pub fn set_story_feedback(
+    db: State<DbState>,
+    story_id: i64,
+    label: Option<String>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    set_feedback(&conn, story_id, label.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_story_feedback(
+    db: State<DbState>,
+    story_ids: Vec<i64>,
+) -> Result<Vec<StoryFeedback>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    get_feedback(&conn, &story_ids).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod engagement_tests {
     use super::*;
@@ -564,5 +663,140 @@ mod engagement_tests {
             .query_row("SELECT COUNT(*) FROM engagement_events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "the recent event must survive the prune");
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+    use crate::db::test_helpers::{seed_briefing, test_db, TestStory};
+
+    fn label_of(conn: &rusqlite::Connection, story_id: i64) -> Option<String> {
+        get_feedback(conn, &[story_id]).unwrap().pop().map(|f| f.label)
+    }
+
+    #[test]
+    fn label_can_be_set_changed_and_cleared() {
+        let conn = test_db();
+        let (bid, ids) = seed_briefing(&conn, "2026-09-24", &[TestStory::new("ai", "One")]);
+
+        set_feedback(&conn, ids[0], Some("mattered")).unwrap();
+        assert_eq!(label_of(&conn, ids[0]).as_deref(), Some("mattered"));
+        let stored_bid: i64 = conn
+            .query_row("SELECT briefing_id FROM story_feedback WHERE story_id = ?1", [ids[0]], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored_bid, bid);
+
+        set_feedback(&conn, ids[0], Some("didnt")).unwrap();
+        assert_eq!(label_of(&conn, ids[0]).as_deref(), Some("didnt"));
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM story_feedback", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "relabelling overwrites, it does not append");
+
+        set_feedback(&conn, ids[0], None).unwrap();
+        assert_eq!(label_of(&conn, ids[0]), None);
+    }
+
+    #[test]
+    fn rejects_unknown_labels_and_unknown_stories() {
+        let conn = test_db();
+        let (_, ids) = seed_briefing(&conn, "2026-09-24", &[TestStory::new("ai", "One")]);
+        assert!(set_feedback(&conn, ids[0], Some("meh")).is_err());
+        assert!(set_feedback(&conn, 999_999, Some("mattered")).is_err());
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM story_feedback", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0);
+        // Clearing a label that was never set is a no-op, not an error.
+        assert!(set_feedback(&conn, ids[0], None).is_ok());
+    }
+
+    #[test]
+    fn lookup_returns_only_requested_labelled_stories() {
+        let conn = test_db();
+        let (_, ids) = seed_briefing(
+            &conn,
+            "2026-09-24",
+            &[TestStory::new("ai", "A"), TestStory::new("tech", "B"), TestStory::new("italy", "C")],
+        );
+        set_feedback(&conn, ids[0], Some("mattered")).unwrap();
+        set_feedback(&conn, ids[2], Some("didnt")).unwrap();
+        let got = get_feedback(&conn, &[ids[0], ids[1]]).unwrap();
+        assert_eq!(got, vec![StoryFeedback { story_id: ids[0], label: "mattered".into() }]);
+        assert!(get_feedback(&conn, &[]).unwrap().is_empty());
+        assert!(get_feedback(&conn, &vec![1; MAX_FEEDBACK_LOOKUP + 1]).is_err());
+    }
+
+    /// A simulated briefing session end to end: the reader opens one story twice
+    /// (two reads), labels two, ignores one; one fetched article was never shown.
+    /// The view must carry every signal for the shown stories, and the buried
+    /// article must be findable as a candidate with no story.
+    #[test]
+    fn simulated_session_lands_in_the_signals_view() {
+        let conn = test_db();
+        let (bid, ids) = seed_briefing(
+            &conn,
+            "2026-09-24",
+            &[TestStory::new("ai", "Read"), TestStory::new("tech", "Skimmed"), TestStory::new("miami", "Ignored")],
+        );
+        let open = |id: i64| EngagementInput { story_id: Some(id), briefing_id: Some(bid), ..ev_base("story_open") };
+        let close = |id: i64, ms: i64| EngagementInput {
+            story_id: Some(id),
+            briefing_id: Some(bid),
+            dwell_ms: Some(ms),
+            ..ev_base("story_close")
+        };
+        insert_event(&conn, &open(ids[0])).unwrap();
+        insert_event(&conn, &close(ids[0], 30_000)).unwrap();
+        insert_event(&conn, &open(ids[0])).unwrap();
+        insert_event(&conn, &close(ids[0], 12_500)).unwrap();
+        set_feedback(&conn, ids[0], Some("mattered")).unwrap();
+        set_feedback(&conn, ids[1], Some("didnt")).unwrap();
+
+        conn.execute(
+            "INSERT INTO fetch_candidates (briefing_id, url_hash, url, title, sector, pool_position,
+                 precurate_ran, kept_by_precurate, summarized, story_id)
+             VALUES (?1, 'h_shown', 'https://x/shown', 'Read', 'ai', 0, 1, 1, 1, ?2),
+                    (?1, 'h_buried', 'https://x/buried', 'Buried', 'italy', 1, 1, 0, 0, NULL)",
+            rusqlite::params![bid, ids[0]],
+        )
+        .unwrap();
+
+        let rows: Vec<(i64, i64, i64, f64, Option<String>)> = conn
+            .prepare(
+                "SELECT story_id, rank_shown, opened, read_seconds, explicit_label
+                 FROM story_feedback_signals WHERE briefing_id = ?1 ORDER BY rank_shown",
+            )
+            .unwrap()
+            .query_map([bid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (ids[0], 0, 1, 42.5, Some("mattered".into())),
+                (ids[1], 1, 0, 0.0, Some("didnt".into())),
+                (ids[2], 2, 0, 0.0, None),
+            ]
+        );
+
+        let buried: Vec<String> = conn
+            .prepare("SELECT url FROM fetch_candidates WHERE briefing_id = ?1 AND story_id IS NULL")
+            .unwrap()
+            .query_map([bid], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(buried, vec!["https://x/buried".to_string()]);
+    }
+
+    fn ev_base(event: &str) -> EngagementInput {
+        EngagementInput {
+            surface: "/".into(),
+            event: event.into(),
+            story_id: None,
+            briefing_id: None,
+            sector: None,
+            dwell_ms: None,
+            detail: None,
+        }
     }
 }

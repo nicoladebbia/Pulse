@@ -210,6 +210,11 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // weeks with nothing but a log line nobody reads.
     let mut pre_curate_fell_back = false;
     let mut analysis_degraded = false;
+    // The whole post-dedup pool, snapshotted before the cut consumes it, for the
+    // fetch_candidates record in Phase 8.2. Nothing downstream reads it.
+    let candidate_pool = news_articles.clone();
+    // Which cut produced the summarized set; set inside the branches below.
+    let mut precurate_cut = crate::candidates::PreCurateCut::None;
     let articles_to_summarize = if news_articles.len() > 100 {
         tracing::info!("Pre-curating: selecting best articles from {} candidates...", news_articles.len());
         let api_key = std::env::var("GROQ_API_KEY")
@@ -217,6 +222,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
         match client.pre_curate(&news_articles).await {
             Ok(indices) => {
+                precurate_cut = crate::candidates::PreCurateCut::Groq;
                 let curated: Vec<_> = indices.into_iter()
                     .filter_map(|i| news_articles.get(i).cloned())
                     .collect();
@@ -254,6 +260,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    precurate_cut = crate::candidates::PreCurateCut::FallbackCap;
                     balanced
                 } else {
                     news_articles
@@ -269,6 +276,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     progress.start_stage(3);
     // Ground summaries in real article text (best-effort — fetch failures keep
     // the snippet). Without this, models fabricate specifics from title+snippet.
+    let kept_hashes = crate::candidates::url_hashes(articles_to_summarize.iter().map(|a| a.url.as_str()));
     tracing::info!("Phase 3: Fetching article bodies for {} stories...", articles_to_summarize.len());
     let articles_to_summarize = crate::article_text::enrich(articles_to_summarize).await;
     // Grounding coverage feeds the post-run health alert: 0 grounded articles
@@ -281,6 +289,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let outcome = crate::claude::summarize_stories(&articles_to_summarize, Some(&progress), db_path).await?;
     let summarize_failure = outcome.failure;
     let summaries = outcome.stories;
+    let summarized_hashes = crate::candidates::url_hashes(summaries.iter().map(|s| s.article.url.as_str()));
     let sum_count = summaries.len() as i64;
     let sum_failed = articles_to_summarize.len() as i64 - sum_count;
     // No hardcoded log_usage here — GroqClient now logs each summarize_story call
@@ -477,7 +486,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // Phase 8: Write NEWS stories to database (with embeddings)
     progress.start_stage(8);
     tracing::info!("Phase 8: Writing {} news stories to database...", analysis.curated_stories.len());
-    write_to_db(db_path, &analysis, embeddings.as_deref(), prefixes.as_deref(), executive_summary.as_deref())?;
+    let briefing_id = write_to_db(db_path, &analysis, embeddings.as_deref(), prefixes.as_deref(), executive_summary.as_deref())?;
 
     // Phase 8.1: Write financial stories (after main briefing exists so they share the same briefing_id)
     if !financial_stories.is_empty() {
@@ -487,6 +496,26 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
             Err(e) => tracing::warn!("Financial story write failed: {}", e),
         }
         record_financial_dedup(db_path, &financial_stories);
+    }
+
+    // Phase 8.2: Record the whole candidate pool and how far each article got
+    // (fetch_candidates). Observational only — the briefing is already written, and
+    // a failure here is logged and dropped.
+    {
+        let outcome = crate::candidates::StageOutcome {
+            precurate_cut,
+            kept: kept_hashes,
+            summarized: summarized_hashes,
+        };
+        match rusqlite::Connection::open(db_path).and_then(|conn| {
+            conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+            crate::candidates::record(&conn, briefing_id, &candidate_pool, &outcome)
+        }) {
+            Ok((inserted, linked)) => tracing::info!(
+                "Recorded {} fetch candidates ({} curated into the briefing)", inserted, linked
+            ),
+            Err(e) => tracing::warn!("Fetch candidate record failed (non-fatal): {}", e),
+        }
     }
 
     // Phase 8.5: Auto-backfill missing embeddings from previous failed runs (non-fatal)
@@ -1295,7 +1324,7 @@ async fn backfill_missing_embeddings(db_path: &Path, max_stories: usize) -> anyh
     Ok(filled)
 }
 
-fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddings: Option<&[crate::embeddings::StoryEmbedding]>, prefixes: Option<&[Option<String>]>, executive_summary: Option<&str>) -> anyhow::Result<()> {
+fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddings: Option<&[crate::embeddings::StoryEmbedding]>, prefixes: Option<&[Option<String>]>, executive_summary: Option<&str>) -> anyhow::Result<i64> {
     // Ensure parent directory exists
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1474,7 +1503,7 @@ fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddi
 
     tx.commit()?;
     tracing::info!("Wrote {} stories to briefing {}", total, briefing_id);
-    Ok(())
+    Ok(briefing_id)
 }
 
 async fn extract_entities_from_stories(db_path: &Path, analysis: &crate::claude::AnalysisResult, progress: &ProgressWriter) -> anyhow::Result<usize> {
