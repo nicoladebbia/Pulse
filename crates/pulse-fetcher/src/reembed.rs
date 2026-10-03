@@ -134,6 +134,11 @@ fn staged(conn: &Connection) -> rusqlite::Result<i64> {
 /// in one transaction. Stories added during the run have no staged vector; the
 /// next backfill embeds them with the new model.
 fn swap_in(conn: &Connection, model: &str) -> anyhow::Result<usize> {
+    // Freedom vectors live under negative ids that aren't in `stories`, so they
+    // can't satisfy story_embeddings' foreign key; the freedoms pipeline writes
+    // them on a connection without FK enforcement, and so must this. (The pragma
+    // is a no-op inside a transaction, hence before it.)
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM story_embeddings", [])?;
     let n = tx.execute(
@@ -157,15 +162,19 @@ mod tests {
     #[test]
     fn swap_replaces_vectors_and_records_the_model() {
         let conn = Connection::open_in_memory().unwrap();
+        // Same FK as the real schema, enforced, as run_migrations leaves it.
         conn.execute_batch(&format!(
-            "CREATE TABLE stories (id INTEGER PRIMARY KEY, headline TEXT, summary TEXT, key_facts TEXT);
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE stories (id INTEGER PRIMARY KEY, headline TEXT, summary TEXT, key_facts TEXT);
              CREATE TABLE freedom_stories (id INTEGER PRIMARY KEY, headline TEXT, summary TEXT, key_facts TEXT);
-             CREATE TABLE story_embeddings (story_id INTEGER PRIMARY KEY, embedding BLOB NOT NULL);
+             CREATE TABLE story_embeddings (story_id INTEGER PRIMARY KEY REFERENCES stories(id) ON DELETE CASCADE, embedding BLOB NOT NULL);
+             PRAGMA foreign_keys=OFF;
              CREATE TABLE {STAGING} (story_id INTEGER PRIMARY KEY, embedding BLOB NOT NULL, model TEXT NOT NULL);
              INSERT INTO stories VALUES (1, 'a', 'b', '[]'), (2, 'c', 'd', '[]');
              INSERT INTO freedom_stories VALUES (7, 'f', 'g', '[]');
              INSERT INTO story_embeddings VALUES (1, x'01'), (2, x'01'), (-100007, x'01');
-             INSERT INTO {STAGING} VALUES (1, x'02', 'm'), (-100007, x'02', 'm'), (99, x'02', 'm');"
+             INSERT INTO {STAGING} VALUES (1, x'02', 'm'), (-100007, x'02', 'm'), (99, x'02', 'm');
+             PRAGMA foreign_keys=ON;"
         ))
         .unwrap();
 

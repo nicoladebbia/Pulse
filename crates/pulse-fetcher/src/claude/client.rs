@@ -788,7 +788,13 @@ impl GroqClient {
         // and as a bonus is immune to the Groq VPN/IP 403 block. Set
         // PULSE_ANALYZE_PROVIDER=groq to force the old path for A/B.
         let force_groq = std::env::var("PULSE_ANALYZE_PROVIDER").map(|v| v.eq_ignore_ascii_case("groq")).unwrap_or(false);
-        let text = if !force_groq && pulse_llm::api_key("ANTHROPIC_API_KEY").is_ok() {
+        let text = if pulse_llm::is_local() {
+            // Locally the OpenAI-style route is the better one: Ollama enforces
+            // json_object there with a grammar, while its Anthropic route has no JSON
+            // mode, and the local model broke this long body's JSON there (2026-10-03).
+            // 16000 for the same reason as the Haiku path below.
+            self.call(STRONG_MODEL_DEFAULT, "analyze", system, &user_msg, 16000).await?
+        } else if !force_groq && pulse_llm::api_key("ANTHROPIC_API_KEY").is_ok() {
             // 16000, not the Groq path's 8000: Haiku's relevance `reason` strings run
             // longer than 70B's and a 125-story payload measured ~8k output — the 8000
             // cap truncated a live run (2026-08-06). Haiku bills only tokens produced.
