@@ -241,7 +241,7 @@ pub(crate) async fn resolve_llm_prediction(
     p: &PredToResolve,
     today: &str,
 ) -> anyhow::Result<ResolutionOutcome> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
     // Gather stories near the target_date (+/- 7 days) that mention keywords
@@ -309,7 +309,7 @@ pub(crate) async fn resolve_llm_prediction(
     input.push_str("\nReturn your verdict as strict JSON only.");
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(30)))
         .build()?;
 
     let body = serde_json::json!({
@@ -320,11 +320,11 @@ pub(crate) async fn resolve_llm_prediction(
     });
 
     let resp = client
-        .post("https://api.anthropic.com/v1/messages")
+        .post(pulse_llm::messages_url())
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .header("Content-Type", "application/json")
-        .json(&body)
+        .json(&pulse_llm::messages_body(&body))
         .send()
         .await?;
 
@@ -751,7 +751,7 @@ pub(crate) async fn generate_predictions(
 ) -> anyhow::Result<usize> {
     use chrono::{Datelike, Local, Weekday};
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
     // Sunday = weekly Opus deep-dive. Other days = Sonnet.
@@ -852,7 +852,7 @@ pub(crate) async fn generate_predictions(
     };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(60)))
         .build()?;
 
     let body = serde_json::json!({
@@ -863,11 +863,11 @@ pub(crate) async fn generate_predictions(
     });
 
     let resp = client
-        .post("https://api.anthropic.com/v1/messages")
+        .post(pulse_llm::messages_url())
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .header("Content-Type", "application/json")
-        .json(&body)
+        .json(&pulse_llm::messages_body(&body))
         .send()
         .await?;
 

@@ -153,15 +153,25 @@ pub struct VoyageProvider {
 
 impl VoyageProvider {
     pub fn new(api_key: &str) -> Self {
+        // Locally a person is usually waiting on this (chat search), and a
+        // stalled Ollama must not hang the chat; the cloud client is unchanged.
+        let http = if pulse_llm::is_local() {
+            reqwest::Client::builder()
+                .timeout(pulse_llm::LOCAL_INTERACTIVE_TIMEOUT)
+                .build()
+                .unwrap_or_default()
+        } else {
+            reqwest::Client::new()
+        };
         Self {
             api_key: api_key.to_owned(),
-            http: reqwest::Client::new(),
+            http,
         }
     }
 
     pub fn from_env() -> Result<Self> {
         let api_key =
-            std::env::var("VOYAGE_API_KEY").context("VOYAGE_API_KEY not set in environment")?;
+            pulse_llm::api_key("VOYAGE_API_KEY").context("VOYAGE_API_KEY not set in environment")?;
         Ok(Self::new(&api_key))
     }
 }
@@ -179,15 +189,11 @@ struct VoyageEmbedding {
 #[async_trait]
 impl EmbeddingProvider for VoyageProvider {
     async fn embed(&self, texts: &[String], input_type: &str) -> Result<Vec<Vec<f32>>> {
-        let body = serde_json::json!({
-            "model": VOYAGE_MODEL,
-            "input": texts,
-            "input_type": input_type,
-        });
+        let body = pulse_llm::embeddings_body(VOYAGE_MODEL, texts, input_type);
 
         let resp = self
             .http
-            .post(VOYAGE_API_URL)
+            .post(pulse_llm::embeddings_url(VOYAGE_API_URL))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&body)

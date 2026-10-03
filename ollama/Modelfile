@@ -1,0 +1,5 @@
+# Pulse's local model: Qwen3.6 35B-A3B (MoE, ~3B active, ~22 GB) with a context
+# window big enough for pre-curation, which sends ~1,500 headlines in one prompt.
+# Ollama's default context is far smaller and it silently cuts longer prompts.
+FROM qwen3.6:35b-a3b
+PARAMETER num_ctx 65536

@@ -56,7 +56,6 @@ pub struct ClaudeEntityExtractor {
     http: reqwest::Client,
 }
 
-const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
 
 const EXTRACTION_SYSTEM_PROMPT: &str = r#"You are an entity extraction engine for a news intelligence system.
@@ -81,7 +80,7 @@ impl ClaudeEntityExtractor {
 
     pub fn from_env() -> Result<Self> {
         let api_key =
-            std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set in environment")?;
+            pulse_llm::api_key("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set in environment")?;
         Ok(Self::new(&api_key))
     }
 }
@@ -113,11 +112,11 @@ impl EntityExtractor for ClaudeEntityExtractor {
 
         let resp = self
             .http
-            .post(CLAUDE_API_URL)
+            .post(pulse_llm::messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
-            .json(&body)
+            .json(&pulse_llm::messages_body(&body))
             .send()
             .await
             .context("Claude API request failed")?;

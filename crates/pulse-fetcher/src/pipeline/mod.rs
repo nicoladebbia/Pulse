@@ -217,7 +217,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let mut precurate_cut = crate::candidates::PreCurateCut::None;
     let articles_to_summarize = if news_articles.len() > 100 {
         tracing::info!("Pre-curating: selecting best articles from {} candidates...", news_articles.len());
-        let api_key = std::env::var("GROQ_API_KEY")
+        let api_key = pulse_llm::api_key("GROQ_API_KEY")
             .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
         let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
         match client.pre_curate(&news_articles).await {
@@ -370,7 +370,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // connections (measured 0-2/run). A single-task call over the curated list
     // complies much better. Run whenever analyze produced <3; keep the longer list.
     if !analysis_degraded && analysis.connections.len() < 3
-        && let Ok(api_key) = std::env::var("GROQ_API_KEY")
+        && let Ok(api_key) = pulse_llm::api_key("GROQ_API_KEY")
             && let Ok(client) = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf())) {
                 match client.find_connections(&analysis.curated_stories).await {
                     Ok(conns) if conns.len() > analysis.connections.len() => {
@@ -966,7 +966,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
 
 
 async fn generate_freedoms_summary(curated: &[(&str, &crate::claude::SummarizedStory)], db_path: &Path) -> anyhow::Result<String> {
-    let api_key = std::env::var("GROQ_API_KEY")
+    let api_key = pulse_llm::api_key("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
     let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 
@@ -1108,7 +1108,7 @@ fn clean_theme_output(raw: &str) -> String {
 
 
 async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult, db_path: &Path) -> anyhow::Result<String> {
-    let api_key = std::env::var("GROQ_API_KEY")
+    let api_key = pulse_llm::api_key("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
     let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 
@@ -1139,7 +1139,7 @@ async fn generate_executive_summary(analysis: &crate::claude::AnalysisResult, db
 // Takes no `analysis`: it selects its own candidates straight from the DB
 // (relevance_score >= 8 for today), so the parameter was always ignored.
 async fn generate_deep_summaries(db_path: &std::path::Path) -> anyhow::Result<usize> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
     let conn = rusqlite::Connection::open(db_path)?;
@@ -1172,7 +1172,7 @@ async fn generate_deep_summaries(db_path: &std::path::Path) -> anyhow::Result<us
     // 60s per-request timeout — without this, a hung Anthropic connection
     // (e.g. school-network DNS stall) freezes the whole pipeline indefinitely.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(60)))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut count = 0;
@@ -1193,11 +1193,11 @@ async fn generate_deep_summaries(db_path: &std::path::Path) -> anyhow::Result<us
         });
 
         match client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(pulse_llm::messages_url())
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
-            .json(&body)
+            .json(&pulse_llm::messages_body(&body))
             .send()
             .await
         {
@@ -1507,11 +1507,11 @@ fn write_to_db(db_path: &Path, analysis: &crate::claude::AnalysisResult, embeddi
 }
 
 async fn extract_entities_from_stories(db_path: &Path, analysis: &crate::claude::AnalysisResult, progress: &ProgressWriter) -> anyhow::Result<usize> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(60)))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
     let conn = rusqlite::Connection::open(db_path)?;
@@ -1583,11 +1583,11 @@ Focus on MOST important entities (max 5 per story). Prioritize companies, key pe
         });
 
         let resp = client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(pulse_llm::messages_url())
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .json(&pulse_llm::messages_body(&body))
             .send()
             .await?;
 
@@ -1702,11 +1702,11 @@ async fn extract_entities_from_freedoms(
     db_path: &Path,
     curated: &[(&str, &crate::claude::SummarizedStory)],
 ) -> anyhow::Result<usize> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(60)))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
     let conn = rusqlite::Connection::open(db_path)?;
@@ -1739,11 +1739,11 @@ Focus on MOST important entities (max 5 per story)."#,
     });
 
     let resp = client
-        .post("https://api.anthropic.com/v1/messages")
+        .post(pulse_llm::messages_url())
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&body)
+        .json(&pulse_llm::messages_body(&body))
         .send()
         .await?;
 
@@ -1943,7 +1943,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     // Phase 2.5: Pre-curate if many articles
     let to_summarize = if unique.len() > 40 {
         tracing::info!("Freedoms: Pre-curating from {} articles...", unique.len());
-        let api_key = std::env::var("GROQ_API_KEY")
+        let api_key = pulse_llm::api_key("GROQ_API_KEY")
             .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
         let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
         match client.pre_curate_freedoms(&unique).await {
@@ -1986,7 +1986,7 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 4: Curate with freedoms prompt
     tracing::info!("Freedoms: Curating...");
-    let api_key = std::env::var("GROQ_API_KEY")
+    let api_key = pulse_llm::api_key("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
     let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 

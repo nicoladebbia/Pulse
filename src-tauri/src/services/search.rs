@@ -163,7 +163,6 @@ impl ExpandedQuery {
 }
 
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
-const HAIKU_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const REWRITE_TIMEOUT_SECS: u64 = 3;
 
 /// Check if a query is simple enough to skip the Haiku rewrite.
@@ -202,7 +201,7 @@ pub async fn rewrite_query(api_key: &str, message: &str, conversation_context: O
     }
 
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(REWRITE_TIMEOUT_SECS),
+        pulse_llm::interactive_timeout(std::time::Duration::from_secs(REWRITE_TIMEOUT_SECS)),
         rewrite_query_inner(api_key, message, conversation_context),
     )
     .await;
@@ -254,11 +253,11 @@ async fn rewrite_query_inner(api_key: &str, message: &str, conversation_context:
     });
 
     let resp = client
-        .post(HAIKU_API_URL)
+        .post(pulse_llm::messages_url())
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&body)
+        .json(&pulse_llm::messages_body(&body))
         .send()
         .await
         .context("Haiku rewrite request failed")?;
@@ -1091,6 +1090,11 @@ pub async fn voyage_rerank(
 ) -> Vec<ScoredStory> {
     if stories.len() <= top_k {
         return stories;
+    }
+
+    // Local mode has no Voyage reranker; the LLM reranker runs on the local model instead.
+    if pulse_llm::is_local() {
+        return super::reranking::llm_rerank(pulse_llm::LOCAL_KEY, question, stories, top_k).await;
     }
 
     let api_key = match std::env::var("VOYAGE_API_KEY") {

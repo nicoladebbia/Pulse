@@ -98,6 +98,9 @@ pub fn is_groq_block_status(code: u16) -> bool {
 /// Returns `true` if Groq is reachable, `false` if blocked or the probe errored
 /// (fail-closed: a network error at probe time means don't start the pipeline).
 pub async fn groq_reachable() -> bool {
+    if pulse_llm::is_local() {
+        return true; // local mode never talks to Groq
+    }
     let http = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -168,6 +171,10 @@ pub(crate) fn is_reasoning_model(model: &str) -> bool {
 /// extraction and summarization rather than multi-step reasoning.
 pub(crate) fn reasoning_params(model: &str, max_tokens: u32) -> (u32, Option<&'static str>) {
     const ALLOWANCE: u32 = 1024;
+    if pulse_llm::is_local() {
+        // Ollama's "none" turns thinking off: the answer gets the whole budget.
+        return (max_tokens, Some("none"));
+    }
     if is_reasoning_model(model) {
         (max_tokens.saturating_add(ALLOWANCE), Some("low"))
     } else {
@@ -331,7 +338,7 @@ struct CurationResult {
 impl GroqClient {
     pub fn new(api_key: &str, db_path: Option<PathBuf>) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(pulse_llm::timeout(std::time::Duration::from_secs(60)))
             .pool_max_idle_per_host(0)
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
@@ -365,7 +372,7 @@ impl GroqClient {
         }
         let (max_tokens, reasoning_effort) = reasoning_params(model, max_tokens);
         let request = ChatRequest {
-            model: model.to_string(),
+            model: pulse_llm::model(model),
             messages: vec![
                 ChatMessage { role: "system".to_string(), content: system.to_string() },
                 ChatMessage { role: "user".to_string(), content: user_msg.to_string() },
@@ -380,7 +387,7 @@ impl GroqClient {
         let mut last_err = None;
         for attempt in 0..4u32 {
             let resp = match self.http
-                .post(API_URL)
+                .post(pulse_llm::chat_completions_url(API_URL))
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .header("Content-Type", "application/json")
                 .json(&request)
@@ -490,7 +497,7 @@ impl GroqClient {
         }
         let (max_tokens, reasoning_effort) = reasoning_params(model, max_tokens);
         let request = ChatRequest {
-            model: model.to_string(),
+            model: pulse_llm::model(model),
             messages: vec![
                 ChatMessage { role: "system".to_string(), content: system.to_string() },
                 ChatMessage { role: "user".to_string(), content: user_msg.to_string() },
@@ -504,7 +511,7 @@ impl GroqClient {
         let mut last_err = None;
         for attempt in 0..4u32 {
             let resp = match self.http
-                .post(API_URL)
+                .post(pulse_llm::chat_completions_url(API_URL))
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .header("Content-Type", "application/json")
                 .json(&request)
@@ -607,7 +614,7 @@ impl GroqClient {
     /// (headers, body shape, usage field names). Logs real token counts under
     /// provider "anthropic". Retries on 429/5xx/network; bails on 4xx.
     async fn call_anthropic(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
+        let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
             .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
         let body = serde_json::json!({
@@ -624,15 +631,15 @@ impl GroqClient {
                 tokio::time::sleep(std::time::Duration::from_secs(15 * attempt as u64)).await;
             }
             let resp = match self.http
-                .post("https://api.anthropic.com/v1/messages")
+                .post(pulse_llm::messages_url())
                 // self.http's 60s default was tuned for Groq; an 8000-max_token
                 // generation over a 140-story payload can exceed it. Per-request
                 // override so a slow-but-fine Haiku call isn't billed then discarded.
-                .timeout(std::time::Duration::from_secs(180))
+                .timeout(pulse_llm::timeout(std::time::Duration::from_secs(180)))
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&body)
+                .json(&pulse_llm::messages_body(&body))
                 .send()
                 .await
             {
@@ -781,7 +788,13 @@ impl GroqClient {
         // and as a bonus is immune to the Groq VPN/IP 403 block. Set
         // PULSE_ANALYZE_PROVIDER=groq to force the old path for A/B.
         let force_groq = std::env::var("PULSE_ANALYZE_PROVIDER").map(|v| v.eq_ignore_ascii_case("groq")).unwrap_or(false);
-        let text = if !force_groq && std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        let text = if pulse_llm::is_local() {
+            // Locally the OpenAI-style route is the better one: Ollama enforces
+            // json_object there with a grammar, while its Anthropic route has no JSON
+            // mode, and the local model broke this long body's JSON there (2026-10-03).
+            // 16000 for the same reason as the Haiku path below.
+            self.call(STRONG_MODEL_DEFAULT, "analyze", system, &user_msg, 16000).await?
+        } else if !force_groq && pulse_llm::api_key("ANTHROPIC_API_KEY").is_ok() {
             // 16000, not the Groq path's 8000: Haiku's relevance `reason` strings run
             // longer than 70B's and a 125-story payload measured ~8k output — the 8000
             // cap truncated a live run (2026-08-06). Haiku bills only tokens produced.

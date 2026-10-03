@@ -23,9 +23,15 @@ pub fn run() {
             let db_path = db::connection::dev_db_override().unwrap_or_else(|| app_data.join("pulse.db"));
 
             // Load .env from the project directory for API keys
-            let project_env = dirs::home_dir()
-                .unwrap_or_default()
-                .join("Projects/Pulse/.env");
+            // ~/Projects/Pulse is the long-standing checkout; otherwise use the
+            // checkout this binary was built from.
+            let project_env = [
+                dirs::home_dir().unwrap_or_default().join("Projects/Pulse/.env"),
+                std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.env")),
+            ]
+            .into_iter()
+            .find(|p| p.exists())
+            .unwrap_or_default();
             if project_env.exists() {
                 dotenvy::from_path(&project_env).ok();
             }

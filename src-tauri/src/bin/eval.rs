@@ -413,7 +413,7 @@ fn run_search(
     // pool size to actually exercise the API. We rerank to k*2 (default 20) so
     // the top-k slice we evaluate is genuinely the reranked top.
     if !no_rerank && !stories.is_empty() {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY").unwrap_or_default();
         let rerank_target = (k * 2).min(stories.len().saturating_sub(1).max(1));
         if stories.len() > rerank_target {
             let pre = stories.iter().take(rerank_target).map(|s| s.story_id).collect::<Vec<_>>();
@@ -454,7 +454,7 @@ async fn generate_hyde_texts(queries: &[String], cache_path: &std::path::Path) -
         }
     }
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .context("ANTHROPIC_API_KEY not set")?;
 
     let queries_text = queries.iter().enumerate()
@@ -485,11 +485,11 @@ etc."#,
 
     let client = reqwest::Client::new();
     let resp = client
-        .post("https://api.anthropic.com/v1/messages")
+        .post(pulse_llm::messages_url())
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&body)
+        .json(&pulse_llm::messages_body(&body))
         .send()
         .await
         .context("Haiku API request failed")?;
@@ -609,7 +609,7 @@ fn run_judge_mode(conn: &Connection, args: &Args, rt: &tokio::runtime::Runtime) 
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY").unwrap_or_default();
     if args.auto_judge && api_key.is_empty() {
         anyhow::bail!("--auto-judge requires ANTHROPIC_API_KEY in env");
     }
@@ -753,11 +753,11 @@ just the numbers, no prose. Example output: 1,3,4,7. If none are relevant return
 
     let client = reqwest::Client::new();
     let resp = client
-        .post("https://api.anthropic.com/v1/messages")
+        .post(pulse_llm::messages_url())
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&body)
+        .json(&pulse_llm::messages_body(&body))
         .send()
         .await
         .context("Haiku auto-judge request failed")?;
@@ -808,7 +808,7 @@ fn run_eval(conn: &Connection, args: &Args, rt: &tokio::runtime::Runtime) -> Res
     // The vector embedding uses the ORIGINAL query; FTS uses fts_keywords; HyDE
     // embeds semantic_text. Without this step the eval was measuring a degraded
     // retrieval path and underreported what users actually see.
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY").unwrap_or_default();
     let rewrites: Vec<pulse_lib::services::search::ExpandedQuery> = if args.no_rewrite || api_key.is_empty() {
         if args.no_rewrite {
             println!("Query rewrite: DISABLED (--no-rewrite)");
@@ -1140,9 +1140,13 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load .env
-    let env_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join("Projects/Pulse/.env");
+    let env_path = [
+        dirs::home_dir().unwrap_or_default().join("Projects/Pulse/.env"),
+        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.env")),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+    .unwrap_or_default();
     dotenvy::from_path(&env_path).ok();
 
     let db_path = resolve_db_path(&args.db_path);

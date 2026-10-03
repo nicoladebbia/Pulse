@@ -2958,6 +2958,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "futures-util",
+ "pulse-llm",
  "pulse-pricing",
  "pulse-weights",
  "reqwest 0.12.28",
@@ -2987,6 +2988,7 @@ dependencies = [
  "feed-rs",
  "futures",
  "libc",
+ "pulse-llm",
  "pulse-pricing",
  "pulse-weights",
  "quick-xml 0.37.5",
@@ -3003,6 +3005,14 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "pulse-llm"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

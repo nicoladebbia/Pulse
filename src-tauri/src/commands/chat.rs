@@ -109,23 +109,37 @@ pub async fn chat_send_stream(
         None
     };
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .map_err(|_| "ANTHROPIC_API_KEY not set. Add it to .env".to_string())?;
 
     let query_type = search::classify_query_type(&message);
     tracing::info!("Query type: {:?}", query_type);
 
+    // Query vectors must come from the model the stored vectors came from;
+    // otherwise skip vector search and rely on keyword search alone.
+    let vectors_match = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        pulse_llm::space::matches(&conn)
+    };
+    if !vectors_match {
+        tracing::warn!(
+            "Stored search vectors are from another embedding model than {}; using keyword \
+             search only. Run `pulse-fetcher --mode reembed` to fix.",
+            pulse_llm::space::current_model()
+        );
+    }
+
     // 3. Parallel: rewrite query + embed raw query concurrently (saves 2-3s)
     let rewrite_fut = search::rewrite_query(&api_key, &message, conversation_context.as_deref());
     let embed_fut = async {
         match embeddings::VoyageProvider::from_env() {
-            Ok(provider) => {
+            Ok(provider) if vectors_match => {
                 match provider.embed(std::slice::from_ref(&message), "query").await {
                     Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
                     _ => None,
                 }
             }
-            Err(_) => None,
+            _ => None,
         }
     };
 
@@ -135,13 +149,13 @@ pub async fn chat_send_stream(
     // do a second embedding and pass both to hybrid_search for merged results
     let hyde_embedding: Option<Vec<f32>> = if expanded.semantic_text != expanded.original && expanded.semantic_text.len() > 20 {
         match embeddings::VoyageProvider::from_env() {
-            Ok(provider) => {
+            Ok(provider) if vectors_match => {
                 match provider.embed(std::slice::from_ref(&expanded.semantic_text), "query").await {
                     Ok(mut embs) if !embs.is_empty() => Some(embs.swap_remove(0)),
                     _ => None,
                 }
             }
-            Err(_) => None,
+            _ => None,
         }
     } else {
         None
@@ -948,7 +962,7 @@ async fn generate_thread_title(api_key: &str, question: &str, answer: &str) -> S
         }
     };
 
-    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
+    let client = match reqwest::Client::builder().timeout(pulse_llm::interactive_timeout(std::time::Duration::from_secs(10))).build() {
         Ok(c) => c,
         Err(_) => return fallback(),
     };
@@ -961,11 +975,11 @@ async fn generate_thread_title(api_key: &str, question: &str, answer: &str) -> S
     });
 
     let resp = client
-        .post("https://api.anthropic.com/v1/messages")
+        .post(pulse_llm::messages_url())
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&body)
+        .json(&pulse_llm::messages_body(&body))
         .send()
         .await;
 

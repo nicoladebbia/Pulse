@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 pulse-pricing = { path = "../pulse-pricing" }
 pulse-weights = { path = "../pulse-weights" }
+pulse-llm = { path = "../pulse-llm" }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
