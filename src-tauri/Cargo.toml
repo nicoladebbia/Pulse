@@ -41,6 +41,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -7,7 +7,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 echo "Building pulse-fetcher sidecar..."
 
 cd "$PROJECT_DIR"
-. "$HOME/.cargo/env"
+# rustup installs may or may not ship this (Homebrew rustup does not)
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
 # Build release binary
 cargo build --release -p pulse-fetcher

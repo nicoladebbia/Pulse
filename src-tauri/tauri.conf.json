@@ -31,13 +31,23 @@
       "icons/icon.icns"
     ],
     "macOS": {
-      "minimumSystemVersion": "13.0"
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": "-"
     },
-    "externalBin": ["binaries/pulse-fetcher"]
+    "externalBin": [
+      "binaries/pulse-fetcher"
+    ],
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "shell": {
       "open": true
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERBQzFBRTIyREU3MDE2M0YKUldRL0ZuRGVJcTdCMm1GRWl1YVE2RytTZGlIc09qNUlLSmNTS3RHWHZsUkhTS21VRnJwTmh4ZEcK",
+      "endpoints": [
+        "https://github.com/nicoladebbia/Pulse/releases/latest/download/latest.json"
+      ]
     }
   }
 }

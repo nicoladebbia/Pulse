@@ -1143,6 +1143,7 @@ fn main() -> Result<()> {
     let env_path = [
         dirs::home_dir().unwrap_or_default().join("Projects/Pulse/.env"),
         std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.env")),
+        dirs::data_dir().unwrap_or_default().join("com.pulse.app/.env"),
     ]
     .into_iter()
     .find(|p| p.exists())
