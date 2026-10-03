@@ -34,3 +34,8 @@ cargo build -p pulse-fetcher    # Build fetcher only
 
 ## Environment Variables
 Required in `.env`: ANTHROPIC_API_KEY, VOYAGE_API_KEY, GROQ_API_KEY — or `PULSE_LLM=local` to run every AI call on Ollama with no keys (`crates/pulse-llm`, `scripts/setup-local-ai.sh`). New AI call sites must go through `pulse_llm` (`messages_url`, `messages_body`, `api_key`, `embeddings_body`) or they will silently bypass local mode.
+
+## Releases & updates
+- `git tag v0.2.0 && git push --tags` → `.github/workflows/release.yml` builds the macOS app, signs the update (secrets `TAURI_SIGNING_PRIVATE_KEY` / `_PASSWORD`, key at `~/.tauri/pulse-updater.key`) and publishes `latest.json`. The tag is the version and must go up each release.
+- Installed apps check every 4h and show an "Update to vX" button in the sidebar (`src/lib/updater.ts`).
+- `scripts/install-app.sh` installs the latest release (or a local `Pulse.app`) into /Applications and schedules the 08:00 / 21:00 briefings (`scripts/scheduled-fetch.sh`). Installed builds read `.env` from `~/Library/Application Support/com.pulse.app/.env`.

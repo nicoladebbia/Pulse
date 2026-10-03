@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Installed-app schedule (scripts/install-app.sh fills in __HOME__).
+         Fires hourly; scripts/scheduled-fetch.sh runs the 08:00 and 21:00
+         briefings once each per day. -->
+    <key>Label</key>
+    <string>com.pulse.scheduled-fetch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/Library/Application Support/com.pulse.app/scheduled-fetch.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/Pulse/fetch-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/Pulse/fetch-stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

@@ -7,6 +7,7 @@
 	import { isFetching, fetchDone, triggerFetch as storeTriggerFetch } from '$lib/stores/fetch';
 	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
 	import FetchProgressBar from '$lib/components/FetchProgressBar.svelte';
+	import UpdateButton from './UpdateButton.svelte';
 	import { trackSectorFilter } from '$lib/engagement';
 
 	let usageStats = $state<UsageStats | null>(null);
@@ -135,12 +136,12 @@
 		return `${diffDay}d ago`;
 	}
 
-	// Launchd schedules daily fetches at 7 AM / 12 PM / 6 PM / 10 PM local (4 slots to
-	// catch a clean Groq window under the intermittent VPN/school-network IP block).
+	// Briefings run at 8 AM and 9 PM local (scripts/scheduled-fetch.sh, installed by
+	// scripts/install-app.sh).
 	function nextFetchLabel(nowMs: number): string {
 		const d = new Date(nowMs);
 		const currentMin = d.getHours() * 60 + d.getMinutes();
-		const schedules = [7 * 60, 12 * 60, 18 * 60, 22 * 60];
+		const schedules = [8 * 60, 21 * 60];
 		for (const s of schedules) {
 			if (s > currentMin) {
 				const h = Math.floor(s / 60);
@@ -148,7 +149,7 @@
 				return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 			}
 		}
-		return '07:00'; // tomorrow
+		return '08:00'; // tomorrow
 	}
 
 	let lastFetchedMs = $derived(
@@ -227,6 +228,8 @@
 			{/if}
 			<span>Next {nextFetchAt}</span>
 		</div>
+
+		<UpdateButton />
 	</div>
 
 	<!-- Sector filters -->

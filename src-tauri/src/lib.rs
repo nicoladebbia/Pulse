@@ -13,6 +13,8 @@ pub struct ChatAbortFlag(pub Arc<AtomicBool>);
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let app_data = app
                 .path()
@@ -28,6 +30,8 @@ pub fn run() {
             let project_env = [
                 dirs::home_dir().unwrap_or_default().join("Projects/Pulse/.env"),
                 std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.env")),
+                // Installed builds (made on CI) have no checkout: settings live next to the DB.
+                app_data.join(".env"),
             ]
             .into_iter()
             .find(|p| p.exists())

@@ -127,12 +127,14 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    // Auto-load .env from project directory
+    // Auto-load .env from project directory, else the app data dir
     // ~/Projects/Pulse is the long-standing checkout; otherwise use the checkout
     // this binary was built from, so a clone anywhere else finds its .env too.
     let env_path = [
         dirs::home_dir().unwrap_or_default().join("Projects/Pulse/.env"),
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env")),
+        // Installed builds (made on CI) have no checkout: settings live next to the DB.
+        dirs::data_dir().unwrap_or_default().join("com.pulse.app/.env"),
     ]
     .into_iter()
     .find(|p| p.exists())
