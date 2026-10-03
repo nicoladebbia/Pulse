@@ -7,6 +7,7 @@ mod contextual;
 pub(crate) mod db;
 mod dedup;
 mod embeddings;
+mod reembed;
 pub(crate) mod market_prices;
 pub(crate) mod calibration;
 pub(crate) mod position_management;
@@ -56,7 +57,8 @@ fn acquire_single_instance_lock(db_path: &std::path::Path) -> Option<SingleInsta
 #[derive(Parser, Debug)]
 #[command(name = "pulse-fetcher", about = "Daily news fetch pipeline for Pulse")]
 struct Args {
-    /// Fetch mode: 'daily' for scheduled fetch, 'manual' for on-demand
+    /// Fetch mode: 'daily' for scheduled fetch, 'manual' for on-demand,
+    /// 'reembed' to rebuild every search vector with the current embedding model
     #[arg(long, default_value = "daily")]
     mode: String,
 
@@ -126,9 +128,15 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Auto-load .env from project directory
-    let env_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join("Projects/Pulse/.env");
+    // ~/Projects/Pulse is the long-standing checkout; otherwise use the checkout
+    // this binary was built from, so a clone anywhere else finds its .env too.
+    let env_path = [
+        dirs::home_dir().unwrap_or_default().join("Projects/Pulse/.env"),
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env")),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+    .unwrap_or_default();
     if env_path.exists() {
         dotenvy::from_path(&env_path).ok();
         tracing::info!("Loaded API keys from {}", env_path.display());
@@ -147,6 +155,16 @@ async fn main() -> anyhow::Result<()> {
     // Must run before any pipeline work so a forced-block test exercises the same code
     // path a real 403 would, from the first call onward.
     crate::claude::client::apply_forced_block_from_env();
+    crate::embeddings::set_db_path(&db_path);
+    if pulse_llm::is_local() {
+        tracing::info!(
+            "LOCAL MODE (PULSE_LLM=local): all AI calls go to Ollama at {} — chat model {}, \
+             embedding model {}. No API keys used, no cost.",
+            pulse_llm::ollama_url(),
+            pulse_llm::local_model(),
+            pulse_llm::local_embed_model()
+        );
+    }
 
     match args.mode.as_str() {
         "notify-test" => {
@@ -216,6 +234,9 @@ async fn main() -> anyhow::Result<()> {
             }
             tracing::info!("Backfilling embeddings for stories without them...");
             backfill_embeddings(&db_path, args.limit, args.max_minutes).await?;
+        }
+        "reembed" => {
+            reembed::run(&db_path, args.force).await?;
         }
         "extract-entities" => {
             tracing::info!("Extracting entities from all stories...");
@@ -667,6 +688,8 @@ async fn backfill_embeddings(
     // scheduled independently of the daily fetch, so it can be the first process to touch
     // the DB after an update.
     db::run_migrations(&conn)?;
+    // Fail fast instead of erroring on every batch.
+    pulse_llm::space::ensure_writable(&conn).map_err(|e| anyhow::anyhow!(e))?;
 
     let (before_embedded, total_stories) = coverage(&conn)?;
     tracing::info!(
@@ -891,7 +914,7 @@ async fn extract_entities(db_path: &std::path::Path) -> anyhow::Result<()> {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (3)", [])?;
     }
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
     // Get all stories that don't have entity_mentions yet
@@ -917,7 +940,7 @@ async fn extract_entities(db_path: &std::path::Path) -> anyhow::Result<()> {
     tracing::info!("Found {} stories to extract entities from", stories.len());
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(60)))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
 
@@ -950,11 +973,11 @@ Focus on the MOST important entities (max 5 per story). Prioritize companies, ke
         });
 
         let resp = client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(pulse_llm::messages_url())
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .json(&pulse_llm::messages_body(&body))
             .send()
             .await?;
 

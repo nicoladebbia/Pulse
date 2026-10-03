@@ -45,7 +45,7 @@ Pulse's retrieval layer is built around these three facts.
                                                   ▲
 ┌─────────────────────────────────────────────────┴────────────────────────────────────────────────────┐
 │ crates/pulse-fetcher/  — standalone Rust binary, run by launchd at 08:00 / 21:00                       │
-│   collect (16 free sources, concurrent, non-fatal) ─▶ dedup ─▶ summarize (Haiku) ─▶ cross-sector       │
+│   collect (14 free sources, concurrent, non-fatal) ─▶ dedup ─▶ summarize (Haiku) ─▶ cross-sector       │
 │   analysis (Sonnet) ─▶ embed (Voyage) ─▶ extract entities ─▶ write SQLite                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -112,6 +112,12 @@ pnpm tauri dev                # run the desktop app (frontend + Rust backend)
 pnpm tauri build             # production app build
 ```
 
+**Free local mode (no API keys):** every AI call — summaries, curation, chat, predictions, query rewrite, rerank and embeddings — can run on [Ollama](https://ollama.com) on this Mac instead of Anthropic, Groq and Voyage.
+```bash
+./scripts/setup-local-ai.sh   # pulls Qwen3.6 35B-A3B + EmbeddingGemma (~23 GB), writes PULSE_LLM=local to .env
+```
+Search vectors from two models can't be compared, so each database records which embedding model its vectors came from and refuses to mix them. To move an existing Voyage database to local embeddings (or back), rebuild every vector once with `./target/debug/pulse-fetcher --mode reembed`. The research lane (PDF paper reads via the Batch API) stays cloud-only and is skipped in local mode. Settings: `PULSE_LOCAL_MODEL` (default `pulse-local`, see `ollama/Modelfile`), `PULSE_LOCAL_EMBED_MODEL` (default `embeddinggemma`), `OLLAMA_HOST`.
+
 **Fetch pipeline (headless):**
 ```bash
 cargo build -p pulse-fetcher
@@ -144,4 +150,4 @@ Honest limitations, stated plainly:
 - The **trading layer is paper-only** and intentionally stays that way; the backtester has repeatedly found no real edge.
 - The pipeline depends on external APIs (Anthropic, Voyage, plus free data sources) — every stage degrades gracefully, but with no keys the RAG and fetch paths are inert.
 
-The numbers cited above (41k corpus, 512-dim embeddings, 431 tests, 39 eval cases, 56 commands, 16 sources, 25 migrations) are read from the code and database, not estimated. The eval harness exists and runs; this README does **not** quote eval *scores*, because they depend on a live API run and would go stale — run `pulse-eval` to produce current numbers.
+The numbers cited above (41k corpus, 512-dim embeddings, 431 tests, 39 eval cases, 56 commands, 14 sources, 25 migrations) are read from the code and database, not estimated. The eval harness exists and runs; this README does **not** quote eval *scores*, because they depend on a live API run and would go stale — run `pulse-eval` to produce current numbers.

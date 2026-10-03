@@ -726,7 +726,13 @@ pub fn log_api_usage(
 ) {
     // Prices come from the shared pulse-pricing crate, which reads pricing.json
     // (next to pulse.db) on every call — edit that file to update prices live.
-    let cost = pulse_pricing::estimate_cost(provider, model, input_tokens, output_tokens);
+    // Local-mode calls never reach a paid API: record them as free so they show
+    // up in usage but can never trip the daily cost cap.
+    let (provider, model, cost) = if pulse_llm::is_local() {
+        ("local", pulse_llm::local_model(), 0.0)
+    } else {
+        (provider, model.to_string(), pulse_pricing::estimate_cost(provider, model, input_tokens, output_tokens))
+    };
 
     conn.execute(
         "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd)

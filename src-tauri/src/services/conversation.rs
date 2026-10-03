@@ -756,7 +756,6 @@ pub struct ClaudeConversation {
     http: reqwest::Client,
 }
 
-const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const CONVERSATION_MODEL_FAST: &str = "claude-haiku-4-5-20251001";
 pub const CONVERSATION_MODEL_DEEP: &str = "claude-sonnet-4-6";
 
@@ -769,7 +768,7 @@ impl ClaudeConversation {
     }
 
     pub fn from_env() -> Result<Self> {
-        let key = std::env::var("ANTHROPIC_API_KEY")
+        let key = pulse_llm::api_key("ANTHROPIC_API_KEY")
             .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
         Ok(Self::new(&key))
     }
@@ -838,11 +837,11 @@ impl ClaudeConversation {
 
         let resp = self
             .http
-            .post(CLAUDE_API_URL)
+            .post(pulse_llm::messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
-            .json(&body)
+            .json(&pulse_llm::messages_body(&body))
             .send()
             .await
             .context("Claude API request failed")?;
@@ -914,11 +913,11 @@ impl ClaudeConversation {
 
         let resp = self
             .http
-            .post(CLAUDE_API_URL)
+            .post(pulse_llm::messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
-            .json(&body)
+            .json(&pulse_llm::messages_body(&body))
             .send()
             .await
             .context("Claude streaming request failed")?;

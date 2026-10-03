@@ -946,7 +946,7 @@ pub async fn get_trade_rationale(
     };
     // Lock dropped above — safe to await from here.
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .map_err(|_| "ANTHROPIC_API_KEY not set. Add it to .env".to_string())?;
     let prompt = build_rationale_prompt(&facts);
     let text = call_haiku_for_rationale(&api_key, &prompt).await?;
@@ -970,7 +970,7 @@ pub async fn get_trade_rationale(
 
 async fn call_haiku_for_rationale(api_key: &str, facts: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(pulse_llm::interactive_timeout(std::time::Duration::from_secs(20)))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -997,11 +997,11 @@ async fn call_haiku_for_rationale(api_key: &str, facts: &str) -> Result<String, 
     });
 
     let resp = client
-        .post("https://api.anthropic.com/v1/messages")
+        .post(pulse_llm::messages_url())
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&body)
+        .json(&pulse_llm::messages_body(&body))
         .send()
         .await
         .map_err(|e| format!("Anthropic request failed: {}", e))?;

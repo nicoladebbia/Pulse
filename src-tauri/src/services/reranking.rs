@@ -2,7 +2,6 @@ use super::search::ScoredStory;
 use anyhow::Context;
 
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
-const HAIKU_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const RERANK_TIMEOUT_SECS: u64 = 8;
 
 /// Rerank stories by relevance to the user question using Haiku.
@@ -19,7 +18,7 @@ pub async fn llm_rerank(
     }
 
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(RERANK_TIMEOUT_SECS),
+        pulse_llm::interactive_timeout(std::time::Duration::from_secs(RERANK_TIMEOUT_SECS)),
         rerank_inner(api_key, question, &stories),
     )
     .await;
@@ -63,11 +62,11 @@ async fn rerank_inner(
     });
 
     let resp = client
-        .post(HAIKU_API_URL)
+        .post(pulse_llm::messages_url())
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&body)
+        .json(&pulse_llm::messages_body(&body))
         .send()
         .await
         .context("Haiku rerank request failed")?;

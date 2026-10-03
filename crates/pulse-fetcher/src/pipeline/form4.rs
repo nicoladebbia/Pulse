@@ -339,7 +339,7 @@ pub(crate) fn classify_form4_trade(code: &str, is_officer: bool, is_director: bo
 /// Classify ambiguous 8-K filings (Item 8.01 "other_event") using Claude Haiku.
 /// Only processes recent unclassified 8-Ks. ~$0.0005 per call.
 pub(crate) async fn classify_ambiguous_8ks(db_path: &Path) -> anyhow::Result<usize> {
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+    let api_key = match pulse_llm::api_key("ANTHROPIC_API_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => return Ok(0),
     };
@@ -367,7 +367,7 @@ pub(crate) async fn classify_ambiguous_8ks(db_path: &Path) -> anyhow::Result<usi
     if candidates.is_empty() { return Ok(0); }
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(30)))
         .build()?;
 
     let mut classified = 0;
@@ -387,11 +387,11 @@ pub(crate) async fn classify_ambiguous_8ks(db_path: &Path) -> anyhow::Result<usi
         });
 
         let resp = client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(pulse_llm::messages_url())
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .json(&pulse_llm::messages_body(&body))
             .send()
             .await?;
 

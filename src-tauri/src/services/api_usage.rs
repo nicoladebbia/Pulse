@@ -42,7 +42,12 @@ pub fn log_usage(
     input_tokens: i64,
     output_tokens: i64,
 ) -> Result<()> {
-    let cost = estimate_cost(provider, model, input_tokens, output_tokens);
+    // Local-mode calls never reach a paid API: record them as free.
+    let (provider, model, cost) = if pulse_llm::is_local() {
+        ("local", pulse_llm::local_model(), 0.0)
+    } else {
+        (provider, model.to_string(), estimate_cost(provider, model, input_tokens, output_tokens))
+    };
     conn.execute(
         "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",

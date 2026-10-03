@@ -33,6 +33,11 @@ pub struct Reply {
 }
 
 pub fn api_key() -> anyhow::Result<String> {
+    // Paper reads need PDF blocks, structured outputs and the Batch API, none of
+    // which a local model offers, so the research lane stays cloud-only.
+    if pulse_llm::is_local() {
+        bail!("research lane needs the Anthropic API and is off in local mode (PULSE_LLM=local)");
+    }
     std::env::var("ANTHROPIC_API_KEY").map_err(|_| anyhow!("ANTHROPIC_API_KEY not set"))
 }
 

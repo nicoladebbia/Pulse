@@ -176,7 +176,7 @@ pub(crate) fn dominant_failure(errors: &[String], attempted: usize) -> Option<St
 }
 
 pub async fn summarize_stories(articles: &[RawArticle], progress: Option<&crate::pipeline::ProgressWriter>, db_path: &std::path::Path) -> anyhow::Result<SummarizeOutcome> {
-    let api_key = std::env::var("GROQ_API_KEY")
+    let api_key = pulse_llm::api_key("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
     let client = client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 
@@ -231,7 +231,7 @@ pub async fn summarize_stories(articles: &[RawArticle], progress: Option<&crate:
 }
 
 pub async fn analyze_cross_sector(stories: &[SummarizedStory], db_path: &std::path::Path) -> anyhow::Result<AnalysisResult> {
-    let api_key = std::env::var("GROQ_API_KEY")
+    let api_key = pulse_llm::api_key("GROQ_API_KEY")
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
     let client = client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
 

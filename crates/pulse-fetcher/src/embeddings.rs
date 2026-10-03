@@ -1,15 +1,8 @@
 use crate::claude::SummarizedStory;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 const VOYAGE_API_URL: &str = "https://api.voyageai.com/v1/embeddings";
 const VOYAGE_MODEL: &str = "voyage-3-lite";
-
-#[derive(Serialize)]
-struct EmbeddingRequest {
-    model: String,
-    input: Vec<String>,
-    input_type: String,
-}
 
 #[derive(Deserialize)]
 struct EmbeddingResponse {
@@ -19,6 +12,21 @@ struct EmbeddingResponse {
 #[derive(Deserialize)]
 struct EmbeddingData {
     embedding: Vec<f32>,
+}
+
+/// The database the vectors are written to, set once by `main`. Every vector
+/// this crate makes is checked against that database's embedding model first,
+/// so a local run can never mix its vectors into a Voyage database (or back).
+static DB_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_db_path(path: &std::path::Path) {
+    let _ = DB_PATH.set(path.to_path_buf());
+}
+
+fn check_embedding_space() -> anyhow::Result<()> {
+    let Some(path) = DB_PATH.get() else { return Ok(()) };
+    let conn = rusqlite::Connection::open(path)?;
+    pulse_llm::space::ensure_writable(&conn).map_err(|e| anyhow::anyhow!("embeddings skipped: {e}"))
 }
 
 pub struct StoryEmbedding {
@@ -35,7 +43,8 @@ pub async fn generate(
     // healthy run as interrupted. Optional so backfill/tests can pass a no-op.
     mut heartbeat: impl FnMut(&str, f64),
 ) -> anyhow::Result<Vec<StoryEmbedding>> {
-    let api_key = std::env::var("VOYAGE_API_KEY")
+    check_embedding_space()?;
+    let api_key = pulse_llm::api_key("VOYAGE_API_KEY")
         .map_err(|_| anyhow::anyhow!("VOYAGE_API_KEY not set"))?;
 
     let texts: Vec<(usize, String)> = stories
@@ -67,7 +76,7 @@ pub async fn generate(
         .collect();
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(30)))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
 
@@ -101,11 +110,7 @@ pub async fn generate(
         let batch_texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
         let batch_indices: Vec<usize> = chunk.iter().map(|(i, _)| *i).collect();
 
-        let request = EmbeddingRequest {
-            model: VOYAGE_MODEL.to_string(),
-            input: batch_texts,
-            input_type: "document".to_string(),
-        };
+        let request = pulse_llm::embeddings_body(VOYAGE_MODEL, &batch_texts, "document");
 
         // Retry with exponential backoff. Was "retry once after 5s", which is inside the
         // same network blip that caused the first failure — both attempts died together.
@@ -121,7 +126,7 @@ pub async fn generate(
                 tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             }
             match client
-                .post(VOYAGE_API_URL)
+                .post(pulse_llm::embeddings_url(VOYAGE_API_URL))
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json")
                 .json(&request)
@@ -224,18 +229,21 @@ pub fn backoff_secs(attempt: u32) -> u64 {
 /// is worth fighting for because the backfill is the LAST line of defence: a story that
 /// this gives up on stays unsearchable until the next backfill run picks it up again.
 pub async fn generate_from_texts(texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-    let api_key = std::env::var("VOYAGE_API_KEY")
+    check_embedding_space()?;
+    embed_texts(texts).await
+}
+
+/// [`generate_from_texts`] without the embedding-space check, for `--mode reembed`,
+/// which writes into a staging table, never into the live vectors.
+pub async fn embed_texts(texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+    let api_key = pulse_llm::api_key("VOYAGE_API_KEY")
         .map_err(|_| anyhow::anyhow!("VOYAGE_API_KEY not set"))?;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(30)))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let request = EmbeddingRequest {
-        model: VOYAGE_MODEL.to_string(),
-        input: texts.to_vec(),
-        input_type: "document".to_string(),
-    };
+    let request = pulse_llm::embeddings_body(VOYAGE_MODEL, texts, "document");
 
     let mut last_err = String::from("no attempt made");
     for attempt in 1..=MAX_BATCH_ATTEMPTS {
@@ -246,7 +254,7 @@ pub async fn generate_from_texts(texts: &[String]) -> anyhow::Result<Vec<Vec<f32
         }
 
         let resp = match client
-            .post(VOYAGE_API_URL)
+            .post(pulse_llm::embeddings_url(VOYAGE_API_URL))
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(&request)
@@ -287,6 +295,9 @@ pub async fn generate_from_texts(texts: &[String]) -> anyhow::Result<Vec<Vec<f32
 /// Shared by the pipeline and the backfill so they cannot drift apart — the backfill
 /// used to hardcode 21s and silently ignore `PULSE_VOYAGE_RPM`.
 pub fn rate_limit_pause_secs() -> u64 {
+    if pulse_llm::is_local() {
+        return 0; // no rate limit on this machine's own model
+    }
     let rpm: u64 = std::env::var("PULSE_VOYAGE_RPM")
         .ok()
         .and_then(|v| v.parse().ok())

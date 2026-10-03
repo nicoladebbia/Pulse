@@ -2,7 +2,6 @@ use crate::claude::SummarizedStory;
 use serde::Deserialize;
 
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
 /// Generate contextual prefixes for stories using Haiku.
 /// Each prefix situates the story within its sector, names key entities,
@@ -32,11 +31,11 @@ pub async fn generate_prefixes(
     stories: &[SummarizedStory],
     day_context: &str,
 ) -> anyhow::Result<Vec<Option<String>>> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = pulse_llm::api_key("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(pulse_llm::timeout(std::time::Duration::from_secs(30)))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
     let mut all_prefixes: Vec<Option<String>> = vec![None; stories.len()];
@@ -73,11 +72,11 @@ Keep each prefix under 80 words. Be specific — use names, not descriptions."#,
         });
 
         let resp = match client
-            .post(API_URL)
+            .post(pulse_llm::messages_url())
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .json(&pulse_llm::messages_body(&body))
             .send()
             .await
         {
