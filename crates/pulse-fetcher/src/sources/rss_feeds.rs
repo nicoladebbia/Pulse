@@ -1,26 +1,22 @@
 use super::RawArticle;
 
 const FEEDS: &[(&str, &str, &str, &str)] = &[
-    // === AI (16 feeds) ===
-    ("ai", "OpenAI Blog", "https://openai.com/blog/rss/", "en"),
-    ("ai", "Google AI Blog", "https://ai.googleblog.com/feeds/posts/default", "en"),
+    // === AI (29 feeds) ===
+    ("ai", "OpenAI Blog", "https://openai.com/news/rss.xml", "en"),
+    ("ai", "Google AI Blog", "https://blog.google/technology/ai/rss/", "en"),
     ("ai", "DeepMind Blog", "https://deepmind.com/blog/feed/basic/", "en"),
     ("ai", "HuggingFace Blog", "https://huggingface.co/blog/feed.xml", "en"),
     ("ai", "ArXiv AI", "https://rss.arxiv.org/rss/cs.AI", "en"),
     ("ai", "VentureBeat AI", "https://venturebeat.com/category/ai/feed/", "en"),
     ("ai", "MIT Tech Review AI", "https://www.technologyreview.com/topic/artificial-intelligence/feed", "en"),
-    ("ai", "The Batch (deeplearning.ai)", "https://www.deeplearning.ai/the-batch/feed/", "en"),
-    ("ai", "Anthropic Blog", "https://www.anthropic.com/feed.xml", "en"),
-    ("ai", "Meta AI Blog", "https://ai.meta.com/blog/rss/", "en"),
     ("ai", "NVIDIA AI Blog", "https://blogs.nvidia.com/feed/", "en"),
     ("ai", "ArXiv Machine Learning", "https://rss.arxiv.org/rss/cs.LG", "en"),
     ("ai", "ArXiv Computation & Language", "https://rss.arxiv.org/rss/cs.CL", "en"),
     ("ai", "The Gradient", "https://thegradient.pub/rss/", "en"),
     ("ai", "Towards Data Science", "https://towardsdatascience.com/feed", "en"),
     ("ai", "Synced AI", "https://syncedreview.com/feed/", "en"),
-    ("ai", "AI News", "https://www.artificialintelligence-news.com/feed/", "en"),
     ("ai", "Weights & Biases Blog", "https://wandb.ai/fully-connected/rss.xml", "en"),
-    ("ai", "Microsoft AI Blog", "https://blogs.microsoft.com/ai/feed/", "en"),
+    ("ai", "Microsoft Research", "https://www.microsoft.com/en-us/research/feed/", "en"),
     ("ai", "Amazon Science", "https://www.amazon.science/index.rss", "en"),
     ("ai", "Apple ML Research", "https://machinelearning.apple.com/rss.xml", "en"),
     ("ai", "AI Alignment Forum", "https://www.alignmentforum.org/feed.xml", "en"),
@@ -30,13 +26,12 @@ const FEEDS: &[(&str, &str, &str, &str)] = &[
     ("ai", "Import AI Newsletter", "https://importai.substack.com/feed", "en"),
     ("ai", "Simon Willison's Weblog", "https://simonwillison.net/atom/everything", "en"),
     ("ai", "Latent Space", "https://www.latent.space/feed", "en"),
-    ("ai", "Mistral AI Blog", "https://mistral.ai/feed/", "en"),
     ("ai", "AI Snake Oil", "https://www.aisnakeoil.com/feed", "en"),
     ("ai", "Ahead of AI (Seb Raschka)", "https://magazine.sebastianraschka.com/feed", "en"),
     ("ai", "The Decoder", "https://the-decoder.com/feed/", "en"),
     ("ai", "Interconnects (Nathan Lambert)", "https://www.interconnects.ai/feed", "en"),
     ("ai", "Jack Clark (Import AI)", "https://jack-clark.net/feed/", "en"),
-    // === Tech (16 feeds) ===
+    // === Tech (35 feeds) ===
     ("tech", "TechCrunch", "https://techcrunch.com/feed/", "en"),
     ("tech", "The Verge", "https://www.theverge.com/rss/index.xml", "en"),
     ("tech", "Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", "en"),
@@ -44,7 +39,6 @@ const FEEDS: &[(&str, &str, &str, &str)] = &[
     ("tech", "Engadget", "https://www.engadget.com/rss.xml", "en"),
     ("tech", "Tom's Hardware", "https://www.tomshardware.com/feeds/all", "en"),
     ("tech", "Hacker News", "https://hnrss.org/frontpage", "en"),
-    ("tech", "AnandTech", "https://www.anandtech.com/rss/", "en"),
     ("tech", "The Register", "https://www.theregister.com/headlines.atom", "en"),
     ("tech", "ZDNet", "https://www.zdnet.com/news/rss.xml", "en"),
     ("tech", "TechRadar", "https://www.techradar.com/rss", "en"),
@@ -57,7 +51,6 @@ const FEEDS: &[(&str, &str, &str, &str)] = &[
     ("tech", "Liliputing", "https://liliputing.com/feed/", "en"),
     ("tech", "Android Authority", "https://www.androidauthority.com/feed/", "en"),
     ("tech", "MacRumors", "https://feeds.macrumors.com/MacRumors-All", "en"),
-    ("tech", "Protocol", "https://www.protocol.com/feeds/feed.rss", "en"),
     ("tech", "Slashdot", "https://rss.slashdot.org/Slashdot/slashdotMain", "en"),
     ("tech", "XDA Developers", "https://www.xda-developers.com/feed/", "en"),
     ("tech", "How-To Geek", "https://www.howtogeek.com/feed/", "en"),
@@ -71,11 +64,10 @@ const FEEDS: &[(&str, &str, &str, &str)] = &[
     ("tech", "Schneier on Security", "https://www.schneier.com/feed/", "en"),
     ("tech", "Product Hunt", "https://www.producthunt.com/feed", "en"),
     ("tech", "Y Combinator Blog", "https://www.ycombinator.com/blog/rss/", "en"),
-    ("tech", "a]16z Blog", "https://a16z.com/feed/", "en"),
     ("tech", "Benedict Evans", "https://www.ben-evans.com/benedictevans?format=rss", "en"),
     ("tech", "Stratechery", "https://stratechery.com/feed/", "en"),
     ("tech", "The Information", "https://www.theinformation.com/feed", "en"),
-    // === Italy (25 feeds) ===
+    // === Italy (24 feeds) ===
     ("italy", "ANSA Politica", "https://www.ansa.it/sito/notizie/politica/politica_rss.xml", "it"),
     ("italy", "ANSA Cronaca", "https://www.ansa.it/sito/notizie/cronaca/cronaca_rss.xml", "it"),
     ("italy", "ANSA Economia", "https://www.ansa.it/sito/notizie/economia/economia_rss.xml", "it"),
@@ -98,14 +90,12 @@ const FEEDS: &[(&str, &str, &str, &str)] = &[
     ("italy", "Linkiesta", "https://www.linkiesta.it/feed/", "it"),
     ("italy", "Quotidiano Nazionale", "https://www.quotidiano.net/rss/", "it"),
     ("italy", "TPI News", "https://www.tpi.it/feed/", "it"),
-    ("italy", "Adnkronos", "https://www.adnkronos.com/rss", "it"),
     ("italy", "Libero Quotidiano", "https://www.liberoquotidiano.it/rss.xml", "it"),
     ("italy", "Valigia Blu", "https://www.valigiablu.it/feed/", "it"),
-    // === Miami (16 feeds) ===
+    // === Miami (25 feeds) ===
     ("miami", "WSVN Miami", "https://wsvn.com/feed", "en"),
     ("miami", "NBC 6 South Florida", "https://www.nbcmiami.com/news/local/feed/", "en"),
     ("miami", "Local10 WPLG", "https://www.local10.com/arc/outboundfeeds/rss/?outputType=xml", "en"),
-    ("miami", "The Next Miami", "https://www.thenextmiami.com/feed/", "en"),
     ("miami", "CBS Miami", "https://www.cbsnews.com/miami/latest/rss/main", "en"),
     ("miami", "Refresh Miami", "https://refreshmiami.com/feed/", "en"),
     ("miami", "Florida Politics", "https://floridapolitics.com/feed/", "en"),
@@ -113,7 +103,6 @@ const FEEDS: &[(&str, &str, &str, &str)] = &[
     ("miami", "Miami Today News", "https://www.miamitodaynews.com/feed/", "en"),
     ("miami", "Florida Insider", "https://floridainsider.com/feed/", "en"),
     ("miami", "South Florida Reporter", "https://southfloridareporter.com/feed/", "en"),
-    ("miami", "Miami Agent Magazine", "https://miamiagentmagazine.com/feed/", "en"),
     ("miami", "The Real Deal Miami", "https://therealdeal.com/miami/feed/", "en"),
     ("miami", "Miami Eater", "https://miami.eater.com/rss/index.xml", "en"),
     ("miami", "Miami Beach Chamber", "https://www.miamibeachchamber.com/feed/", "en"),
@@ -123,25 +112,19 @@ const FEEDS: &[(&str, &str, &str, &str)] = &[
     // google_news.rs cover the rest with 48 daily-fresh queries) ===
     // Freedom: Time (3)
     ("freedom_time", "Lifehacker", "https://lifehacker.com/feed/rss", "en"),
-    ("freedom_time", "Notion Blog", "https://www.notion.so/blog/rss.xml", "en"),
     ("freedom_time", "Tim Ferriss Blog", "https://tim.blog/feed/", "en"),
     // Freedom: Wealth (7)
     ("freedom_wealth", "Motley Fool", "https://www.fool.com/feeds/index.aspx", "en"),
     ("freedom_wealth", "Seeking Alpha", "https://seekingalpha.com/feed.xml", "en"),
     ("freedom_wealth", "SaaStr Blog", "https://www.saastr.com/feed/", "en"),
     ("freedom_wealth", "NerdWallet Blog", "https://www.nerdwallet.com/blog/feed/", "en"),
-    ("freedom_wealth", "The Hustle", "https://thehustle.co/feed/", "en"),
-    ("freedom_wealth", "Morning Brew", "https://www.morningbrew.com/daily/rss", "en"),
-    ("freedom_wealth", "Finimize", "https://www.finimize.com/wp/feed/", "en"),
+    ("freedom_wealth", "Morning Brew", "https://www.morningbrew.com/feed.xml", "en"),
     // Freedom: Location (3)
     ("freedom_location", "The Points Guy", "https://thepointsguy.com/feed/", "en"),
     ("freedom_location", "Travel Lemming", "https://travellemming.com/feed/", "en"),
-    ("freedom_location", "Remote OK Blog", "https://remoteok.com/blog.rss", "en"),
     // Freedom: Health (4)
     ("freedom_health", "Lifespan.io", "https://www.lifespan.io/feed/", "en"),
     ("freedom_health", "Peter Attia", "https://peterattiamd.com/feed/", "en"),
-    ("freedom_health", "Healthline Nutrition", "https://www.healthline.com/nutrition/feed", "en"),
-    ("freedom_health", "Well+Good", "https://www.wellandgood.com/feed/", "en"),
 ];
 
 pub async fn fetch_all() -> anyhow::Result<Vec<RawArticle>> {
