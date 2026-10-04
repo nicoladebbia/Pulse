@@ -77,6 +77,62 @@ pub fn anthropic_equivalent(groq_model: &str) -> &'static str {
     }
 }
 
+/// Local mode, but named tasks still run on Groq's cloud.
+///
+/// `PULSE_CLOUD_TASKS=summarize` sends per-story summaries — ~140 calls and about
+/// 70 of the ~90 minutes a local briefing takes — to Groq, where they finish in
+/// about a minute. Everything else stays on Ollama. Needs a real `GROQ_API_KEY`;
+/// without one, or once Groq refuses the key, calls quietly stay local.
+static CLOUD_OFFLOAD_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Unix time (seconds) before which offloading is paused after Groq rate limits.
+static CLOUD_OFFLOAD_PAUSED_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Send offloadable calls to the local model for the next `secs` seconds.
+fn pause_cloud_offload(secs: f64) {
+    let until = unix_now() + secs.min(3600.0) as u64;
+    let prev = CLOUD_OFFLOAD_PAUSED_UNTIL.fetch_max(until, std::sync::atomic::Ordering::Relaxed);
+    if prev < unix_now() {
+        tracing::warn!("Groq rate limit hit: using the local model for the next {:.0}s.", secs.min(3600.0));
+    }
+}
+
+/// Should a call for `endpoint` go to Groq's cloud instead of the local model?
+/// Pure so the rules can be tested without touching the environment.
+pub(crate) fn offload_wanted(local: bool, tasks: Option<&str>, endpoint: &str, key: Option<&str>) -> bool {
+    local
+        && key.is_some_and(|k| !k.trim().is_empty() && k.trim() != pulse_llm::LOCAL_KEY)
+        && tasks.is_some_and(|t| {
+            t.split(',').map(str::trim).any(|t| t.eq_ignore_ascii_case(endpoint) || t.eq_ignore_ascii_case("all"))
+        })
+}
+
+/// The real Groq key when `endpoint` should be offloaded this run, else None.
+fn cloud_offload_key(endpoint: &str) -> Option<String> {
+    if CLOUD_OFFLOAD_OFF.load(std::sync::atomic::Ordering::Relaxed)
+        || CLOUD_OFFLOAD_PAUSED_UNTIL.load(std::sync::atomic::Ordering::Relaxed) > unix_now()
+    {
+        return None;
+    }
+    let key = std::env::var("GROQ_API_KEY").ok();
+    let tasks = std::env::var("PULSE_CLOUD_TASKS").ok();
+    offload_wanted(pulse_llm::is_local(), tasks.as_deref(), endpoint, key.as_deref()).then(|| key.unwrap_or_default())
+}
+
+/// Stop offloading for the rest of the run (bad key or blocked IP). Logs once.
+fn stop_cloud_offload(reason: &str) {
+    if !CLOUD_OFFLOAD_OFF.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!("Groq cloud offload off for this run ({}). Continuing on the local model.", reason);
+    }
+}
+
 /// Does this Groq HTTP status mean "your IP is blocked", as opposed to a transient blip?
 /// 403 is the pre-auth block signature; everything else retries normally.
 pub fn is_groq_block_status(code: u16) -> bool {
@@ -170,8 +226,14 @@ pub(crate) fn is_reasoning_model(model: &str) -> bool {
 /// spend with no observed quality loss on these tasks, all of which are
 /// extraction and summarization rather than multi-step reasoning.
 pub(crate) fn reasoning_params(model: &str, max_tokens: u32) -> (u32, Option<&'static str>) {
+    reasoning_params_for(model, max_tokens, pulse_llm::is_local())
+}
+
+/// [`reasoning_params`] with the local/cloud choice made by the caller — a task
+/// offloaded to Groq from local mode needs the cloud budget, not Ollama's.
+fn reasoning_params_for(model: &str, max_tokens: u32, local: bool) -> (u32, Option<&'static str>) {
     const ALLOWANCE: u32 = 1024;
-    if pulse_llm::is_local() {
+    if local {
         // Ollama's "none" turns thinking off: the answer gets the whole budget.
         return (max_tokens, Some("none"));
     }
@@ -363,6 +425,12 @@ impl GroqClient {
     }
 
     pub async fn call(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+        if let Some(key) = cloud_offload_key(endpoint) {
+            match self.call_groq_cloud(&key, model, endpoint, system, user_msg, max_tokens).await {
+                Ok(text) => return Ok(text),
+                Err(e) => tracing::warn!("Groq cloud {} failed, using the local model: {:#}", endpoint, e),
+            }
+        }
         // Groq already known blocked this run -> do not spend 150s of retries proving it
         // again for every one of ~140 stories. Straight to Anthropic.
         if groq_is_blocked() {
@@ -485,6 +553,92 @@ impl GroqClient {
         }
 
         anyhow::bail!("Groq API: max retries exceeded (last error: {})", last_err.unwrap_or_else(|| "rate limiting".into()))
+    }
+
+    /// One JSON call straight to Groq's cloud with the real key, used by local
+    /// mode's offloaded tasks. Short retries only: the caller falls back to the
+    /// local model on any error, so waiting minutes here would be pure loss.
+    async fn call_groq_cloud(&self, key: &str, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+        let (max_tokens, reasoning_effort) = reasoning_params_for(model, max_tokens, false);
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage { role: "system".to_string(), content: system.to_string() },
+                ChatMessage { role: "user".to_string(), content: user_msg.to_string() },
+            ],
+            max_tokens,
+            temperature: 0.3,
+            response_format: ResponseFormat { fmt_type: "json_object".to_string() },
+            reasoning_effort,
+        };
+        let mut last_err = String::from("no attempt");
+        for attempt in 0..3u64 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
+            }
+            let resp = match self.http
+                .post(API_URL)
+                .timeout(std::time::Duration::from_secs(60))
+                .bearer_auth(key)
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue;
+                }
+            };
+            let code = resp.status().as_u16();
+            if code == 401 || is_groq_block_status(code) {
+                stop_cloud_offload(&format!("HTTP {code}"));
+                anyhow::bail!("Groq refused the key (HTTP {code})");
+            }
+            if code == 429 {
+                // Groq says how long to wait. A short wait is a per-minute limit:
+                // sleep it off. A long one (daily quota) or a third 429 pauses the
+                // offload so every other story goes local instead of queueing here.
+                let wait = resp.headers().get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(5.0)
+                    .max(1.0);
+                if wait > 20.0 || attempt == 2 {
+                    pause_cloud_offload(wait.max(30.0));
+                    anyhow::bail!("Groq rate limited (retry-after {wait:.0}s)");
+                }
+                last_err = "rate limited".into();
+                tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
+                continue;
+            }
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                let err = format!("HTTP {code}: {}", body.chars().take(160).collect::<String>());
+                // Only timeouts and server errors are worth another try.
+                if code != 408 && code < 500 {
+                    anyhow::bail!(err);
+                }
+                last_err = err;
+                continue;
+            }
+            let response: ChatResponse = resp.json().await?;
+            if let Some(err) = response.error {
+                anyhow::bail!("Groq API error: {}", err.message);
+            }
+            if let Some(ref u) = response.usage {
+                self.log_call(model, endpoint, u);
+            }
+            let text = response
+                .choices
+                .and_then(|c| c.into_iter().next())
+                .map(|c| c.message.content)
+                .unwrap_or_default();
+            // Empty means the budget went on reasoning: let the local model try.
+            anyhow::ensure!(!text.trim().is_empty(), "Groq returned an empty answer");
+            return Ok(text);
+        }
+        anyhow::bail!("{last_err}")
     }
 
     /// Like `call()` but returns plain text (no JSON response_format constraint).
@@ -1582,6 +1736,27 @@ mod reasoning_model_tests {
     fn both_configured_models_are_recognised_as_reasoning_models() {
         assert!(is_reasoning_model(FAST_MODEL));
         assert!(is_reasoning_model(STRONG_MODEL_DEFAULT));
+    }
+
+    #[test]
+    fn offload_needs_local_mode_a_listed_task_and_a_real_key() {
+        let key = Some("gsk_real");
+        assert!(offload_wanted(true, Some("summarize"), "summarize", key));
+        assert!(offload_wanted(true, Some(" Summarize , analyze"), "summarize", key));
+        assert!(offload_wanted(true, Some("all"), "pre-curate", key));
+        // Cloud mode already uses Groq; nothing to offload.
+        assert!(!offload_wanted(false, Some("summarize"), "summarize", key));
+        assert!(!offload_wanted(true, Some("analyze"), "summarize", key));
+        assert!(!offload_wanted(true, None, "summarize", key));
+        assert!(!offload_wanted(true, Some("summarize"), "summarize", None));
+        assert!(!offload_wanted(true, Some("summarize"), "summarize", Some("  ")));
+        assert!(!offload_wanted(true, Some("summarize"), "summarize", Some(pulse_llm::LOCAL_KEY)));
+    }
+
+    #[test]
+    fn offloaded_calls_get_the_cloud_budget_even_in_local_mode() {
+        assert_eq!(reasoning_params_for(FAST_MODEL, 2000, true), (2000, Some("none")));
+        assert_eq!(reasoning_params_for(FAST_MODEL, 2000, false), (3024, Some("low")));
     }
 
     /// A reasoning model must never be handed the caller's raw budget: reasoning

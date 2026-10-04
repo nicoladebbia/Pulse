@@ -220,9 +220,28 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         let api_key = pulse_llm::api_key("GROQ_API_KEY")
             .map_err(|_| anyhow::anyhow!("GROQ_API_KEY not set"))?;
         let client = crate::claude::client::GroqClient::new(&api_key, Some(db_path.to_path_buf()))?;
-        match client.pre_curate(&news_articles).await {
-            Ok(indices) => {
+        // Jev (opt-in via TYPESAFE_API_KEY) scores each article; the LLM pick is the fallback.
+        let jev_pick = match crate::jev::api_key() {
+            Some(key) => match crate::jev::pre_curate(&key, &news_articles, 140).await {
+                Ok(indices) => Some(indices),
+                Err(e) => {
+                    tracing::warn!("Jev pre-curation failed, using the LLM pick: {:#}", e);
+                    None
+                }
+            },
+            None => None,
+        };
+        let picked = match jev_pick {
+            Some(indices) => {
+                precurate_cut = crate::candidates::PreCurateCut::Jev;
+                Ok(indices)
+            }
+            None => client.pre_curate(&news_articles).await.inspect(|_| {
                 precurate_cut = crate::candidates::PreCurateCut::Groq;
+            }),
+        };
+        match picked {
+            Ok(indices) => {
                 let curated: Vec<_> = indices.into_iter()
                     .filter_map(|i| news_articles.get(i).cloned())
                     .collect();
