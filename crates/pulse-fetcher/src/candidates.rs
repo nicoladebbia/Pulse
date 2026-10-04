@@ -22,13 +22,15 @@ const SNIPPET_MAX_CHARS: usize = 2000;
 /// Which cut decided what reached summarization. Stored as `precurate_ran`:
 /// 0 none (pool at or under the threshold, or Groq failed on a pool small enough
 /// that the fallback keeps everything), 1 the Groq pre-curate, 2 the
-/// sector-balanced fallback cap. A fallback day is not the model's judgment, so
+/// sector-balanced fallback cap, 3 the Jev per-article scores. A fallback day is not the model's judgment, so
 /// an eval of the Groq cut must be able to tell the two apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreCurateCut {
     None = 0,
     Groq = 1,
     FallbackCap = 2,
+    /// Per-article Jev scores (`crate::jev`), sector-balanced.
+    Jev = 3,
 }
 
 /// How far a pool article got. Stages are matched by url_hash — the same key
