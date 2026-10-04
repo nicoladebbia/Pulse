@@ -153,10 +153,15 @@ pub async fn get_positions() -> Result<Vec<AlpacaPosition>> {
 }
 
 /// Place a market order on Alpaca paper trading.
+///
+/// `client_order_id` makes the order idempotent: Alpaca rejects a second order
+/// with the same id (HTTP 422), so a double-clicked Buy or Close can't place
+/// two orders — for a sell, a second order could open a short.
 pub async fn place_order(
     symbol: &str,
     qty: f64,
     side: &str, // "buy" or "sell"
+    client_order_id: &str,
 ) -> Result<AlpacaOrder> {
     let (key, secret) = get_credentials()?;
     let client = build_client()?;
@@ -166,7 +171,8 @@ pub async fn place_order(
         "qty": qty.to_string(),
         "side": side,
         "type": "market",
-        "time_in_force": "day"
+        "time_in_force": "day",
+        "client_order_id": client_order_id,
     });
 
     let resp = client
@@ -180,10 +186,74 @@ pub async fn place_order(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 422 && body.contains("client_order_id") {
+            anyhow::bail!("An order for {} was already sent — check Alpaca before trying again", symbol);
+        }
         anyhow::bail!("Alpaca order API returned {}: {}", status, body);
     }
 
     Ok(resp.json().await?)
+}
+
+/// Re-read an order by id.
+pub async fn get_order(order_id: &str) -> Result<AlpacaOrder> {
+    let (key, secret) = get_credentials()?;
+    let client = build_client()?;
+    let resp = client
+        .get(format!("{}/orders/{}", PAPER_BASE_URL, order_id))
+        .header("APCA-API-KEY-ID", &key)
+        .header("APCA-API-SECRET-KEY", &secret)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Alpaca order lookup returned {}", resp.status());
+    }
+    Ok(resp.json().await?)
+}
+
+/// True once Alpaca will not change the order any more.
+pub fn order_is_final(status: &str) -> bool {
+    matches!(status, "filled" | "canceled" | "expired" | "rejected" | "done_for_day")
+}
+
+/// A market order placed while the market is open usually fills within a
+/// second or two. Poll briefly so the trade records the real fill price; an
+/// order still open after that (e.g. market closed) is returned as-is.
+pub async fn wait_for_fill(order: AlpacaOrder) -> AlpacaOrder {
+    let mut order = order;
+    for _ in 0..6 {
+        if order_is_final(&order.status) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match get_order(&order.id).await {
+            Ok(o) => order = o,
+            Err(_) => break,
+        }
+    }
+    order
+}
+
+/// Fill price once the order is completely filled. A partial fill also carries
+/// an average price, but treating it as done would book the whole position
+/// while the rest is still working; it stays pending for the fetcher to settle.
+pub fn fill_price(order: &AlpacaOrder) -> Option<f64> {
+    if order.status != "filled" {
+        return None;
+    }
+    order.filled_avg_price.as_deref().and_then(|p| p.parse().ok()).filter(|p: &f64| *p > 0.0)
+}
+
+/// Client order id for a manual buy: one per ticker per day.
+pub fn manual_buy_order_id(ticker: &str, day: &str) -> String {
+    format!("pulse-manual-{}-{}", ticker, day.replace('-', ""))
+}
+
+/// Client order id for closing a trade: one per trade per day. A sell sent
+/// after hours fills at the next open; by the next day it has filled (nothing
+/// left to sell) or expired (safe to send again).
+pub fn close_order_id(trade_id: i64, day: &str) -> String {
+    format!("pulse-close-{}-{}", trade_id, day.replace('-', ""))
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +368,38 @@ fn get_trades_by_status(conn: &Connection, status: &str) -> Result<Vec<PaperTrad
     };
 
     Ok(trades)
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    #[test]
+    fn order_ids_are_stable_per_ticker_day_and_per_trade() {
+        assert_eq!(manual_buy_order_id("NVDA", "2026-10-05"), "pulse-manual-NVDA-20261005");
+        assert_eq!(close_order_id(42, "2026-10-05"), "pulse-close-42-20261005");
+    }
+
+    #[test]
+    fn partial_fills_have_no_fill_price() {
+        let order = |status: &str| AlpacaOrder {
+            id: "o".into(), symbol: "X".into(), qty: Some("10".into()),
+            filled_qty: Some("4".into()), filled_avg_price: Some("12.5".into()),
+            side: "sell".into(), status: status.into(), created_at: String::new(),
+        };
+        assert_eq!(fill_price(&order("filled")), Some(12.5));
+        assert_eq!(fill_price(&order("partially_filled")), None);
+    }
+
+    #[test]
+    fn only_terminal_statuses_are_final() {
+        for s in ["filled", "canceled", "expired", "rejected", "done_for_day"] {
+            assert!(order_is_final(s), "{s}");
+        }
+        for s in ["new", "accepted", "partially_filled", "pending_new"] {
+            assert!(!order_is_final(s), "{s}");
+        }
+    }
 }
 
 #[cfg(test)]

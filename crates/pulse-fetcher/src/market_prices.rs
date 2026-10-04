@@ -1,13 +1,13 @@
 use rusqlite::Connection;
 use serde::Deserialize;
 
-/// Finnhub market price fetcher.
+/// Market price fetcher.
 /// Fetches daily quotes for all entities with ticker mappings.
 /// Stores in entity_prices table — NOT as stories (prices aren't content).
 ///
-/// API: https://finnhub.io/api/v1/quote
-/// Free tier: 60 calls/min, 30 calls/sec
-/// Env var: FINNHUB_API_KEY
+/// Source: Alpaca IEX snapshots when ALPACA_API_KEY/ALPACA_SECRET_KEY are set
+/// (100 tickers per call), else Finnhub https://finnhub.io/api/v1/quote
+/// (free tier 60 calls/min, env FINNHUB_API_KEY).
 
 #[derive(Debug, Deserialize)]
 struct FinnhubQuote {
@@ -22,6 +22,35 @@ struct FinnhubQuote {
 
 /// Finnhub quotes we fetch per day. ~4,100 public tickers compete for these.
 pub const DAILY_PRICE_SLOTS: usize = 200;
+/// Alpaca prices 100 tickers per call, so the daily budget is far larger.
+pub const ALPACA_DAILY_PRICE_SLOTS: usize = 1000;
+
+/// A quote from either source, before it is written to entity_prices.
+#[derive(Debug, Clone)]
+struct Quote {
+    c: f64,
+    pc: f64,
+    o: Option<f64>,
+    h: Option<f64>,
+    l: Option<f64>,
+}
+
+impl From<FinnhubQuote> for Quote {
+    fn from(q: FinnhubQuote) -> Self {
+        Quote { c: q.c, pc: q.pc, o: Some(q.o), h: Some(q.h), l: Some(q.l) }
+    }
+}
+
+impl Quote {
+    /// None for a stale last trade; the range only when the bar is today's session.
+    fn from_snapshot(s: &pulse_alpaca::Snapshot, today: &str) -> Option<Self> {
+        if s.is_stale(chrono::Utc::now(), pulse_alpaca::max_quote_age()) {
+            return None;
+        }
+        let (o, h, l) = s.ohlc_for(today);
+        Some(Quote { c: s.price, pc: s.prev_close.unwrap_or(0.0), o, h, l })
+    }
+}
 
 /// Write one candle, filling gaps in a row that already exists.
 ///
@@ -139,36 +168,61 @@ pub fn select_tickers_to_price(
 /// Fetch and store prices for all entities with ticker mappings.
 /// Returns the number of prices stored.
 pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
-    let api_key = match std::env::var("FINNHUB_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            tracing::info!("Finnhub: skipping (FINNHUB_API_KEY not set)");
-            return Ok(0);
-        }
-    };
+    let alpaca = pulse_alpaca::credentials();
+    let api_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
+    if alpaca.is_none() && api_key.is_empty() {
+        tracing::info!("Prices: skipping (neither Alpaca keys nor FINNHUB_API_KEY set)");
+        return Ok(0);
+    }
+    let source = if alpaca.is_some() { "Alpaca" } else { "Finnhub" };
 
     let conn = Connection::open(db_path)?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    let tickers = select_tickers_to_price(&conn, &today, DAILY_PRICE_SLOTS)?;
+    let slots = if alpaca.is_some() { ALPACA_DAILY_PRICE_SLOTS } else { DAILY_PRICE_SLOTS };
+    let tickers = select_tickers_to_price(&conn, &today, slots)?;
 
     if tickers.is_empty() {
-        tracing::info!("Finnhub: no tickers need price updates today");
+        tracing::info!("{source}: no tickers need price updates today");
         return Ok(0);
     }
 
-    tracing::info!("Finnhub: fetching prices for {} tickers", tickers.len());
+    tracing::info!("{source}: fetching prices for {} tickers", tickers.len());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
 
+    // Alpaca: every quote up front in a handful of batched calls. If Alpaca is
+    // down, fall back to Finnhub when that key exists.
+    let alpaca_quotes = match &alpaca {
+        Some(creds) => {
+            let symbols: Vec<String> = tickers.iter().map(|(_, t)| t.clone()).collect();
+            match pulse_alpaca::snapshots(&client, creds, &symbols).await {
+                Ok(quotes) => {
+                    crate::db::log_api_usage(&conn, "alpaca", "snapshots", "fetch_price", 0, 0);
+                    Some(quotes)
+                }
+                Err(e) if !api_key.is_empty() => {
+                    tracing::warn!("Alpaca snapshots failed ({e}) — falling back to Finnhub");
+                    None
+                }
+                Err(e) => anyhow::bail!(e),
+            }
+        }
+        None => None,
+    };
+
     let mut stored = 0;
     let mut errors = 0;
 
     for (entity_id, ticker) in &tickers {
-        match fetch_quote(&client, &api_key, ticker).await {
+        let result = match &alpaca_quotes {
+            Some(quotes) => Ok(quotes.get(ticker).and_then(|s| Quote::from_snapshot(s, &today))),
+            None => fetch_quote(&client, &api_key, ticker).await.map(|q| q.map(Quote::from)),
+        };
+        match result {
             Ok(Some(quote)) => {
                 // Compute change percentages from historical data
                 let change_1d = if quote.pc > 0.0 {
@@ -192,8 +246,9 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
                 )?;
                 stored += 1;
 
-                // Log API usage
-                crate::db::log_api_usage(&conn, "finnhub", "quote", "fetch_price", 0, 0);
+                if alpaca_quotes.is_none() {
+                    crate::db::log_api_usage(&conn, "finnhub", "quote", "fetch_price", 0, 0);
+                }
             }
             Ok(None) => {} // No data (market closed, invalid ticker)
             Err(e) => {
@@ -206,11 +261,13 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
             }
         }
 
-        // Rate limit: 100ms between requests (stay under 60/min = 1/sec)
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Rate limit: 100ms between Finnhub requests (stay under 60/min = 1/sec)
+        if alpaca_quotes.is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
-    tracing::info!("Finnhub: stored {} prices ({} errors)", stored, errors);
+    tracing::info!("{source}: stored {} prices ({} errors)", stored, errors);
 
     // Backfill 30-day candle history for tickers missing 7d/30d changes.
     // Held and recently-signalled tickers first, for the same reason they are
@@ -514,6 +571,8 @@ pub async fn check_ticker_universe_eligibility(
     let mut last_price: Option<f64> = None;
     let mut alpaca_tradable = false;
     let mut alpaca_status = String::new();
+    let mut alpaca_exchange = String::new();
+    let mut alpaca_marginable = false;
     // Tracks whether each upstream call actually succeeded, so a rejection can be
     // logged as "data says ineligible" vs "couldn't reach Finnhub/Alpaca" — these
     // look identical downstream (both leave the Option unset / bool false) but are
@@ -562,8 +621,18 @@ pub async fn check_ticker_universe_eligibility(
                 tracing::warn!("Universe gate: Finnhub quote request failed for {}: {}", ticker, e);
             }
         }
+    } else if let Some(creds) = pulse_alpaca::credentials() {
+        // No Finnhub: price from Alpaca; market cap is unknown, so the stricter
+        // Alpaca-only rule below (`eligible_without_market_cap`) applies instead.
+        match pulse_alpaca::latest_price(client, &creds, ticker).await {
+            Ok(p) => {
+                finnhub_quote_ok = true;
+                last_price = p;
+            }
+            Err(e) => tracing::warn!("Universe gate: Alpaca price for {} failed: {}", ticker, e),
+        }
     } else {
-        tracing::warn!("Universe gate: FINNHUB_API_KEY unset — {} will fail closed", ticker);
+        tracing::warn!("Universe gate: no price source — {} will fail closed", ticker);
     }
 
     if !alpaca_key.is_empty() && !alpaca_secret.is_empty() {
@@ -579,6 +648,8 @@ pub async fn check_ticker_universe_eligibility(
                 if let Ok(asset) = resp.json::<serde_json::Value>().await {
                     alpaca_tradable = asset.get("tradable").and_then(|v| v.as_bool()).unwrap_or(false);
                     alpaca_status = asset.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    alpaca_exchange = asset.get("exchange").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    alpaca_marginable = asset.get("marginable").and_then(|v| v.as_bool()).unwrap_or(false);
                 }
             }
             Ok(resp) => {
@@ -599,10 +670,14 @@ pub async fn check_ticker_universe_eligibility(
         );
     }
 
-    let eligible = market_cap.map(|m| m >= MIN_MARKET_CAP_MILLIONS).unwrap_or(false)
-        && last_price.map(|p| p >= MIN_PRICE).unwrap_or(false)
-        && alpaca_tradable
-        && alpaca_status == "active";
+    let eligible = if finnhub_key.is_empty() {
+        eligible_without_market_cap(last_price, alpaca_tradable, &alpaca_status, &alpaca_exchange, alpaca_marginable)
+    } else {
+        market_cap.map(|m| m >= MIN_MARKET_CAP_MILLIONS).unwrap_or(false)
+            && last_price.map(|p| p >= MIN_PRICE).unwrap_or(false)
+            && alpaca_tradable
+            && alpaca_status == "active"
+    };
 
     let _ = conn.execute(
         "INSERT INTO ticker_eligibility_cache
@@ -626,6 +701,26 @@ pub async fn check_ticker_universe_eligibility(
     }
 
     eligible
+}
+
+/// Universe rule when there is no Finnhub key, so no market cap. It stands in
+/// for the $300M floor with what Alpaca's asset record does say: listed on a
+/// national exchange (no OTC), marginable (brokers mark thin and penny names
+/// non-marginable) and a $5 price floor instead of $1. Still fails closed.
+fn eligible_without_market_cap(
+    price: Option<f64>,
+    tradable: bool,
+    status: &str,
+    exchange: &str,
+    marginable: bool,
+) -> bool {
+    const MIN_PRICE_NO_CAP: f64 = 5.0;
+    const LISTED: [&str; 5] = ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"];
+    price.is_some_and(|p| p >= MIN_PRICE_NO_CAP)
+        && tradable
+        && status == "active"
+        && LISTED.contains(&exchange)
+        && marginable
 }
 
 /// Legacy Finnhub candle backfill — premium-only on free keys.
@@ -1081,5 +1176,26 @@ mod candle_write_tests {
 
         let (_, close, _, _) = row(&conn, "LMT", "2026-08-05");
         assert_eq!(close, 405.0, "each date keeps its own quote close");
+    }
+}
+
+#[cfg(test)]
+mod no_market_cap_gate_tests {
+    use super::*;
+
+    #[test]
+    fn listed_marginable_names_above_five_dollars_pass() {
+        assert!(eligible_without_market_cap(Some(42.0), true, "active", "NASDAQ", true));
+        assert!(eligible_without_market_cap(Some(5.0), true, "active", "NYSE", true));
+    }
+
+    #[test]
+    fn anything_missing_or_thin_fails_closed() {
+        assert!(!eligible_without_market_cap(None, true, "active", "NASDAQ", true));
+        assert!(!eligible_without_market_cap(Some(4.99), true, "active", "NASDAQ", true));
+        assert!(!eligible_without_market_cap(Some(42.0), true, "active", "OTC", true));
+        assert!(!eligible_without_market_cap(Some(42.0), true, "active", "NASDAQ", false));
+        assert!(!eligible_without_market_cap(Some(42.0), false, "active", "NASDAQ", true));
+        assert!(!eligible_without_market_cap(Some(42.0), true, "inactive", "NASDAQ", true));
     }
 }

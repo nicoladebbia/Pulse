@@ -893,7 +893,7 @@
 				<span class="text-xs text-text-muted">
 					{prices.length} tickers · most-recent close per ticker
 					{#if priceRefreshFailed}
-						<span class="text-amber-400" title="Today's Finnhub refresh failed — showing last stored prices">· refresh failed, showing stored</span>
+						<span class="text-amber-400" title="Today's price refresh failed — showing last stored prices">· refresh failed, showing stored</span>
 					{:else if pricesRefreshing}
 						<span class="text-text-muted">· refreshing…</span>
 					{/if}
@@ -957,7 +957,7 @@
 					{totalPnlPct >= 0 ? '+' : ''}{totalPnlPct.toFixed(2)}%
 				</div>
 				<button onclick={toggleStream}
-					title={streaming ? 'Live Finnhub stream active — positions tick as trades print' : 'Start a Finnhub WebSocket stream to see positions tick live'}
+					title={streaming ? 'Live price stream active — positions tick as trades print' : 'Start a live price stream to see positions tick live'}
 					class="absolute top-3 right-3 flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] transition-colors {streaming ? 'bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25' : 'bg-zinc-500/10 text-text-muted hover:bg-zinc-500/20'}">
 					<span class="w-1.5 h-1.5 rounded-full {streaming ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-500'}"></span>
 					{streaming ? 'LIVE' : 'Stream'}
