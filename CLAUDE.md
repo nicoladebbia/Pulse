@@ -35,6 +35,12 @@ cargo build -p pulse-fetcher    # Build fetcher only
 ## Environment Variables
 Required in `.env`: ANTHROPIC_API_KEY, VOYAGE_API_KEY, GROQ_API_KEY — or `PULSE_LLM=local` to run every AI call on Ollama with no keys (`crates/pulse-llm`, `scripts/setup-local-ai.sh`). New AI call sites must go through `pulse_llm` (`messages_url`, `messages_body`, `api_key`, `embeddings_body`) or they will silently bypass local mode.
 
+## Trading (Alpaca paper)
+- All orders go to `paper-api.alpaca.markets` only. Keys: `ALPACA_API_KEY` / `ALPACA_SECRET_KEY`.
+- Prices (daily quotes, Signals refresh, live stream) come from Alpaca's free IEX feed via `crates/pulse-alpaca` when those keys are set; Finnhub is the fallback. Without Finnhub the auto-trade universe gate uses the Alpaca-only rule (`eligible_without_market_cap`).
+- Manual Buy/Close use `client_order_id`s (`pulse-manual-…`, `pulse-close-…`) so double clicks can't double-order.
+- `scripts/scheduled-fetch.sh` runs `--mode manage-positions` hourly and `--mode auto-trade` once a day during US market hours (10:00–15:59 ET, weekdays).
+
 ## Releases & updates
 - `git tag v0.2.0 && git push --tags` → `.github/workflows/release.yml` builds the macOS app, signs the update (secrets `TAURI_SIGNING_PRIVATE_KEY` / `_PASSWORD`, key at `~/.tauri/pulse-updater.key`) and publishes `latest.json`. The tag is the version and must go up each release.
 - Installed apps check every 4h and show an "Update to vX" button in the sidebar (`src/lib/updater.ts`).

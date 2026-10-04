@@ -387,9 +387,13 @@ async fn main() -> anyhow::Result<()> {
         "manage-positions" => {
             // Run ONLY the exit-evaluation phase. Honors EXIT_DRY_RUN (default true).
             tracing::info!("Running position management (exit evaluation) only...");
+            // Errors exit non-zero so scripts/scheduled-fetch.sh can tell.
             match pipeline::run_position_management(&db_path).await {
                 Ok(n) => tracing::info!("Position management complete: {} action(s)", n),
-                Err(e) => tracing::error!("Position management failed: {}", e),
+                Err(e) => {
+                    tracing::error!("Position management failed: {}", e);
+                    return Err(e);
+                }
             }
         }
         "auto-trade" => {
@@ -400,7 +404,22 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Running auto-trade (buy path) only...");
             match pipeline::run_auto_trade(&db_path).await {
                 Ok(n) => tracing::info!("Auto-trade complete: {} order(s) placed", n),
-                Err(e) => tracing::error!("Auto-trade failed: {}", e),
+                Err(e) => {
+                    tracing::error!("Auto-trade failed: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+        "market-open" => {
+            // Exit 0 when the US market is open now (Alpaca clock), 3 when it is
+            // closed (weekends, holidays, after hours), 1 on error. Lets
+            // scripts/scheduled-fetch.sh skip trading when nothing can fill.
+            let creds = pulse_alpaca::credentials().ok_or_else(|| anyhow::anyhow!("Alpaca keys not set"))?;
+            let client = pulse_alpaca::client(std::time::Duration::from_secs(15)).map_err(|e| anyhow::anyhow!(e))?;
+            let open = pulse_alpaca::market_open(&client, &creds).await.map_err(|e| anyhow::anyhow!(e))?;
+            tracing::info!("US market is {}", if open { "open" } else { "closed" });
+            if !open {
+                std::process::exit(3);
             }
         }
         "refresh-prices" => {

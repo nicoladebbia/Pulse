@@ -23,6 +23,7 @@ tauri-build = { version = "2", features = [] }
 pulse-pricing = { path = "../crates/pulse-pricing" }
 pulse-weights = { path = "../crates/pulse-weights" }
 pulse-llm = { path = "../crates/pulse-llm" }
+pulse-alpaca = { path = "../crates/pulse-alpaca" }
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-shell = "2"
 serde = { workspace = true }
