@@ -480,7 +480,14 @@ impl GroqClient {
     }
 
     pub async fn call(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
-        for (i, key) in cloud_providers_for(endpoint) {
+        self.call_with(model, endpoint, system, user_msg, max_tokens, true).await
+    }
+
+    /// [`call`](Self::call), optionally skipping the cloud offload — a retry after
+    /// the cloud model's answer failed to parse should get a different model.
+    async fn call_with(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32, allow_cloud: bool) -> anyhow::Result<String> {
+        let providers = if allow_cloud { cloud_providers_for(endpoint) } else { Vec::new() };
+        for (i, key) in providers {
             // Another call may have paused or dropped it since the list was taken.
             if !cloud_available(i) {
                 continue;
@@ -903,7 +910,9 @@ impl GroqClient {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
 
-            let text = match self.call(FAST_MODEL, "summarize", system, &user_msg, 2000).await {
+            // The retry skips the cloud: gpt-oss-120b on Cerebras was seen leaving out
+            // `why_it_matters` on the same story twice in a row, the local model did not.
+            let text = match self.call_with(FAST_MODEL, "summarize", system, &user_msg, 2000, attempt == 0).await {
                 Ok(t) => t,
                 Err(e) => {
                     last_err = Some(e);
