@@ -77,16 +77,40 @@ pub fn anthropic_equivalent(groq_model: &str) -> &'static str {
     }
 }
 
-/// Local mode, but named tasks still run on Groq's cloud.
+/// Local mode, but named tasks still run in the cloud.
 ///
 /// `PULSE_CLOUD_TASKS=summarize` sends per-story summaries — ~140 calls and about
-/// 70 of the ~90 minutes a local briefing takes — to Groq, where they finish in
-/// about a minute. Everything else stays on Ollama. Needs a real `GROQ_API_KEY`;
-/// without one, or once Groq refuses the key, calls quietly stay local.
-static CLOUD_OFFLOAD_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 70 of the ~90 minutes a local briefing takes — to the fast cloud providers
+/// below. Everything else stays on Ollama. Each provider is used only when its
+/// key is set; a rate limit pauses that provider and the call moves on to the
+/// next one, then to the local model. Free plans are small (Cerebras 5 requests
+/// a minute, Groq ~3 summaries a minute), so the providers and the local model
+/// share the work instead of waiting on each other.
+pub(crate) struct CloudProvider {
+    pub name: &'static str,
+    key_var: &'static str,
+    url: &'static str,
+    /// Fixed model, or None to send the Groq model the caller asked for.
+    model: Option<&'static str>,
+}
 
-/// Unix time (seconds) before which offloading is paused after Groq rate limits.
-static CLOUD_OFFLOAD_PAUSED_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) const CLOUD_PROVIDERS: [CloudProvider; 2] = [
+    // gpt-oss-120b (the stronger sibling of Groq's 20b), 1M free tokens a day.
+    CloudProvider {
+        name: "cerebras",
+        key_var: "CEREBRAS_API_KEY",
+        url: "https://api.cerebras.ai/v1/chat/completions",
+        model: Some("gpt-oss-120b"),
+    },
+    CloudProvider { name: "groq", key_var: "GROQ_API_KEY", url: API_URL, model: None },
+];
+
+/// Per provider: turned off for the run (bad key / blocked), and paused-until
+/// (unix seconds) after a rate limit.
+static CLOUD_OFF: [std::sync::atomic::AtomicBool; 2] =
+    [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)];
+static CLOUD_PAUSED_UNTIL: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -95,16 +119,24 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Send offloadable calls to the local model for the next `secs` seconds.
-fn pause_cloud_offload(secs: f64) {
-    let until = unix_now() + secs.min(3600.0) as u64;
-    let prev = CLOUD_OFFLOAD_PAUSED_UNTIL.fetch_max(until, std::sync::atomic::Ordering::Relaxed);
-    if prev < unix_now() {
-        tracing::warn!("Groq rate limit hit: using the local model for the next {:.0}s.", secs.min(3600.0));
+/// Skip provider `i` for the next `secs` seconds.
+fn pause_cloud(i: usize, secs: f64) {
+    let secs = secs.clamp(1.0, 3600.0);
+    let now = unix_now();
+    let prev = CLOUD_PAUSED_UNTIL[i].fetch_max(now + secs.ceil() as u64, std::sync::atomic::Ordering::Relaxed);
+    if prev <= now {
+        tracing::info!("{} rate limit: skipping it for {:.0}s.", CLOUD_PROVIDERS[i].name, secs);
     }
 }
 
-/// Should a call for `endpoint` go to Groq's cloud instead of the local model?
+/// Stop using provider `i` for the rest of the run. Logs once.
+fn stop_cloud(i: usize, reason: &str) {
+    if !CLOUD_OFF[i].swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!("{} off for this run ({}).", CLOUD_PROVIDERS[i].name, reason);
+    }
+}
+
+/// Should a call for `endpoint` go to a cloud provider instead of the local model?
 /// Pure so the rules can be tested without touching the environment.
 pub(crate) fn offload_wanted(local: bool, tasks: Option<&str>, endpoint: &str, key: Option<&str>) -> bool {
     local
@@ -114,23 +146,35 @@ pub(crate) fn offload_wanted(local: bool, tasks: Option<&str>, endpoint: &str, k
         })
 }
 
-/// The real Groq key when `endpoint` should be offloaded this run, else None.
-fn cloud_offload_key(endpoint: &str) -> Option<String> {
-    if CLOUD_OFFLOAD_OFF.load(std::sync::atomic::Ordering::Relaxed)
-        || CLOUD_OFFLOAD_PAUSED_UNTIL.load(std::sync::atomic::Ordering::Relaxed) > unix_now()
-    {
-        return None;
-    }
-    let key = std::env::var("GROQ_API_KEY").ok();
+/// Providers available right now for `endpoint`, in order, with their keys.
+fn cloud_providers_for(endpoint: &str) -> Vec<(usize, String)> {
     let tasks = std::env::var("PULSE_CLOUD_TASKS").ok();
-    offload_wanted(pulse_llm::is_local(), tasks.as_deref(), endpoint, key.as_deref()).then(|| key.unwrap_or_default())
+    (0..CLOUD_PROVIDERS.len())
+        .filter(|&i| cloud_available(i))
+        .filter_map(|i| {
+            let key = std::env::var(CLOUD_PROVIDERS[i].key_var).ok();
+            offload_wanted(pulse_llm::is_local(), tasks.as_deref(), endpoint, key.as_deref())
+                .then(|| (i, key.unwrap_or_default().trim().to_string()))
+        })
+        .collect()
 }
 
-/// Stop offloading for the rest of the run (bad key or blocked IP). Logs once.
-fn stop_cloud_offload(reason: &str) {
-    if !CLOUD_OFFLOAD_OFF.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!("Groq cloud offload off for this run ({}). Continuing on the local model.", reason);
-    }
+/// Not turned off, not paused, and (for Groq) not behind the run's IP block.
+fn cloud_available(i: usize) -> bool {
+    !CLOUD_OFF[i].load(std::sync::atomic::Ordering::Relaxed)
+        && CLOUD_PAUSED_UNTIL[i].load(std::sync::atomic::Ordering::Relaxed) <= unix_now()
+        && !(CLOUD_PROVIDERS[i].url == API_URL && groq_is_blocked())
+}
+
+/// Seconds to back off after a 429: the server's `retry-after` when given, else
+/// one free-plan request slot (Cerebras allows 5 a minute and sends no header).
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> f64 {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite())
+        .unwrap_or(12.0)
 }
 
 /// Does this Groq HTTP status mean "your IP is blocked", as opposed to a transient blip?
@@ -424,11 +468,33 @@ impl GroqClient {
             }
     }
 
+    /// Usage of an offloaded call: it reached a real cloud API even in local mode.
+    fn log_cloud_call(&self, provider: &str, model: &str, endpoint: &str, usage: &Usage) {
+        if let Some(ref path) = self.db_path
+            && let Ok(conn) = rusqlite::Connection::open(path) {
+                crate::db::log_cloud_api_usage(
+                    &conn, provider, model, endpoint,
+                    usage.prompt_tokens, usage.completion_tokens,
+                );
+            }
+    }
+
     pub async fn call(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
-        if let Some(key) = cloud_offload_key(endpoint) {
-            match self.call_groq_cloud(&key, model, endpoint, system, user_msg, max_tokens).await {
+        self.call_with(model, endpoint, system, user_msg, max_tokens, true).await
+    }
+
+    /// [`call`](Self::call), optionally skipping the cloud offload — a retry after
+    /// the cloud model's answer failed to parse should get a different model.
+    async fn call_with(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32, allow_cloud: bool) -> anyhow::Result<String> {
+        let providers = if allow_cloud { cloud_providers_for(endpoint) } else { Vec::new() };
+        for (i, key) in providers {
+            // Another call may have paused or dropped it since the list was taken.
+            if !cloud_available(i) {
+                continue;
+            }
+            match self.call_cloud(i, &key, model, endpoint, system, user_msg, max_tokens).await {
                 Ok(text) => return Ok(text),
-                Err(e) => tracing::warn!("Groq cloud {} failed, using the local model: {:#}", endpoint, e),
+                Err(e) => tracing::debug!("{} {} not used: {:#}", CLOUD_PROVIDERS[i].name, endpoint, e),
             }
         }
         // Groq already known blocked this run -> do not spend 150s of retries proving it
@@ -555,10 +621,13 @@ impl GroqClient {
         anyhow::bail!("Groq API: max retries exceeded (last error: {})", last_err.unwrap_or_else(|| "rate limiting".into()))
     }
 
-    /// One JSON call straight to Groq's cloud with the real key, used by local
-    /// mode's offloaded tasks. Short retries only: the caller falls back to the
-    /// local model on any error, so waiting minutes here would be pure loss.
-    async fn call_groq_cloud(&self, key: &str, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+    /// One JSON call to cloud provider `i`, used by local mode's offloaded tasks.
+    /// No waiting on rate limits: the provider is paused and the caller moves on
+    /// to the next provider or the local model, which is faster than queueing.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_cloud(&self, i: usize, key: &str, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
+        let provider = &CLOUD_PROVIDERS[i];
+        let model = provider.model.unwrap_or(model);
         let (max_tokens, reasoning_effort) = reasoning_params_for(model, max_tokens, false);
         let request = ChatRequest {
             model: model.to_string(),
@@ -571,74 +640,55 @@ impl GroqClient {
             response_format: ResponseFormat { fmt_type: "json_object".to_string() },
             reasoning_effort,
         };
-        let mut last_err = String::from("no attempt");
-        for attempt in 0..3u64 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
+        // One attempt. Anything that fails pauses this provider so the next
+        // stories go straight to the next option instead of repeating the wait.
+        let resp = match self.http
+            .post(provider.url)
+            .timeout(std::time::Duration::from_secs(60))
+            .bearer_auth(key)
+            .json(&request)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                pause_cloud(i, 60.0);
+                anyhow::bail!("{} unreachable: {e}", provider.name);
             }
-            let resp = match self.http
-                .post(API_URL)
-                .timeout(std::time::Duration::from_secs(60))
-                .bearer_auth(key)
-                .json(&request)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    last_err = e.to_string();
-                    continue;
-                }
-            };
-            let code = resp.status().as_u16();
-            if code == 401 || is_groq_block_status(code) {
-                stop_cloud_offload(&format!("HTTP {code}"));
-                anyhow::bail!("Groq refused the key (HTTP {code})");
-            }
-            if code == 429 {
-                // Groq says how long to wait. A short wait is a per-minute limit:
-                // sleep it off. A long one (daily quota) or a third 429 pauses the
-                // offload so every other story goes local instead of queueing here.
-                let wait = resp.headers().get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(5.0)
-                    .max(1.0);
-                if wait > 20.0 || attempt == 2 {
-                    pause_cloud_offload(wait.max(30.0));
-                    anyhow::bail!("Groq rate limited (retry-after {wait:.0}s)");
-                }
-                last_err = "rate limited".into();
-                tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
-                continue;
-            }
-            if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                let err = format!("HTTP {code}: {}", body.chars().take(160).collect::<String>());
-                // Only timeouts and server errors are worth another try.
-                if code != 408 && code < 500 {
-                    anyhow::bail!(err);
-                }
-                last_err = err;
-                continue;
-            }
-            let response: ChatResponse = resp.json().await?;
-            if let Some(err) = response.error {
-                anyhow::bail!("Groq API error: {}", err.message);
-            }
-            if let Some(ref u) = response.usage {
-                self.log_call(model, endpoint, u);
-            }
-            let text = response
-                .choices
-                .and_then(|c| c.into_iter().next())
-                .map(|c| c.message.content)
-                .unwrap_or_default();
-            // Empty means the budget went on reasoning: let the local model try.
-            anyhow::ensure!(!text.trim().is_empty(), "Groq returned an empty answer");
-            return Ok(text);
+        };
+        let code = resp.status().as_u16();
+        if code == 401 || code == 403 {
+            stop_cloud(i, &format!("HTTP {code}"));
+            anyhow::bail!("{} refused the key (HTTP {code})", provider.name);
         }
-        anyhow::bail!("{last_err}")
+        if code == 429 {
+            pause_cloud(i, retry_after_secs(resp.headers()));
+            anyhow::bail!("{} rate limited", provider.name);
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            // Server trouble passes; a rejected request (bad parameter, unknown
+            // model) will repeat on every story, so sit this provider out longer.
+            let secs = if code == 408 || code >= 500 { 60.0 } else { 600.0 };
+            pause_cloud(i, secs);
+            tracing::warn!("{} HTTP {code}: {}", provider.name, body.chars().take(160).collect::<String>());
+            anyhow::bail!("{} HTTP {code}", provider.name);
+        }
+        let response: ChatResponse = resp.json().await?;
+        if let Some(err) = response.error {
+            anyhow::bail!("{} API error: {}", provider.name, err.message);
+        }
+        if let Some(ref u) = response.usage {
+            self.log_cloud_call(provider.name, model, endpoint, u);
+        }
+        let text = response
+            .choices
+            .and_then(|c| c.into_iter().next())
+            .map(|c| c.message.content)
+            .unwrap_or_default();
+        // Empty means the budget went on reasoning: let the next option try.
+        anyhow::ensure!(!text.trim().is_empty(), "{} returned an empty answer", provider.name);
+        Ok(text)
     }
 
     /// Like `call()` but returns plain text (no JSON response_format constraint).
@@ -860,7 +910,9 @@ impl GroqClient {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
 
-            let text = match self.call(FAST_MODEL, "summarize", system, &user_msg, 2000).await {
+            // The retry skips the cloud: gpt-oss-120b on Cerebras was seen leaving out
+            // `why_it_matters` on the same story twice in a row, the local model did not.
+            let text = match self.call_with(FAST_MODEL, "summarize", system, &user_msg, 2000, attempt == 0).await {
                 Ok(t) => t,
                 Err(e) => {
                     last_err = Some(e);
@@ -1751,6 +1803,25 @@ mod reasoning_model_tests {
         assert!(!offload_wanted(true, Some("summarize"), "summarize", None));
         assert!(!offload_wanted(true, Some("summarize"), "summarize", Some("  ")));
         assert!(!offload_wanted(true, Some("summarize"), "summarize", Some(pulse_llm::LOCAL_KEY)));
+    }
+
+    #[test]
+    fn cerebras_is_tried_before_groq_and_uses_its_own_model() {
+        assert_eq!(CLOUD_PROVIDERS[0].name, "cerebras");
+        assert_eq!(CLOUD_PROVIDERS[0].model, Some("gpt-oss-120b"));
+        assert!(is_reasoning_model("gpt-oss-120b"), "needs the reasoning budget");
+        assert_eq!(CLOUD_PROVIDERS[1].name, "groq");
+        assert_eq!(CLOUD_PROVIDERS[1].model, None);
+    }
+
+    #[test]
+    fn rate_limit_backoff_uses_the_header_or_one_free_plan_slot() {
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_secs(&h), 12.0);
+        h.insert("retry-after", "2.5".parse().unwrap());
+        assert_eq!(retry_after_secs(&h), 2.5);
+        h.insert("retry-after", "soon".parse().unwrap());
+        assert_eq!(retry_after_secs(&h), 12.0);
     }
 
     #[test]

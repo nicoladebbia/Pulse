@@ -728,12 +728,36 @@ pub fn log_api_usage(
     // (next to pulse.db) on every call — edit that file to update prices live.
     // Local-mode calls never reach a paid API: record them as free so they show
     // up in usage but can never trip the daily cost cap.
-    let (provider, model, cost) = if pulse_llm::is_local() {
-        ("local", pulse_llm::local_model(), 0.0)
+    if pulse_llm::is_local() {
+        insert_api_usage(conn, "local", &pulse_llm::local_model(), endpoint, input_tokens, output_tokens, 0.0);
     } else {
-        (provider, model.to_string(), pulse_pricing::estimate_cost(provider, model, input_tokens, output_tokens))
-    };
+        log_cloud_api_usage(conn, provider, model, endpoint, input_tokens, output_tokens);
+    }
+}
 
+/// Log a call that really went to a cloud provider, even in local mode
+/// (`PULSE_CLOUD_TASKS` offload), so usage and the cost cap see it as such.
+pub fn log_cloud_api_usage(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    model: &str,
+    endpoint: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) {
+    let cost = pulse_pricing::estimate_cost(provider, model, input_tokens, output_tokens);
+    insert_api_usage(conn, provider, model, endpoint, input_tokens, output_tokens, cost);
+}
+
+fn insert_api_usage(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    model: &str,
+    endpoint: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost: f64,
+) {
     conn.execute(
         "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",

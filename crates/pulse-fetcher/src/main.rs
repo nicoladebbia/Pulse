@@ -171,8 +171,8 @@ async fn main() -> anyhow::Result<()> {
             && !tasks.trim().is_empty()
         {
             tracing::info!(
-                "Cloud offload (PULSE_CLOUD_TASKS={}): these tasks use Groq when GROQ_API_KEY is set, \
-                 falling back to the local model on any error.",
+                "Cloud offload (PULSE_CLOUD_TASKS={}): these tasks use Cerebras / Groq when \
+                 CEREBRAS_API_KEY / GROQ_API_KEY are set, falling back to the local model.",
                 tasks.trim()
             );
         }
