@@ -1,5 +1,6 @@
 #!/bin/bash
-# Morning (08:00) and evening (21:00) briefings for an installed Pulse.app.
+# Morning (08:00) and evening (21:00) briefings for an installed Pulse.app,
+# plus paper-trading upkeep during US market hours.
 #
 # launchd fires this every hour (a LaunchAgent with an `Hour` key never fired
 # on this setup, see com.pulse.embedding-backfill.plist), and the script decides
@@ -42,6 +43,30 @@ run_slot() { # name, extra args...
     echo "$(date) $name briefing not made (exit $code), next hour retries"
   fi
 }
+
+# Paper trading while the US market is open (weekdays, 10:00–15:59 New York
+# time): settle fills and run stops every hour, look for new buys once a day.
+# Quick, no AI calls, and first so a long briefing below can't delay it.
+et_hour=$((10#$(TZ=America/New_York date +%H)))
+et_weekday="$(TZ=America/New_York date +%u)"
+# The Alpaca clock catches holidays; it also fails (skipping trading) when no
+# Alpaca keys are set.
+if [ "$et_weekday" -le 5 ] && [ "$et_hour" -ge 10 ] && [ "$et_hour" -le 15 ] \
+  && "$FETCHER" --mode market-open >/dev/null 2>&1; then
+  echo "$(date) market open: managing paper positions"
+  "$FETCHER" --mode manage-positions
+  rc=$?
+  [ "$rc" -eq 0 ] || echo "$(date) manage-positions failed (exit $rc)"
+  if [ "$(cat "$STATE_DIR/auto-trade" 2>/dev/null)" != "$today" ]; then
+    "$FETCHER" --mode auto-trade
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "$today" > "$STATE_DIR/auto-trade"
+    else
+      echo "$(date) auto-trade failed (exit $rc), next hour retries"
+    fi
+  fi
+fi
 
 if [ "$hour" -ge 21 ]; then
   # The morning one already exists by now, so the evening run needs --force

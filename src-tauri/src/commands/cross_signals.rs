@@ -158,13 +158,28 @@ fn write_refreshed_quote(
     )
 }
 
-/// Refresh prices for top tickers from Finnhub. Called on signals page load.
+/// Percent change from the latest close at least `days` days old.
+fn change_since(conn: &rusqlite::Connection, ticker: &str, price: f64, days: i64) -> Option<f64> {
+    conn.query_row(
+        "SELECT close FROM entity_prices WHERE ticker = ?1 AND date <= date('now', ?2) ORDER BY date DESC LIMIT 1",
+        rusqlite::params![ticker, format!("-{days} days")],
+        |row| row.get::<_, f64>(0),
+    )
+    .ok()
+    .and_then(|past| if past > 0.0 { Some((price - past) / past * 100.0) } else { None })
+}
+
+/// Refresh prices for top tickers from Alpaca (when its keys are set) or
+/// Finnhub. Called on signals page load.
 #[tauri::command]
 pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
+    let alpaca = pulse_alpaca::credentials();
     let api_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
+    if alpaca.is_none() && api_key.is_empty() {
         return Ok(0);
     }
+    // One batched Alpaca call covers far more names than Finnhub's 60/min.
+    let limit: i64 = if alpaca.is_some() { 100 } else { 25 };
 
     // Get tickers to refresh (from DB, drop lock before async)
     let tickers: Vec<(i64, String)> = {
@@ -179,9 +194,9 @@ pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
              GROUP BY et.ticker
              ORDER BY (et.ticker IN (SELECT ticker FROM paper_trades WHERE status = 'open')) DESC,
                       MAX(et.confidence) DESC
-             LIMIT 25"
+             LIMIT ?1"
         ).map_err(|e| e.to_string())?;
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        stmt.query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect()
@@ -195,8 +210,35 @@ pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
         .build().map_err(|e| e.to_string())?;
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let mut updated = 0;
 
+    if let Some(creds) = &alpaca {
+        let symbols: Vec<String> = tickers.iter().map(|(_, t)| t.clone()).collect();
+        let quotes = pulse_alpaca::snapshots(&client, creds, &symbols).await?;
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut updated = 0;
+        for (entity_id, ticker) in &tickers {
+            let Some(q) = quotes.get(ticker) else { continue };
+            if q.is_stale(chrono::Utc::now(), pulse_alpaca::max_quote_age()) {
+                continue;
+            }
+            let (open, high, low) = q.ohlc_for(&today);
+            let change_7d = change_since(&conn, ticker, q.price, 7);
+            let change_30d = change_since(&conn, ticker, q.price, 30);
+            if write_refreshed_quote(
+                &conn, *entity_id, ticker, &today, q.price,
+                open, high, low, q.change_1d(), change_7d, change_30d,
+            ).is_ok() {
+                updated += 1;
+            }
+        }
+        conn.execute(
+            "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd) VALUES ('alpaca', 'snapshots', 'refresh_prices', 0, 0, 0.0)",
+            [],
+        ).ok();
+        return Ok(updated);
+    }
+
+    let mut updated = 0;
     for (entity_id, ticker) in &tickers {
         let url = format!("https://finnhub.io/api/v1/quote?symbol={}&token={}", ticker, api_key);
         let resp = match client.get(&url).send().await {
@@ -235,16 +277,8 @@ pub async fn refresh_prices(db: State<'_, DbState>) -> Result<usize, String> {
         {
             let conn = db.0.lock().map_err(|e| e.to_string())?;
 
-            // Compute 7d/30d from historical data
-            let change_7d: Option<f64> = conn.query_row(
-                "SELECT close FROM entity_prices WHERE ticker = ?1 AND date <= date('now', '-7 days') ORDER BY date DESC LIMIT 1",
-                [&ticker], |row| row.get(0),
-            ).ok().and_then(|past: f64| if past > 0.0 { Some(((quote.c - past) / past) * 100.0) } else { None });
-
-            let change_30d: Option<f64> = conn.query_row(
-                "SELECT close FROM entity_prices WHERE ticker = ?1 AND date <= date('now', '-30 days') ORDER BY date DESC LIMIT 1",
-                [&ticker], |row| row.get(0),
-            ).ok().and_then(|past: f64| if past > 0.0 { Some(((quote.c - past) / past) * 100.0) } else { None });
+            let change_7d = change_since(&conn, ticker, quote.c, 7);
+            let change_30d = change_since(&conn, ticker, quote.c, 30);
 
             write_refreshed_quote(
                 &conn, *entity_id, ticker, &today, quote.c,

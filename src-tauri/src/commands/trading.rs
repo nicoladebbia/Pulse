@@ -103,6 +103,15 @@ pub async fn execute_trade(
     if open_count >= 15 {
         return Err("Max 15 open positions reached".to_string());
     }
+    // Size off Alpaca's latest trade; the stored close can be a day or more old.
+    let live_price = match pulse_alpaca::credentials() {
+        Some(creds) => match pulse_alpaca::client(std::time::Duration::from_secs(10)) {
+            Ok(client) => pulse_alpaca::latest_price(&client, &creds, &ticker).await.ok().flatten(),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let current_price = live_price.unwrap_or(current_price);
     if current_price <= 0.0 {
         return Err(format!("No price data for {}", ticker));
     }
@@ -114,17 +123,19 @@ pub async fn execute_trade(
     let position_pct = if confidence > 0.75 { 0.05 } else if confidence > 0.60 { 0.02 } else { 0.01 };
     let position_value = portfolio_value * position_pct;
     let qty = (position_value / current_price).floor().max(1.0);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    let order = paper_trading::place_order(&ticker, qty, "buy").await.map_err(|e| e.to_string())?;
+    let order_id = paper_trading::manual_buy_order_id(&ticker, &today);
+    let order = paper_trading::place_order(&ticker, qty, "buy", &order_id).await.map_err(|e| e.to_string())?;
+    let order = paper_trading::wait_for_fill(order).await;
     // Outside market hours the order comes back unfilled. Record it as pending
-    // with the last close as an estimate; the fetcher settles it by order id.
+    // with the latest price as an estimate; the fetcher settles it by order id.
     // Written as a plain open row, the fetcher's next run found no position,
     // took that as a sale and closed it with no P&L, orphaning the shares.
-    let fill_price: Option<f64> = order.filled_avg_price.as_deref().and_then(|p| p.parse().ok()).filter(|p: &f64| *p > 0.0);
+    let fill_price = paper_trading::fill_price(&order);
     let filled_price = fill_price.unwrap_or(current_price);
     let order_status = if fill_price.is_some() { "filled" } else { "pending" };
     let filled_qty: Option<f64> = order.filled_qty.as_deref().and_then(|q| q.parse().ok()).filter(|q: &f64| *q > 0.0);
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     // Write trade to DB (re-acquire lock)
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -193,15 +204,14 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
         return Err(format!("{} not held on Alpaca — marked closed in DB", ticker));
     }
 
-    // Place the sell.
-    let order = paper_trading::place_order(&ticker, held_qty, "sell")
+    // Place the sell. The id is fixed per trade and day, so a second click while
+    // the first sell is still open is refused by Alpaca instead of selling again.
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let order = paper_trading::place_order(&ticker, held_qty, "sell", &paper_trading::close_order_id(trade_id, &day))
         .await
         .map_err(|e| e.to_string())?;
-    let exit_price = order
-        .filled_avg_price
-        .as_deref()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0.0);
+    let order = paper_trading::wait_for_fill(order).await;
+    let exit_price = paper_trading::fill_price(&order).unwrap_or(0.0);
     let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
     // If we didn't get a fill price back synchronously, don't fabricate one;

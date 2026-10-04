@@ -2859,6 +2859,7 @@ dependencies = [
  "dirs 6.0.0",
  "dotenvy",
  "futures-util",
+ "pulse-alpaca",
  "pulse-llm",
  "pulse-pricing",
  "pulse-weights",
@@ -2879,6 +2880,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulse-alpaca"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pulse-fetcher"
 version = "0.1.0"
 dependencies = [
@@ -2891,6 +2902,7 @@ dependencies = [
  "feed-rs",
  "futures",
  "libc",
+ "pulse-alpaca",
  "pulse-llm",
  "pulse-pricing",
  "pulse-weights",
