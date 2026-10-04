@@ -166,6 +166,15 @@ async fn main() -> anyhow::Result<()> {
             pulse_llm::local_model(),
             pulse_llm::local_embed_model()
         );
+        if let Ok(tasks) = std::env::var("PULSE_CLOUD_TASKS")
+            && !tasks.trim().is_empty()
+        {
+            tracing::info!(
+                "Cloud offload (PULSE_CLOUD_TASKS={}): these tasks use Groq when GROQ_API_KEY is set, \
+                 falling back to the local model on any error.",
+                tasks.trim()
+            );
+        }
     }
 
     match args.mode.as_str() {
