@@ -45,6 +45,8 @@ fn defaults() -> Vec<PriceEntry> {
         e("groq", "8b", 0.05, 0.08),
         e("groq", "scout", 0.11, 0.34),
         e("groq", "llama", 0.59, 0.79), // catch-all for other llama models (70B rates)
+        // Cerebras (local mode's summary offload). cerebras.ai/pricing, pay-as-you-go.
+        e("cerebras", "gpt-oss-120b", 0.35, 0.75),
         // Voyage (embeddings: input only)
         e("voyage", "voyage", 0.01, 0.0),
     ]
@@ -124,6 +126,7 @@ mod tests {
         // undercount this crate exists to prevent, in a new coat.
         assert_eq!(cost("groq", "openai/gpt-oss-20b"), Some((0.075, 0.30)));
         assert_eq!(cost("groq", "openai/gpt-oss-120b"), Some((0.15, 0.60)));
+        assert_eq!(cost("cerebras", "gpt-oss-120b"), Some((0.35, 0.75)));
         assert_eq!(cost("groq", "qwen/qwen3.6-27b"), Some((0.15, 0.60)));
         assert_eq!(cost("voyage", "voyage-3-lite"), Some((0.01, 0.0)));
         // Free APIs fall through to no entry.

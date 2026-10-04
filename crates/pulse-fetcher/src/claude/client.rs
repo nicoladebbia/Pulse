@@ -149,18 +149,21 @@ pub(crate) fn offload_wanted(local: bool, tasks: Option<&str>, endpoint: &str, k
 /// Providers available right now for `endpoint`, in order, with their keys.
 fn cloud_providers_for(endpoint: &str) -> Vec<(usize, String)> {
     let tasks = std::env::var("PULSE_CLOUD_TASKS").ok();
-    let now = unix_now();
     (0..CLOUD_PROVIDERS.len())
-        .filter(|&i| {
-            !CLOUD_OFF[i].load(std::sync::atomic::Ordering::Relaxed)
-                && CLOUD_PAUSED_UNTIL[i].load(std::sync::atomic::Ordering::Relaxed) <= now
-        })
+        .filter(|&i| cloud_available(i))
         .filter_map(|i| {
             let key = std::env::var(CLOUD_PROVIDERS[i].key_var).ok();
             offload_wanted(pulse_llm::is_local(), tasks.as_deref(), endpoint, key.as_deref())
                 .then(|| (i, key.unwrap_or_default().trim().to_string()))
         })
         .collect()
+}
+
+/// Not turned off, not paused, and (for Groq) not behind the run's IP block.
+fn cloud_available(i: usize) -> bool {
+    !CLOUD_OFF[i].load(std::sync::atomic::Ordering::Relaxed)
+        && CLOUD_PAUSED_UNTIL[i].load(std::sync::atomic::Ordering::Relaxed) <= unix_now()
+        && !(CLOUD_PROVIDERS[i].url == API_URL && groq_is_blocked())
 }
 
 /// Seconds to back off after a 429: the server's `retry-after` when given, else
@@ -478,6 +481,10 @@ impl GroqClient {
 
     pub async fn call(&self, model: &str, endpoint: &str, system: &str, user_msg: &str, max_tokens: u32) -> anyhow::Result<String> {
         for (i, key) in cloud_providers_for(endpoint) {
+            // Another call may have paused or dropped it since the list was taken.
+            if !cloud_available(i) {
+                continue;
+            }
             match self.call_cloud(i, &key, model, endpoint, system, user_msg, max_tokens).await {
                 Ok(text) => return Ok(text),
                 Err(e) => tracing::debug!("{} {} not used: {:#}", CLOUD_PROVIDERS[i].name, endpoint, e),
@@ -626,61 +633,55 @@ impl GroqClient {
             response_format: ResponseFormat { fmt_type: "json_object".to_string() },
             reasoning_effort,
         };
-        let mut last_err = String::from("no attempt");
-        for attempt in 0..2u64 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // One attempt. Anything that fails pauses this provider so the next
+        // stories go straight to the next option instead of repeating the wait.
+        let resp = match self.http
+            .post(provider.url)
+            .timeout(std::time::Duration::from_secs(60))
+            .bearer_auth(key)
+            .json(&request)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                pause_cloud(i, 60.0);
+                anyhow::bail!("{} unreachable: {e}", provider.name);
             }
-            let resp = match self.http
-                .post(provider.url)
-                .timeout(std::time::Duration::from_secs(60))
-                .bearer_auth(key)
-                .json(&request)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    last_err = e.to_string();
-                    continue;
-                }
-            };
-            let code = resp.status().as_u16();
-            if code == 401 || code == 403 {
-                stop_cloud(i, &format!("HTTP {code}"));
-                anyhow::bail!("{} refused the key (HTTP {code})", provider.name);
-            }
-            if code == 429 {
-                pause_cloud(i, retry_after_secs(resp.headers()));
-                anyhow::bail!("{} rate limited", provider.name);
-            }
-            if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                let err = format!("{} HTTP {code}: {}", provider.name, body.chars().take(160).collect::<String>());
-                // Only timeouts and server errors are worth another try.
-                if code != 408 && code < 500 {
-                    anyhow::bail!(err);
-                }
-                last_err = err;
-                continue;
-            }
-            let response: ChatResponse = resp.json().await?;
-            if let Some(err) = response.error {
-                anyhow::bail!("{} API error: {}", provider.name, err.message);
-            }
-            if let Some(ref u) = response.usage {
-                self.log_cloud_call(provider.name, model, endpoint, u);
-            }
-            let text = response
-                .choices
-                .and_then(|c| c.into_iter().next())
-                .map(|c| c.message.content)
-                .unwrap_or_default();
-            // Empty means the budget went on reasoning: let the next option try.
-            anyhow::ensure!(!text.trim().is_empty(), "{} returned an empty answer", provider.name);
-            return Ok(text);
+        };
+        let code = resp.status().as_u16();
+        if code == 401 || code == 403 {
+            stop_cloud(i, &format!("HTTP {code}"));
+            anyhow::bail!("{} refused the key (HTTP {code})", provider.name);
         }
-        anyhow::bail!("{last_err}")
+        if code == 429 {
+            pause_cloud(i, retry_after_secs(resp.headers()));
+            anyhow::bail!("{} rate limited", provider.name);
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            // Server trouble passes; a rejected request (bad parameter, unknown
+            // model) will repeat on every story, so sit this provider out longer.
+            let secs = if code == 408 || code >= 500 { 60.0 } else { 600.0 };
+            pause_cloud(i, secs);
+            tracing::warn!("{} HTTP {code}: {}", provider.name, body.chars().take(160).collect::<String>());
+            anyhow::bail!("{} HTTP {code}", provider.name);
+        }
+        let response: ChatResponse = resp.json().await?;
+        if let Some(err) = response.error {
+            anyhow::bail!("{} API error: {}", provider.name, err.message);
+        }
+        if let Some(ref u) = response.usage {
+            self.log_cloud_call(provider.name, model, endpoint, u);
+        }
+        let text = response
+            .choices
+            .and_then(|c| c.into_iter().next())
+            .map(|c| c.message.content)
+            .unwrap_or_default();
+        // Empty means the budget went on reasoning: let the next option try.
+        anyhow::ensure!(!text.trim().is_empty(), "{} returned an empty answer", provider.name);
+        Ok(text)
     }
 
     /// Like `call()` but returns plain text (no JSON response_format constraint).
