@@ -2038,35 +2038,39 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     }
     user_msg.push_str("\nReturn valid JSON with key: curation.");
 
-    let curation_text = client
-        .call(
-            &crate::claude::client::strong_model(),
-            "freedoms_analyze",
-            crate::claude::prompts::FREEDOMS_ANALYSIS_SYSTEM,
-            &user_msg,
-            2000,
-        )
-        .await?;
-
-    // Parse curation result
-    let json_str = extract_json_str(&curation_text);
-
-    #[derive(serde::Deserialize)]
-    struct FreedomsCuration {
-        time: Vec<usize>,
-        wealth: Vec<usize>,
-        location: Vec<usize>,
-        health: Vec<usize>,
-        #[serde(default)]
-        whoop: Vec<usize>,
+    // Local models sometimes ignore the "array of indices" contract (objects
+    // instead of ints, or truncated JSON). Parse leniently and retry once with
+    // a stricter reminder before giving up -- a failure here leaves the day
+    // with no freedoms briefing at all.
+    let mut parsed: Option<FreedomsResponse> = None;
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        let msg = if attempt == 0 {
+            user_msg.clone()
+        } else {
+            format!("{user_msg}\nIMPORTANT: each of time, wealth, location, health, whoop MUST be a flat JSON array of integer story numbers (the [N] values above), e.g. {{\"curation\":{{\"time\":[3,17],\"wealth\":[5],\"location\":[],\"health\":[8],\"whoop\":[]}}}}. No objects, no titles, no commentary.")
+        };
+        let curation_text = client
+            .call(
+                &crate::claude::client::strong_model(),
+                "freedoms_analyze",
+                crate::claude::prompts::FREEDOMS_ANALYSIS_SYSTEM,
+                &msg,
+                4000,
+            )
+            .await?;
+        match parse_freedoms_curation(&curation_text) {
+            Ok(p) => {
+                parsed = Some(p);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("Freedoms curation parse failed (attempt {}): {}", attempt + 1, e);
+                last_err = e;
+            }
+        }
     }
-    #[derive(serde::Deserialize)]
-    struct FreedomsResponse {
-        curation: FreedomsCuration,
-    }
-
-    let parsed: FreedomsResponse = serde_json::from_str(json_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse freedoms curation: {} — raw: {}", e, json_str))?;
+    let parsed = parsed.ok_or_else(|| anyhow::anyhow!("Failed to parse freedoms curation: {}", last_err))?;
 
     // Build curated list with freedom labels, cap at 10 per freedom
     let max_per_freedom = 10;
@@ -2202,6 +2206,57 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     tracing::info!("Freedoms pipeline complete in {:.1}s", duration.as_secs_f64());
 
     Ok(())
+}
+
+#[derive(serde::Deserialize, Default)]
+struct FreedomsCuration {
+    #[serde(default, deserialize_with = "lenient_indices")]
+    time: Vec<usize>,
+    #[serde(default, deserialize_with = "lenient_indices")]
+    wealth: Vec<usize>,
+    #[serde(default, deserialize_with = "lenient_indices")]
+    location: Vec<usize>,
+    #[serde(default, deserialize_with = "lenient_indices")]
+    health: Vec<usize>,
+    #[serde(default, deserialize_with = "lenient_indices")]
+    whoop: Vec<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct FreedomsResponse {
+    curation: FreedomsCuration,
+}
+
+/// Accept `[3, "7", {"id": 9, ...}, {"index": 4}]` as story indices. Entries
+/// that carry no usable index are skipped rather than failing the whole parse.
+fn lenient_indices<'de, D>(d: D) -> Result<Vec<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let vals = <Vec<serde_json::Value> as serde::Deserialize>::deserialize(d)?;
+    Ok(vals
+        .iter()
+        .filter_map(|v| match v {
+            serde_json::Value::Number(n) => n.as_u64().map(|n| n as usize),
+            serde_json::Value::String(s) => s.trim().trim_matches(|c| c == '[' || c == ']').parse().ok(),
+            serde_json::Value::Object(o) => ["id", "index", "idx", "story_id", "n"]
+                .iter()
+                .find_map(|k| o.get(*k))
+                .and_then(|x| match x {
+                    serde_json::Value::Number(n) => n.as_u64().map(|n| n as usize),
+                    serde_json::Value::String(s) => s.trim().parse().ok(),
+                    _ => None,
+                }),
+            _ => None,
+        })
+        .collect())
+}
+
+fn parse_freedoms_curation(text: &str) -> Result<FreedomsResponse, String> {
+    serde_json::from_str(extract_json_str(text)).map_err(|e| {
+        let head: String = text.chars().take(300).collect();
+        format!("{e} -- raw head: {head}")
+    })
 }
 
 fn extract_json_str(text: &str) -> &str {
@@ -3280,5 +3335,31 @@ mod freedom_hero_tests {
             heroes_of(&curated),
             vec![("health".to_string(), "Only story".to_string())]
         );
+    }
+}
+
+#[cfg(test)]
+mod freedoms_curation_parse_tests {
+    use super::parse_freedoms_curation;
+
+    #[test]
+    fn plain_integer_arrays() {
+        let p = parse_freedoms_curation(r#"{"curation":{"time":[1,2],"wealth":[3],"location":[],"health":[4]}}"#).unwrap();
+        assert_eq!(p.curation.time, vec![1, 2]);
+        assert_eq!(p.curation.wealth, vec![3]);
+        assert!(p.curation.whoop.is_empty());
+    }
+
+    #[test]
+    fn object_entries_from_local_model() {
+        let raw = "```json\n{\"curation\":{\"time\":[{\"id\":162,\"title\":\"x\",\"importance\":7},{\"id\":\"72\"}],\"wealth\":[\"5\",{\"title\":\"no id\"}],\"location\":[],\"health\":[],\"whoop\":[]}}\n```";
+        let p = parse_freedoms_curation(raw).unwrap();
+        assert_eq!(p.curation.time, vec![162, 72]);
+        assert_eq!(p.curation.wealth, vec![5]);
+    }
+
+    #[test]
+    fn truncated_json_is_an_error() {
+        assert!(parse_freedoms_curation(r#"{"curation":{"time":[{"id":1,"#).is_err());
     }
 }
