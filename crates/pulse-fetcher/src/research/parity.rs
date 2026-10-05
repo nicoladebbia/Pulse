@@ -57,10 +57,10 @@ mod tests {
         let p = StrategyParams::live();
         assert!(TRADING_RS.contains("AND cs.compound_score > 0.3"));
         assert_eq!(p.min_score, 0.30);
-        assert!(SIZING_RS.contains("pub const TOP_TIER_PCT: f64 = 0.10;"));
+        assert!(SIZING_RS.contains("pub const TOP_TIER_PCT: f64 = 0.08;"));
         assert!(SIZING_RS.contains("if score > 0.6 {\n        TOP_TIER_PCT\n    } else if score > 0.4 {\n        0.05\n    } else {\n        0.02\n    }"));
         let tiers: Vec<(f64, f64)> = p.sizing_tiers.iter().map(|t| (t.above_score, t.pct)).collect();
-        assert_eq!(tiers[0], (0.6, 10.0));
+        assert_eq!(tiers[0], (0.6, 8.0));
         assert_eq!(tiers[1], (0.4, 5.0));
         assert_eq!(tiers[2].1, 2.0);
     }
