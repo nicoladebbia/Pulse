@@ -180,6 +180,66 @@ pub async fn latest_price(client: &reqwest::Client, creds: &Credentials, symbol:
     Ok(snapshots(client, creds, &[symbol.to_string()]).await?.get(symbol).map(|s| s.price))
 }
 
+/// One daily bar from the consolidated (SIP) feed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailyBar {
+    /// `YYYY-MM-DD`
+    pub date: String,
+    pub close: f64,
+    pub volume: f64,
+}
+
+pub fn parse_bars(body: &Value) -> Vec<DailyBar> {
+    body.get("bars")
+        .and_then(Value::as_array)
+        .map(|bars| {
+            bars.iter()
+                .filter_map(|b| {
+                    let close = b.get("c").and_then(Value::as_f64).filter(|c| *c > 0.0)?;
+                    Some(DailyBar {
+                        date: b.get("t").and_then(Value::as_str)?.get(..10)?.to_string(),
+                        close,
+                        volume: b.get("v").and_then(Value::as_f64).unwrap_or(0.0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Daily bars since `start` (`YYYY-MM-DD`), oldest first.
+///
+/// From the consolidated SIP feed, not IEX: IEX carries a few percent of the
+/// volume, so liquidity read from it would be off by ~30x. The free plan
+/// serves SIP only up to 15 minutes ago, hence the `end`.
+pub async fn daily_bars(
+    client: &reqwest::Client,
+    creds: &Credentials,
+    symbol: &str,
+    start: &str,
+) -> Result<Vec<DailyBar>, String> {
+    let end = (chrono::Utc::now() - chrono::Duration::minutes(16)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let resp = creds
+        .auth(client.get(format!("{DATA_URL}/stocks/{symbol}/bars")))
+        .query(&[
+            ("timeframe", "1Day"),
+            ("feed", "sip"),
+            ("adjustment", "split"),
+            ("limit", "1000"),
+            ("start", start),
+            ("end", end.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Alpaca bars request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Alpaca bars returned {status}"));
+    }
+    let body: Value = resp.json().await.map_err(|e| format!("Alpaca bars: bad JSON: {e}"))?;
+    Ok(parse_bars(&body))
+}
+
 /// Whether the US market is open right now (`/v2/clock`).
 pub async fn market_open(client: &reqwest::Client, creds: &Credentials) -> Result<bool, String> {
     let resp = creds
@@ -331,5 +391,16 @@ mod tests {
         assert_eq!(auth, json!({"action": "auth", "key": "k", "secret": "s"}));
         let sub: Value = serde_json::from_str(&stream_subscribe_message(&["A".into()], false)).unwrap();
         assert_eq!(sub, json!({"action": "unsubscribe", "trades": ["A"]}));
+    }
+
+    #[test]
+    fn bars_keep_date_close_and_volume_and_drop_bad_rows() {
+        let body = json!({"bars": [
+            {"t": "2026-09-25T04:00:00Z", "c": 771.35, "v": 36735822.0},
+            {"t": "2026-09-28T04:00:00Z", "c": 0.0, "v": 1.0},
+            {"c": 5.0, "v": 1.0}
+        ]});
+        assert_eq!(parse_bars(&body), vec![DailyBar { date: "2026-09-25".into(), close: 771.35, volume: 36735822.0 }]);
+        assert!(parse_bars(&json!({"bars": null})).is_empty());
     }
 }

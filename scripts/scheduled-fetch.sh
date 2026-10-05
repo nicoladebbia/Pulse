@@ -45,7 +45,9 @@ run_slot() { # name, extra args...
 }
 
 # Paper trading while the US market is open (weekdays, 10:00–15:59 New York
-# time): settle fills and run stops every hour, look for new buys once a day.
+# time): settle fills and run stops every hour, look for new buys twice a day
+# (once from 10:00, once from 13:00, so a signal found after the morning run
+# can still be bought the same day).
 # Quick, no AI calls, and first so a long briefing below can't delay it.
 et_hour=$((10#$(TZ=America/New_York date +%H)))
 et_weekday="$(TZ=America/New_York date +%u)"
@@ -57,11 +59,12 @@ if [ "$et_weekday" -le 5 ] && [ "$et_hour" -ge 10 ] && [ "$et_hour" -le 15 ] \
   "$FETCHER" --mode manage-positions
   rc=$?
   [ "$rc" -eq 0 ] || echo "$(date) manage-positions failed (exit $rc)"
-  if [ "$(cat "$STATE_DIR/auto-trade" 2>/dev/null)" != "$today" ]; then
+  if [ "$et_hour" -lt 13 ]; then slot="$today-am"; else slot="$today-pm"; fi
+  if [ "$(cat "$STATE_DIR/auto-trade" 2>/dev/null)" != "$slot" ]; then
     "$FETCHER" --mode auto-trade
     rc=$?
     if [ "$rc" -eq 0 ]; then
-      echo "$today" > "$STATE_DIR/auto-trade"
+      echo "$slot" > "$STATE_DIR/auto-trade"
     else
       echo "$(date) auto-trade failed (exit $rc), next hour retries"
     fi

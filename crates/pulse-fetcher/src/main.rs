@@ -12,6 +12,7 @@ mod reembed;
 pub(crate) mod market_prices;
 pub(crate) mod calibration;
 pub(crate) mod position_management;
+pub(crate) mod entry_filters;
 pub(crate) mod position_sizing;
 pub(crate) mod edge_report;
 pub(crate) mod research;
@@ -413,7 +414,7 @@ async fn main() -> anyhow::Result<()> {
             // the daily run skipped Phase 13.5 at the already-fetched guard.
             tracing::info!("Running auto-trade (buy path) only...");
             match pipeline::run_auto_trade(&db_path).await {
-                Ok(n) => tracing::info!("Auto-trade complete: {} order(s) placed", n),
+                Ok(n) => tracing::info!("Auto-trade complete: {} buy(s) (previewed only if AUTO_TRADE_PREVIEW is on)", n),
                 Err(e) => {
                     tracing::error!("Auto-trade failed: {}", e);
                     return Err(e);

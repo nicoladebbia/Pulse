@@ -39,7 +39,10 @@ Required in `.env`: ANTHROPIC_API_KEY, VOYAGE_API_KEY, GROQ_API_KEY — or `PULS
 - All orders go to `paper-api.alpaca.markets` only. Keys: `ALPACA_API_KEY` / `ALPACA_SECRET_KEY`.
 - Prices (daily quotes, Signals refresh, live stream) come from Alpaca's free IEX feed via `crates/pulse-alpaca` when those keys are set; Finnhub is the fallback. Without Finnhub the auto-trade universe gate uses the Alpaca-only rule (`eligible_without_market_cap`).
 - Manual Buy/Close use `client_order_id`s (`pulse-manual-…`, `pulse-close-…`) so double clicks can't double-order.
-- `scripts/scheduled-fetch.sh` runs `--mode manage-positions` hourly and `--mode auto-trade` once a day during US market hours (10:00–15:59 ET, weekdays).
+- `scripts/scheduled-fetch.sh` runs `--mode manage-positions` hourly and `--mode auto-trade` twice a day (from 10:00 and from 13:00 ET) during US market hours. Buys only happen while the market is open, in whole shares.
+- Each held position keeps a GTC sell-stop at Alpaca (`crates/pulse-alpaca/src/stops.rs`); any other sell must cancel it first.
+- New buys pass `crates/pulse-fetcher/src/entry_filters.rs`: $5 price, $10M/day dollar volume (SIP bars), no earnings within 3 trading days, 30% per industry, 40 positions max, half size when SPY < 50-day average.
+- Test runs place real orders. Use `AUTO_TRADE_ENABLED=false EXIT_DRY_RUN=true`, and `AUTO_TRADE_PREVIEW=true` to see what auto-trade would buy without sending orders.
 
 ## Releases & updates
 - `git tag v0.2.0 && git push --tags` → `.github/workflows/release.yml` builds the macOS app, signs the update (secrets `TAURI_SIGNING_PRIVATE_KEY` / `_PASSWORD`, key at `~/.tauri/pulse-updater.key`) and publishes `latest.json`. The tag is the version and must go up each release.
