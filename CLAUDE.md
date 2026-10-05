@@ -41,7 +41,7 @@ Required in `.env`: ANTHROPIC_API_KEY, VOYAGE_API_KEY, GROQ_API_KEY — or `PULS
 - Manual Buy/Close use `client_order_id`s (`pulse-manual-…`, `pulse-close-…`) so double clicks can't double-order.
 - `scripts/scheduled-fetch.sh` runs `--mode manage-positions` hourly and `--mode auto-trade` twice a day (from 10:00 and from 13:00 ET) during US market hours. Buys only happen while the market is open, in whole shares.
 - Each held position keeps a GTC sell-stop at Alpaca (`crates/pulse-alpaca/src/stops.rs`); any other sell must cancel it first.
-- New buys pass `crates/pulse-fetcher/src/entry_filters.rs`: $5 price, $10M/day dollar volume (SIP bars), no earnings within 3 trading days, 30% per industry, 40 positions max, half size when SPY < 50-day average.
+- New buys pass `crates/pulse-fetcher/src/entry_filters.rs`: $5 price, $10M/day dollar volume (SIP bars), no earnings within 3 trading days, 30% per industry, 40 positions max, half size when SPY < 50-day average, and a 14-day ATR of at least 3% of price (the signal has only paid on stocks that move; backtest notes in the file).
 - Test runs place real orders. Use `AUTO_TRADE_ENABLED=false EXIT_DRY_RUN=true`, and `AUTO_TRADE_PREVIEW=true` to see what auto-trade would buy without sending orders.
 
 ## Releases & updates
