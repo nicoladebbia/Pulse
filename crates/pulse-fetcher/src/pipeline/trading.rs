@@ -491,10 +491,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
            AND l.ticker NOT IN (
                SELECT ticker FROM paper_trades WHERE status = 'open'
            )
-           -- A real catalyst, not search interest alone: insider buying,
-           -- government money or news momentum must be strong on its own.
-           AND MAX(COALESCE(l.insider_signal, 0), COALESCE(l.government_signal, 0),
-                   COALESCE(l.news_momentum, 0)) > 0.3
+           -- No "real catalyst" filter (insider/government/news > 0.3): tested
+           -- 2026-10-05 on 145 days of signals, it would have removed ARM, INTC
+           -- and META, the three best signals (+44% vs SPY over 20 days).
          ORDER BY l.compound_score DESC
          LIMIT 15"
     )?;
