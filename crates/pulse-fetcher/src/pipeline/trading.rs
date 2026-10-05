@@ -680,6 +680,21 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                     );
                     continue;
                 }
+                // The signal has only paid on stocks that move (see entry_filters).
+                match ef::atr_pct(&bars, ef::ATR_DAYS) {
+                    Some(v) if v >= ef::MIN_ATR_PCT => {}
+                    Some(v) => {
+                        tracing::info!(
+                            "Auto-trade: skipping {} ({}) — too calm (ATR {:.1}% of price, floor {:.0}%)",
+                            name, ticker, v * 100.0, ef::MIN_ATR_PCT * 100.0
+                        );
+                        continue;
+                    }
+                    None => {
+                        tracing::info!("Auto-trade: skipping {} ({}) — too little history for an ATR", name, ticker);
+                        continue;
+                    }
+                }
             }
             // No access to the consolidated feed: every candidate would fail
             // the same way, so stop once instead of once per name.

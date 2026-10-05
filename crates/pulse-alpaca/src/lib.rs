@@ -185,6 +185,10 @@ pub async fn latest_price(client: &reqwest::Client, creds: &Credentials, symbol:
 pub struct DailyBar {
     /// `YYYY-MM-DD`
     pub date: String,
+    /// High and low fall back to the close when either is missing, so a
+    /// partial row cannot invent a range.
+    pub high: f64,
+    pub low: f64,
     pub close: f64,
     pub volume: f64,
 }
@@ -196,8 +200,16 @@ pub fn parse_bars(body: &Value) -> Vec<DailyBar> {
             bars.iter()
                 .filter_map(|b| {
                     let close = b.get("c").and_then(Value::as_f64).filter(|c| *c > 0.0)?;
+                    let high = b.get("h").and_then(Value::as_f64).filter(|h| *h > 0.0);
+                    let low = b.get("l").and_then(Value::as_f64).filter(|l| *l > 0.0);
+                    let (high, low) = match (high, low) {
+                        (Some(h), Some(l)) => (h, l),
+                        _ => (close, close),
+                    };
                     Some(DailyBar {
                         date: b.get("t").and_then(Value::as_str)?.get(..10)?.to_string(),
+                        high,
+                        low,
                         close,
                         volume: b.get("v").and_then(Value::as_f64).unwrap_or(0.0),
                     })
@@ -396,11 +408,18 @@ mod tests {
     #[test]
     fn bars_keep_date_close_and_volume_and_drop_bad_rows() {
         let body = json!({"bars": [
-            {"t": "2026-09-25T04:00:00Z", "c": 771.35, "v": 36735822.0},
+            {"t": "2026-09-25T04:00:00Z", "h": 780.0, "l": 760.5, "c": 771.35, "v": 36735822.0},
+            {"t": "2026-09-26T04:00:00Z", "h": 790.0, "c": 772.0, "v": 1.0},
             {"t": "2026-09-28T04:00:00Z", "c": 0.0, "v": 1.0},
             {"c": 5.0, "v": 1.0}
         ]});
-        assert_eq!(parse_bars(&body), vec![DailyBar { date: "2026-09-25".into(), close: 771.35, volume: 36735822.0 }]);
+        assert_eq!(
+            parse_bars(&body),
+            vec![
+                DailyBar { date: "2026-09-25".into(), high: 780.0, low: 760.5, close: 771.35, volume: 36735822.0 },
+                DailyBar { date: "2026-09-26".into(), high: 772.0, low: 772.0, close: 772.0, volume: 1.0 },
+            ]
+        );
         assert!(parse_bars(&json!({"bars": null})).is_empty());
     }
 }
