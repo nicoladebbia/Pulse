@@ -556,7 +556,8 @@ pub async fn check_ticker_universe_eligibility(
     ticker: &str,
 ) -> bool {
     const MIN_MARKET_CAP_MILLIONS: f64 = 300.0;
-    const MIN_PRICE: f64 = 1.0;
+    // $5, raised from $1 on 2026-10-05: cheap names gap through stops.
+    const MIN_PRICE: f64 = 5.0;
 
     if let Ok(eligible) = conn.query_row(
         "SELECT eligible FROM ticker_eligibility_cache

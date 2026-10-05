@@ -53,6 +53,7 @@ pub const MIGRATION_035: &str = include_str!("../../../migrations/035_research_p
 pub const MIGRATION_036: &str = include_str!("../../../migrations/036_trade_order_status.sql");
 pub const MIGRATION_037: &str = include_str!("../../../migrations/037_trade_realized_pnl.sql");
 pub const MIGRATION_038: &str = include_str!("../../../migrations/038_trade_broker_stop.sql");
+pub const MIGRATION_039: &str = include_str!("../../../migrations/039_ticker_industry.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -730,6 +731,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_038)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (38)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 39: ticker_industry — industry per ticker for the sector cap.
+    if !applied.contains(&39) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_039)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (39)", [])?;
         tx.commit()?;
     }
 

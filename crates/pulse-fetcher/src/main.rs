@@ -12,6 +12,7 @@ mod reembed;
 pub(crate) mod market_prices;
 pub(crate) mod calibration;
 pub(crate) mod position_management;
+pub(crate) mod entry_filters;
 pub(crate) mod position_sizing;
 pub(crate) mod edge_report;
 pub(crate) mod research;

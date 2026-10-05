@@ -394,6 +394,10 @@ async fn whole_share_order(
             return None;
         }
     };
+    if price < crate::entry_filters::MIN_PRICE {
+        tracing::info!("Auto-trade: skipping {} — ${:.2} is under the ${:.0} price floor", ticker, price, crate::entry_filters::MIN_PRICE);
+        return None;
+    }
     let sized = whole_shares(notional, price);
     if sized.is_none() {
         tracing::info!("Auto-trade: skipping {} — one share (${:.2}) is over the ${:.0} budget", ticker, price, notional);
@@ -408,7 +412,12 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     let trading_enabled = std::env::var("AUTO_TRADE_ENABLED")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false);
-    if !trading_enabled {
+    // Preview: every check and size runs, no order is sent, the market clock
+    // is ignored. For testing the entry rules any day of the week.
+    let preview = std::env::var("AUTO_TRADE_PREVIEW")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if !trading_enabled && !preview {
         tracing::info!("Auto-trade: DISABLED (set AUTO_TRADE_ENABLED=true to re-enable)");
         return Ok(0);
     }
@@ -434,6 +443,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     // overnight gap — at a price nobody saw when deciding. Fails closed.
     match pulse_alpaca::market_open(&client, &creds).await {
         Ok(true) => {}
+        _ if preview => tracing::info!("Auto-trade: PREVIEW — market clock ignored"),
         Ok(false) => {
             tracing::info!("Auto-trade: market closed — no entries this run");
             return Ok(0);
@@ -478,8 +488,12 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
            AND l.ticker NOT IN (
                SELECT ticker FROM paper_trades WHERE status = 'open'
            )
+           -- A real catalyst, not search interest alone: insider buying,
+           -- government money or news momentum must be strong on its own.
+           AND MAX(COALESCE(l.insider_signal, 0), COALESCE(l.government_signal, 0),
+                   COALESCE(l.news_momentum, 0)) > 0.3
          ORDER BY l.compound_score DESC
-         LIMIT 5"
+         LIMIT 15"
     )?;
 
     #[allow(clippy::type_complexity)]
@@ -577,6 +591,38 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     let entry_datetime = now.format("%Y-%m-%dT%H:%M:%S").to_string();
     let mut traded = 0;
 
+    // Book-level context for the entry filters (see entry_filters.rs).
+    use crate::entry_filters as ef;
+    let today_date = now.date_naive();
+    let mut open_positions: i64 = conn
+        .query_row("SELECT COUNT(*) FROM paper_trades WHERE status = 'open'", [], |r| r.get(0))
+        .unwrap_or(0);
+    let regime = match ef::recent_bars(&client, &creds, "SPY", 100).await {
+        Ok(spy) => ef::regime_multiplier(&spy),
+        Err(e) => {
+            tracing::warn!("Auto-trade: SPY bars unavailable ({}) — full size", e);
+            1.0
+        }
+    };
+    if regime < 1.0 {
+        tracing::info!("Auto-trade: SPY below its 50-day average — new buys at {:.0}% size", regime * 100.0);
+    }
+    // Unreadable positions fail closed, like the risk book: the sector cap
+    // cannot be checked without them.
+    let mut by_industry = match ef::exposure_by_industry(&client, &creds, &conn, &finnhub_key).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Auto-trade: sector exposure unavailable ({}) — no new buys this run", e);
+            return Ok(0);
+        }
+    };
+    // An unreadable calendar does not block: this trims risk, it is not a
+    // safety gate.
+    let earnings = ef::upcoming_earnings(&client, &finnhub_key, today_date).await.unwrap_or_else(|e| {
+        tracing::warn!("Auto-trade: earnings calendar unavailable ({}) — not checked this run", e);
+        Default::default()
+    });
+
     // Veto threshold: heavy net insider selling. The $1M scale matches the
     // positive-side normalize_signal scale, so -$1M is roughly the mirror image
     // of what would have shown up as a meaningful BUY signal.
@@ -600,12 +646,45 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             continue;
         }
 
+        if open_positions >= ef::MAX_OPEN_POSITIONS {
+            tracing::info!("Auto-trade: {} positions open (max {}) — no more buys this run", open_positions, ef::MAX_OPEN_POSITIONS);
+            break;
+        }
+
+        // No buy just before an earnings report. An unreadable calendar does
+        // not block: this trims risk, it is not a safety gate.
+        if let Some(dates) = earnings.get(ticker.as_str())
+            && ef::in_earnings_blackout(dates, today_date)
+        {
+            tracing::info!("Auto-trade: skipping {} ({}) — earnings within {} trading days", name, ticker, ef::EARNINGS_BLACKOUT_DAYS);
+            continue;
+        }
+
+        // Liquidity and price from the consolidated tape. Fails closed.
+        match ef::recent_bars(&client, &creds, ticker, 40).await {
+            Ok(bars) => {
+                let adv = ef::avg_dollar_volume(&bars, 20);
+                let last = bars.last().map(|b| b.close).unwrap_or(0.0);
+                if adv.is_none_or(|v| v < ef::MIN_DOLLAR_VOLUME) || last < ef::MIN_PRICE {
+                    tracing::info!(
+                        "Auto-trade: skipping {} ({}) — too thin or cheap (avg ${:.1}M/day, last ${:.2})",
+                        name, ticker, adv.unwrap_or(0.0) / 1e6, last
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Auto-trade: skipping {} — no daily bars ({})", ticker, e);
+                continue;
+            }
+        }
+
         let notional = match crate::position_sizing::entry_notional(
             portfolio_value,
             buying_power,
             *score,
         ) {
-            Some(n) => n,
+            Some(n) => n * regime,
             None => {
                 tracing::info!("Auto-trade: skipping {} — buying power below entry floor", ticker);
                 continue;
@@ -663,7 +742,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let mut sized_risk = None;
         let notional = match risk_book.as_ref() {
             None => notional,
-            Some(rb) => match rb.size(&conn, ticker, existing_exposure, 1.0) {
+            Some(rb) => match rb.size(&conn, ticker, existing_exposure, regime) {
                 Some(s) => {
                     tracing::info!(
                         "Auto-trade: {} ({}) risk-sized ${:.0} — risks ${:.0} to a {:.1}% stop",
@@ -714,6 +793,34 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let Some((qty, notional)) = whole_share_order(&client, &creds, ticker, notional).await else {
             continue;
         };
+
+        let industry = ef::industry(&client, &conn, &finnhub_key, ticker).await;
+        if let Some(ind) = industry.as_deref() {
+            let held = by_industry.get(ind).copied().unwrap_or(0.0);
+            if !ef::sector_has_room(held, notional, portfolio_value) {
+                tracing::info!(
+                    "Auto-trade: skipping {} ({}) — {} already ${:.0} of ${:.0} ({:.0}% cap)",
+                    name, ticker, ind, held, portfolio_value, ef::MAX_SECTOR_PCT * 100.0
+                );
+                continue;
+            }
+        }
+
+        if preview {
+            tracing::info!(
+                "Auto-trade: PREVIEW — would buy {} {} (~${:.0}, {})",
+                qty, ticker, notional, industry.as_deref().unwrap_or("industry unknown")
+            );
+            if let (Some(rb), Some(s)) = (risk_book.as_mut(), sized_risk.as_ref()) {
+                rb.commit(s);
+            }
+            open_positions += 1;
+            if let Some(ind) = industry {
+                *by_industry.entry(ind).or_default() += notional;
+            }
+            traded += 1;
+            continue;
+        }
 
         let order = serde_json::json!({
             "symbol": ticker,
@@ -854,6 +961,10 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             if let (Some(rb), Some(s)) = (risk_book.as_mut(), sized_risk.as_ref()) {
                 rb.commit(s);
             }
+            open_positions += 1;
+            if let Some(ind) = industry {
+                *by_industry.entry(ind).or_default() += notional;
+            }
             traded += 1;
         } else {
             let status = resp.status();
@@ -934,6 +1045,11 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             continue;
         };
         tracing::info!("Scale-in: {} — score increased to {:.2}, adding {} sh (~${:.2})", ticker, new_score, qty, scale_notional);
+
+        if preview {
+            tracing::info!("Scale-in: PREVIEW — would add {} {}", qty, ticker);
+            continue;
+        }
 
         // One add per ticker per day, refused at the source like entries.
         let order = serde_json::json!({
