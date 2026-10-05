@@ -199,8 +199,12 @@ pub async fn exposure_by_industry(
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0)
             .abs();
-        if let Some(ind) = industry(client, conn, finnhub_key, symbol).await {
-            *out.entry(ind).or_default() += value;
+        match industry(client, conn, finnhub_key, symbol).await {
+            Some(ind) => *out.entry(ind).or_default() += value,
+            None if !finnhub_key.is_empty() => {
+                tracing::warn!("Sector cap: industry of held {} unknown — its ${:.0} is not counted", symbol, value)
+            }
+            None => {}
         }
     }
     Ok(out)

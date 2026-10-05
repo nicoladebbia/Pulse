@@ -417,6 +417,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     let preview = std::env::var("AUTO_TRADE_PREVIEW")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false);
+    if preview {
+        tracing::warn!("Auto-trade: PREVIEW mode — no orders will be sent (unset AUTO_TRADE_PREVIEW to trade)");
+    }
     if !trading_enabled && !preview {
         tracing::info!("Auto-trade: DISABLED (set AUTO_TRADE_ENABLED=true to re-enable)");
         return Ok(0);
@@ -607,6 +610,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     if regime < 1.0 {
         tracing::info!("Auto-trade: SPY below its 50-day average — new buys at {:.0}% size", regime * 100.0);
     }
+    if finnhub_key.is_empty() {
+        tracing::warn!("Auto-trade: no FINNHUB_API_KEY — sector cap and earnings blackout are OFF");
+    }
     // Unreadable positions fail closed, like the risk book: the sector cap
     // cannot be checked without them.
     let mut by_industry = match ef::exposure_by_industry(&client, &creds, &conn, &finnhub_key).await {
@@ -662,9 +668,12 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
 
         // Liquidity and price from the consolidated tape. Fails closed.
         match ef::recent_bars(&client, &creds, ticker, 40).await {
-            Ok(bars) => {
-                let adv = ef::avg_dollar_volume(&bars, 20);
+            Ok(mut bars) => {
+                // Today's bar is partial (half an hour of volume at 10:00).
+                let today_str = today_date.to_string();
                 let last = bars.last().map(|b| b.close).unwrap_or(0.0);
+                bars.retain(|b| b.date < today_str);
+                let adv = ef::avg_dollar_volume(&bars, 20);
                 if adv.is_none_or(|v| v < ef::MIN_DOLLAR_VOLUME) || last < ef::MIN_PRICE {
                     tracing::info!(
                         "Auto-trade: skipping {} ({}) — too thin or cheap (avg ${:.1}M/day, last ${:.2})",
@@ -672,6 +681,12 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                     );
                     continue;
                 }
+            }
+            // No access to the consolidated feed: every candidate would fail
+            // the same way, so stop once instead of once per name.
+            Err(e) if e.contains("401") || e.contains("403") => {
+                tracing::warn!("Auto-trade: daily bars refused ({}) — no buys this run", e);
+                break;
             }
             Err(e) => {
                 tracing::warn!("Auto-trade: skipping {} — no daily bars ({})", ticker, e);
@@ -795,6 +810,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         };
 
         let industry = ef::industry(&client, &conn, &finnhub_key, ticker).await;
+        if industry.is_none() && !finnhub_key.is_empty() {
+            tracing::warn!("Auto-trade: industry of {} unknown — sector cap not applied to it", ticker);
+        }
         if let Some(ind) = industry.as_deref() {
             let held = by_industry.get(ind).copied().unwrap_or(0.0);
             if !ef::sector_has_room(held, notional, portfolio_value) {
