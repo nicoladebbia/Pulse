@@ -50,6 +50,7 @@ const MIGRATION_034: &str = include_str!("../../../migrations/034_story_feedback
 const MIGRATION_035: &str = include_str!("../../../migrations/035_research_papers.sql");
 const MIGRATION_036: &str = include_str!("../../../migrations/036_trade_order_status.sql");
 const MIGRATION_037: &str = include_str!("../../../migrations/037_trade_realized_pnl.sql");
+const MIGRATION_038: &str = include_str!("../../../migrations/038_trade_broker_stop.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -704,6 +705,15 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_037)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (37)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 38: paper_trades.stop_order_id / broker_stop_price — the GTC
+    // stop held at Alpaca for each open trade.
+    if !applied.contains(&38) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_038)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (38)", [])?;
         tx.commit()?;
     }
 

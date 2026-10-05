@@ -52,6 +52,7 @@ pub const MIGRATION_034: &str = include_str!("../../../migrations/034_story_feed
 pub const MIGRATION_035: &str = include_str!("../../../migrations/035_research_papers.sql");
 pub const MIGRATION_036: &str = include_str!("../../../migrations/036_trade_order_status.sql");
 pub const MIGRATION_037: &str = include_str!("../../../migrations/037_trade_realized_pnl.sql");
+pub const MIGRATION_038: &str = include_str!("../../../migrations/038_trade_broker_stop.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -720,6 +721,15 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_037)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (37)", [])?;
+        tx.commit()?;
+    }
+
+    // Migration 38: paper_trades.stop_order_id / broker_stop_price — the GTC
+    // stop held at Alpaca for each open trade.
+    if !applied.contains(&38) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_038)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (38)", [])?;
         tx.commit()?;
     }
 

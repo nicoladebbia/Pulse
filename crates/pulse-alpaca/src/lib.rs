@@ -5,6 +5,8 @@
 //! prices from those keys, so Pulse needs no Finnhub key for quotes or the
 //! live stream.
 
+pub mod stops;
+
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;

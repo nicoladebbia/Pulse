@@ -139,7 +139,7 @@ mod tests {
         assert!(c.contains("insider_signal (weight 0.3411)"));
         assert!(c.contains("political_signal (weight 0.0000)"));
         assert!(c.contains("OR compound >= 0.4"));
-        assert!(c.contains("10% of equity if score > 0.6"));
+        assert!(c.contains("8% of equity if score > 0.6"));
         assert!(c.contains("145 days of scored history (2026-04-14 to 2026-09-24)"));
         assert!(c.contains("58 closed paper trades"));
         for d in DIMENSIONS {

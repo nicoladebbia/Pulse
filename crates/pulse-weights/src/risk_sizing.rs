@@ -1,6 +1,6 @@
 //! Risk-based position sizing, shared by the live trader and the backtester.
 //!
-//! The score tiers (2/5/10% of equity by compound score) size a trade by how
+//! The score tiers (2/5/8% of equity by compound score) size a trade by how
 //! strong the signal looks. Measured on the live ledger through 2026-09-29, the
 //! score does not predict returns, so the tiers were sizing on noise: ARM and
 //! AIRI each reached ~$15.7k and together lost $4k.
@@ -67,7 +67,7 @@ impl Default for RiskParams {
         RiskParams {
             risk_per_trade: 0.005,
             max_heat: 0.10,
-            max_ticker_pct: 0.10,
+            max_ticker_pct: 0.08,
             atr_mult: 3.0,
             min_stop_pct: 0.03,
             max_stop_pct: 0.15,
@@ -268,17 +268,17 @@ mod tests {
 
     #[test]
     fn a_trade_risks_its_budget_at_the_stop() {
-        // $100 stock, ATR $2 -> 3 ATR = 6% stop. 0.5% of $100k = $500 risk.
-        let s = size_order(&book(), 100.0, 2.0, 0.0, &EdgeStats::default(), 1.0, &p()).unwrap();
-        assert!(close(s.stop_pct, 0.06));
-        assert!(close(s.notional, 500.0 / 0.06));
+        // $100 stock, ATR $2.5 -> 3 ATR = 7.5% stop. 0.5% of $100k = $500 risk.
+        let s = size_order(&book(), 100.0, 2.5, 0.0, &EdgeStats::default(), 1.0, &p()).unwrap();
+        assert!(close(s.stop_pct, 0.075));
+        assert!(close(s.notional, 500.0 / 0.075));
         assert!(close(s.risk, 500.0));
     }
 
     #[test]
     fn a_volatile_name_gets_fewer_dollars_for_the_same_risk() {
-        // Both stops wide enough (6%, 12%) that the 10% ticker cap does not bind.
-        let quiet = size_order(&book(), 100.0, 2.0, 0.0, &EdgeStats::default(), 1.0, &p()).unwrap();
+        // Both stops wide enough (7.5%, 12%) that the 8% ticker cap does not bind.
+        let quiet = size_order(&book(), 100.0, 2.5, 0.0, &EdgeStats::default(), 1.0, &p()).unwrap();
         let wild = size_order(&book(), 100.0, 4.0, 0.0, &EdgeStats::default(), 1.0, &p()).unwrap();
         assert!(wild.notional < quiet.notional);
         assert!(close(wild.risk, quiet.risk));
@@ -294,10 +294,10 @@ mod tests {
 
     #[test]
     fn the_ticker_cap_counts_what_is_already_held() {
-        // 3% stop wants $16.7k; cap is $10k, $7k already held -> $3k.
-        let s = size_order(&book(), 100.0, 0.5, 7_000.0, &EdgeStats::default(), 1.0, &p()).unwrap();
+        // 3% stop wants $16.7k; cap is $8k, $5k already held -> $3k.
+        let s = size_order(&book(), 100.0, 0.5, 5_000.0, &EdgeStats::default(), 1.0, &p()).unwrap();
         assert!(close(s.notional, 3_000.0));
-        assert!(size_order(&book(), 100.0, 0.5, 9_990.0, &EdgeStats::default(), 1.0, &p()).is_none());
+        assert!(size_order(&book(), 100.0, 0.5, 7_990.0, &EdgeStats::default(), 1.0, &p()).is_none());
     }
 
     #[test]
@@ -388,15 +388,15 @@ mod tests {
         let mut b = book();
         b.drawdown = 0.125; // 0.625x
         let strong = EdgeStats { trades: 60, wins: 30, avg_win: 2.0, avg_loss: 1.0 }; // 3x
-        // 15% stop keeps the $6,250 order under the $10k ticker cap.
+        // 15% stop keeps the $6,250 order under the $8k ticker cap.
         let s = size_order(&b, 100.0, 5.0, 0.0, &strong, 1.0, &p()).unwrap();
         assert!(close(s.risk, 100_000.0 * 0.005 * 0.625 * 3.0));
     }
 
     #[test]
     fn a_scale_in_risks_half_an_entry() {
-        let full = size_order(&book(), 100.0, 2.0, 0.0, &EdgeStats::default(), 1.0, &p()).unwrap();
-        let half = size_order(&book(), 100.0, 2.0, 0.0, &EdgeStats::default(), p().scale_in_fraction, &p()).unwrap();
+        let full = size_order(&book(), 100.0, 2.5, 0.0, &EdgeStats::default(), 1.0, &p()).unwrap();
+        let half = size_order(&book(), 100.0, 2.5, 0.0, &EdgeStats::default(), p().scale_in_fraction, &p()).unwrap();
         assert!(close(half.risk * 2.0, full.risk));
     }
 

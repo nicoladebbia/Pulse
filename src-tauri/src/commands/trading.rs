@@ -165,13 +165,18 @@ pub async fn execute_trade(
 #[tauri::command]
 pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<PaperTrade, String> {
     // Gather trade info, drop lock before async Alpaca calls.
-    let (ticker, entry_price, order_status) = {
+    let (ticker, entry_price, order_status, stop_order_id) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT ticker, entry_price, order_status FROM paper_trades
+            "SELECT ticker, entry_price, order_status, stop_order_id FROM paper_trades
              WHERE id = ?1 AND status = 'open'",
             [trade_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, String>(2)?)),
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            )),
         )
         .map_err(|_| format!("No open trade with id {}", trade_id))?
     };
@@ -183,6 +188,27 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
             "The buy order for {} hasn't filled yet — close it after the market opens",
             ticker
         ));
+    }
+
+    // The broker stop holds the shares: Alpaca refuses any other sell for them
+    // until it is cancelled.
+    if let Some(creds) = pulse_alpaca::credentials() {
+        let client = pulse_alpaca::client(std::time::Duration::from_secs(15))?;
+        let cleared = pulse_alpaca::stops::clear_stops(&client, &creds, &ticker, stop_order_id.as_deref())
+            .await
+            .map_err(|e| format!("Could not cancel the stop order for {ticker} first: {e}"))?;
+        // It fired while being cancelled. Selling the rest here would close the
+        // trade without the stop's sale; the next position check books both.
+        if let Some(o) = cleared.iter().find(|o| o.sold().is_some()) {
+            let (qty, price) = o.sold().unwrap_or_default();
+            // Point the row at the stop that sold, so the check finds it.
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            conn.execute("UPDATE paper_trades SET stop_order_id = ?1 WHERE id = ?2", rusqlite::params![o.id, trade_id])
+                .map_err(|e| e.to_string())?;
+            return Err(format!(
+                "The stop order for {ticker} just sold {qty:.0} shares at ${price:.2} — the next position check records it and closes the rest"
+            ));
+        }
     }
 
     // Get the real held qty from Alpaca (DB stores dollar notional, not shares).
@@ -720,7 +746,10 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
     // decides it, so a drift here shows the user a rationale for a number the
     // engine did not produce.
     let score = original_compound_score.unwrap_or(trade.confidence);
-    let tier_pct = if score > 0.6 { 0.10 } else if score > 0.4 { 0.05 } else { 0.02 };
+    // The top tier dropped from 10% to 8% for entries after 2026-10-04; older
+    // trades were sized at 10% and are explained as such.
+    let top_tier = if trade.entry_date.as_str() > "2026-10-05" { 0.08 } else { 0.10 };
+    let tier_pct = if score > 0.6 { top_tier } else if score > 0.4 { 0.05 } else { 0.02 };
     let scale_ins = scale_in_count.unwrap_or(0);
     let clamped = (trade.position_size - 50.0).abs() < 0.01
         || (trade.position_size - 20_000.0).abs() < 0.01;

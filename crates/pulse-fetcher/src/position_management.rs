@@ -237,6 +237,37 @@ pub fn evaluate_position(
     PositionAction::Hold
 }
 
+/// The stop the broker should hold for a position: the same levels
+/// `evaluate_position` checks each run, so the broker sells at the moment this
+/// code would have — not up to an hour (or a gap) later.
+///
+/// With an ATR it is the trailing stop, `hwm - 3*ATR`, but never below the
+/// -15% hard stop. Without one it is the fixed -10% stop.
+pub fn stop_level_from(entry_price: f64, high_water_mark: f64, atr: f64) -> f64 {
+    if entry_price.is_nan() || entry_price <= 0.0 {
+        return 0.0;
+    }
+    if atr > 0.0 && atr.is_finite() {
+        let hwm = if high_water_mark.is_finite() { high_water_mark.max(entry_price) } else { entry_price };
+        (hwm - atr * 3.0).max(entry_price * 0.85)
+    } else {
+        entry_price * 0.90
+    }
+}
+
+/// `stop_level_from` with this trade's stored high-water mark and current ATR.
+/// Call after `evaluate_position`, which moves the high-water mark.
+pub fn broker_stop_level(conn: &Connection, trade_id: i64, ticker: &str, entry_price: f64) -> f64 {
+    let hwm: f64 = conn
+        .query_row(
+            "SELECT COALESCE(high_water_mark, entry_price) FROM paper_trades WHERE id = ?1",
+            [trade_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(entry_price);
+    stop_level_from(entry_price, hwm, compute_atr(conn, ticker, 14))
+}
+
 /// How old a `cross_signals` row may be and still count as this ticker's
 /// current reading.
 ///
@@ -754,7 +785,7 @@ mod signal_decay_tests {
 
 #[cfg(test)]
 mod state_write_tests {
-    use super::{classify_state_write, StateWrite};
+    use super::{classify_state_write, stop_level_from, StateWrite};
 
     #[test]
     fn an_error_is_a_failure_not_a_success() {
@@ -772,5 +803,18 @@ mod state_write_tests {
     #[test]
     fn one_row_updated_is_persisted() {
         assert_eq!(classify_state_write(&Ok(1)), StateWrite::Persisted);
+    }
+
+    #[test]
+    fn the_broker_stop_matches_the_stops_checked_each_run() {
+        // Trailing: $120 high, $3 ATR -> $111.
+        assert!((stop_level_from(100.0, 120.0, 3.0) - 111.0).abs() < 1e-9);
+        // A wide ATR never puts it below the -15% hard stop.
+        assert!((stop_level_from(100.0, 100.0, 10.0) - 85.0).abs() < 1e-9);
+        // No ATR: the fixed -10% stop.
+        assert!((stop_level_from(100.0, 130.0, 0.0) - 90.0).abs() < 1e-9);
+        assert!((stop_level_from(100.0, f64::NAN, 2.0) - 94.0).abs() < 1e-9);
+        assert_eq!(stop_level_from(0.0, 10.0, 1.0), 0.0);
+        assert_eq!(stop_level_from(f64::NAN, 10.0, 1.0), 0.0);
     }
 }

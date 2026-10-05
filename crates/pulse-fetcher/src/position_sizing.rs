@@ -10,7 +10,8 @@ const SCALE_IN_PCT: f64 = 0.01;
 const SCALE_IN_CAP: f64 = 5_000.0;
 
 /// The largest fraction of the portfolio any tier will allocate to one entry.
-pub const TOP_TIER_PCT: f64 = 0.10;
+/// Lowered from 10% to 8% on 2026-10-04 (user's choice: max ~$8k per name).
+pub const TOP_TIER_PCT: f64 = 0.08;
 
 /// Hard ceiling on total exposure to a single ticker, as a fraction of
 /// portfolio value.
@@ -293,9 +294,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_high_score_uses_10pct() {
+    fn entry_high_score_uses_8pct() {
         let n = entry_notional(100_000.0, 100_000.0, 0.7).unwrap();
-        assert!((n - 10_000.0).abs() < 0.01);
+        assert!((n - 8_000.0).abs() < 0.01);
     }
 
     #[test]
@@ -362,7 +363,7 @@ mod tests {
         // The reported symptom: score > 0.6 on a ticker held at zero.
         let pv = 100_000.0;
         let n = entry_notional(pv, pv, 0.7).unwrap();
-        assert_eq!(clamp_to_ticker_cap(pv, 0.0, n), Some(10_000.0));
+        assert_eq!(clamp_to_ticker_cap(pv, 0.0, n), Some(8_000.0));
     }
 
     #[test]
@@ -371,7 +372,7 @@ mod tests {
         // a "10% of portfolio" tier into 20% of the portfolio, which then could
         // not clear a cap measured against portfolio value at any setting.
         let n = entry_notional(100_000.0, 200_000.0, 0.7).unwrap();
-        assert!((n - 10_000.0).abs() < 0.01, "sized {n}, expected 10% of equity");
+        assert!((n - 8_000.0).abs() < 0.01, "sized {n}, expected 8% of equity");
     }
 
     #[test]
@@ -386,29 +387,29 @@ mod tests {
         // Alpaca occasionally reports no portfolio_value. Sizing must not become
         // zero — ENTRY_CAP stays the only bound, as it was before the cap existed.
         let n = entry_notional(0.0, 100_000.0, 0.7).unwrap();
-        assert!((n - 10_000.0).abs() < 0.01, "sized {n}");
+        assert!((n - 8_000.0).abs() < 0.01, "sized {n}");
         assert_eq!(ticker_headroom(0.0, 50_000.0), f64::INFINITY);
     }
 
     #[test]
     fn a_name_already_at_the_cap_gets_nothing_more() {
-        // The META case: the position is at 10% and a fresh signal arrives.
-        assert_eq!(clamp_to_ticker_cap(100_000.0, 10_000.0, 5_000.0), None);
+        // The META case: the position is at the cap and a fresh signal arrives.
+        assert_eq!(clamp_to_ticker_cap(100_000.0, 8_000.0, 5_000.0), None);
         assert_eq!(clamp_to_ticker_cap(100_000.0, 25_000.0, 5_000.0), None);
     }
 
     #[test]
     fn a_partly_filled_name_is_topped_up_to_the_cap_not_skipped() {
-        // 9% held, a $5,000 signal arrives, $1,000 of room. The old code threw
+        // 7% held, a $5,000 signal arrives, $1,000 of room. The old code threw
         // the whole order away; the right answer is the $1,000.
-        let got = clamp_to_ticker_cap(100_000.0, 9_000.0, 5_000.0).unwrap();
+        let got = clamp_to_ticker_cap(100_000.0, 7_000.0, 5_000.0).unwrap();
         assert!((got - 1_000.0).abs() < 0.01, "clamped to {got}");
     }
 
     #[test]
     fn a_sliver_of_headroom_is_skipped_rather_than_traded() {
         // $30 of room is not worth a round trip — below ENTRY_FLOOR, so skip.
-        assert_eq!(clamp_to_ticker_cap(100_000.0, 9_970.0, 5_000.0), None);
+        assert_eq!(clamp_to_ticker_cap(100_000.0, 7_970.0, 5_000.0), None);
     }
 
     #[test]
@@ -420,8 +421,8 @@ mod tests {
         let pv = 100_000.0;
         let add = scale_in_notional(200_000.0).unwrap();
         assert!((add - 2_000.0).abs() < 0.01, "scale-in sized {add}");
-        assert_eq!(clamp_to_ticker_cap(pv, 10_000.0, add), None);
-        let room = clamp_to_ticker_cap(pv, 8_500.0, add).unwrap();
+        assert_eq!(clamp_to_ticker_cap(pv, 8_000.0, add), None);
+        let room = clamp_to_ticker_cap(pv, 6_500.0, add).unwrap();
         assert!((room - 1_500.0).abs() < 0.01, "clamped to {room}");
     }
 

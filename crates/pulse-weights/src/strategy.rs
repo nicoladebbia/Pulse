@@ -53,7 +53,7 @@ impl StrategyParams {
             min_score: 0.30,
             max_positions: 10,
             sizing_tiers: vec![
-                SizingTier { above_score: 0.6, pct: 10.0 },
+                SizingTier { above_score: 0.6, pct: 8.0 },
                 SizingTier { above_score: 0.4, pct: 5.0 },
                 SizingTier { above_score: f64::NEG_INFINITY, pct: 2.0 },
             ],
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn sizing_tiers_follow_live() {
         let p = StrategyParams::live();
-        assert_eq!(p.size_pct(0.61), 10.0);
+        assert_eq!(p.size_pct(0.61), 8.0);
         assert_eq!(p.size_pct(0.6), 5.0);
         assert_eq!(p.size_pct(0.41), 5.0);
         assert_eq!(p.size_pct(0.31), 2.0);
