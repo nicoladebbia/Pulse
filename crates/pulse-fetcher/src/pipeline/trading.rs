@@ -491,7 +491,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
            AND l.ticker NOT IN (
                SELECT ticker FROM paper_trades WHERE status = 'open'
            )
-           -- No "real catalyst" filter (insider/government/news > 0.3): tested
+           -- No real-catalyst filter (insider/government/news > 0.3): tested
            -- 2026-10-05 on 145 days of signals, it would have removed ARM, INTC
            -- and META, the three best signals (+44% vs SPY over 20 days).
          ORDER BY l.compound_score DESC
