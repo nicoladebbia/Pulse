@@ -1421,6 +1421,9 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         // `stop_known` is false when Alpaca could not be asked — placing a stop
         // blind could stack a second one on the first.
         let mut stop_fired = t.stop_filled_at.is_some();
+        // The stop still to cancel before a sell. Cleared once its sale is
+        // booked, or cancelling it would find the same fill and book it twice.
+        let mut known_stop: Option<&str> = if stop_fired { None } else { t.stop_order_id.as_deref() };
         let mut live_stop: Option<stops::StopOrder> = None;
         let mut stop_known = true;
         if !stop_fired && let Some(id) = t.stop_order_id.as_deref() {
@@ -1436,6 +1439,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                             ticker, sold, price, booked, held_qty
                         );
                         stop_fired = true;
+                        known_stop = None;
                     } else {
                         // Cancelled, expired or replaced without selling.
                         conn.execute("UPDATE paper_trades SET stop_order_id = NULL WHERE id = ?1", [t.id]).ok();
@@ -1532,7 +1536,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         // A sell stop holds its shares: Alpaca refuses any other sell for them
         // until it is cancelled. If it cannot be cancelled, do not sell this
         // run — the stop is still protecting the position.
-        let cleared = match stops::clear_stops(&client, &creds, ticker, t.stop_order_id.as_deref()).await {
+        let cleared = match stops::clear_stops(&client, &creds, ticker, known_stop).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("Position mgmt: {} broker stop not cancelled ({}) — no sell this run", ticker, e);
@@ -1562,6 +1566,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         }
 
         // --- Place the SELL order (live) ---
+        let mut sent_order: Option<serde_json::Value> = None;
         // Deterministic client_order_id keyed on ticker+day+half-vs-full prevents a
         // launchd retry storm from double-selling (same bug class as the buy-side
         // ORCL stacking). A full and a half close on the same day get distinct ids.
@@ -1575,21 +1580,44 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             "time_in_force": "day",
             "client_order_id": exit_coid
         });
-        let resp = client
+        let sent = client
             .post("https://paper-api.alpaca.markets/v2/orders")
             .header("APCA-API-KEY-ID", &alpaca_key)
             .header("APCA-API-SECRET-KEY", &alpaca_secret)
             .json(&order)
             .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            tracing::warn!("Position mgmt: sell failed for {} — {} {}", ticker, status, body);
+            .await;
+        let failure = match sent {
+            Err(e) => Some(e.to_string()),
+            Ok(r) if !r.status().is_success() => {
+                let status = r.status();
+                Some(format!("{} {}", status, r.text().await.unwrap_or_default()))
+            }
+            Ok(r) => match r.json::<serde_json::Value>().await {
+                Ok(v) => {
+                    sent_order = Some(v);
+                    None
+                }
+                // Sent but the reply was unreadable: it may be live and
+                // holding the shares, so a new stop would be refused anyway.
+                Err(e) => {
+                    tracing::warn!("Position mgmt: sell for {} sent, reply unreadable ({}) — reconciles next run", ticker, e);
+                    actions += 1;
+                    continue;
+                }
+            },
+        };
+        if let Some(why) = failure {
+            tracing::warn!("Position mgmt: sell failed for {} — {}", ticker, why);
+            // The stop was cancelled to free the shares; put it back so the
+            // position is not left unprotected until the next run.
+            if stop_known {
+                let want = crate::position_management::broker_stop_level(&conn, t.id, ticker, *entry_price);
+                sync_broker_stop(&conn, &client, &creds, t.id, ticker, held_qty, want, None, false).await;
+            }
             continue;
         }
-        let order_resp: serde_json::Value = resp.json().await?;
+        let order_resp = sent_order.take().unwrap_or_default();
         let order_id = order_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
         // Poll for fill (day orders may sit unfilled pre-market — that's fine).
