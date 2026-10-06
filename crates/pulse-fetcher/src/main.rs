@@ -519,13 +519,14 @@ async fn main() -> anyhow::Result<()> {
         }
         "live-signals" => {
             // Intraday, no AI: new filings -> signals -> cross-signal scores.
-            // Shares the daily fetch's lock and yields to it (exit 0, next run
-            // tries again), since both rewrite today's cross_signals rows.
+            // Shares the daily fetch's lock and yields to it, since both
+            // rewrite today's cross_signals rows. Exit 75 (EX_TEMPFAIL) tells
+            // live-signals.sh the run didn't happen, so it isn't counted.
             let instance_lock = match acquire_single_instance_lock(&db_path) {
                 Some(lock) => lock,
                 None => {
                     tracing::info!("Live signals: another pulse-fetcher is running, skipping this run");
-                    return Ok(());
+                    std::process::exit(75);
                 }
             };
             let report = pipeline::run_live_signals(&db_path, args.full_sources).await?;

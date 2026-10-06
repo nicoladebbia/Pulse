@@ -2,9 +2,9 @@ use super::*;
 
 use std::collections::BTreeSet;
 
-/// Companies checked for new Form 4s per live run. At ~0.35s each (request +
-/// throttle) that is about 90 seconds, once every 5 minutes: ~0.8 SEC
-/// requests a second on average, against SEC's 10/second limit.
+/// Companies checked for new Form 4s per live run, one SEC request each with
+/// a 150 ms pause: with enrichment and the EDGAR feeds a run makes ~300-650
+/// SEC requests over 2-3 minutes, 2-4 a second against SEC's 10/second limit.
 const LIVE_FORM4_LIMIT: usize = 250;
 
 /// What one live run found.
@@ -49,12 +49,18 @@ pub(crate) async fn run_live_signals(db_path: &Path, full_sources: bool) -> anyh
         Ok(n) => report.form4_new = n,
         Err(e) => tracing::warn!("Live: targeted Form 4 failed: {}", e),
     }
-    match enrich_form4_stories(db_path).await {
-        Ok(n) => report.form4_enriched = n,
-        Err(e) => tracing::warn!("Live: Form 4 enrichment failed: {}", e),
+    let sec_ok = || !sources::SEC_THROTTLED.load(std::sync::atomic::Ordering::Relaxed);
+    if sec_ok() {
+        match enrich_form4_stories(db_path).await {
+            Ok(n) => report.form4_enriched = n,
+            Err(e) => tracing::warn!("Live: Form 4 enrichment failed: {}", e),
+        }
     }
 
-    let raw = if full_sources {
+    let raw = if !sec_ok() {
+        tracing::warn!("Live: SEC is throttling, skipping the filing feeds this run");
+        Vec::new()
+    } else if full_sources {
         let (articles, failed) = sources::collect_financial_sources().await;
         if !failed.is_empty() {
             tracing::warn!("Live: {} source(s) failed: {}", failed.len(), failed.join(", "));
@@ -109,16 +115,20 @@ pub(crate) async fn run_live_signals(db_path: &Path, full_sources: bool) -> anyh
     Ok(report)
 }
 
-/// Tickers the auto-trade entry query would consider right now: a converging
-/// signal above 0.30 from the last day, not already held. Kept in step with
-/// the `latest` CTE in `auto_trade_on_convergence`.
+/// Tickers the auto-trade entry query would consider right now: the newest
+/// row per ticker converging above 0.30 from the last day, not already held.
+/// Kept in step with the `latest` CTE in `auto_trade_on_convergence`.
 fn buy_grade_tickers(conn: &rusqlite::Connection) -> BTreeSet<String> {
     conn.prepare(
-        "SELECT DISTINCT ticker FROM cross_signals
-         WHERE convergence_detected = 1 AND ticker IS NOT NULL
-           AND compound_score > 0.3
-           AND computed_at >= date('now', '-1 day')
-           AND ticker NOT IN (SELECT ticker FROM paper_trades WHERE status = 'open')",
+        "WITH latest AS (
+             SELECT ticker, ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY computed_at DESC, compound_score DESC) AS rn
+             FROM cross_signals
+             WHERE convergence_detected = 1 AND ticker IS NOT NULL
+               AND compound_score > 0.3
+               AND computed_at >= date('now', '-1 day')
+         )
+         SELECT ticker FROM latest
+         WHERE rn = 1 AND ticker NOT IN (SELECT ticker FROM paper_trades WHERE status = 'open')",
     )
     .and_then(|mut stmt| {
         stmt.query_map([], |r| r.get::<_, String>(0))

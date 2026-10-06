@@ -104,6 +104,10 @@ impl ApiCallCounters {
 
 pub static API_CALLS: ApiCallCounters = ApiCallCounters::new();
 
+/// Set when SEC answered 429 (or kept failing) during this run, so the live
+/// run skips its remaining SEC requests instead of hammering a blocked API.
+pub static SEC_THROTTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawArticle {
     pub title: String,

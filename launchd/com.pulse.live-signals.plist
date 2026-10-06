@@ -4,9 +4,9 @@
 <plist version="1.0">
 <dict>
     <!-- Installed-app live signals (scripts/install-app.sh fills in __HOME__).
-         Fires at minutes 5..55 of every hour; scripts/live-signals.sh only
-         does work while the US market is open. Minute 0 belongs to
-         com.pulse.scheduled-fetch. -->
+         Fires at minutes 5..50 of every hour; scripts/live-signals.sh only
+         does work while the US market is open. Minutes 55-0 are left to
+         com.pulse.scheduled-fetch (a run takes 2-3 minutes). -->
     <key>Label</key>
     <string>com.pulse.live-signals</string>
 
@@ -65,10 +65,6 @@
         <dict>
             <key>Minute</key>
             <integer>50</integer>
-        </dict>
-        <dict>
-            <key>Minute</key>
-            <integer>55</integer>
         </dict>
     </array>
 

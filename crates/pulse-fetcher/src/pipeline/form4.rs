@@ -70,6 +70,19 @@ pub(crate) async fn fetch_targeted_form4(db_path: &Path, limit: usize) -> anyhow
         .build()?;
 
     let mut inserted = 0;
+    let mut failures_in_a_row = 0;
+
+    // Accessions already stored, read once: a LIKE scan of `stories` per filing
+    // cost ~30 ms each, minutes per run once the list grew to 250 companies.
+    let mut stored: Vec<String> = conn
+        .prepare(
+            "SELECT financial_metadata FROM stories
+             WHERE source_type = 'financial' AND financial_metadata IS NOT NULL
+               AND created_at >= datetime('now', '-60 days')",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
 
     for (cik, ticker) in &ciks {
         let padded = format!("{:0>10}", cik.trim_start_matches('0'));
@@ -83,10 +96,23 @@ pub(crate) async fn fetch_targeted_form4(db_path: &Path, limit: usize) -> anyhow
             Ok(r) if r.status().is_success() => r,
             Ok(r) if r.status().as_u16() == 429 => {
                 tracing::warn!("Targeted Form 4: SEC 429, stopping after {} inserted", inserted);
+                crate::sources::SEC_THROTTLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
-            Ok(_) | Err(_) => { tokio::time::sleep(std::time::Duration::from_millis(150)).await; continue; }
+            Ok(_) | Err(_) => {
+                // A blocked or unreachable SEC fails every request: stop
+                // instead of walking the whole list.
+                failures_in_a_row += 1;
+                if failures_in_a_row >= 5 {
+                    tracing::warn!("Targeted Form 4: 5 failed requests in a row, stopping");
+                    crate::sources::SEC_THROTTLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                continue;
+            }
         };
+        failures_in_a_row = 0;
 
         let json: serde_json::Value = match resp.json().await {
             Ok(j) => j,
@@ -118,13 +144,9 @@ pub(crate) async fn fetch_targeted_form4(db_path: &Path, limit: usize) -> anyhow
             let accession = accessions[i].as_str().unwrap_or("");
             if accession.is_empty() { continue; }
 
-            // Skip if already stored.
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM stories WHERE financial_metadata LIKE ?1)",
-                [format!("%{}%", accession)],
-                |row| row.get(0),
-            ).unwrap_or(false);
-            if exists { continue; }
+            // Skip if already stored (stories older than the 60-day read can't
+            // hold a filing from the last 30 days).
+            if stored.iter().any(|m| m.contains(accession)) { continue; }
 
             // Insert a bare Form 4 story; transaction details get filled by the
             // existing enrich_form4_stories phase on a later run.
@@ -159,7 +181,10 @@ pub(crate) async fn fetch_targeted_form4(db_path: &Path, limit: usize) -> anyhow
                 ],
             );
             match res {
-                Ok(n) => inserted += n,
+                Ok(n) => {
+                    inserted += n;
+                    stored.push(accession.to_string());
+                }
                 Err(e) => tracing::warn!("Targeted Form 4: insert failed for {} {}: {}", ticker, accession, e),
             }
         }
@@ -189,6 +214,7 @@ pub(crate) async fn enrich_form4_stories(db_path: &Path) -> anyhow::Result<usize
            AND json_valid(financial_metadata)
            AND json_extract(financial_metadata, '$.transaction_code') IS NULL
            AND created_at >= datetime('now', '-7 days')
+         ORDER BY created_at DESC
          LIMIT 30"
     )?;
 
@@ -252,6 +278,7 @@ pub(crate) async fn enrich_form4_stories(db_path: &Path) -> anyhow::Result<usize
             } else {
                 if status.as_u16() == 429 {
                     tracing::warn!("Form 4 enrichment: SEC rate limit (429), stopping early after {} enriched", enriched);
+                    crate::sources::SEC_THROTTLED.store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
                 None
