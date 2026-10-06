@@ -181,18 +181,20 @@ async fn fetch_filing_type(
 
         // For Form 4: download and parse the actual XML for transaction details
         // Cap at 15 to leave rate-limit budget for 13F infotable downloads
+        // The caps count attempts, not successes: counting only successes let
+        // a run of failing downloads walk the whole list at up to 3 requests
+        // each (~300 SEC requests per live run).
         let form4_data = if form == "4" && form4_xml_count < 15 {
-            match download_form4_xml(client, &base_url, &accession).await {
-                Ok(data) => { form4_xml_count += 1; Some(data) }
-                Err(_) => None,
-            }
+            form4_xml_count += 1;
+            download_form4_xml(client, &base_url, &accession).await.ok()
         } else { None };
 
         // For 8-K: download HTML and parse Item numbers
         // Cap at 10 to leave rate-limit budget for 13F infotable downloads
         let eight_k_data = if form == "8-K" && eight_k_parsed < 10 {
+            eight_k_parsed += 1;
             match download_8k_items(client, &base_url).await {
-                Ok(data) => { eight_k_parsed += 1; Some(data) }
+                Ok(data) => Some(data),
                 Err(_) => {
                     // Fallback: set default classification so classify_ambiguous_8ks can find it
                     Some(EightKData {
@@ -462,7 +464,7 @@ async fn download_form4_xml(
             .split("href=\"")
             .skip(1)
             .filter_map(|s| s.split('"').next())
-            .find(|href| href.ends_with(".xml") && !href.contains("R1") && !href.contains("R2"))
+            .find(|href| href.ends_with(".xml") && !href.contains("R1") && !href.contains("R2") && !href.contains("xsl"))
             .ok_or_else(|| anyhow::anyhow!("No XML found in Form 4 index"))?;
 
         let full_xml_url = if xml_file.starts_with("http") {
