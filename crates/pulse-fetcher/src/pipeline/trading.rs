@@ -458,6 +458,12 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     }
 
     let conn = rusqlite::Connection::open(db_path)?;
+    // Hourly modes can be the first process to touch the DB after an update.
+    // Non-fatal: trading must not stop because a newer table is missing.
+    if let Err(e) = crate::db::run_migrations(&conn) {
+        tracing::warn!("Migrations failed (continuing): {}", e);
+    }
+    let log = crate::decisions::DecisionLog::start(&conn);
 
     // Find convergence signals with tickers, not already in open trades.
     // cross_signals stores 1 row per (entity, day), so the same ticker can have
@@ -512,6 +518,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         .collect();
 
     if candidates.is_empty() {
+        log.stopped("no_candidates", "No convergence signal above 0.30 in the last day that isn't already held");
         return Ok(0);
     }
 
@@ -540,6 +547,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
 
     if buying_power < 100.0 {
         tracing::info!("Auto-trade: insufficient buying power (${:.2})", buying_power);
+        log.stopped("no_cash", format!("Buying power ${:.0}", buying_power));
         return Ok(0);
     }
 
@@ -565,6 +573,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             open_book_risk(&client, &alpaca_key, &alpaca_secret, &conn, &params).await
         else {
             tracing::warn!("Auto-trade: risk sizing on but Alpaca positions unreadable — no entries this run");
+            log.stopped("broker_unreadable", "Alpaca positions could not be read");
             return Ok(0);
         };
         let rb = crate::position_sizing::RiskBook {
@@ -618,6 +627,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("Auto-trade: sector exposure unavailable ({}) — no new buys this run", e);
+            log.stopped("broker_unreadable", "Sector exposure could not be read");
             return Ok(0);
         }
     };
@@ -639,6 +649,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 "Auto-trade: vetoing {} ({}) — heavy insider selling (net ${:.0})",
                 name, ticker, insider_raw
             );
+                log.skip(ticker, name, *score, "insider_selling", format!("Insiders sold a net ${:.0}", -insider_raw));
             continue;
         }
 
@@ -648,11 +659,13 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             &client, &conn, &finnhub_key, &alpaca_key, &alpaca_secret, ticker,
         ).await {
             tracing::warn!("Auto-trade: skipping {} ({}) — failed universe quality gate", name, ticker);
+            log.skip(ticker, name, *score, "universe", "Too small, under $1 or not tradable at Alpaca");
             continue;
         }
 
         if open_positions >= ef::MAX_OPEN_POSITIONS {
             tracing::info!("Auto-trade: {} positions open (max {}) — no more buys this run", open_positions, ef::MAX_OPEN_POSITIONS);
+            log.stopped("max_positions", format!("{} positions open (max {})", open_positions, ef::MAX_OPEN_POSITIONS));
             break;
         }
 
@@ -662,6 +675,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             && ef::in_earnings_blackout(dates, today_date)
         {
             tracing::info!("Auto-trade: skipping {} ({}) — earnings within {} trading days", name, ticker, ef::EARNINGS_BLACKOUT_DAYS);
+            log.skip(ticker, name, *score, "earnings", format!("Reports earnings within {} trading days", ef::EARNINGS_BLACKOUT_DAYS));
             continue;
         }
 
@@ -678,6 +692,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                         "Auto-trade: skipping {} ({}) — too thin or cheap (avg ${:.1}M/day, last ${:.2})",
                         name, ticker, adv.unwrap_or(0.0) / 1e6, last
                     );
+                        log.skip(ticker, name, *score, "too_thin", format!("Trades ${:.1}M a day at ${:.2} (needs ${:.0}M and ${:.0})", adv.unwrap_or(0.0) / 1e6, last, ef::MIN_DOLLAR_VOLUME / 1e6, ef::MIN_PRICE));
                     continue;
                 }
                 // The signal has only paid on stocks that move (see entry_filters).
@@ -688,10 +703,12 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                             "Auto-trade: skipping {} ({}) — too calm (ATR {:.1}% of price, floor {:.0}%)",
                             name, ticker, v * 100.0, ef::MIN_ATR_PCT * 100.0
                         );
+                            log.skip(ticker, name, *score, "too_calm", format!("Moves {:.1}% a day (needs {:.0}%)", v * 100.0, ef::MIN_ATR_PCT * 100.0));
                         continue;
                     }
                     None => {
                         tracing::info!("Auto-trade: skipping {} ({}) — too little history for an ATR", name, ticker);
+                        log.skip(ticker, name, *score, "new_listing", "Too little price history");
                         continue;
                     }
                 }
@@ -700,10 +717,12 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             // the same way, so stop once instead of once per name.
             Err(e) if e.contains("401") || e.contains("403") => {
                 tracing::warn!("Auto-trade: daily bars refused ({}) — no buys this run", e);
+                log.stopped("bars_refused", "Alpaca refused the daily price history");
                 break;
             }
             Err(e) => {
                 tracing::warn!("Auto-trade: skipping {} — no daily bars ({})", ticker, e);
+                log.skip(ticker, name, *score, "no_bars", "No daily price history");
                 continue;
             }
         }
@@ -716,6 +735,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             Some(n) => n * regime,
             None => {
                 tracing::info!("Auto-trade: skipping {} — buying power below entry floor", ticker);
+                log.skip(ticker, name, *score, "no_cash", "Not enough buying power");
                 continue;
             }
         };
@@ -732,6 +752,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 "Auto-trade: skipping {} ({}) — Alpaca holds ${:.0} that no open trade tracks; reconcile the ledger first",
                 name, ticker, existing_exposure
             );
+                log.skip(ticker, name, *score, "untracked_holding", format!("Alpaca already holds ${:.0} the app doesn't track", existing_exposure));
             continue;
         }
 
@@ -762,6 +783,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                     name, ticker, existing_exposure,
                     max_per_ticker_dollars, MAX_PER_TICKER_PCT * 100.0, portfolio_value
                 );
+                    log.skip(ticker, name, *score, "ticker_cap", format!("Already ${:.0}, at the {:.0}% per-stock cap", existing_exposure, MAX_PER_TICKER_PCT * 100.0));
                 continue;
             }
         };
@@ -782,6 +804,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 }
                 None => {
                     tracing::info!("Auto-trade: skipping {} ({}) — no heat, cap room or cash left for its risk", name, ticker);
+                    log.skip(ticker, name, *score, "no_risk_room", "No risk budget left this run");
                     continue;
                 }
             },
@@ -814,12 +837,14 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         };
         if has_open_order {
             tracing::warn!("Auto-trade: skipping {} — open order already exists on Alpaca", ticker);
+            log.skip(ticker, name, *score, "open_order", "An order for it is already open at Alpaca");
             continue;
         }
 
         // Whole shares, so the broker stop (GTC, whole shares only) covers the
         // entire position instead of leaving a fraction unprotected.
         let Some((qty, notional)) = whole_share_order(&client, &creds, ticker, notional).await else {
+            log.skip(ticker, name, *score, "price", "No live price, or one share costs more than the budget");
             continue;
         };
 
@@ -834,6 +859,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                     "Auto-trade: skipping {} ({}) — {} already ${:.0} of ${:.0} ({:.0}% cap)",
                     name, ticker, ind, held, portfolio_value, ef::MAX_SECTOR_PCT * 100.0
                 );
+                    log.skip(ticker, name, *score, "sector_full", format!("{} is already at the {:.0}% sector cap", ind, ef::MAX_SECTOR_PCT * 100.0));
                 continue;
             }
         }
@@ -843,6 +869,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 "Auto-trade: PREVIEW — would buy {} {} (~${:.0}, {})",
                 qty, ticker, notional, industry.as_deref().unwrap_or("industry unknown")
             );
+                log.preview(ticker, name, *score, format!("Would buy {} shares (~${:.0})", qty, notional));
             if let (Some(rb), Some(s)) = (risk_book.as_mut(), sized_risk.as_ref()) {
                 rb.commit(s);
             }
@@ -973,6 +1000,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 .unwrap_or(false);
             if already_open {
                 tracing::warn!("Auto-trade: skipping duplicate insert for {} — already open", ticker);
+                log.skip(ticker, name, *score, "open_order", "Already held");
                 continue;
             }
 
@@ -990,6 +1018,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             }
 
             tracing::info!("Auto-trade: placed order {} for {} (${:.2} @ ${:.2}, qty {:.4})", order_id, ticker, notional, filled_price, filled_qty);
+            log.bought(ticker, name, *score, format!("Bought ~${:.0} ({})", notional, order_status));
             if let (Some(rb), Some(s)) = (risk_book.as_mut(), sized_risk.as_ref()) {
                 rb.commit(s);
             }
@@ -1003,10 +1032,12 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             let body = resp.text().await.unwrap_or_default();
             // A duplicate client_order_id (same ticker, same day) is the dedup guard
             // working as intended during a re-run race — log it as such, not as an error.
-            if body.contains("client_order_id") || status.as_u16() == 422 {
+            if body.contains("client_order_id") {
                 tracing::info!("Auto-trade: dedup blocked duplicate same-day order for {} ({})", ticker, status);
+                log.skip(ticker, name, *score, "open_order", "Already ordered today");
             } else {
                 tracing::warn!("Auto-trade: order failed for {} — {} {}", ticker, status, body);
+                log.skip(ticker, name, *score, "order_failed", format!("Alpaca rejected the order ({})", status));
             }
         }
 
@@ -1165,6 +1196,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
+    if !preview {
+        stamp_spy_prices(&conn, &client, &creds).await;
+    }
     Ok(traded)
 }
 
@@ -1435,6 +1469,48 @@ async fn sync_broker_stop(
     }
 }
 
+/// Stamp SPY's current price on trades bought or sold today that
+/// lack it, so the Signals page can compare each trade with holding the S&P
+/// 500 over the same days. One quote, and only when a row needs it. Covers
+/// every path that opens or closes a row (auto, manual, stop fills booked
+/// between runs) without threading a price through each of them; a fill
+/// booked an hour late carries SPY from the booking run.
+pub(crate) async fn stamp_spy_prices(conn: &rusqlite::Connection, client: &reqwest::Client, creds: &pulse_alpaca::Credentials) {
+    let needs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM paper_trades
+             WHERE (spy_entry_price IS NULL AND status = 'open' AND entry_date >= date('now', 'localtime'))
+                OR (spy_exit_price IS NULL AND status != 'open' AND pnl_pct IS NOT NULL
+                    AND exit_date >= date('now', 'localtime'))",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if needs == 0 {
+        return;
+    }
+    let spy = match pulse_alpaca::latest_price(client, creds, "SPY").await {
+        Ok(Some(p)) if p > 0.0 => p,
+        other => {
+            tracing::debug!("SPY stamp skipped: no price ({:?})", other.err());
+            return;
+        }
+    };
+    conn.execute(
+        "UPDATE paper_trades SET spy_entry_price = ?1
+         WHERE spy_entry_price IS NULL AND status = 'open' AND entry_date >= date('now', 'localtime')",
+        [spy],
+    )
+    .ok();
+    conn.execute(
+        "UPDATE paper_trades SET spy_exit_price = ?1
+         WHERE spy_exit_price IS NULL AND status != 'open' AND pnl_pct IS NOT NULL
+           AND exit_date >= date('now', 'localtime')",
+        [spy],
+    )
+    .ok();
+}
+
 /// Phase 13.6 — evaluate and act on exits for every open paper position.
 ///
 /// This is the half of the loop that was missing: `position_management::
@@ -1486,6 +1562,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
+    stamp_spy_prices(&conn, &client, &creds).await;
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let now_dt = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -1828,6 +1905,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         );
     }
 
+    stamp_spy_prices(&conn, &client, &creds).await;
     Ok(actions)
 }
 

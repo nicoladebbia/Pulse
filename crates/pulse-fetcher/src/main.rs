@@ -12,7 +12,9 @@ mod reembed;
 pub(crate) mod market_prices;
 pub(crate) mod calibration;
 pub(crate) mod position_management;
+pub(crate) mod decisions;
 pub(crate) mod entry_filters;
+pub(crate) mod scorecard;
 pub(crate) mod position_sizing;
 pub(crate) mod edge_report;
 pub(crate) mod research;
@@ -490,6 +492,17 @@ async fn main() -> anyhow::Result<()> {
                 Ok(n) => tracing::info!("Backfill-prices complete: {} candles stored across {} tickers", n, tickers.len()),
                 Err(e) => {
                     tracing::error!("Backfill-prices failed: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+        "scorecard" => {
+            // Weekly: which signal dimensions and score ranges beat SPY (table
+            // signal_scorecard, shown on the Signals page). Read-only on trades.
+            match scorecard::run(&db_path).await {
+                Ok(n) => tracing::info!("Scorecard complete: {} groups", n),
+                Err(e) => {
+                    tracing::error!("Scorecard failed: {}", e);
                     return Err(e);
                 }
             }
