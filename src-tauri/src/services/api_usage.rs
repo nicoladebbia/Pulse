@@ -42,8 +42,11 @@ pub fn log_usage(
     input_tokens: i64,
     output_tokens: i64,
 ) -> Result<()> {
-    // Local-mode calls never reach a paid API: record them as free.
-    let (provider, model, cost) = if pulse_llm::is_local() {
+    // Local-mode AI calls never reach a paid API: record them as free. Alpaca,
+    // Tavily and other non-AI calls are real either way and keep their name,
+    // or their quota counters read zero in local mode.
+    let ai_provider = matches!(provider, "anthropic" | "groq" | "voyage" | "cerebras" | "openai");
+    let (provider, model, cost) = if pulse_llm::is_local() && ai_provider {
         ("local", pulse_llm::local_model(), 0.0)
     } else {
         (provider, model.to_string(), estimate_cost(provider, model, input_tokens, output_tokens))
@@ -91,7 +94,7 @@ pub fn get_usage(conn: &Connection, days: u32) -> Result<UsageStats> {
     let mut stmt = conn.prepare(
         "SELECT provider, COALESCE(model, 'unknown'),
                 SUM(input_tokens), SUM(output_tokens),
-                SUM(estimated_cost_usd), COUNT(*)
+                SUM(estimated_cost_usd), SUM(calls)
          FROM api_usage
          WHERE created_at >= datetime('now', ?1)
          GROUP BY provider, model
@@ -176,13 +179,13 @@ pub fn get_financial_quotas(conn: &Connection) -> Result<Vec<FinancialApiQuota>>
 
     for &(provider, rpm, rph, daily_limit, desc) in FINANCIAL_RATE_LIMITS {
         let calls_today: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM api_usage WHERE provider = ?1 AND DATE(created_at) = DATE('now')",
+            "SELECT COALESCE(SUM(calls), 0) FROM api_usage WHERE provider = ?1 AND DATE(created_at) = DATE('now')",
             params![provider],
             |row| row.get(0),
         ).unwrap_or(0);
 
         let calls_this_hour: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM api_usage WHERE provider = ?1 AND created_at >= datetime('now', '-1 hour')",
+            "SELECT COALESCE(SUM(calls), 0) FROM api_usage WHERE provider = ?1 AND created_at >= datetime('now', '-1 hour')",
             params![provider],
             |row| row.get(0),
         ).unwrap_or(0);

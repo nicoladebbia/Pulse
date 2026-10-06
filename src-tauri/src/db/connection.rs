@@ -55,6 +55,7 @@ pub const MIGRATION_037: &str = include_str!("../../../migrations/037_trade_real
 pub const MIGRATION_038: &str = include_str!("../../../migrations/038_trade_broker_stop.sql");
 pub const MIGRATION_039: &str = include_str!("../../../migrations/039_ticker_industry.sql");
 pub const MIGRATION_040: &str = include_str!("../../../migrations/040_signals_page.sql");
+pub const MIGRATION_041: &str = include_str!("../../../migrations/041_api_usage_calls.sql");
 
 pub fn initialize(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
@@ -747,6 +748,13 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_040)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (40)", [])?;
+        tx.commit()?;
+    }
+
+    if !applied.contains(&41) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_041)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (41)", [])?;
         tx.commit()?;
     }
 

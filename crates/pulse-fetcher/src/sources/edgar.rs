@@ -97,6 +97,27 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
     Ok(articles)
 }
 
+/// The fast-moving EDGAR filings only (Form 4 insider trades and 8-K events),
+/// for the intraday live-signals run. Form D and 13F change slowly and their
+/// infotable downloads are the expensive part, so they stay in the full fetch.
+pub async fn fetch_live() -> anyhow::Result<Vec<RawArticle>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let mut articles = Vec::new();
+    match fetch_filing_type(&client, "4", "edgar_form4", 50).await {
+        Ok(a) => articles.extend(a),
+        Err(e) => tracing::warn!("SEC EDGAR Form 4 failed: {}", e),
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    match fetch_filing_type(&client, "8-K", "edgar_8k", 30).await {
+        Ok(a) => articles.extend(a),
+        Err(e) => tracing::warn!("SEC EDGAR 8-K failed: {}", e),
+    }
+    Ok(articles)
+}
+
 /// Fetch a specific filing type from EDGAR's full-text search.
 async fn fetch_filing_type(
     client: &reqwest::Client,
