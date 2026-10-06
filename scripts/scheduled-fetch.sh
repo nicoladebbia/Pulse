@@ -74,7 +74,10 @@ fi
 # Weekly signal scorecard (which signal types and score ranges beat SPY), once
 # per ISO week at the first run that finds it due. A few Alpaca calls, no AI.
 week="$(date +%G-W%V)"
-if [ "$(cat "$STATE_DIR/scorecard" 2>/dev/null)" != "$week" ]; then
+# Older fetchers ran the full pipeline for modes they didn't know; the
+# scorecard table name in the binary marks one that has the mode.
+if [ "$(cat "$STATE_DIR/scorecard" 2>/dev/null)" != "$week" ] \
+  && grep -qa signal_scorecard "$FETCHER"; then
   if "$FETCHER" --mode scorecard; then
     echo "$week" > "$STATE_DIR/scorecard"
   else
