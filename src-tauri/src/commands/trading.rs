@@ -62,6 +62,7 @@ pub fn get_paper_trades(db: State<'_, DbState>, status: Option<String>) -> Resul
                 pnl: row.get(12)?,
                 pnl_pct: row.get(13)?,
                 trade_journal: row.get(14)?,
+                ..Default::default()
             })
         })
         .map_err(|e| e.to_string())?
@@ -157,6 +158,7 @@ pub async fn execute_trade(
         signal_profile, status: "open".to_string(),
         pnl: None, pnl_pct: None,
         trade_journal: None,
+        ..Default::default()
     }))
 }
 
@@ -694,7 +696,8 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
                     exit_price, exit_date, position_size, confidence,
                     signal_profile, status, pnl, pnl_pct, trade_journal,
                     created_at, alpaca_order_id, high_water_mark, trailing_stop,
-                    original_compound_score, scale_in_count, half_closed_at
+                    original_compound_score, scale_in_count, half_closed_at,
+                    CASE WHEN stop_order_id IS NOT NULL THEN broker_stop_price END, exit_reason
              FROM paper_trades WHERE id = ?1",
             [trade_id],
             |row| {
@@ -715,6 +718,8 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
                         pnl: row.get(12)?,
                         pnl_pct: row.get(13)?,
                         trade_journal: row.get(14)?,
+                        broker_stop_price: row.get(22)?,
+                        exit_reason: row.get(23)?,
                     },
                     row.get(15)?,
                     row.get(16)?,
@@ -1308,4 +1313,116 @@ pub fn get_calibration_gate_status(db: State<'_, DbState>) -> Result<Calibration
         |row| row.get(0),
     ).map_err(|e| e.to_string())?;
     Ok(CalibrationGateStatus { total_resolved, threshold: 10 })
+}
+
+/// The bot against holding the S&P 500: per trade, closed trades in total,
+/// open trades, and the account curve. Its own command so a failed SPY fetch
+/// never blanks the portfolio.
+#[tauri::command]
+pub async fn get_benchmark(db: State<'_, DbState>) -> Result<crate::services::benchmark::Benchmark, String> {
+    let (trades, equity) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        (
+            crate::services::benchmark::load_trades(&conn).map_err(|e| e.to_string())?,
+            crate::services::benchmark::load_equity(&conn).map_err(|e| e.to_string())?,
+        )
+    };
+    crate::services::benchmark::benchmark(trades, equity).await
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TradeDecision {
+    pub run_at: String,
+    pub ticker: String,
+    pub name: Option<String>,
+    pub score: Option<f64>,
+    pub outcome: String,
+    pub reason: String,
+    pub detail: Option<String>,
+}
+
+/// What the auto-trader did with each candidate in its recent runs, newest
+/// run first. `days` defaults to 3.
+#[tauri::command]
+pub fn get_trade_decisions(db: State<'_, DbState>, days: Option<i64>) -> Result<Vec<TradeDecision>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let window = format!("-{} days", days.unwrap_or(3).clamp(1, 30));
+    let mut stmt = conn
+        .prepare(
+            "SELECT run_at, ticker, name, score, outcome, reason, detail FROM trade_decisions
+             WHERE run_at >= datetime('now', 'localtime', ?1)
+             ORDER BY run_at DESC, (outcome = 'run_stopped') DESC, score DESC LIMIT 300",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([window], |r| {
+            Ok(TradeDecision {
+                run_at: r.get(0)?,
+                ticker: r.get(1)?,
+                name: r.get(2)?,
+                score: r.get(3)?,
+                outcome: r.get(4)?,
+                reason: r.get(5)?,
+                detail: r.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScorecardRow {
+    pub grp_kind: String,
+    pub grp: String,
+    pub signals: i64,
+    pub win_rate: Option<f64>,
+    pub avg_excess: Option<f64>,
+    pub median_excess: Option<f64>,
+    pub trades: i64,
+    pub trade_pnl: Option<f64>,
+    pub trade_win_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SignalScorecard {
+    pub computed_at: Option<String>,
+    pub rows: Vec<ScorecardRow>,
+}
+
+/// The latest weekly scorecard (`pulse-fetcher --mode scorecard`).
+#[tauri::command]
+pub fn get_signal_scorecard(db: State<'_, DbState>) -> Result<SignalScorecard, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let computed_at: Option<String> = conn
+        .query_row("SELECT MAX(computed_at) FROM signal_scorecard", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let Some(at) = computed_at.clone() else {
+        return Ok(SignalScorecard { computed_at: None, rows: vec![] });
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT grp_kind, grp, signals, win_rate, avg_excess, median_excess, trades, trade_pnl, trade_win_rate
+             FROM signal_scorecard WHERE computed_at = ?1 ORDER BY grp_kind, grp",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([at], |r| {
+            Ok(ScorecardRow {
+                grp_kind: r.get(0)?,
+                grp: r.get(1)?,
+                signals: r.get(2)?,
+                win_rate: r.get(3)?,
+                avg_excess: r.get(4)?,
+                median_excess: r.get(5)?,
+                trades: r.get(6)?,
+                trade_pnl: r.get(7)?,
+                trade_win_rate: r.get(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(SignalScorecard { computed_at, rows })
 }

@@ -185,6 +185,8 @@ pub async fn latest_price(client: &reqwest::Client, creds: &Credentials, symbol:
 pub struct DailyBar {
     /// `YYYY-MM-DD`
     pub date: String,
+    /// Falls back to the close when missing.
+    pub open: f64,
     /// High and low fall back to the close when either is missing, so a
     /// partial row cannot invent a range.
     pub high: f64,
@@ -194,29 +196,83 @@ pub struct DailyBar {
 }
 
 pub fn parse_bars(body: &Value) -> Vec<DailyBar> {
-    body.get("bars")
-        .and_then(Value::as_array)
-        .map(|bars| {
-            bars.iter()
-                .filter_map(|b| {
-                    let close = b.get("c").and_then(Value::as_f64).filter(|c| *c > 0.0)?;
-                    let high = b.get("h").and_then(Value::as_f64).filter(|h| *h > 0.0);
-                    let low = b.get("l").and_then(Value::as_f64).filter(|l| *l > 0.0);
-                    let (high, low) = match (high, low) {
-                        (Some(h), Some(l)) => (h, l),
-                        _ => (close, close),
-                    };
-                    Some(DailyBar {
-                        date: b.get("t").and_then(Value::as_str)?.get(..10)?.to_string(),
-                        high,
-                        low,
-                        close,
-                        volume: b.get("v").and_then(Value::as_f64).unwrap_or(0.0),
-                    })
-                })
-                .collect()
+    body.get("bars").and_then(Value::as_array).map(|bars| parse_bar_list(bars)).unwrap_or_default()
+}
+
+fn parse_bar_list(bars: &[Value]) -> Vec<DailyBar> {
+    bars.iter()
+        .filter_map(|b| {
+            let close = b.get("c").and_then(Value::as_f64).filter(|c| *c > 0.0)?;
+            let high = b.get("h").and_then(Value::as_f64).filter(|h| *h > 0.0);
+            let low = b.get("l").and_then(Value::as_f64).filter(|l| *l > 0.0);
+            let (high, low) = match (high, low) {
+                (Some(h), Some(l)) => (h, l),
+                _ => (close, close),
+            };
+            Some(DailyBar {
+                date: b.get("t").and_then(Value::as_str)?.get(..10)?.to_string(),
+                open: b.get("o").and_then(Value::as_f64).filter(|o| *o > 0.0).unwrap_or(close),
+                high,
+                low,
+                close,
+                volume: b.get("v").and_then(Value::as_f64).unwrap_or(0.0),
+            })
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+/// Daily bars since `start` for many symbols at once (oldest first per
+/// symbol), following `next_page_token`. Same feed and `end` as `daily_bars`.
+pub async fn daily_bars_multi(
+    client: &reqwest::Client,
+    creds: &Credentials,
+    symbols: &[String],
+    start: &str,
+) -> Result<std::collections::HashMap<String, Vec<DailyBar>>, String> {
+    let end = (chrono::Utc::now() - chrono::Duration::minutes(16)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut out: std::collections::HashMap<String, Vec<DailyBar>> = std::collections::HashMap::new();
+    for chunk in symbols.chunks(100) {
+        let joined = chunk.join(",");
+        let mut page: Option<String> = None;
+        loop {
+            let mut query = vec![
+                ("symbols", joined.as_str()),
+                ("timeframe", "1Day"),
+                ("feed", "sip"),
+                ("adjustment", "split"),
+                ("limit", "10000"),
+                ("start", start),
+                ("end", end.as_str()),
+            ];
+            if let Some(token) = page.as_deref() {
+                query.push(("page_token", token));
+            }
+            let resp = creds
+                .auth(client.get(format!("{DATA_URL}/stocks/bars")))
+                .query(&query)
+                .send()
+                .await
+                .map_err(|e| format!("Alpaca bars request failed: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("Alpaca bars returned {status}"));
+            }
+            let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+            for (symbol, bars) in body.get("bars").and_then(Value::as_object).into_iter().flatten() {
+                if let Some(list) = bars.as_array() {
+                    out.entry(symbol.clone()).or_default().extend(parse_bar_list(list));
+                }
+            }
+            page = body.get("next_page_token").and_then(Value::as_str).map(str::to_string);
+            if page.is_none() {
+                break;
+            }
+        }
+    }
+    for bars in out.values_mut() {
+        bars.sort_by(|a, b| a.date.cmp(&b.date));
+    }
+    Ok(out)
 }
 
 /// Daily bars since `start` (`YYYY-MM-DD`), oldest first.
@@ -408,7 +464,7 @@ mod tests {
     #[test]
     fn bars_keep_date_close_and_volume_and_drop_bad_rows() {
         let body = json!({"bars": [
-            {"t": "2026-09-25T04:00:00Z", "h": 780.0, "l": 760.5, "c": 771.35, "v": 36735822.0},
+            {"t": "2026-09-25T04:00:00Z", "o": 771.35, "h": 780.0, "l": 760.5, "c": 771.35, "v": 36735822.0},
             {"t": "2026-09-26T04:00:00Z", "h": 790.0, "c": 772.0, "v": 1.0},
             {"t": "2026-09-28T04:00:00Z", "c": 0.0, "v": 1.0},
             {"c": 5.0, "v": 1.0}
@@ -416,8 +472,8 @@ mod tests {
         assert_eq!(
             parse_bars(&body),
             vec![
-                DailyBar { date: "2026-09-25".into(), high: 780.0, low: 760.5, close: 771.35, volume: 36735822.0 },
-                DailyBar { date: "2026-09-26".into(), high: 772.0, low: 772.0, close: 772.0, volume: 1.0 },
+                DailyBar { date: "2026-09-25".into(), open: 771.35, high: 780.0, low: 760.5, close: 771.35, volume: 36735822.0 },
+                DailyBar { date: "2026-09-26".into(), open: 772.0, high: 772.0, low: 772.0, close: 772.0, volume: 1.0 },
             ]
         );
         assert!(parse_bars(&json!({"bars": null})).is_empty());

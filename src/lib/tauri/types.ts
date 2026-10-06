@@ -511,6 +511,70 @@ export interface PaperTrade {
 	pnl: number | null;
 	pnl_pct: number | null;
 	trade_journal: string | null;
+	/** The live sell-stop's price at Alpaca, while one is held. */
+	broker_stop_price?: number | null;
+	exit_reason?: string | null;
+}
+
+// === Benchmark (bot vs holding the S&P 500) ===
+
+export interface TradeVsSpy {
+	trade_id: number;
+	/** SPY's return over the same span, in %. */
+	spy_pct: number;
+	/** Trade return minus SPY's, in percentage points. */
+	excess_pct: number;
+}
+
+export interface EquityPoint {
+	date: string;
+	equity: number;
+	spy_equity: number;
+}
+
+export interface Benchmark {
+	trades: TradeVsSpy[];
+	closed_count: number;
+	closed_beat_spy: number;
+	closed_pnl: number;
+	closed_spy_pnl: number;
+	open_pnl: number;
+	open_spy_pnl: number;
+	equity_curve: EquityPoint[];
+	account_return_pct: number | null;
+	spy_return_pct: number | null;
+	since: string | null;
+}
+
+// === Auto-trade decisions ("Why didn't it buy?") ===
+
+export interface TradeDecision {
+	run_at: string;
+	ticker: string;
+	name: string | null;
+	score: number | null;
+	outcome: 'bought' | 'preview' | 'skipped' | 'run_stopped' | string;
+	reason: string;
+	detail: string | null;
+}
+
+// === Weekly signal scorecard ===
+
+export interface ScorecardRow {
+	grp_kind: 'dimension' | 'score' | string;
+	grp: string;
+	signals: number;
+	win_rate: number | null;
+	avg_excess: number | null;
+	median_excess: number | null;
+	trades: number;
+	trade_pnl: number | null;
+	trade_win_rate: number | null;
+}
+
+export interface SignalScorecard {
+	computed_at: string | null;
+	rows: ScorecardRow[];
 }
 
 // === Trade Detail (forensics page) ===

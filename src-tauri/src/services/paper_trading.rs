@@ -74,7 +74,7 @@ pub struct Position {
     pub side: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PaperTrade {
     pub id: i64,
     pub entity_id: i64,
@@ -91,6 +91,11 @@ pub struct PaperTrade {
     pub pnl: Option<f64>,
     pub pnl_pct: Option<f64>,
     pub trade_journal: Option<String>,
+    /// The live sell-stop's price at Alpaca, while one is held.
+    #[serde(default)]
+    pub broker_stop_price: Option<f64>,
+    #[serde(default)]
+    pub exit_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +320,8 @@ pub async fn get_portfolio_with_trades(
 /// Column list + row-mapper shared by the status queries.
 const TRADE_COLUMNS: &str = "id, entity_id, ticker, direction, entry_price, entry_date, \
      exit_price, exit_date, position_size, confidence, \
-     signal_profile, status, pnl, pnl_pct, trade_journal";
+     signal_profile, status, pnl, pnl_pct, trade_journal, \
+     CASE WHEN stop_order_id IS NOT NULL THEN broker_stop_price END, exit_reason";
 
 fn map_trade_row(row: &rusqlite::Row) -> rusqlite::Result<PaperTrade> {
     Ok(PaperTrade {
@@ -334,6 +340,8 @@ fn map_trade_row(row: &rusqlite::Row) -> rusqlite::Result<PaperTrade> {
         pnl: row.get(12)?,
         pnl_pct: row.get(13)?,
         trade_journal: row.get(14)?,
+        broker_stop_price: row.get(15)?,
+        exit_reason: row.get(16)?,
     })
 }
 

@@ -5,14 +5,18 @@
 		executeTrade, closePosition, getFinancialEvents, getSignalEvidence, getSourceHealth,
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getExitReview, getTradeJournal,
 		runBacktest, startPriceStream, stopPriceStream, getTradeRationale,
-		getPendingCalibration, applyPendingCalibration, rejectPendingCalibration, getCalibrationGateStatus
+		getPendingCalibration, applyPendingCalibration, rejectPendingCalibration, getCalibrationGateStatus,
+		getBenchmark, getTradeDecisions, getSignalScorecard
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics, ExitReview,
 		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate, TradeRationale,
-		PendingCalibrationRow, CalibrationGateStatus
+		PendingCalibrationRow, CalibrationGateStatus, Benchmark, TradeDecision, SignalScorecard as Scorecard
 	} from '$lib/tauri/types';
+	import BenchmarkCard from '$lib/components/signals/BenchmarkCard.svelte';
+	import TradeDecisions from '$lib/components/signals/TradeDecisions.svelte';
+	import SignalScorecard from '$lib/components/signals/SignalScorecard.svelte';
 	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
 	import ResearchTab from '$lib/components/research/ResearchTab.svelte';
 	import { parseTradeReason, fmtReasonSignals } from '$lib/trade-reason';
@@ -64,6 +68,16 @@
 	let calibrationError = $state<string | null>(null);
 	let calibrationStatus = $state<string | null>(null);
 	let calibration = $derived(splitCalibrationBatches(pendingCalibration));
+	let portfolioError = $state<string | null>(null);
+	let benchmark = $state<Benchmark | null>(null);
+	let benchmarkError = $state<string | null>(null);
+	let decisions = $state<TradeDecision[] | null>(null);
+	let decisionsError = $state<string | null>(null);
+	let scorecard = $state<Scorecard | null>(null);
+	let scorecardError = $state<string | null>(null);
+	/** Sections whose data failed to load, so a failure doesn't look like "no data". */
+	let loadErrors = $state<string[]>([]);
+	let vsSpy = $derived(new Map((benchmark?.trades ?? []).map(t => [t.trade_id, t])));
 
 	$effect(() => {
 		if (loaded) return;
@@ -153,15 +167,21 @@
 
 	async function loadData() {
 		error = null;
+		loadErrors = [];
 		isLoading = true;
 		try {
 			if (!isTauri()) { isLoading = false; return; }
+			const failed = (section: string) => (e: unknown) => {
+				console.warn(`Signals: ${section} failed to load`, e);
+				if (!loadErrors.includes(section)) loadErrors = [...loadErrors, section];
+				return [];
+			};
 			const [s, c, ev, e, p] = await Promise.all([
-				getCrossSignals(30).catch(() => []),
-				getConvergenceAlerts(40).catch(() => []),
-				getSignalEvidence(40).catch(() => []),
-				getFinancialEvents(20).catch(() => []),
-				getEntityPrices(100).catch(() => []),
+				getCrossSignals(30).catch(failed('signals')),
+				getConvergenceAlerts(40).catch(failed('convergence')),
+				getSignalEvidence(40).catch(failed('evidence')),
+				getFinancialEvents(20).catch(failed('financial events')),
+				getEntityPrices(100).catch(failed('prices')),
 			]);
 			signals = s;
 			convergence = c;
@@ -169,13 +189,17 @@
 			events = e;
 			prices = p;
 			// Load async data separately (Alpaca API call + price refresh)
-			getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
-			getPortfolioAnalytics().then(a => { analytics = a; }).catch(() => {});
-			getExitReview().then(r => { exitReview = r; }).catch(() => {});
-			getSourceHealth().then(sh => { sources = sh; }).catch(() => {});
-			getFinancialQuotas().then(q => { quotas = q; }).catch(() => {});
-			getPendingCalibration().then(rows => { pendingCalibration = rows; }).catch(() => {});
-			getCalibrationGateStatus().then(g => { calibrationGate = g; }).catch(() => {});
+			loadPortfolio();
+			getPortfolioAnalytics().then(a => { analytics = a; }).catch(failed('analytics'));
+			getExitReview().then(r => { exitReview = r; }).catch(failed('exit review'));
+			getSourceHealth().then(sh => { sources = sh; }).catch(failed('source health'));
+			getFinancialQuotas().then(q => { quotas = q; }).catch(failed('API quotas'));
+			getPendingCalibration().then(rows => { pendingCalibration = rows; }).catch(failed('calibration'));
+			getCalibrationGateStatus().then(g => { calibrationGate = g; }).catch(failed('calibration gate'));
+			decisionsError = null;
+			getTradeDecisions(3).then(d => { decisions = d; }).catch(e => { decisionsError = String(e?.message ?? e); });
+			scorecardError = null;
+			getSignalScorecard().then(sc => { scorecard = sc; }).catch(e => { scorecardError = String(e?.message ?? e); });
 			// Refresh prices in background, then reload price list
 			pricesRefreshing = true;
 			priceRefreshFailed = false;
@@ -191,6 +215,18 @@
 		}
 	}
 
+	/** Portfolio and its S&P comparison; errors are shown, never swallowed. */
+	function loadPortfolio() {
+		portfolioError = null;
+		getPortfolio()
+			.then(pf => { portfolio = pf; })
+			.catch(e => { portfolioError = String(e?.message ?? e); });
+		benchmarkError = null;
+		getBenchmark()
+			.then(b => { benchmark = b; })
+			.catch(e => { benchmarkError = String(e?.message ?? e); });
+	}
+
 	async function handleTrade(ticker: string, confidence: number) {
 		tradeStatus = `Placing order for ${ticker}...`;
 		try {
@@ -200,7 +236,7 @@
 			} else {
 				tradeStatus = 'Skipped (already holding or max positions)';
 			}
-			getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
+			loadPortfolio();
 		} catch (e: any) {
 			tradeStatus = `Error: ${e?.message ?? e}`;
 		}
@@ -216,7 +252,7 @@
 			const result = await closePosition(tradeId);
 			const pnl = result.pnl_pct ?? 0;
 			tradeStatus = `Closed ${result.ticker} @ $${(result.exit_price ?? 0).toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%)`;
-			getPortfolio().then(pf => { portfolio = pf; }).catch(() => {});
+			loadPortfolio();
 		} catch (e: any) {
 			tradeStatus = `${e?.message ?? e}`;
 		} finally {
@@ -624,7 +660,19 @@
 
 	{:else if error}
 		<div class="text-center py-20 text-rose-400">{error}</div>
+		<div class="text-center"><button onclick={loadData} class="text-xs text-blue-400 hover:text-blue-300">Retry</button></div>
 
+	{/if}
+
+	{#if !isLoading && !error && loadErrors.length > 0}
+		<div class="mb-4 px-4 py-2.5 rounded-lg text-xs bg-amber-500/10 text-amber-300 border border-amber-500/20 flex items-center justify-between gap-3">
+			<span>Some data couldn't load, so those sections may look empty: {loadErrors.join(', ')}.</span>
+			<button onclick={loadData} class="shrink-0 text-amber-200 hover:text-white underline">Retry</button>
+		</div>
+	{/if}
+
+	{#if isLoading || error}
+		<!-- loading / error shown above -->
 	<!-- ==================== OVERVIEW TAB ==================== -->
 	{:else if activeTab === 'overview'}
 
@@ -723,6 +771,11 @@
 						</div>
 					{/each}
 				</div>
+			</div>
+		{:else if !loadErrors.includes('convergence')}
+			<div class="mb-6 bg-bg-card border border-border rounded-xl p-4">
+				<h2 class="text-xs font-semibold text-text uppercase tracking-wider mb-1">Convergence Watchlist</h2>
+				<p class="text-xs text-text-muted">No convergence right now: no company has two or more signal types stacking up. It's recomputed with every briefing.</p>
 			</div>
 		{/if}
 
@@ -947,6 +1000,12 @@
 	{:else if activeTab === 'portfolio'}
 
 		{#if portfolio}
+			{#if portfolioError}
+				<div class="flex items-center justify-between gap-3 bg-amber-500/10 border border-amber-500/20 rounded-lg px-4 py-2 mb-4">
+					<p class="text-xs text-amber-400">Couldn't refresh from Alpaca, showing the last numbers loaded. {portfolioError}</p>
+					<button onclick={loadPortfolio} class="text-xs font-medium px-3 py-1 rounded-lg border border-border text-text-secondary hover:text-text transition-colors shrink-0">Retry</button>
+				</div>
+			{/if}
 			<!-- P&L Hero -->
 			<div class="bg-bg-card border {totalPnl >= 0 ? 'border-emerald-500/20' : 'border-rose-500/20'} rounded-xl p-6 mb-5 text-center relative">
 				<div class="text-[10px] text-text-muted uppercase tracking-wider mb-1">Total Unrealized P&L</div>
@@ -980,6 +1039,9 @@
 					<div class="text-lg font-mono font-bold text-text">{fmtPrice(portfolio.buying_power)}</div>
 				</div>
 			</div>
+
+			<BenchmarkCard {benchmark} error={benchmarkError} />
+			<TradeDecisions {decisions} error={decisionsError} />
 
 			<!-- Analytics Toggle -->
 			<button onclick={() => showAnalytics = !showAnalytics}
@@ -1226,6 +1288,8 @@
 				{/if}
 			{/if}
 
+			<SignalScorecard {scorecard} error={scorecardError} />
+
 			<!-- Open Positions -->
 			{#if portfolio.positions.length > 0}
 				<h2 class="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">Open Positions</h2>
@@ -1259,6 +1323,24 @@
 								<span>Cost: {fmtPrice(pos.avg_entry_price * pos.qty)} &rarr; {fmtPrice(pos.market_value)}</span>
 							</div>
 							{#if dbTrade}
+								{@const stop = dbTrade.broker_stop_price}
+								{@const spy = vsSpy.get(dbTrade.id)}
+								<div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+									{#if stop}
+										{@const gap = pos.current_price > 0 ? (stop / pos.current_price - 1) * 100 : null}
+										<span class="text-text-secondary" title="A real GTC sell-stop held at Alpaca. It sells even when Pulse isn't running.">
+											<span class="text-amber-400/80">Stop at Alpaca</span> <span class="font-mono">${stop.toFixed(2)}</span>{#if gap != null}<span class="text-text-muted"> ({gap.toFixed(1)}% from now)</span>{/if}
+										</span>
+									{:else}
+										<span class="text-text-muted" title="The stop is placed by the next hourly check during market hours.">No stop at Alpaca yet</span>
+									{/if}
+									{#if spy}
+										<span class="text-text-muted" title="SPY over the same days">
+											S&amp;P {spy.spy_pct >= 0 ? '+' : ''}{spy.spy_pct.toFixed(1)}% ·
+											<span class="font-mono {spy.excess_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}">{spy.excess_pct >= 0 ? '+' : ''}{spy.excess_pct.toFixed(1)} pts vs S&amp;P</span>
+										</span>
+									{/if}
+								</div>
 								<div class="mt-1.5 text-[11px] text-text-muted">
 									<span>Opened {dbTrade.entry_date.slice(0, 10)}</span>
 									{#if reason?.kind === 'auto'}
@@ -1355,7 +1437,13 @@
 								<div class="flex items-center justify-between mt-1.5 text-[11px] text-text-muted">
 									<span>Bought @ ${trade.entry_price.toFixed(2)} &middot; {fmtPrice(trade.position_size)} invested &middot; {trade.entry_date.slice(0, 10)}</span>
 									{#if trade.exit_price}
-										<span>Sold @ ${trade.exit_price.toFixed(2)} &middot; {trade.exit_date?.slice(0, 10)}</span>
+										{@const spy = vsSpy.get(trade.id)}
+										<span>
+											Sold @ ${trade.exit_price.toFixed(2)} &middot; {trade.exit_date?.slice(0, 10)}
+											{#if spy}
+												&middot; <span class="font-mono {spy.excess_pct >= 0 ? 'text-emerald-400/80' : 'text-rose-400/80'}" title="S&P 500 over the same days: {spy.spy_pct >= 0 ? '+' : ''}{spy.spy_pct.toFixed(1)}%">{spy.excess_pct >= 0 ? '+' : ''}{spy.excess_pct.toFixed(1)} pts vs S&amp;P</span>
+											{/if}
+										</span>
 									{/if}
 								</div>
 							</button>
@@ -1474,6 +1562,12 @@
 				{#if tradeStatus}
 					<p class="text-xs mt-2 {tradeStatus.startsWith('Error') ? 'text-rose-400' : 'text-emerald-400'}">{tradeStatus}</p>
 				{/if}
+			</div>
+		{:else if portfolioError}
+			<div class="bg-bg-card border border-rose-500/20 rounded-xl p-8 text-center">
+				<p class="text-sm text-rose-400 mb-1">Couldn't reach Alpaca</p>
+				<p class="text-xs text-text-muted mb-3">{portfolioError}</p>
+				<button onclick={loadPortfolio} class="text-xs font-medium px-3 py-1.5 rounded-lg border border-border text-text-secondary hover:text-text transition-colors">Retry</button>
 			</div>
 		{:else}
 			<div class="bg-bg-card border border-border rounded-xl p-8 text-center">

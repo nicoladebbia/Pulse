@@ -323,6 +323,18 @@
 				{/if}
 
 				<div class="divide-y divide-border/50 text-xs">
+					<div class="py-2.5 grid grid-cols-[9rem_1fr] gap-x-4">
+						<span class="text-amber-300 font-medium">Stop at Alpaca</span>
+						<span class="text-text-secondary leading-relaxed">
+							{#if t.broker_stop_price}
+								<span class="font-mono text-text">{fmt$(t.broker_stop_price)}</span>
+								{#if plan.current_price > 0}<span class="text-text-muted"> ({distPct(t.broker_stop_price, plan.current_price)})</span>{/if}
+								— a real GTC sell-stop held by the broker, so it sells even when Pulse isn't running. It follows the trailing stop below and only moves up.
+							{:else}
+								<span class="text-text-muted">None yet — the next hourly check during market hours places it.</span>
+							{/if}
+						</span>
+					</div>
 					{#if !plan.no_atr_fallback && plan.live_trailing_stop !== null}
 						<div class="py-2.5 grid grid-cols-[9rem_1fr] gap-x-4">
 							<span class="text-rose-300 font-medium">Trailing stop</span>
