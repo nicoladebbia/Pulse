@@ -70,6 +70,16 @@ struct Args {
     #[arg(long)]
     db_path: Option<PathBuf>,
 
+    /// live-signals mode: also pull the slower government/financial sources
+    /// (the hourly tier), not just EDGAR Form 4 / 8-K.
+    #[arg(long, default_value_t = false)]
+    full_sources: bool,
+
+    /// live-signals mode: run auto-trade when a stock newly turns buy-grade.
+    /// scheduled-fetch passes it only inside the 10:00–15:30 New York window.
+    #[arg(long, default_value_t = false)]
+    live_trade: bool,
+
     /// Force re-fetch even if today's briefing already exists
     #[arg(long, default_value_t = false)]
     force: bool,
@@ -507,6 +517,34 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        "live-signals" => {
+            // Intraday, no AI: new filings -> signals -> cross-signal scores.
+            // Shares the daily fetch's lock and yields to it (exit 0, next run
+            // tries again), since both rewrite today's cross_signals rows.
+            let instance_lock = match acquire_single_instance_lock(&db_path) {
+                Some(lock) => lock,
+                None => {
+                    tracing::info!("Live signals: another pulse-fetcher is running, skipping this run");
+                    return Ok(());
+                }
+            };
+            let report = pipeline::run_live_signals(&db_path, args.full_sources).await?;
+            tracing::info!(
+                "Live signals: {} new Form 4, {} enriched, {} new filings{}, {} scores, newly buy-grade: [{}]",
+                report.form4_new, report.form4_enriched, report.filings_new,
+                if report.full_sources { " (all sources)" } else { "" },
+                report.signals, report.new_candidates.join(", ")
+            );
+            drop(instance_lock);
+            if args.live_trade && !report.new_candidates.is_empty() {
+                // Same entry rules as the scheduled runs; it checks the market
+                // clock itself and skips what it already holds or ordered today.
+                match pipeline::auto_trade_on_convergence(&db_path).await {
+                    Ok(n) => tracing::info!("Live signals: auto-trade placed {} order(s)", n),
+                    Err(e) => tracing::warn!("Live signals: auto-trade failed: {}", e),
+                }
+            }
+        }
         "edge-report" => {
             // Step 6: re-measure the paper-trading edge on REAL fills placed after
             // the 2026-07-15 ticker fix + arming. Reads ONLY paper_trades, applies an
@@ -517,9 +555,15 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::error!("Edge report failed: {}", e),
             }
         }
-        other => {
-            tracing::info!("Running in {} mode", other);
+        "manual" => {
+            tracing::info!("Running in manual mode");
             pipeline::run(&db_path).await?;
+        }
+        other => {
+            // Unknown modes used to fall through to the full pipeline (fetch,
+            // AI, trading), so a typo or a scheduler newer than this binary
+            // ran a whole briefing. Refuse instead.
+            anyhow::bail!("unknown --mode {other}");
         }
     }
 

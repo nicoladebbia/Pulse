@@ -281,7 +281,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
 
 /// The eight financial/government sources. Never produce a `freedom_*`
 /// sector, which is why the freedoms run skips them entirely.
-async fn collect_financial_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
+pub(crate) async fn collect_financial_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
     let (usa_spending, fed_register, sec_edgar, fred_data, fec_data, eia_data, lda_data, patent_data) = tokio::join!(
         bounded("USASpending", usaspending::fetch()),
         bounded("Federal Register", federal_register::fetch()),

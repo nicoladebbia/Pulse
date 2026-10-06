@@ -53,6 +53,7 @@ const MIGRATION_037: &str = include_str!("../../../migrations/037_trade_realized
 const MIGRATION_038: &str = include_str!("../../../migrations/038_trade_broker_stop.sql");
 const MIGRATION_039: &str = include_str!("../../../migrations/039_ticker_industry.sql");
 const MIGRATION_040: &str = include_str!("../../../migrations/040_signals_page.sql");
+const MIGRATION_041: &str = include_str!("../../../migrations/041_api_usage_calls.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -734,6 +735,13 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         tx.commit()?;
     }
 
+    if !applied.contains(&41) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_041)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (41)", [])?;
+        tx.commit()?;
+    }
+
     // Ensure composite indexes exist (idempotent)
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_freedom_stories_bf ON freedom_stories(briefing_id, freedom, display_order);"
@@ -755,11 +763,29 @@ pub fn log_api_usage(
     // (next to pulse.db) on every call — edit that file to update prices live.
     // Local-mode calls never reach a paid API: record them as free so they show
     // up in usage but can never trip the daily cost cap.
-    if pulse_llm::is_local() {
+    // Only AI providers are rerouted; Alpaca, Finnhub and the data sources are
+    // real calls in either mode and must keep their name for the quota panel.
+    let ai_provider = matches!(provider, "anthropic" | "groq" | "voyage" | "cerebras" | "openai");
+    if pulse_llm::is_local() && ai_provider {
         insert_api_usage(conn, "local", &pulse_llm::local_model(), endpoint, input_tokens, output_tokens, 0.0);
     } else {
         log_cloud_api_usage(conn, provider, model, endpoint, input_tokens, output_tokens);
     }
+}
+
+/// Log a fetch run's requests to one free data source (SEC, FRED, ...) as a
+/// single row with the request count. Recorded under the source's own name in
+/// local AI mode too: these are real external calls with real rate limits.
+pub fn log_fetch_calls(conn: &rusqlite::Connection, provider: &str, endpoint: &str, calls: u32) {
+    if calls == 0 {
+        return;
+    }
+    conn.execute(
+        "INSERT INTO api_usage (provider, model, endpoint, input_tokens, output_tokens, estimated_cost_usd, calls)
+         VALUES (?1, 'fetch', ?2, 0, 0, 0.0, ?3)",
+        rusqlite::params![provider, endpoint, calls],
+    )
+    .ok();
 }
 
 /// Log a call that really went to a cloud provider, even in local mode
