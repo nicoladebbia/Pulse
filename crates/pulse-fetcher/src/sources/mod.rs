@@ -104,6 +104,10 @@ impl ApiCallCounters {
 
 pub static API_CALLS: ApiCallCounters = ApiCallCounters::new();
 
+/// Set when SEC answered 429 (or kept failing) during this run, so the live
+/// run skips its remaining SEC requests instead of hammering a blocked API.
+pub static SEC_THROTTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawArticle {
     pub title: String,
@@ -281,7 +285,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
 
 /// The eight financial/government sources. Never produce a `freedom_*`
 /// sector, which is why the freedoms run skips them entirely.
-async fn collect_financial_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
+pub(crate) async fn collect_financial_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
     let (usa_spending, fed_register, sec_edgar, fred_data, fec_data, eia_data, lda_data, patent_data) = tokio::join!(
         bounded("USASpending", usaspending::fetch()),
         bounded("Federal Register", federal_register::fetch()),

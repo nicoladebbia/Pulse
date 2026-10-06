@@ -572,12 +572,13 @@ pub fn get_source_health(db: State<'_, DbState>) -> Result<Vec<SourceHealth>, St
             ).unwrap_or(0)
         };
 
-        // API-call count in the last 7 days. NOTE: api_usage logs one row per HTTP request
+        // API-call count in the last 7 days (`calls`: fetch runs log one row per source
+        // with their request count, other callers one row per request). NOTE: it counts
         // regardless of whether any data came back, so this is "did we try", NOT "did we get
         // data". It must never by itself mean a source is healthy (that was the old bug: a
         // dead scraper that 200s an empty page every run looked "active").
         let api_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM api_usage WHERE provider = ?1 AND created_at >= datetime('now', '-7 days')",
+            "SELECT COALESCE(SUM(calls), 0) FROM api_usage WHERE provider = ?1 AND created_at >= datetime('now', '-7 days')",
             [api_provider],
             |row| row.get(0),
         ).unwrap_or(0);

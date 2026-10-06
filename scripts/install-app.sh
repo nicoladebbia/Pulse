@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 APP_DATA="$HOME/Library/Application Support/com.pulse.app"
 AGENT="$HOME/Library/LaunchAgents/com.pulse.scheduled-fetch.plist"
+LIVE_AGENT="$HOME/Library/LaunchAgents/com.pulse.live-signals.plist"
 REPO="nicoladebbia/Pulse"
 
 mkdir -p "$APP_DATA" "$HOME/Library/Logs/Pulse" "$HOME/Library/LaunchAgents"
@@ -47,6 +48,11 @@ sed "s#__HOME__#$HOME#g" "$PROJECT_DIR/launchd/com.pulse.scheduled-fetch.plist" 
 launchctl bootout "gui/$(id -u)/com.pulse.scheduled-fetch" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$AGENT"
 
+cp "$SCRIPT_DIR/live-signals.sh" "$APP_DATA/live-signals.sh"
+sed "s#__HOME__#$HOME#g" "$PROJECT_DIR/launchd/com.pulse.live-signals.plist" > "$LIVE_AGENT"
+launchctl bootout "gui/$(id -u)/com.pulse.live-signals" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$LIVE_AGENT"
+
 for old in com.pulse.daily-fetch com.pulse.embedding-backfill; do
   if launchctl print "gui/$(id -u)/$old" >/dev/null 2>&1; then
     echo "! $old (the checkout-based schedule) is also loaded. Two schedulers will"
@@ -56,3 +62,4 @@ done
 
 echo "✓ Pulse installed in /Applications"
 echo "✓ Briefings scheduled for 08:00 and 21:00 (log: ~/Library/Logs/Pulse/fetch-stdout.log)"
+echo "✓ Live signals every 5 minutes during US market hours (log: ~/Library/Logs/Pulse/live-stdout.log)"

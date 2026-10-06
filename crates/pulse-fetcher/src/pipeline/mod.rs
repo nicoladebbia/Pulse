@@ -4,6 +4,8 @@ pub(crate) mod notify;
 pub(crate) mod signals;
 mod tickers;
 mod trading;
+mod live;
+pub(crate) use live::run_live_signals;
 pub(crate) use form4::{classify_ambiguous_8ks, enrich_form4_stories, fetch_targeted_form4,
     run_targeted_form4};
 pub(crate) use notify::{notify_degraded, notify_degraded_test, notify_info, send_notification};
@@ -68,7 +70,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // companies blind on insider, the largest-weighted signal). Runs before enrichment
     // so today's new filings get their transaction details filled in the same run.
     tracing::info!("Phase 0a: Fetching targeted Form 4 filings for tracked companies...");
-    match fetch_targeted_form4(db_path).await {
+    match fetch_targeted_form4(db_path, form4::TARGETED_FORM4_LIMIT).await {
         Ok(count) => {
             if count > 0 {
                 tracing::info!("Targeted Form 4: inserted {} new insider filings", count);
@@ -134,12 +136,11 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
 
     // Log API calls for quota tracking — 1 row per actual HTTP request,
     // not per batch. Each source module bumps its atomic counter inside
-    // every fetch() call; we write that many rows here.
+    // every fetch() call; one row per provider carries that count.
     {
-        let snapshot = sources::API_CALLS.snapshot();
-        for (provider, calls) in snapshot {
-            for _ in 0..calls {
-                log_usage(db_path, provider, "fetch", "collect", 0, 0);
+        if let Ok(conn) = rusqlite::Connection::open(db_path) {
+            for (provider, calls) in sources::API_CALLS.snapshot() {
+                crate::db::log_fetch_calls(&conn, provider, "collect", calls);
             }
         }
     }
@@ -155,24 +156,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         raw_financial
     };
 
-    let financial_stories: Vec<crate::claude::SummarizedStory> = financial_articles
-        .into_iter()
-        .map(|article| {
-            let (key_facts, why_it_matters, what_to_watch) = generate_financial_fts_fields(&article);
-            crate::claude::SummarizedStory {
-                headline: article.title.clone(),
-                summary: article.content_snippet.clone(),
-                key_facts,
-                why_it_matters,
-                what_to_watch,
-                importance_score: 5,
-                sentiment: None,
-                novelty: None,
-                event_type: Some("financial_data".to_string()),
-                article,
-            }
-        })
-        .collect();
+    let financial_stories = financial_stories_from(financial_articles);
 
     // Financial stories will be written after the main briefing (Phase 8) to avoid creating a stub briefing
 
@@ -1893,10 +1877,9 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     let all_articles = sources::collect_freedoms().await?;
     // Log per-call API usage for this fetch run
     {
-        let snapshot = sources::API_CALLS.snapshot();
-        for (provider, calls) in snapshot {
-            for _ in 0..calls {
-                log_usage(db_path, provider, "fetch", "collect", 0, 0);
+        if let Ok(conn) = rusqlite::Connection::open(db_path) {
+            for (provider, calls) in sources::API_CALLS.snapshot() {
+                crate::db::log_fetch_calls(&conn, provider, "collect", calls);
             }
         }
     }
@@ -2458,6 +2441,29 @@ fn dedup_within_batch(articles: Vec<sources::RawArticle>) -> Vec<sources::RawArt
 /// financial_dedup table (which covers previous runs only — see `dedup_within_batch`).
 /// Uses feed_id as source_type and url as source_id for dedup.
 /// Returns only articles not previously seen.
+/// Financial articles are already structured: they skip the LLM summary and
+/// become stories with fields built from their metadata.
+fn financial_stories_from(articles: Vec<sources::RawArticle>) -> Vec<crate::claude::SummarizedStory> {
+    articles
+        .into_iter()
+        .map(|article| {
+            let (key_facts, why_it_matters, what_to_watch) = generate_financial_fts_fields(&article);
+            crate::claude::SummarizedStory {
+                headline: article.title.clone(),
+                summary: article.content_snippet.clone(),
+                key_facts,
+                why_it_matters,
+                what_to_watch,
+                importance_score: 5,
+                sentiment: None,
+                novelty: None,
+                event_type: Some("financial_data".to_string()),
+                article,
+            }
+        })
+        .collect()
+}
+
 fn dedup_financial_articles(
     db_path: &Path,
     articles: Vec<sources::RawArticle>,
