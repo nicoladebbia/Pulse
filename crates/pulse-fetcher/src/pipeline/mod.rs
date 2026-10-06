@@ -70,7 +70,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // companies blind on insider, the largest-weighted signal). Runs before enrichment
     // so today's new filings get their transaction details filled in the same run.
     tracing::info!("Phase 0a: Fetching targeted Form 4 filings for tracked companies...");
-    match fetch_targeted_form4(db_path, form4::TARGETED_FORM4_LIMIT).await {
+    match fetch_targeted_form4(db_path, form4::TARGETED_FORM4_LIMIT, None).await {
         Ok(count) => {
             if count > 0 {
                 tracing::info!("Targeted Form 4: inserted {} new insider filings", count);

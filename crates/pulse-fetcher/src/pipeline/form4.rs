@@ -18,14 +18,17 @@ pub(crate) async fn run_targeted_form4(db_path: &Path) -> anyhow::Result<usize> 
     let conn = rusqlite::Connection::open(db_path)?;
     crate::db::run_migrations(&conn)?;
     drop(conn);
-    fetch_targeted_form4(db_path, TARGETED_FORM4_LIMIT).await
+    fetch_targeted_form4(db_path, TARGETED_FORM4_LIMIT, None).await
 }
 
 /// Companies checked per daily run. The live run passes a larger number: it
 /// runs every few minutes, so the extra calls spread thin against SEC's limit.
 pub(crate) const TARGETED_FORM4_LIMIT: usize = 150;
 
-pub(crate) async fn fetch_targeted_form4(db_path: &Path, limit: usize) -> anyhow::Result<usize> {
+/// `share = Some((k, n))` checks only every n-th company, starting at k, so
+/// back-to-back live runs split the list instead of re-asking SEC about all
+/// of it every few minutes.
+pub(crate) async fn fetch_targeted_form4(db_path: &Path, limit: usize, share: Option<(usize, usize)>) -> anyhow::Result<usize> {
     let conn = rusqlite::Connection::open(db_path)?;
 
     // Target CIKs: ticker-mapped entities that have appeared in cross_signals
@@ -45,6 +48,9 @@ pub(crate) async fn fetch_targeted_form4(db_path: &Path, limit: usize) -> anyhow
         )?;
         stmt.query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
             .filter_map(|r| r.ok())
+            .enumerate()
+            .filter(|(i, _)| share.is_none_or(|(k, n)| i % n == k))
+            .map(|(_, c)| c)
             .collect()
     };
 
@@ -252,9 +258,16 @@ pub(crate) async fn enrich_form4_stories(db_path: &Path) -> anyhow::Result<usize
             if status.is_success() {
                 let html = resp.text().await.unwrap_or_default();
                 let mut found_xml = None;
+                let mut tries = 0;
                 for part in html.split("href=\"") {
                     let href = part.split('"').next().unwrap_or("");
-                    if href.ends_with(".xml") && !href.contains("R1") && !href.contains("R2") && !href.contains("index") {
+                    // `xsl…/x.xml` is the same filing rendered as HTML (never an
+                    // ownershipDocument) and FilingSummary.xml is metadata:
+                    // fetching them tripled the requests per filing.
+                    if href.ends_with(".xml") && !href.contains("R1") && !href.contains("R2") && !href.contains("index")
+                        && !href.contains("xsl") && !href.contains("FilingSummary") {
+                        tries += 1;
+                        if tries > 3 { break; }
                         let full_url = if href.starts_with("/") {
                             format!("https://www.sec.gov{}", href)
                         } else {

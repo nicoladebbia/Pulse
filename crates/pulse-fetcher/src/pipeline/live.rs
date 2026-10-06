@@ -2,10 +2,13 @@ use super::*;
 
 use std::collections::BTreeSet;
 
-/// Companies checked for new Form 4s per live run, one SEC request each with
-/// a 150 ms pause: with enrichment and the EDGAR feeds a run makes ~300-650
-/// SEC requests over 2-3 minutes, 2-4 a second against SEC's 10/second limit.
+/// Companies tracked for new Form 4s, one SEC request each. Each live run
+/// checks a quarter of them (rotating by the 5-minute slot), so every company
+/// is checked every 20 minutes. Checking all 250 every 5 minutes made ~12,000
+/// SEC requests a day and drew 429s; EDGAR's latest-filings feed, read every
+/// run, still catches any new Form 4 within 5 minutes.
 const LIVE_FORM4_LIMIT: usize = 250;
+const LIVE_FORM4_SHARES: usize = 4;
 
 /// What one live run found.
 #[derive(Debug, Default)]
@@ -45,10 +48,13 @@ pub(crate) async fn run_live_signals(db_path: &Path, full_sources: bool) -> anyh
         buy_grade_tickers(&conn)
     };
 
-    match fetch_targeted_form4(db_path, LIVE_FORM4_LIMIT).await {
+    let slot = chrono::Local::now().timestamp() as usize / 300 % LIVE_FORM4_SHARES;
+    match fetch_targeted_form4(db_path, LIVE_FORM4_LIMIT, Some((slot, LIVE_FORM4_SHARES))).await {
         Ok(n) => report.form4_new = n,
         Err(e) => tracing::warn!("Live: targeted Form 4 failed: {}", e),
     }
+    let sec_calls = || sources::API_CALLS.sec_edgar.load(std::sync::atomic::Ordering::Relaxed);
+    let after_form4 = sec_calls();
     let sec_ok = || !sources::SEC_THROTTLED.load(std::sync::atomic::Ordering::Relaxed);
     if sec_ok() {
         match enrich_form4_stories(db_path).await {
@@ -57,6 +63,7 @@ pub(crate) async fn run_live_signals(db_path: &Path, full_sources: bool) -> anyh
         }
     }
 
+    let after_enrich = sec_calls();
     let raw = if !sec_ok() {
         tracing::warn!("Live: SEC is throttling, skipping the filing feeds this run");
         Vec::new()
@@ -72,6 +79,10 @@ pub(crate) async fn run_live_signals(db_path: &Path, full_sources: bool) -> anyh
             Vec::new()
         })
     };
+    tracing::info!(
+        "Live: SEC requests: {} company checks, {} enrichment, {} filing feeds",
+        after_form4, after_enrich - after_form4, sec_calls() - after_enrich
+    );
     let fresh = dedup_financial_articles(db_path, raw);
     if !fresh.is_empty() {
         let stories = financial_stories_from(fresh);
