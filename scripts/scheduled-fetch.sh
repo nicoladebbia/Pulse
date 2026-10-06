@@ -71,6 +71,17 @@ if [ "$et_weekday" -le 5 ] && [ "$et_hour" -ge 10 ] && [ "$et_hour" -le 15 ] \
   fi
 fi
 
+# Weekly signal scorecard (which signal types and score ranges beat SPY), once
+# per ISO week at the first run that finds it due. A few Alpaca calls, no AI.
+week="$(date +%G-W%V)"
+if [ "$(cat "$STATE_DIR/scorecard" 2>/dev/null)" != "$week" ]; then
+  if "$FETCHER" --mode scorecard; then
+    echo "$week" > "$STATE_DIR/scorecard"
+  else
+    echo "$(date) scorecard failed, next hour retries"
+  fi
+fi
+
 if [ "$hour" -ge 21 ]; then
   # The morning one already exists by now, so the evening run needs --force
   # (multiple briefings per day are allowed; each gets its own time label).

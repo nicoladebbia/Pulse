@@ -248,7 +248,7 @@ mod tests {
         closes
             .iter()
             .enumerate()
-            .map(|(i, c)| DailyBar { date: format!("2026-09-{:02}", i + 1), high: *c, low: *c, close: *c, volume })
+            .map(|(i, c)| DailyBar { date: format!("2026-09-{:02}", i + 1), open: *c, high: *c, low: *c, close: *c, volume })
             .collect()
     }
 
@@ -285,7 +285,7 @@ mod tests {
         assert!((pct - 0.04).abs() < 1e-9, "{pct}");
         // A gap counts from the prior close, not just the day's own range.
         let last = b.len() - 1;
-        b[last] = DailyBar { date: "2026-09-30".into(), high: 111.0, low: 110.0, close: 110.0, volume: 1.0 };
+        b[last] = DailyBar { date: "2026-09-30".into(), open: 110.0, high: 111.0, low: 110.0, close: 110.0, volume: 1.0 };
         let gapped = atr_pct(&b, ATR_DAYS).unwrap();
         assert!((gapped - (13.0 * 4.0 + 11.0) / 14.0 / 110.0).abs() < 1e-9, "{gapped}");
         assert_eq!(atr_pct(&b[..14], ATR_DAYS), None, "needs a prior close");
