@@ -168,17 +168,18 @@ pub async fn execute_trade(
 #[tauri::command]
 pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<PaperTrade, String> {
     // Gather trade info, drop lock before async Alpaca calls.
-    let (ticker, entry_price, order_status, stop_order_id) = {
+    let (ticker, entry_price, order_status, stop_order_id, short) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT ticker, entry_price, order_status, stop_order_id FROM paper_trades
-             WHERE id = ?1 AND status = 'open'",
+            "SELECT ticker, entry_price, order_status, stop_order_id, COALESCE(direction, 'long') = 'short'
+             FROM paper_trades WHERE id = ?1 AND status = 'open'",
             [trade_id],
             |row| Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, f64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, bool>(4)?,
             )),
         )
         .map_err(|_| format!("No open trade with id {}", trade_id))?
@@ -197,7 +198,8 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
     // until it is cancelled.
     if let Some(creds) = pulse_alpaca::credentials() {
         let client = pulse_alpaca::client(std::time::Duration::from_secs(15))?;
-        let cleared = pulse_alpaca::stops::clear_stops(&client, &creds, &ticker, stop_order_id.as_deref())
+        let side = pulse_alpaca::stops::Side::protecting(short);
+        let cleared = pulse_alpaca::stops::clear_stops_for(side, &client, &creds, &ticker, stop_order_id.as_deref())
             .await
             .map_err(|e| format!("Could not cancel the stop order for {ticker} first: {e}"))?;
         // It fired while being cancelled. Selling the rest here would close the
@@ -216,11 +218,13 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
 
     // Get the real held qty from Alpaca (DB stores dollar notional, not shares).
     let positions = paper_trading::get_positions().await.map_err(|e| e.to_string())?;
-    let held_qty: f64 = positions
+    let signed_qty: f64 = positions
         .iter()
         .find(|p| p.symbol == ticker)
         .and_then(|p| p.qty.parse().ok())
         .unwrap_or(0.0);
+    // A short is negative at Alpaca; one held the other way is not this trade.
+    let held_qty = if short { -signed_qty } else { signed_qty };
 
     if held_qty <= 0.0 {
         // Alpaca has no position — reconcile the DB row to closed without an order.
@@ -236,7 +240,8 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
     // Place the sell. The id is fixed per trade and day, so a second click while
     // the first sell is still open is refused by Alpaca instead of selling again.
     let day = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let order = paper_trading::place_order(&ticker, held_qty, "sell", &paper_trading::close_order_id(trade_id, &day))
+    let side = if short { "buy" } else { "sell" };
+    let order = paper_trading::place_order(&ticker, held_qty, side, &paper_trading::close_order_id(trade_id, &day))
         .await
         .map_err(|e| e.to_string())?;
     let order = paper_trading::wait_for_fill(order).await;
@@ -252,8 +257,9 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
         ));
     }
 
-    let pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0;
-    let pnl = (exit_price - entry_price) * held_qty;
+    let sign = if short { -1.0 } else { 1.0 };
+    let pnl_pct = sign * ((exit_price - entry_price) / entry_price) * 100.0;
+    let pnl = sign * (exit_price - entry_price) * held_qty;
 
     // On top of realized_pnl: a half-closed trade has already booked that half.
     let conn = db.0.lock().map_err(|e| e.to_string())?;

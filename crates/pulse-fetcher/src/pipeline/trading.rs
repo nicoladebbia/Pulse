@@ -172,7 +172,18 @@ pub(crate) fn log_trade_event(
     }
 }
 
-/// Close a trade in full and return the P&L booked for the shares sold now.
+/// What a one-dollar rise is worth per share: 1 for a long, -1 for a short
+/// (`paper_trades.direction`).
+pub(crate) fn trade_sign(conn: &rusqlite::Connection, trade_id: i64) -> f64 {
+    let dir: Option<String> = conn
+        .query_row("SELECT direction FROM paper_trades WHERE id = ?1", [trade_id], |r| r.get(0))
+        .ok()
+        .flatten();
+    if dir.as_deref() == Some("short") { -1.0 } else { 1.0 }
+}
+
+/// Close a trade in full and return the P&L booked for the shares sold now
+/// (bought back, for a short).
 ///
 /// The final `pnl` is `realized_pnl` (booked by an earlier half close) plus the
 /// shares sold now. The full close used to write only the remaining half, and
@@ -186,8 +197,9 @@ pub(crate) fn record_full_close(
     exit_at: &str,
     reason: &str,
 ) -> rusqlite::Result<f64> {
-    let pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0;
-    let pnl_now = (exit_price - entry_price) * qty_sold;
+    let sign = trade_sign(conn, trade_id);
+    let pnl_pct = sign * ((exit_price - entry_price) / entry_price) * 100.0;
+    let pnl_now = sign * (exit_price - entry_price) * qty_sold;
     conn.execute(
         "UPDATE paper_trades SET status = ?7, exit_price = ?1, exit_date = ?2,
              pnl = COALESCE(realized_pnl, 0) + ?3, realized_pnl = COALESCE(realized_pnl, 0) + ?3,
@@ -220,7 +232,7 @@ pub(crate) fn book_stop_sale(
     qty_left: f64,
     filled_at: &str,
 ) -> rusqlite::Result<f64> {
-    let pnl_now = (stop_price - entry_price) * qty_sold;
+    let pnl_now = trade_sign(conn, trade_id) * (stop_price - entry_price) * qty_sold;
     let left_fraction = if qty_sold + qty_left > 0.0 { qty_left / (qty_sold + qty_left) } else { 0.0 };
     conn.execute(
         "UPDATE paper_trades SET realized_pnl = COALESCE(realized_pnl, 0) + ?1,
@@ -248,7 +260,7 @@ pub(crate) fn book_partial_sale(
     at: &str,
     half: bool,
 ) -> rusqlite::Result<f64> {
-    let pnl_now = (price - entry_price) * qty_sold;
+    let pnl_now = trade_sign(conn, trade_id) * (price - entry_price) * qty_sold;
     let left_fraction = if qty_sold + qty_left > 0.0 { qty_left / (qty_sold + qty_left) } else { 0.0 };
     conn.execute(
         "UPDATE paper_trades SET realized_pnl = COALESCE(realized_pnl, 0) + ?1,
@@ -321,7 +333,8 @@ pub(crate) fn resync_sold_shares(
     held_qty: f64,
     now: &str,
 ) -> rusqlite::Result<f64> {
-    let realized: f64 = sells.iter().map(|(q, p)| (p - entry_price) * q).sum();
+    let sign = trade_sign(conn, trade_id);
+    let realized: f64 = sells.iter().map(|(q, p)| sign * (p - entry_price) * q).sum();
     conn.execute(
         "UPDATE paper_trades SET realized_pnl = ?1, pnl = ?1, filled_qty = ?2, position_size = entry_price * ?2,
              half_closed_at = CASE WHEN ?3 THEN COALESCE(half_closed_at, ?4) ELSE half_closed_at END
@@ -359,7 +372,8 @@ pub(crate) fn sells_explain_gap(sells: &[(f64, f64)], expected: f64, held: f64) 
     !sells.is_empty() && (expected - held - sold).abs() < 0.01_f64.max(expected * 1e-4)
 }
 
-/// Shares Alpaca holds of a symbol; 0 when it holds none.
+/// Shares Alpaca holds of a symbol; 0 when it holds none, negative for a
+/// short.
 async fn held_shares(client: &reqwest::Client, creds: &pulse_alpaca::Credentials, ticker: &str) -> Result<f64, String> {
     let resp = creds
         .auth(client.get(format!("https://paper-api.alpaca.markets/v2/positions/{ticker}")))
@@ -376,12 +390,14 @@ async fn held_shares(client: &reqwest::Client, creds: &pulse_alpaca::Credentials
     Ok(order_num(&pos, "qty"))
 }
 
-/// Filled sells `(qty, price)` for a symbol since a trade's entry (a local
-/// timestamp, or a bare date).
-async fn sells_since(
+/// Filled orders `(qty, price)` on one side (`sell` closes a long, `buy`
+/// covers a short) for a symbol since a trade's entry (a local timestamp, or
+/// a bare date).
+async fn fills_since(
     client: &reqwest::Client,
     creds: &pulse_alpaca::Credentials,
     ticker: &str,
+    side: &str,
     entry_local: &str,
 ) -> Result<Vec<(f64, f64)>, String> {
     use chrono::TimeZone;
@@ -397,7 +413,7 @@ async fn sells_since(
         .to_rfc3339();
     let resp = creds
         .auth(client.get("https://paper-api.alpaca.markets/v2/orders"))
-        .query(&[("status", "closed"), ("symbols", ticker), ("side", "sell"), ("after", &after), ("limit", "100")])
+        .query(&[("status", "closed"), ("symbols", ticker), ("side", side), ("after", &after), ("limit", "100")])
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -527,6 +543,8 @@ async fn current_exposure(
                     .and_then(|m| m.as_str())
                     .and_then(|s| s.parse::<f64>().ok())
             })
+            // A short's market value is negative; exposure is its size.
+            .map(f64::abs)
             .unwrap_or(0.0),
         _ => 0.0,
     }
@@ -567,14 +585,38 @@ async fn open_book_risk(
             )
             .ok()
             .flatten();
-        total += pulse_weights::risk_sizing::position_risk(
-            order_num(pos, "qty"),
-            order_num(pos, "current_price"),
-            stop,
-            params,
-        );
+        let (qty, price) = (order_num(pos, "qty"), order_num(pos, "current_price"));
+        total += if qty < 0.0 {
+            // A short loses as the price rises to its buy stop.
+            match stop {
+                Some(s) if s > 0.0 && s.is_finite() && price > 0.0 => -qty * (s - price).max(0.0),
+                _ => -qty * price * params.max_stop_pct,
+            }
+        } else {
+            pulse_weights::risk_sizing::position_risk(qty, price, stop, params)
+        };
     }
     Some(total)
+}
+
+/// Whether Alpaca will lend `ticker` for a short: shortable and easy to
+/// borrow (a hard-to-borrow name can be recalled or refused).
+async fn short_borrowable(client: &reqwest::Client, creds: &pulse_alpaca::Credentials, ticker: &str) -> Result<bool, String> {
+    let resp = creds
+        .auth(client.get(format!("https://paper-api.alpaca.markets/v2/assets/{ticker}")))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("asset returned {}", resp.status()));
+    }
+    let asset: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(borrowable(&asset))
+}
+
+pub(crate) fn borrowable(asset: &serde_json::Value) -> bool {
+    let yes = |k: &str| asset.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    yes("tradable") && yes("shortable") && yes("easy_to_borrow")
 }
 
 /// Whole shares for a dollar budget at `price`, and what they cost. None when
@@ -641,6 +683,8 @@ struct Candidate {
     /// Fraction of a normal entry.
     size: f64,
     event: Option<serde_json::Value>,
+    /// Sold short instead of bought.
+    short: bool,
 }
 
 impl Candidate {
@@ -662,6 +706,7 @@ impl Candidate {
             trigger: ev.kind,
             size: crate::event_signals::EVENT_SIZE,
             event: serde_json::from_str(&ev.detail).ok(),
+            short: ev.direction == "short",
         }
     }
 }
@@ -783,6 +828,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             trigger: "convergence".to_string(),
             size: 1.0,
             event: None,
+            short: false,
         }))?
         .filter_map(|r| r.ok())
         .collect();
@@ -792,7 +838,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     // the morning briefing's news is acted on at the first run after it.
     crate::event_signals::detect(&conn);
     if crate::event_signals::enabled() {
-        match crate::event_signals::candidates(&conn, &["long"]) {
+        match crate::event_signals::candidates(&conn, crate::event_signals::directions()) {
             Ok(events) => {
                 for ev in events {
                     if candidates.iter().any(|c| c.ticker == ev.ticker) {
@@ -827,6 +873,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         .await?
         .json()
         .await?;
+
+    // Paper accounts can short from $2,000 of equity; Alpaca says so here.
+    let can_short = account.get("shorting_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let buying_power: f64 = account.get("buying_power")
         .and_then(|v| v.as_str())
@@ -944,7 +993,8 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let Candidate {
             entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political, insider_raw, ..
         } = c;
-        if *insider_raw < INSIDER_VETO_THRESHOLD {
+        // Insider selling backs a short; it only vetoes buys.
+        if !c.short && *insider_raw < INSIDER_VETO_THRESHOLD {
             tracing::info!(
                 "Auto-trade: vetoing {} ({}) — heavy insider selling (net ${:.0})",
                 name, ticker, insider_raw
@@ -1118,7 +1168,10 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             },
         };
 
-        tracing::info!("Auto-trade: {} ({}) — {} {:.2}, notional ${:.2}", name, ticker, c.trigger, score, notional);
+        tracing::info!(
+            "Auto-trade: {} ({}) — {}{} {:.2}, notional ${:.2}",
+            name, ticker, c.trigger, if c.short { " short" } else { "" }, score, notional
+        );
 
         // Cross-run dedup: if the pipeline runs multiple times in a short window
         // (launchd retry storm), the DB `already_open` guard can't help because the
@@ -1156,6 +1209,25 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             continue;
         };
 
+        // A short needs an account allowed to short and shares Alpaca can
+        // borrow without a recall risk (easy to borrow). Fails closed.
+        if c.short {
+            let why = if !can_short {
+                Some("The account is not allowed to short".to_string())
+            } else {
+                match short_borrowable(&client, &creds, ticker).await {
+                    Ok(true) => None,
+                    Ok(false) => Some("Alpaca can't borrow it easily".to_string()),
+                    Err(e) => Some(format!("Borrow status unreadable ({e})")),
+                }
+            };
+            if let Some(why) = why {
+                tracing::info!("Auto-trade: not shorting {} ({}) — {}", name, ticker, why);
+                log.skip(ticker, name, *score, "not_shortable", why);
+                continue;
+            }
+        }
+
         let industry = ef::industry(&client, &conn, &finnhub_key, ticker).await;
         if industry.is_none() && !finnhub_key.is_empty() {
             tracing::warn!("Auto-trade: industry of {} unknown — sector cap not applied to it", ticker);
@@ -1174,10 +1246,10 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
 
         if preview {
             tracing::info!(
-                "Auto-trade: PREVIEW — would buy {} {} (~${:.0}, {})",
-                qty, ticker, notional, industry.as_deref().unwrap_or("industry unknown")
+                "Auto-trade: PREVIEW — would {} {} {} (~${:.0}, {})",
+                if c.short { "short" } else { "buy" }, qty, ticker, notional, industry.as_deref().unwrap_or("industry unknown")
             );
-                log.preview(ticker, name, *score, format!("Would buy {} shares (~${:.0})", qty, notional));
+                log.preview(ticker, name, *score, format!("Would {} {} shares (~${:.0})", if c.short { "short" } else { "buy" }, qty, notional));
             if let (Some(rb), Some(s)) = (risk_book.as_mut(), sized_risk.as_ref()) {
                 rb.commit(s);
             }
@@ -1192,7 +1264,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let order = serde_json::json!({
             "symbol": ticker,
             "qty": qty.to_string(),
-            "side": "buy",
+            "side": if c.short { "sell" } else { "buy" },
             "type": "market",
             "time_in_force": "day",
             "client_order_id": client_order_id
@@ -1340,16 +1412,18 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 "rules": RULES_VERSION,
                 "trigger": c.trigger,
                 "event": c.event,
+                "direction": if c.short { "short" } else { "long" },
             });
 
             // Record in paper_trades with position management columns
             match conn.execute(
                 "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status, high_water_mark, original_compound_score, order_status, filled_qty, entry_context, entry_trigger)
-                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6, ?9, ?10, ?11, ?12)",
+                 VALUES (?1, ?2, ?13, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     entity_id, ticker, filled_price, fill_time, notional, score,
                     signal_profile.to_string(), order_id, order_status,
                     (filled_qty > 0.0).then_some(filled_qty), entry_context.to_string(), c.trigger,
+                    if c.short { "short" } else { "long" },
                 ],
             ) {
                 Ok(_) => log_trade_event(
@@ -1360,7 +1434,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             }
 
             tracing::info!("Auto-trade: placed order {} for {} (${:.2} @ ${:.2}, qty {:.4})", order_id, ticker, notional, filled_price, filled_qty);
-            log.bought(ticker, name, *score, format!("Bought ~${:.0} ({}, {})", notional, order_status, c.trigger));
+            log.bought(ticker, name, *score, format!(
+                "{} ~${:.0} ({}, {})", if c.short { "Shorted" } else { "Bought" }, notional, order_status, c.trigger
+            ));
             if let (Some(rb), Some(s)) = (risk_book.as_mut(), sized_risk.as_ref()) {
                 rb.commit(s);
             }
@@ -1564,16 +1640,17 @@ pub(crate) struct SellFill {
     pub client_order_id: String,
 }
 
-/// Fetch the most recent FILLED sell for a ticker from Alpaca.
+/// Fetch the most recent FILLED order on `side` for a ticker from Alpaca:
+/// `sell` for a long's exit, `buy` for a short's cover.
 /// Used to record real exit P&L when a position closed between runs (e.g. a
 /// pre-market `day` order that filled after the open, or the broker stop).
 pub(crate) async fn latest_filled_sell(
-    client: &reqwest::Client, key: &str, secret: &str, ticker: &str,
+    client: &reqwest::Client, key: &str, secret: &str, ticker: &str, side: &str,
 ) -> Option<SellFill> {
     let resp = client
         .get(format!(
-            "https://paper-api.alpaca.markets/v2/orders?status=closed&symbols={}&side=sell&limit=5&direction=desc",
-            ticker
+            "https://paper-api.alpaca.markets/v2/orders?status=closed&symbols={}&side={}&limit=5&direction=desc",
+            ticker, side
         ))
         .header("APCA-API-KEY-ID", key)
         .header("APCA-API-SECRET-KEY", secret)
@@ -1643,6 +1720,29 @@ struct OpenTrade {
     score_rebase_after: Option<String>,
     /// What opened it: "convergence" or an event kind.
     entry_trigger: String,
+    /// Sold short: Alpaca reports a negative quantity, exits are buys and
+    /// the stop is a buy stop above the price.
+    short: bool,
+}
+
+impl OpenTrade {
+    fn sign(&self) -> f64 {
+        if self.short { -1.0 } else { 1.0 }
+    }
+
+    /// The order side that closes it, and the side of its broker stop.
+    fn exit_side(&self) -> pulse_alpaca::stops::Side {
+        pulse_alpaca::stops::Side::protecting(self.short)
+    }
+
+    /// The broker stop level wanted now.
+    fn stop_level(&self, conn: &rusqlite::Connection) -> f64 {
+        if self.short {
+            crate::position_management::broker_cover_stop_level(conn, self.id, &self.ticker, self.entry_price)
+        } else {
+            crate::position_management::broker_stop_level(conn, self.id, &self.ticker, self.entry_price)
+        }
+    }
 }
 
 fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTrade>> {
@@ -1651,7 +1751,8 @@ fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTra
                 COALESCE(original_compound_score, confidence, 0.30),
                 half_closed_at, position_size, order_status, alpaca_order_id,
                 stop_order_id, broker_stop_filled_at, filled_qty,
-                exit_order_id, exit_order_reason, exit_order_kind, score_rebase_after, entry_trigger
+                exit_order_id, exit_order_reason, exit_order_kind, score_rebase_after, entry_trigger,
+                COALESCE(direction, 'long')
          FROM paper_trades WHERE status = 'open'",
     )?;
     let rows = stmt
@@ -1674,6 +1775,7 @@ fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTra
                 exit_order_kind: row.get::<_, Option<String>>(14).unwrap_or(None),
                 score_rebase_after: row.get::<_, Option<String>>(15).unwrap_or(None),
                 entry_trigger: row.get::<_, String>(16).unwrap_or_else(|_| "convergence".to_string()),
+                short: row.get::<_, String>(17).map(|d| d == "short").unwrap_or(false),
             })
         })?
         .filter_map(|r| r.ok())
@@ -1685,7 +1787,7 @@ fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTra
 /// journal generation — calibration is measure-only and no longer closes
 /// trades. Without this, the Portfolio exit-reasons feature gets no entries.
 fn journal_close(conn: &rusqlite::Connection, t: &OpenTrade, exit_at: &str, exit_price: f64, pnl_dollars: f64, reason: &str) {
-    let pnl_pct = ((exit_price - t.entry_price) / t.entry_price) * 100.0;
+    let pnl_pct = t.sign() * ((exit_price - t.entry_price) / t.entry_price) * 100.0;
     let exit_day = exit_at.get(..10).unwrap_or(exit_at);
     crate::position_management::generate_trade_journal(
         conn, t.id, &t.ticker, &t.entry_date, exit_day,
@@ -1723,12 +1825,12 @@ async fn reconcile_missing_position(
         journal_close(conn, t, &at, price, pnl, &reason);
         tracing::warn!(
             "Position mgmt: {} stopped out by the broker — {:.0} sh @ ${:.2} ({:+.1}%, ${:+.2})",
-            t.ticker, qty, price, ((price - t.entry_price) / t.entry_price) * 100.0, pnl
+            t.ticker, qty, price, t.sign() * ((price - t.entry_price) / t.entry_price) * 100.0, pnl
         );
         return;
     }
 
-    let Some(sell) = latest_filled_sell(client, &creds.key, &creds.secret, &t.ticker).await else {
+    let Some(sell) = latest_filled_sell(client, &creds.key, &creds.secret, &t.ticker, t.exit_side().as_str()).await else {
         // No fill record found — close without P&L rather than leave a
         // phantom-open row, but log it loudly for review.
         conn.execute(
@@ -1759,15 +1861,16 @@ async fn reconcile_missing_position(
     journal_close(conn, t, &at, sell.price, total, &reason);
     tracing::warn!(
         "Position mgmt: {} closed between runs ({}) — reconciled @ ${:.2} ({:+.1}%, ${:+.2})",
-        t.ticker, reason, sell.price, ((sell.price - t.entry_price) / t.entry_price) * 100.0, pnl_now
+        t.ticker, reason, sell.price, t.sign() * ((sell.price - t.entry_price) / t.entry_price) * 100.0, pnl_now
     );
 }
 
-/// Bring the broker stop in line with the wanted level: place it, raise it,
-/// resize it, or cancel it when under one share is held. Never lowers it.
+/// Bring the broker stop in line with the wanted level: place it, tighten it,
+/// resize it, or cancel it when under one share is held. Never loosens it.
 /// Failures are logged, not fatal — the stop checked each run still applies.
 #[allow(clippy::too_many_arguments)]
 async fn sync_broker_stop(
+    side: pulse_alpaca::stops::Side,
     conn: &rusqlite::Connection,
     client: &reqwest::Client,
     creds: &pulse_alpaca::Credentials,
@@ -1779,7 +1882,7 @@ async fn sync_broker_stop(
     dry_run: bool,
 ) {
     use pulse_alpaca::stops::{self, StopPlan};
-    let plan = stops::plan_stop(live, held_qty, want_price);
+    let plan = stops::plan_stop_for(side, live, held_qty, want_price);
     if plan == StopPlan::Keep {
         return;
     }
@@ -1805,7 +1908,7 @@ async fn sync_broker_stop(
     }
     let coid = format!("{}{}-{}-{}", stops::STOP_ID_PREFIX, ticker, trade_id, chrono::Utc::now().timestamp());
     let result = match (&plan, live) {
-        (StopPlan::Place { qty, stop_price }, _) => stops::place_stop(client, creds, ticker, *qty, *stop_price, &coid).await,
+        (StopPlan::Place { qty, stop_price }, _) => stops::place_stop_for(side, client, creds, ticker, *qty, *stop_price, &coid).await,
         (StopPlan::Replace { qty, stop_price }, Some(o)) => {
             match stops::replace_stop(client, creds, &o.id, *qty, *stop_price).await {
                 Ok(n) => Ok(n),
@@ -1815,7 +1918,7 @@ async fn sync_broker_stop(
                     match stops::cancel_and_wait(client, creds, &o.id).await {
                         // It fired meanwhile; the next run books the sale.
                         Ok(c) if c.sold().is_some() => Err("stop filled while being replaced".to_string()),
-                        Ok(_) => stops::place_stop(client, creds, ticker, *qty, *stop_price, &coid).await,
+                        Ok(_) => stops::place_stop_for(side, client, creds, ticker, *qty, *stop_price, &coid).await,
                         Err(e) => Err(e),
                     }
                 }
@@ -1995,7 +2098,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                 }
                 Ok(found) => {
                     let held_now = match held_shares(&client, &creds, ticker).await {
-                        Ok(q) => q,
+                        Ok(q) => q.abs(),
                         Err(e) => {
                             tracing::warn!("Position mgmt: {} position unreadable ({}), sell {} settles next run", ticker, e, oid);
                             continue;
@@ -2057,13 +2160,25 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         let pos = match pos { Some(p) => p, None => continue };
         let current_price: f64 = pos.get("current_price")
             .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        let mut held_qty: f64 = pos.get("qty")
+        let signed_qty: f64 = pos.get("qty")
             .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        // Shares held, or owed on a short.
+        let mut held_qty = signed_qty.abs();
 
         if current_price <= 0.0 || held_qty <= 0.0 {
             tracing::warn!("Position mgmt: {} has no valid price/qty from Alpaca, skipping", ticker);
             continue;
         }
+        // The broker's position points the other way from the row: closing
+        // it would add to the wrong side. Leave it for review.
+        if (signed_qty < 0.0) != t.short {
+            tracing::warn!(
+                "Position mgmt: {} is {} in the ledger but Alpaca holds {:.4} — not touched, review",
+                ticker, if t.short { "short" } else { "long" }, signed_qty
+            );
+            continue;
+        }
+        let side = t.exit_side();
 
         // The broker stop: did it sell since the last run, and what is live now?
         // `stop_known` is false when Alpaca could not be asked — placing a stop
@@ -2106,10 +2221,11 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         // No stop on record (first run with broker stops, or a replace that
         // gave it a new id): adopt the one already open on Alpaca, if any.
         if !stop_fired && stop_known && live_stop.is_none() {
-            match stops::open_stops(&client, &creds, ticker).await {
+            match stops::open_stops_for(side, &client, &creds, ticker).await {
                 Ok(found) => {
+                    // The tightest: highest sell stop, lowest buy stop.
                     live_stop = found.into_iter().max_by(|a, b| {
-                        a.stop_price.partial_cmp(&b.stop_price).unwrap_or(std::cmp::Ordering::Equal)
+                        (t.sign() * a.stop_price).partial_cmp(&(t.sign() * b.stop_price)).unwrap_or(std::cmp::Ordering::Equal)
                     });
                     if let Some(o) = &live_stop {
                         conn.execute(
@@ -2133,7 +2249,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             && let Some(expected) = t.filled_qty
             && held_qty + 1e-3 < expected
         {
-            match sells_since(&client, &creds, ticker, &t.entry_date).await {
+            match fills_since(&client, &creds, ticker, side.as_str(), &t.entry_date).await {
                 Ok(sells) if sells_explain_gap(&sells, expected, held_qty) => {
                     let realized = resync_sold_shares(&conn, t.id, *entry_price, &sells, held_qty, &now_dt).unwrap_or(0.0);
                     tracing::warn!(
@@ -2155,7 +2271,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         }
 
         use crate::position_management::PositionAction;
-        let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
+        let pnl_pct = t.sign() * ((current_price - entry_price) / entry_price) * 100.0;
         let hold_limit = crate::event_signals::max_hold_days(&t.entry_trigger);
         let held_days = chrono::NaiveDate::parse_from_str(t.entry_date.get(..10).unwrap_or(""), "%Y-%m-%d")
             .map(|d| crate::event_signals::weekdays_between(d, chrono::Local::now().date_naive()))
@@ -2182,11 +2298,14 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             // Event trades have no compound score to decay from; they end on
             // their maximum hold instead.
             let decayed = hold_limit.is_none()
+                && !t.short
                 && rebased
                 && crate::position_management::check_signal_decay(&conn, ticker, t.orig_score);
-            let action = crate::position_management::evaluate_position(
-                &conn, t.id, ticker, *entry_price, current_price,
-            );
+            let action = if t.short {
+                crate::position_management::evaluate_short(&conn, t.id, ticker, *entry_price, current_price)
+            } else {
+                crate::position_management::evaluate_position(&conn, t.id, ticker, *entry_price, current_price)
+            };
             // Decide final action: signal decay forces a full close (overrides Hold).
             match action {
                 PositionAction::CloseAll { reason } => (held_qty, reason),
@@ -2218,8 +2337,8 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         if close_qty <= 0.0 {
             tracing::info!("Position mgmt: {} → HOLD (price ${:.2}, pnl {:.1}%)", ticker, current_price, pnl_pct);
             if stop_known {
-                let want = crate::position_management::broker_stop_level(&conn, t.id, ticker, *entry_price);
-                sync_broker_stop(&conn, &client, &creds, t.id, ticker, held_qty, want, live_stop.as_ref(), dry_run).await;
+                let want = t.stop_level(&conn);
+                sync_broker_stop(side, &conn, &client, &creds, t.id, ticker, held_qty, want, live_stop.as_ref(), dry_run).await;
             }
             continue;
         }
@@ -2240,7 +2359,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         // A sell stop holds its shares: Alpaca refuses any other sell for them
         // until it is cancelled. If it cannot be cancelled, do not sell this
         // run — the stop is still protecting the position.
-        let cleared = match stops::clear_stops(&client, &creds, ticker, known_stop).await {
+        let cleared = match stops::clear_stops_for(side, &client, &creds, ticker, known_stop).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("Position mgmt: {} broker stop not cancelled ({}) — no sell this run", ticker, e);
@@ -2281,7 +2400,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         let order = serde_json::json!({
             "symbol": ticker,
             "qty": format!("{:.9}", close_qty),
-            "side": "sell",
+            "side": side.as_str(),
             "type": "market",
             "time_in_force": "day",
             "client_order_id": exit_coid
@@ -2318,8 +2437,8 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             // The stop was cancelled to free the shares; put it back so the
             // position is not left unprotected until the next run.
             if stop_known {
-                let want = crate::position_management::broker_stop_level(&conn, t.id, ticker, *entry_price);
-                sync_broker_stop(&conn, &client, &creds, t.id, ticker, held_qty, want, None, false).await;
+                let want = t.stop_level(&conn);
+                sync_broker_stop(side, &conn, &client, &creds, t.id, ticker, held_qty, want, None, false).await;
             }
             continue;
         }
@@ -2359,7 +2478,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                 .unwrap_or(pnl_dollars);
             journal_close(&conn, &t, &fill.at_local, exit_price, total, &reason);
             tracing::info!("Position mgmt: CLOSED {} @ ${:.2} ({:+.1}%, ${:+.2})",
-                ticker, exit_price, ((exit_price - entry_price) / entry_price) * 100.0, total);
+                ticker, exit_price, t.sign() * ((exit_price - entry_price) / entry_price) * 100.0, total);
         } else {
             // Half close: mark half_closed_at, keep position open. position_size
             // is dollar-notional; halve it to reflect the reduced exposure.
@@ -2372,8 +2491,8 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             tracing::info!("Position mgmt: HALF-CLOSED {} @ ${:.2} (realized ${:+.2} on half)",
                 ticker, exit_price, realized_half);
             // The stop was cancelled to free the shares; put it back on the half still held.
-            let want = crate::position_management::broker_stop_level(&conn, t.id, ticker, *entry_price);
-            sync_broker_stop(&conn, &client, &creds, t.id, ticker, held_qty - close_qty, want, None, false).await;
+            let want = t.stop_level(&conn);
+            sync_broker_stop(side, &conn, &client, &creds, t.id, ticker, held_qty - close_qty, want, None, false).await;
         }
         actions += 1;
 
@@ -2750,6 +2869,37 @@ mod ledger_tests {
                 ("close".into(), Some(1.0), "trailing_stop".into()),
             ]
         );
+    }
+
+    #[test]
+    fn a_short_books_a_falling_price_as_profit() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        conn.execute("UPDATE paper_trades SET direction = 'short', filled_qty = 100 WHERE id = ?1", [id]).unwrap();
+        // Shorted at $20: covering half at $18 is +$2 a share, the stop at $22 -$2.
+        let half = book_partial_sale(&conn, id, 20.0, 18.0, 50.0, 50.0, "2026-10-01T10:00:00", true).unwrap();
+        assert!((half - 100.0).abs() < 1e-9, "{half}");
+        let stop = book_stop_sale(&conn, id, 20.0, 22.0, 25.0, 25.0, "2026-10-02T10:00:00").unwrap();
+        assert!((stop + 50.0).abs() < 1e-9, "{stop}");
+        let last = record_full_close(&conn, id, 20.0, 19.0, 25.0, "2026-10-03T10:00:00", "max_hold").unwrap();
+        assert!((last - 25.0).abs() < 1e-9, "{last}");
+        let (pnl, pnl_pct): (f64, f64) =
+            conn.query_row("SELECT pnl, pnl_pct FROM paper_trades WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert!((pnl - 75.0).abs() < 1e-9, "{pnl}");
+        assert!((pnl_pct - 5.0).abs() < 1e-9, "last leg: 20 -> 19 short is +5%, got {pnl_pct}");
+        // Rebuilt from broker buys: two covers at 18 and 21.
+        let realized = resync_sold_shares(&conn, id, 20.0, &[(10.0, 18.0), (10.0, 21.0)], 80.0, "2026-10-04T10:00:00").unwrap();
+        assert!((realized - 10.0).abs() < 1e-9, "{realized}");
+    }
+
+    #[test]
+    fn an_asset_must_be_easy_to_borrow_to_short() {
+        let a = |t, s, e| serde_json::json!({"tradable": t, "shortable": s, "easy_to_borrow": e});
+        use crate::pipeline::trading::borrowable;
+        assert!(borrowable(&a(true, true, true)));
+        assert!(!borrowable(&a(true, true, false)));
+        assert!(!borrowable(&a(true, false, true)));
+        assert!(!borrowable(&serde_json::json!({})));
     }
 
     fn insert(conn: &Connection, order_status: &str) -> i64 {

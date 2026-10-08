@@ -53,6 +53,17 @@ pub fn enabled() -> bool {
     std::env::var("EVENT_TRADES_ENABLED").map(|v| !(v.eq_ignore_ascii_case("false") || v == "0")).unwrap_or(true)
 }
 
+/// Whether short events are traded (sold short) as well as long ones.
+/// `SHORTS_ENABLED=false` keeps the bot long-only.
+pub fn shorts_enabled() -> bool {
+    std::env::var("SHORTS_ENABLED").map(|v| !(v.eq_ignore_ascii_case("false") || v == "0")).unwrap_or(true)
+}
+
+/// The directions auto-trade acts on.
+pub fn directions() -> &'static [&'static str] {
+    if shorts_enabled() { &["long", "short"] } else { &["long"] }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     pub kind: &'static str,

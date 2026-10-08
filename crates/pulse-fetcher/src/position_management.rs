@@ -268,6 +268,105 @@ pub fn broker_stop_level(conn: &Connection, trade_id: i64, ticker: &str, entry_p
     stop_level_from(entry_price, hwm, compute_atr(conn, ticker, 14))
 }
 
+/// `evaluate_position` for a short: the mirror image. The best price is the
+/// lowest one seen (kept in `high_water_mark`, which for a short is its
+/// low-water mark), the trailing stop sits 3x ATR above it, the hard stop at
+/// +15% against the entry, and half is covered at 3x ATR of profit.
+pub fn evaluate_short(
+    conn: &Connection,
+    trade_id: i64,
+    ticker: &str,
+    entry_price: f64,
+    current_price: f64,
+) -> PositionAction {
+    if current_price <= 0.0 || entry_price <= 0.0 {
+        return PositionAction::Hold;
+    }
+    let pnl_pct = ((entry_price - current_price) / entry_price) * 100.0;
+    if pnl_pct <= -15.0 {
+        return PositionAction::CloseAll { reason: format!("hard_stop_loss ({:.1}%, short)", pnl_pct) };
+    }
+    let atr = compute_atr(conn, ticker, 14);
+    if atr <= 0.0 {
+        if pnl_pct <= -10.0 {
+            return PositionAction::CloseAll {
+                reason: format!("fixed_stop_loss ({:.1}%, short, no ATR data)", pnl_pct),
+            };
+        }
+        return PositionAction::Hold;
+    }
+    let lwm: f64 = conn
+        .query_row(
+            "SELECT COALESCE(high_water_mark, entry_price) FROM paper_trades WHERE id = ?1",
+            [trade_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(entry_price)
+        .min(entry_price)
+        .min(current_price);
+    if current_price < lwm + 0.001 {
+        persist_state(
+            conn.execute(
+                "UPDATE paper_trades SET high_water_mark = ?1 WHERE id = ?2",
+                rusqlite::params![current_price, trade_id],
+            ),
+            "high_water_mark",
+            trade_id,
+        );
+    }
+    let trailing_stop = lwm + atr * 3.0;
+    persist_state(
+        conn.execute(
+            "UPDATE paper_trades SET trailing_stop = ?1 WHERE id = ?2",
+            rusqlite::params![trailing_stop, trade_id],
+        ),
+        "trailing_stop",
+        trade_id,
+    );
+    if current_price >= trailing_stop {
+        return PositionAction::CloseAll {
+            reason: format!(
+                "trailing_stop ({:.1}%, short, ATR={:.2}, low={:.2}, stop={:.2})",
+                pnl_pct, atr, lwm, trailing_stop
+            ),
+        };
+    }
+    let profit_target = entry_price - atr * 3.0;
+    if current_price <= profit_target && pnl_pct >= 10.0 {
+        return PositionAction::CloseHalf {
+            reason: format!("profit_target ({:.1}%, short, target={:.2}, 3x ATR from entry)", pnl_pct, profit_target),
+        };
+    }
+    PositionAction::Hold
+}
+
+/// The buy stop the broker should hold for a short: `low + 3*ATR`, never
+/// above the +15% hard stop; +10% without an ATR.
+pub fn cover_stop_level_from(entry_price: f64, low_water_mark: f64, atr: f64) -> f64 {
+    if entry_price.is_nan() || entry_price <= 0.0 {
+        return 0.0;
+    }
+    if atr > 0.0 && atr.is_finite() {
+        let lwm = if low_water_mark.is_finite() && low_water_mark > 0.0 { low_water_mark.min(entry_price) } else { entry_price };
+        (lwm + atr * 3.0).min(entry_price * 1.15)
+    } else {
+        entry_price * 1.10
+    }
+}
+
+/// `cover_stop_level_from` with this short's stored low and current ATR.
+/// Call after `evaluate_short`, which moves the low.
+pub fn broker_cover_stop_level(conn: &Connection, trade_id: i64, ticker: &str, entry_price: f64) -> f64 {
+    let lwm: f64 = conn
+        .query_row(
+            "SELECT COALESCE(high_water_mark, entry_price) FROM paper_trades WHERE id = ?1",
+            [trade_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(entry_price);
+    cover_stop_level_from(entry_price, lwm, compute_atr(conn, ticker, 14))
+}
+
 /// How old a `cross_signals` row may be and still count as this ticker's
 /// current reading.
 ///
@@ -574,6 +673,42 @@ mod atr_recency_tests {
         seed(&conn, "MIXED", 3, 1);
         seed(&conn, "MIXED", 20, 200);
         assert_eq!(compute_atr(&conn, "MIXED", 14), 0.0);
+    }
+
+    #[test]
+    fn a_short_trails_its_low_and_stops_above_it() {
+        let conn = db();
+        conn.execute_batch(
+            "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY,
+                entry_price REAL, high_water_mark REAL, trailing_stop REAL);
+             INSERT INTO paper_trades (id, entry_price, high_water_mark) VALUES (1, 100.0, 100.0);",
+        )
+        .unwrap();
+        seed(&conn, "SHRT", 20, 1); // ATR 2.00
+        // Falls to 92 (+8%, under the profit target's 10%): the low moves
+        // down, the stop follows to 98.
+        assert!(matches!(evaluate_short(&conn, 1, "SHRT", 100.0, 92.0), PositionAction::Hold));
+        let (low, stop): (f64, f64) =
+            conn.query_row("SELECT high_water_mark, trailing_stop FROM paper_trades", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((low, stop), (92.0, 98.0));
+        // Back up to 97: still under the stop, and the low stays at 92.
+        assert!(matches!(evaluate_short(&conn, 1, "SHRT", 100.0, 97.0), PositionAction::Hold));
+        // 98.5 is above it: cover.
+        match evaluate_short(&conn, 1, "SHRT", 100.0, 98.5) {
+            PositionAction::CloseAll { reason } => assert!(reason.starts_with("trailing_stop"), "{reason}"),
+            other => panic!("expected the trailing stop, got {other:?}"),
+        }
+        // Down 11%, past 3 ATR: cover half.
+        assert!(matches!(evaluate_short(&conn, 1, "SHRT", 100.0, 89.0), PositionAction::CloseHalf { .. }));
+        // A 16% rise is the hard stop whatever the trail says.
+        match evaluate_short(&conn, 1, "SHRT", 100.0, 116.0) {
+            PositionAction::CloseAll { reason } => assert!(reason.starts_with("hard_stop"), "{reason}"),
+            other => panic!("expected the hard stop, got {other:?}"),
+        }
+        // The broker's buy stop: low + 3 ATR, never above +15%; +10% with no ATR.
+        assert_eq!(cover_stop_level_from(100.0, 90.0, 2.0), 96.0);
+        assert!((cover_stop_level_from(100.0, 100.0, 10.0) - 115.0).abs() < 1e-9);
+        assert!((cover_stop_level_from(100.0, 95.0, 0.0) - 110.0).abs() < 1e-9);
     }
 
     #[test]

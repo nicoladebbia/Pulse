@@ -61,6 +61,8 @@ pub struct ClosedTrade {
     /// Whole-trade return in %, all legs included when known.
     pub return_pct: f64,
     pub profile: serde_json::Value,
+    /// Sold short: a falling price is the gain.
+    pub short: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -123,11 +125,15 @@ pub fn review(t: &ClosedTrade, bars: &[DailyBar], spy: &[DailyBar]) -> Option<Re
     // prices (entry close, exit price); full ranges in between.
     let between = if exit_i > entry_i + 1 { &bars[entry_i + 1..exit_i] } else { &[][..] };
     let known = [bars[entry_i].close, t.exit_price];
-    let mfe = between.iter().map(|b| b.high).chain(known).fold(f64::MIN, f64::max);
-    let mae = between.iter().map(|b| b.low).chain(known).fold(f64::MAX, f64::min);
-    let mfe_pct = (mfe > 0.0).then(|| pct(mfe, t.entry_price));
-    let mae_pct = (mae.is_finite() && mae > 0.0).then(|| pct(mae, t.entry_price));
-    let after = |n: usize| bars.get(exit_i + n).map(|b| pct(b.close, t.exit_price));
+    let high = between.iter().map(|b| b.high).chain(known).fold(f64::MIN, f64::max);
+    let low = between.iter().map(|b| b.low).chain(known).fold(f64::MAX, f64::min);
+    // Everything below is from the position's side: positive is good for it.
+    let sign = if t.short { -1.0 } else { 1.0 };
+    let (best, worst) = if t.short { (low, high) } else { (high, low) };
+    let mfe_pct = (best.is_finite() && best > 0.0).then(|| sign * pct(best, t.entry_price));
+    let mae_pct = (worst.is_finite() && worst > 0.0).then(|| sign * pct(worst, t.entry_price));
+    // After the exit: positive means holding on would have paid.
+    let after = |n: usize| bars.get(exit_i + n).map(|b| sign * pct(b.close, t.exit_price));
 
     // Buys happen intraday, so SPY is measured from the entry day's open.
     let spy_open = |day: &str| spy.iter().find(|b| b.date.as_str() >= day).map(|b| b.open);
@@ -136,7 +142,9 @@ pub fn review(t: &ClosedTrade, bars: &[DailyBar], spy: &[DailyBar]) -> Option<Re
         (Some(a), Some(b)) if a > 0.0 => Some(pct(b, a)),
         _ => None,
     };
-    let excess_pct = spy_pct.map(|s| t.return_pct - s);
+    // A short is measured against shorting the S&P: it beat the market when
+    // the stock did worse than SPY.
+    let excess_pct = spy_pct.map(|s| if t.short { t.return_pct + s } else { t.return_pct - s });
     let hold_days = (exit_i - entry_i) as i64;
 
     let kind = exit_kind(&t.exit_reason);
@@ -214,7 +222,8 @@ fn story(
         .map(|h| format!(" (latest story: \"{}\")", h.chars().take(90).collect::<String>()))
         .unwrap_or_default();
     let mut out = format!(
-        "Bought {} on {} at ${:.2} on {} signals{}. Held {} trading day{}.",
+        "{} {} on {} at ${:.2} on {} signals{}. Held {} trading day{}.",
+        if t.short { "Shorted" } else { "Bought" },
         t.ticker,
         t.entry_day,
         t.entry_price,
@@ -227,27 +236,29 @@ fn story(
         out.push_str(&format!(" Best point {}, worst {}.", signed(up), signed(down)));
     }
     out.push_str(&format!(
-        " Sold at ${:.2} ({}) because {}.",
+        " {} at ${:.2} ({}) because {}.",
+        if t.short { "Bought back" } else { "Sold" },
         t.exit_price,
         signed(t.return_pct),
         crate::position_management::describe_exit(&t.exit_reason)
     ));
     if let Some(s) = spy {
-        let e = t.return_pct - s;
+        let e = if t.short { t.return_pct + s } else { t.return_pct - s };
         out.push_str(&format!(
-            " The S&P 500 did {} over the same days, so the trade {} it by {:.1} points.",
+            " The S&P 500 did {} over the same days, so the trade {} {} by {:.1} points.",
             signed(s),
             if e >= 0.0 { "beat" } else { "trailed" },
+            if t.short { "shorting it" } else { "it" },
             e.abs()
         ));
     }
     match (after5, after20) {
         (Some(a5), Some(a20)) => out.push_str(&format!(
-            " After the sale the price moved {} in 5 days and {} in 20.",
+            " After the exit, staying in would have made {} in 5 days and {} in 20.",
             signed(a5),
             signed(a20)
         )),
-        (Some(a5), None) => out.push_str(&format!(" After the sale the price moved {} in 5 days.", signed(a5))),
+        (Some(a5), None) => out.push_str(&format!(" After the exit, staying in would have made {} in 5 days.", signed(a5))),
         _ => {}
     }
     out
@@ -261,7 +272,7 @@ pub fn trades_to_review(conn: &Connection) -> rusqlite::Result<Vec<ClosedTrade>>
                 json_extract(pt.entry_context, '$.notional')
                     + COALESCE((SELECT SUM(COALESCE(e.price * e.qty, json_extract(e.detail, '$.notional')))
                                 FROM trade_events e WHERE e.trade_id = pt.id AND e.kind = 'scale_in'), 0),
-                pt.signal_profile
+                pt.signal_profile, COALESCE(pt.direction, 'long') = 'short'
          FROM paper_trades pt
          LEFT JOIN trade_reviews r ON r.trade_id = pt.id
          WHERE pt.status IN ('closed', 'stopped_out')
@@ -279,9 +290,10 @@ pub fn trades_to_review(conn: &Connection) -> rusqlite::Result<Vec<ClosedTrade>>
         // Whole-trade return when the money put in is known (entry plus
         // scale-ins; half closes book their legs into `pnl`); otherwise the
         // last leg's.
+        let short: bool = r.get(11)?;
         let return_pct = match (pnl, notional) {
             (Some(p), Some(n)) if n > 0.0 => p / n * 100.0,
-            _ => pnl_pct.unwrap_or_else(|| pct(exit, entry)),
+            _ => pnl_pct.unwrap_or_else(|| if short { -pct(exit, entry) } else { pct(exit, entry) }),
         };
         let profile: Option<String> = r.get(10)?;
         Ok(ClosedTrade {
@@ -294,6 +306,7 @@ pub fn trades_to_review(conn: &Connection) -> rusqlite::Result<Vec<ClosedTrade>>
             exit_reason: r.get(6)?,
             return_pct,
             profile: profile.as_deref().and_then(|p| serde_json::from_str(p).ok()).unwrap_or_default(),
+            short,
         })
     })?;
     rows.collect()
@@ -1008,6 +1021,7 @@ mod tests {
             exit_reason: reason.into(),
             return_pct: pct(exit, entry),
             profile: serde_json::json!({"news": 0.5, "search": 0.1, "stories": [{"headline": "AAA wins contract"}]}),
+            short: false,
         }
     }
 
@@ -1039,6 +1053,25 @@ mod tests {
         assert!(r.story.contains("news"), "{}", r.story);
         assert!(r.story.contains("AAA wins contract"));
         assert!(r.story.contains("trailed it by 5.0 points"), "{}", r.story);
+    }
+
+    #[test]
+    fn a_short_is_reviewed_from_its_own_side() {
+        // Shorted at 10.0, the stock fell to 8.0 and was covered at 9.0, then rose.
+        let bars = days(&[10.0, 8.0, 9.0, 9.0, 9.5, 10.0, 11.0, 12.0, 12.5, 13.0]);
+        let mut t = trade(&bars[0].date, &bars[3].date, 10.0, 9.0, "trailing_stop (short)");
+        t.short = true;
+        t.return_pct = 10.0;
+        let spy = days(&[100.0; 10]);
+        let r = review(&t, &bars, &spy).unwrap();
+        // Best point: the low between entry and exit (8.0 * 0.98), from the short's side.
+        assert!((r.mfe_pct.unwrap() - (100.0 - 8.0 * 0.98 * 10.0)).abs() < 1e-6, "{:?}", r.mfe_pct);
+        assert!(r.mae_pct.unwrap() <= 0.0, "worst point is a rise: {:?}", r.mae_pct);
+        // The price rose after the cover: staying short would have lost.
+        assert!(r.after5_pct.unwrap() < 0.0);
+        assert!(r.lessons.contains(&"good_exit") || r.after10_pct.is_none());
+        assert!(r.story.starts_with("Shorted AAA"), "{}", r.story);
+        assert!(r.story.contains("Bought back at $9.00"), "{}", r.story);
     }
 
     #[test]

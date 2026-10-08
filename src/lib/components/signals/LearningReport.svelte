@@ -56,6 +56,7 @@
 		untracked_holding: 'Skipped: untracked holding',
 		open_order: 'Skipped: order already open',
 		no_cash: 'Skipped: no cash',
+		not_shortable: "Skipped: can't be shorted",
 	};
 
 	const EVENTS: Record<string, string> = {
