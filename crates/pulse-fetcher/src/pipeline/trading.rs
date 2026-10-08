@@ -615,6 +615,55 @@ async fn whole_share_order(
     sized
 }
 
+/// One stock an auto-trade run considers: a converging cross-signal score, or
+/// an event signal (`event_signals.rs`).
+#[derive(Debug, Clone)]
+struct Candidate {
+    entity_id: Option<i64>,
+    ticker: String,
+    /// Compound score, or the event's strength.
+    score: f64,
+    name: String,
+    insider: f64,
+    inst: f64,
+    news: f64,
+    gov: f64,
+    search: f64,
+    patent: f64,
+    supply: f64,
+    political: f64,
+    /// Net insider dollars, for the selling veto.
+    insider_raw: f64,
+    /// "convergence" or an event kind (`paper_trades.entry_trigger`).
+    trigger: String,
+    /// Fraction of a normal entry.
+    size: f64,
+    event: Option<serde_json::Value>,
+}
+
+impl Candidate {
+    fn from_event(ev: crate::event_signals::EventCandidate, insider_raw: f64) -> Self {
+        Candidate {
+            entity_id: ev.entity_id,
+            ticker: ev.ticker,
+            score: ev.strength,
+            name: ev.name,
+            insider: 0.0,
+            inst: 0.0,
+            news: 0.0,
+            gov: 0.0,
+            search: 0.0,
+            patent: 0.0,
+            supply: 0.0,
+            political: 0.0,
+            insider_raw,
+            trigger: ev.kind,
+            size: crate::event_signals::EVENT_SIZE,
+            event: serde_json::from_str(&ev.detail).ok(),
+        }
+    }
+}
+
 pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<usize> {
     // Hard kill switch. Default = OFF. Re-enable via `AUTO_TRADE_ENABLED=true`
     // in `.env` once the auto-backtest has shown a positive expectancy across
@@ -714,21 +763,56 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
          LIMIT 15"
     )?;
 
-    #[allow(clippy::type_complexity)]
-    let candidates: Vec<(i64, String, f64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)> = stmt
-        .query_map([], |row| Ok((
-            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-            row.get::<_, f64>(4).unwrap_or(0.0), row.get::<_, f64>(5).unwrap_or(0.0),
-            row.get::<_, f64>(6).unwrap_or(0.0), row.get::<_, f64>(7).unwrap_or(0.0),
-            row.get::<_, f64>(8).unwrap_or(0.0), row.get::<_, f64>(9).unwrap_or(0.0),
-            row.get::<_, f64>(10).unwrap_or(0.0), row.get::<_, f64>(11).unwrap_or(0.0),
-            row.get::<_, f64>(12).unwrap_or(0.0),
-        )))?
+    let mut candidates: Vec<Candidate> = stmt
+        .query_map([], |row| Ok(Candidate {
+            entity_id: Some(row.get(0)?),
+            ticker: row.get(1)?,
+            score: row.get(2)?,
+            name: row.get(3)?,
+            insider: row.get::<_, f64>(4).unwrap_or(0.0),
+            inst: row.get::<_, f64>(5).unwrap_or(0.0),
+            news: row.get::<_, f64>(6).unwrap_or(0.0),
+            gov: row.get::<_, f64>(7).unwrap_or(0.0),
+            search: row.get::<_, f64>(8).unwrap_or(0.0),
+            patent: row.get::<_, f64>(9).unwrap_or(0.0),
+            supply: row.get::<_, f64>(10).unwrap_or(0.0),
+            political: row.get::<_, f64>(11).unwrap_or(0.0),
+            insider_raw: row.get::<_, f64>(12).unwrap_or(0.0),
+            trigger: "convergence".to_string(),
+            size: 1.0,
+            event: None,
+        }))?
         .filter_map(|r| r.ok())
         .collect();
+    drop(stmt);
+
+    // Event signals (news tone surprises, insider clusters): found here so
+    // the morning briefing's news is acted on at the first run after it.
+    crate::event_signals::detect(&conn);
+    if crate::event_signals::enabled() {
+        match crate::event_signals::candidates(&conn, &["long"]) {
+            Ok(events) => {
+                for ev in events {
+                    if candidates.iter().any(|c| c.ticker == ev.ticker) {
+                        continue;
+                    }
+                    let insider_raw = conn
+                        .query_row(
+                            "SELECT COALESCE(s.insider_buy_volume, 0) FROM signals s
+                             WHERE s.topic = LOWER(?1) ORDER BY s.updated_at DESC LIMIT 1",
+                            [ev.name.as_str()],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0.0);
+                    candidates.push(Candidate::from_event(ev, insider_raw));
+                }
+            }
+            Err(e) => tracing::warn!("Auto-trade: event signals unreadable: {}", e),
+        }
+    }
 
     if candidates.is_empty() {
-        log.stopped("no_candidates", "No convergence signal above 0.30 in the last day that isn't already held");
+        log.stopped("no_candidates", "No convergence signal above 0.30 or fresh event in the last day that isn't already held");
         return Ok(0);
     }
 
@@ -854,9 +938,10 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     const INSIDER_VETO_THRESHOLD: f64 = -1_000_000.0;
 
     let weights = crate::pipeline::signals::load_calibrated_weights(&conn);
-    for (rank, (entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political, insider_raw)) in
-        candidates.iter().enumerate()
-    {
+    for (rank, c) in candidates.iter().enumerate() {
+        let Candidate {
+            entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political, insider_raw, ..
+        } = c;
         if *insider_raw < INSIDER_VETO_THRESHOLD {
             tracing::info!(
                 "Auto-trade: vetoing {} ({}) — heavy insider selling (net ${:.0})",
@@ -948,7 +1033,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             buying_power,
             *score,
         ) {
-            Some(n) => n * regime,
+            Some(n) => n * regime * c.size,
             None => {
                 tracing::info!("Auto-trade: skipping {} — buying power below entry floor", ticker);
                 log.skip(ticker, name, *score, "no_cash", "Not enough buying power");
@@ -1009,7 +1094,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let mut sized_risk = None;
         let notional = match risk_book.as_ref() {
             None => notional,
-            Some(rb) => match rb.size(&conn, ticker, existing_exposure, regime) {
+            Some(rb) => match rb.size(&conn, ticker, existing_exposure, regime * c.size) {
                 Some(s) => {
                     tracing::info!(
                         "Auto-trade: {} ({}) risk-sized ${:.0} — risks ${:.0} to a {:.1}% stop",
@@ -1026,7 +1111,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             },
         };
 
-        tracing::info!("Auto-trade: {} ({}) — score {:.2}, notional ${:.2}", name, ticker, score, notional);
+        tracing::info!("Auto-trade: {} ({}) — {} {:.2}, notional ${:.2}", name, ticker, c.trigger, score, notional);
 
         // Cross-run dedup: if the pipeline runs multiple times in a short window
         // (launchd retry storm), the DB `already_open` guard can't help because the
@@ -1200,6 +1285,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 "patent": patent,
                 "supply_chain": supply,
                 "political": political,
+                "trigger": c.trigger,
                 "stories": story_refs.iter().map(|(id, head, src, sentiment, day)| {
                     serde_json::json!({"id": id, "headline": head, "source": src, "sentiment": sentiment, "date": day})
                 }).collect::<Vec<_>>(),
@@ -1245,16 +1331,18 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 "industry": industry,
                 "open_positions": open_positions,
                 "rules": RULES_VERSION,
+                "trigger": c.trigger,
+                "event": c.event,
             });
 
             // Record in paper_trades with position management columns
             match conn.execute(
-                "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status, high_water_mark, original_compound_score, order_status, filled_qty, entry_context)
-                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6, ?9, ?10, ?11)",
+                "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status, high_water_mark, original_compound_score, order_status, filled_qty, entry_context, entry_trigger)
+                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     entity_id, ticker, filled_price, fill_time, notional, score,
                     signal_profile.to_string(), order_id, order_status,
-                    (filled_qty > 0.0).then_some(filled_qty), entry_context.to_string(),
+                    (filled_qty > 0.0).then_some(filled_qty), entry_context.to_string(), c.trigger,
                 ],
             ) {
                 Ok(_) => log_trade_event(
@@ -1265,7 +1353,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             }
 
             tracing::info!("Auto-trade: placed order {} for {} (${:.2} @ ${:.2}, qty {:.4})", order_id, ticker, notional, filled_price, filled_qty);
-            log.bought(ticker, name, *score, format!("Bought ~${:.0} ({})", notional, order_status));
+            log.bought(ticker, name, *score, format!("Bought ~${:.0} ({}, {})", notional, order_status, c.trigger));
             if let (Some(rb), Some(s)) = (risk_book.as_mut(), sized_risk.as_ref()) {
                 rb.commit(s);
             }
@@ -1546,6 +1634,8 @@ struct OpenTrade {
     /// Set (migration 044) on trades scored under the old news formula until
     /// their original score is re-anchored.
     score_rebase_after: Option<String>,
+    /// What opened it: "convergence" or an event kind.
+    entry_trigger: String,
 }
 
 fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTrade>> {
@@ -1554,7 +1644,7 @@ fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTra
                 COALESCE(original_compound_score, confidence, 0.30),
                 half_closed_at, position_size, order_status, alpaca_order_id,
                 stop_order_id, broker_stop_filled_at, filled_qty,
-                exit_order_id, exit_order_reason, exit_order_kind, score_rebase_after
+                exit_order_id, exit_order_reason, exit_order_kind, score_rebase_after, entry_trigger
          FROM paper_trades WHERE status = 'open'",
     )?;
     let rows = stmt
@@ -1576,6 +1666,7 @@ fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTra
                 exit_order_reason: row.get::<_, Option<String>>(13).unwrap_or(None),
                 exit_order_kind: row.get::<_, Option<String>>(14).unwrap_or(None),
                 score_rebase_after: row.get::<_, Option<String>>(15).unwrap_or(None),
+                entry_trigger: row.get::<_, String>(16).unwrap_or_else(|_| "convergence".to_string()),
             })
         })?
         .filter_map(|r| r.ok())
@@ -2058,6 +2149,11 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
 
         use crate::position_management::PositionAction;
         let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
+        let hold_limit = crate::event_signals::max_hold_days(&t.entry_trigger);
+        let held_days = chrono::NaiveDate::parse_from_str(t.entry_date.get(..10).unwrap_or(""), "%Y-%m-%d")
+            .map(|d| crate::event_signals::weekdays_between(d, chrono::Local::now().date_naive()))
+            .unwrap_or(0);
+        let expired = hold_limit.is_some_and(|max| held_days >= max);
         let (mut close_qty, mut reason): (f64, String) = if stop_fired {
             (held_qty, "broker_stop (remainder after the stop sold)".to_string())
         } else {
@@ -2076,7 +2172,11 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                     None => false,
                 },
             };
-            let decayed = rebased && crate::position_management::check_signal_decay(&conn, ticker, t.orig_score);
+            // Event trades have no compound score to decay from; they end on
+            // their maximum hold instead.
+            let decayed = hold_limit.is_none()
+                && rebased
+                && crate::position_management::check_signal_decay(&conn, ticker, t.orig_score);
             let action = crate::position_management::evaluate_position(
                 &conn, t.id, ticker, *entry_price, current_price,
             );
@@ -2101,6 +2201,12 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                 }
             }
         };
+
+        // An event trade past its maximum hold closes whatever else said.
+        if !stop_fired && expired && close_qty < held_qty {
+            close_qty = held_qty;
+            reason = format!("max_hold ({} trading days, {}, pnl {:.1}%)", held_days, t.entry_trigger, pnl_pct);
+        }
 
         if close_qty <= 0.0 {
             tracing::info!("Position mgmt: {} → HOLD (price ${:.2}, pnl {:.1}%)", ticker, current_price, pnl_pct);

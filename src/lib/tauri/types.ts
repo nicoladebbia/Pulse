@@ -611,6 +611,18 @@ export interface LearningGate {
 	t: number;
 }
 
+export interface LearningEvent {
+	kind: 'news_surprise' | 'insider_cluster' | string;
+	direction: 'long' | 'short' | string;
+	hold_days: number;
+	signals: number;
+	/** Points vs SPY over hold_days; sign flipped for shorts (positive = would have made money). */
+	avg_excess: number;
+	t: number;
+	trades: number;
+	trade_avg_excess: number | null;
+}
+
 export interface LearningWeightChange {
 	dimension: string;
 	from: number;
@@ -624,6 +636,7 @@ export interface LearningReportBody {
 	sources: LearningSource[];
 	exits: LearningExit[];
 	gates?: LearningGate[];
+	events?: LearningEvent[];
 	lessons: [string, number][];
 	weight_changes: LearningWeightChange[];
 	weights_applied: boolean;
