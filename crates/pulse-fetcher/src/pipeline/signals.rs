@@ -62,6 +62,8 @@ pub(crate) fn run_backfill_signals(
     }
 
     let conn = rusqlite::Connection::open(db_path)?;
+    // A copy can predate columns the recompute writes.
+    crate::db::run_migrations(&conn)?;
 
     // Wipe stale cross_signals rows in-range FIRST, before the loop writes anything.
     // compute_cross_signals uses INSERT OR REPLACE keyed on (entity_id, date(computed_at))
@@ -193,17 +195,33 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END) AS w7,
             SUM(CASE WHEN em.mentioned_at >= date(?1, '-30 days') THEN 1 ELSE 0 END) AS w30,
             SUM(CASE WHEN em.mentioned_at >= date(?1, ?2) THEN 1 ELSE 0 END) AS w90,
-            COUNT(DISTINCT em.mentioned_at) AS days_active
+            COUNT(DISTINCT em.mentioned_at) AS days_active,
+            SUM(CASE WHEN st.source_type = 'news' AND em.mentioned_at >= date(?1, '-7 days') THEN 1 ELSE 0 END) AS nw7,
+            SUM(CASE WHEN st.source_type = 'news' AND em.mentioned_at >= date(?1, '-30 days') THEN 1 ELSE 0 END) AS nw30
          FROM entity_mentions em
          JOIN temp_topic_map tm ON tm.entity_id = em.entity_id
+         LEFT JOIN stories st ON st.id = em.story_id
          WHERE em.mentioned_at >= date(?1, ?2) AND em.mentioned_at <= ?1
          GROUP BY tm.topic, tm.sector"
     )?;
 
-    let window_rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = stmt
-        .query_map(rusqlite::params![today, window_clause], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?
+    type WindowRow = (String, Option<String>, i64, i64, i64, i64, i64, i64);
+    let all_rows: Vec<WindowRow> = stmt
+        .query_map(rusqlite::params![today, window_clause], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
+        })?
         .filter_map(|r| r.ok())
         .collect();
+    // News-only mention counts, for the news-momentum dimension. The windows
+    // count every mention, and ~90% are filings and Wikipedia pageview rows,
+    // so a pageview spike or a Form 4 also scored as "news" — the same event
+    // counted in two dimensions (47 of 48 trades were news + search).
+    let news_windows: HashMap<(String, String), (i64, i64)> = all_rows
+        .iter()
+        .map(|r| ((r.0.clone(), r.1.clone().unwrap_or_default()), (r.6, r.7)))
+        .collect();
+    let window_rows: Vec<(String, Option<String>, i64, i64, i64, i64)> =
+        all_rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5)).collect();
 
     // Map (topic, sector) -> aggregated metrics. Sector key is normalized to
     // empty string so it round-trips through HashMap (we restore Option<String> on write).
@@ -446,10 +464,9 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
     let mut failed = 0usize;
 
     for (topic, sector, w7, w30, w90, days_active) in &window_rows {
-        let rate_7d = *w7 as f64 / 7.0;
-        let rate_30d = *w30 as f64 / 30.0;
-        let acc = if *w30 == 0 || rate_30d < 0.001 { if *w7 > 0 { 10.0 } else { 0.0 } }
-            else { rate_7d / rate_30d };
+        let acc = mention_acceleration(*w7, *w30);
+        let (news_w7, news_w30) = news_windows.get(&key(topic, sector)).copied().unwrap_or((0, 0));
+        let news_acc = mention_acceleration(news_w7, news_w30);
 
         let total = (*w30).max(*w7);
         let traj = if *w7 == 0 && *w30 == 0 { "dormant" }
@@ -493,10 +510,11 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
         let updated = tx.execute(
             "UPDATE signals SET source_diversity = ?1, insider_buy_volume = ?2, contract_value = ?3,
                  lobbying_spend_delta = ?4, regulatory_sentiment = ?5, patent_filing_rate = ?6,
-                 institutional_flow = ?7, search_trend_delta = ?8, import_volume_delta = ?9
+                 institutional_flow = ?7, search_trend_delta = ?8, import_volume_delta = ?9,
+                 news_window_7d = ?12, news_acceleration = ?13
              WHERE topic = ?10 AND (sector = ?11 OR (?11 IS NULL AND sector IS NULL))",
             rusqlite::params![diversity, insider_vol, contract_val, lobby_spend, reg_composite, patent_count,
-                              inst_flow, search_delta, import_delta, topic, sector],
+                              inst_flow, search_delta, import_delta, topic, sector, news_w7, news_acc],
         );
         let updated = wrote(updated, "dimension UPDATE", topic);
 
@@ -526,6 +544,17 @@ pub(crate) fn recompute_signals_pipeline(conn: &rusqlite::Connection, today: &st
     }
 
     Ok(count)
+}
+
+/// 7-day mention rate over the 30-day rate. A topic with no 30-day history
+/// but mentions this week reads as 10x.
+fn mention_acceleration(w7: i64, w30: i64) -> f64 {
+    let rate_30d = w30 as f64 / 30.0;
+    if w30 == 0 || rate_30d < 0.001 {
+        if w7 > 0 { 10.0 } else { 0.0 }
+    } else {
+        (w7 as f64 / 7.0) / rate_30d
+    }
 }
 
 /// Sigmoid normalization: maps raw value to [0, 1]. Matches cross_signals.rs.
@@ -574,7 +603,7 @@ pub(crate) fn compute_cross_signals(db_path: &Path, as_of: &str) -> anyhow::Resu
 
     // Get all non-dormant signals with ALL 8 dimensions
     let mut stmt = conn.prepare(
-        "SELECT s.topic, s.sector, s.window_7d, s.window_30d, s.acceleration,
+        "SELECT s.topic, s.sector, COALESCE(s.news_window_7d, 0), s.window_30d, COALESCE(s.news_acceleration, 0),
                 COALESCE(s.source_diversity, 0),
                 COALESCE(s.insider_buy_volume, 0),
                 COALESCE(s.institutional_flow, 0),
@@ -607,7 +636,8 @@ pub(crate) fn compute_cross_signals(db_path: &Path, as_of: &str) -> anyhow::Resu
         // Normalize each dimension.
         let insider_norm = normalize_signal(*insider_vol, 1_000_000.0);
         let inst_norm = normalize_signal(*inst_flow, 15.0); // Count of distinct 13F filers holding this stock
-        // Pure acceleration ratio, gated by minimum sample.
+        // Pure acceleration ratio of news-story mentions (not filings or
+        // pageviews, which have their own dimensions), gated by minimum sample.
         let news_norm = if *w7 >= 3 { normalize_signal(*acceleration, 2.0) } else { 0.0 };
         // Government signal: contract value + regulatory/8-K severity composite.
         // 2026-07-23: scale was $10M — measured against real USASpending data,
@@ -980,5 +1010,62 @@ mod signal_write_tests {
     #[test]
     fn both_statements_landing_is_the_only_written_case() {
         assert_eq!(classify_write(Some(1), Some(1)), SignalWrite::Written);
+    }
+}
+
+#[cfg(test)]
+mod news_momentum_tests {
+    use super::{mention_acceleration, recompute_signals_pipeline};
+
+    #[test]
+    fn acceleration_is_the_weekly_rate_over_the_monthly_rate() {
+        assert_eq!(mention_acceleration(0, 0), 0.0);
+        assert_eq!(mention_acceleration(3, 0), 10.0);
+        assert!((mention_acceleration(7, 30) - 1.0).abs() < 1e-9);
+        assert!((mention_acceleration(14, 30) - 2.0).abs() < 1e-9);
+    }
+
+    /// A daily Wikipedia pageview row read as steady "news" (acceleration 1.0,
+    /// normalised 0.39, over the 0.3 vote line) for every entity it tracks.
+    #[test]
+    fn only_news_stories_move_news_momentum() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO briefings (id, date) VALUES (1, '2026-10-08');
+             INSERT INTO entities (id, name, name_normalized, entity_type, first_seen, last_seen)
+                 VALUES (1, 'Acme', 'acme', 'company', '2026-09-01', '2026-10-08');",
+        )
+        .unwrap();
+        let story = |id: i64, kind: &str, day: &str| {
+            conn.execute(
+                "INSERT INTO stories (id, briefing_id, sector, original_title, original_url, source_name, headline,
+                     summary, key_facts, why_it_matters, what_to_watch, url_hash, title_hash, source_type)
+                 VALUES (?1, 1, 'finance', 't', 'u', 's', 'h', '', '', '', '', ?1, ?1, ?2)",
+                rusqlite::params![id, kind],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entity_mentions (entity_id, story_id, mentioned_at) VALUES (1, ?1, ?2)",
+                rusqlite::params![id, day],
+            )
+            .unwrap();
+        };
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        for d in 0..30 {
+            story(100 + d, "financial", &(today - chrono::Duration::days(d)).to_string());
+        }
+        for d in 0..3 {
+            story(200 + d, "news", &(today - chrono::Duration::days(d)).to_string());
+        }
+        recompute_signals_pipeline(&conn, "2026-10-08", 90).unwrap();
+        let (w7, news_w7, news_acc): (i64, i64, f64) = conn
+            .query_row("SELECT window_7d, news_window_7d, news_acceleration FROM signals WHERE topic = 'Acme'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(w7, 11, "activity still counts every mention (the 7-day window spans 8 dates)");
+        assert_eq!(news_w7, 3, "news momentum sees only the news stories");
+        assert!((news_acc - 30.0 / 7.0).abs() < 1e-9, "three news stories, all this week: {news_acc}");
     }
 }

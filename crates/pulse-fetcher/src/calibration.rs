@@ -170,7 +170,8 @@ fn analyze_signal_performance(conn: &Connection) -> anyhow::Result<SignalAnalysi
     let mut stmt = conn.prepare(
         "SELECT signal_profile, pnl_pct FROM paper_trades
          WHERE status IN ('closed', 'stopped_out', 'expired')
-         AND pnl_pct IS NOT NULL"
+         AND pnl_pct IS NOT NULL
+         AND COALESCE(exit_reason, '') NOT LIKE 'merged_into%'"
     )?;
 
     let trades: Vec<(String, f64)> = stmt
