@@ -149,7 +149,7 @@ pub(crate) fn apply_entry_settlement(
 
 /// Bump when an entry or exit rule changes, so `entry_context` tells which
 /// rules a trade was bought under.
-pub(crate) const RULES_VERSION: &str = "2026-10-08";
+pub(crate) const RULES_VERSION: &str = "2026-10-08.2";
 
 /// Append to a trade's history (`trade_events`, read by learning.rs). Best
 /// effort: an event that cannot be written must never stop a booking.
@@ -2302,10 +2302,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                     None => false,
                 },
             };
-            // Event trades have no compound score to decay from; they end on
-            // their maximum hold instead.
-            let decayed = hold_limit.is_none()
-                && !t.short
+            let decayed = crate::position_management::decay_allowed(&t.entry_trigger, t.short, held_days)
                 && rebased
                 && crate::position_management::check_signal_decay(&conn, ticker, t.orig_score);
             let action = if t.short {
@@ -2339,7 +2336,8 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             }
         };
 
-        // An event trade past its maximum hold closes whatever else said.
+        // A trade past its maximum hold for its signal type closes whatever
+        // else said.
         if !stop_fired && expired && close_qty < held_qty {
             close_qty = held_qty;
             reason = format!("max_hold ({} trading days, {}, pnl {:.1}%)", held_days, t.entry_trigger, pnl_pct);
