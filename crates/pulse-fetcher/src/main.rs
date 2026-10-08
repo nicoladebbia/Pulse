@@ -15,6 +15,7 @@ pub(crate) mod position_management;
 pub(crate) mod decisions;
 pub(crate) mod entry_filters;
 pub(crate) mod scorecard;
+pub(crate) mod learning;
 pub(crate) mod position_sizing;
 pub(crate) mod edge_report;
 pub(crate) mod research;
@@ -513,6 +514,17 @@ async fn main() -> anyhow::Result<()> {
                 Ok(n) => tracing::info!("Scorecard complete: {} groups", n),
                 Err(e) => {
                     tracing::error!("Scorecard failed: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+        "learn" => {
+            // Daily: review closed trades, report what each signal source and
+            // exit rule earned, and nudge weights within bounds (learning.rs).
+            match learning::run(&db_path).await {
+                Ok(r) => tracing::info!("Learning complete: {} trades reviewed", r.trades_reviewed),
+                Err(e) => {
+                    tracing::error!("Learning failed: {}", e);
                     return Err(e);
                 }
             }

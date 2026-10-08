@@ -6,17 +6,18 @@
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getExitReview, getTradeJournal,
 		runBacktest, startPriceStream, stopPriceStream, getTradeRationale,
 		getPendingCalibration, applyPendingCalibration, rejectPendingCalibration, getCalibrationGateStatus,
-		getBenchmark, getTradeDecisions, getSignalScorecard
+		getBenchmark, getTradeDecisions, getSignalScorecard, getLearningReport
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics, ExitReview,
 		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate, TradeRationale,
-		PendingCalibrationRow, CalibrationGateStatus, Benchmark, TradeDecision, SignalScorecard as Scorecard
+		PendingCalibrationRow, CalibrationGateStatus, Benchmark, TradeDecision, SignalScorecard as Scorecard, LearningReport as Learning
 	} from '$lib/tauri/types';
 	import BenchmarkCard from '$lib/components/signals/BenchmarkCard.svelte';
 	import TradeDecisions from '$lib/components/signals/TradeDecisions.svelte';
 	import SignalScorecard from '$lib/components/signals/SignalScorecard.svelte';
+	import LearningReport from '$lib/components/signals/LearningReport.svelte';
 	import FreshnessPill from '$lib/components/shared/FreshnessPill.svelte';
 	import ResearchTab from '$lib/components/research/ResearchTab.svelte';
 	import { parseTradeReason, fmtReasonSignals } from '$lib/trade-reason';
@@ -75,6 +76,8 @@
 	let decisionsError = $state<string | null>(null);
 	let scorecard = $state<Scorecard | null>(null);
 	let scorecardError = $state<string | null>(null);
+	let learning = $state<Learning | null>(null);
+	let learningError = $state<string | null>(null);
 	/** Sections whose data failed to load, so a failure doesn't look like "no data". */
 	let loadErrors = $state<string[]>([]);
 	let vsSpy = $derived(new Map((benchmark?.trades ?? []).map(t => [t.trade_id, t])));
@@ -200,6 +203,8 @@
 			getTradeDecisions(3).then(d => { decisions = d; }).catch(e => { decisionsError = String(e?.message ?? e); });
 			scorecardError = null;
 			getSignalScorecard().then(sc => { scorecard = sc; }).catch(e => { scorecardError = String(e?.message ?? e); });
+			learningError = null;
+			getLearningReport().then(l => { learning = l; }).catch(e => { learningError = String(e?.message ?? e); });
 			// Refresh prices in background, then reload price list
 			pricesRefreshing = true;
 			priceRefreshFailed = false;
@@ -1287,6 +1292,8 @@
 					</div>
 				{/if}
 			{/if}
+
+			<LearningReport {learning} error={learningError} />
 
 			<SignalScorecard {scorecard} error={scorecardError} />
 

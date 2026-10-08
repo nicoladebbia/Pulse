@@ -5,8 +5,9 @@
 
 use rusqlite::Connection;
 
-/// Rows older than this are pruned when a run starts.
-const KEEP_DAYS: i64 = 30;
+/// Rows older than this are pruned when a run starts. Long enough for the
+/// learning report to see what the skipped signals did afterwards.
+const KEEP_DAYS: i64 = 180;
 
 pub struct DecisionLog<'a> {
     conn: &'a Connection,

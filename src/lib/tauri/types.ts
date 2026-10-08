@@ -577,6 +577,73 @@ export interface SignalScorecard {
 	rows: ScorecardRow[];
 }
 
+// === Daily learning report (pulse-fetcher --mode learn) ===
+
+export interface LearningSource {
+	dimension: string;
+	signals: number;
+	avg_excess: number;
+	shrunk_excess: number;
+	t: number;
+	win_rate: number;
+	trades: number;
+	trade_avg_excess: number | null;
+}
+
+export interface LearningExit {
+	exit_kind: string;
+	trades: number;
+	avg_return: number;
+	avg_after5: number | null;
+	avg_after10: number | null;
+	avg_gave_back: number | null;
+}
+
+export interface LearningGate {
+	reason: string;
+	outcome: 'bought' | 'skipped' | string;
+	signals: number;
+	avg_excess: number;
+	t: number;
+}
+
+export interface LearningWeightChange {
+	dimension: string;
+	from: number;
+	to: number;
+	why: string;
+}
+
+export interface LearningReportBody {
+	computed_at: string;
+	headline: string[];
+	sources: LearningSource[];
+	exits: LearningExit[];
+	gates?: LearningGate[];
+	lessons: [string, number][];
+	weight_changes: LearningWeightChange[];
+	weights_applied: boolean;
+	trades_reviewed: number;
+}
+
+export interface TradeReviewRow {
+	trade_id: number;
+	ticker: string;
+	exit_date: string | null;
+	return_pct: number;
+	excess_pct: number | null;
+	exit_kind: string;
+	lessons: string[];
+	story: string;
+}
+
+export interface LearningReport {
+	computed_at: string | null;
+	weights_applied: boolean;
+	report: LearningReportBody | null;
+	reviews: TradeReviewRow[];
+}
+
 // === Trade Detail (forensics page) ===
 
 export interface TradeSignalSnapshot {

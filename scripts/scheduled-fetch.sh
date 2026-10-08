@@ -85,6 +85,18 @@ if [ "$(cat "$STATE_DIR/scorecard" 2>/dev/null)" != "$week" ] \
   fi
 fi
 
+# Daily learning (review closed trades, score each signal source and filter,
+# maybe nudge weights), once a day from 17:00 after the market's close. A few
+# Alpaca calls, no AI. The trade_reviews table name marks a binary with the mode.
+if [ "$hour" -ge 17 ] && [ "$(cat "$STATE_DIR/learn" 2>/dev/null)" != "$today" ] \
+  && grep -qa trade_reviews "$FETCHER"; then
+  if "$FETCHER" --mode learn; then
+    echo "$today" > "$STATE_DIR/learn"
+  else
+    echo "$(date) learning failed, next hour retries"
+  fi
+fi
+
 if [ "$hour" -ge 21 ]; then
   # The morning one already exists by now, so the evening run needs --force
   # (multiple briefings per day are allowed; each gets its own time label).
