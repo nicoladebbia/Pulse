@@ -54,6 +54,8 @@ const MIGRATION_038: &str = include_str!("../../../migrations/038_trade_broker_s
 const MIGRATION_039: &str = include_str!("../../../migrations/039_ticker_industry.sql");
 const MIGRATION_040: &str = include_str!("../../../migrations/040_signals_page.sql");
 const MIGRATION_041: &str = include_str!("../../../migrations/041_api_usage_calls.sql");
+const MIGRATION_042: &str = include_str!("../../../migrations/042_trading_health.sql");
+const MIGRATION_044: &str = include_str!("../../../migrations/044_rebase_open_scores.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -739,6 +741,20 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_041)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (41)", [])?;
+        tx.commit()?;
+    }
+
+    if !applied.contains(&42) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_042)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (42)", [])?;
+        tx.commit()?;
+    }
+
+    if !applied.contains(&44) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_044)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (44)", [])?;
         tx.commit()?;
     }
 

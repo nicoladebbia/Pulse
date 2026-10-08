@@ -1308,7 +1308,8 @@ pub struct CalibrationGateStatus {
 pub fn get_calibration_gate_status(db: State<'_, DbState>) -> Result<CalibrationGateStatus, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let total_resolved: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM paper_trades WHERE status IN ('closed', 'stopped_out', 'expired') AND pnl_pct IS NOT NULL",
+        "SELECT COUNT(*) FROM paper_trades WHERE status IN ('closed', 'stopped_out', 'expired') AND pnl_pct IS NOT NULL
+           AND COALESCE(exit_reason, '') NOT LIKE 'merged_into%'",
         [],
         |row| row.get(0),
     ).map_err(|e| e.to_string())?;

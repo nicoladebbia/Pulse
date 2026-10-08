@@ -653,6 +653,10 @@ pub async fn check_ticker_universe_eligibility(
                     alpaca_marginable = asset.get("marginable").and_then(|v| v.as_bool()).unwrap_or(false);
                 }
             }
+            // "asset not found": a definite no, as cacheable as a real record.
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                alpaca_ok = true;
+            }
             Ok(resp) => {
                 tracing::warn!("Universe gate: Alpaca assets for {} returned status {}", ticker, resp.status());
             }
@@ -662,6 +666,21 @@ pub async fn check_ticker_universe_eligibility(
         }
     } else {
         tracing::warn!("Universe gate: Alpaca keys unset — {} will fail closed", ticker);
+    }
+
+    // Finnhub is rate-limited often; a quote it could not give (or gave as 0)
+    // comes from Alpaca instead of failing the ticker.
+    if last_price.is_none()
+        && !finnhub_key.is_empty()
+        && let Some(creds) = pulse_alpaca::credentials()
+    {
+        match pulse_alpaca::latest_price(client, &creds, ticker).await {
+            Ok(p) => {
+                finnhub_quote_ok = true;
+                last_price = p;
+            }
+            Err(e) => tracing::warn!("Universe gate: Alpaca price for {} failed: {}", ticker, e),
+        }
     }
 
     if !finnhub_profile_ok || !finnhub_quote_ok || !alpaca_ok {
@@ -680,19 +699,23 @@ pub async fn check_ticker_universe_eligibility(
             && alpaca_status == "active"
     };
 
-    let _ = conn.execute(
-        "INSERT INTO ticker_eligibility_cache
-             (ticker, market_cap_millions, last_price, alpaca_tradable, alpaca_status, eligible, checked_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
-         ON CONFLICT(ticker) DO UPDATE SET
-             market_cap_millions = excluded.market_cap_millions,
-             last_price = excluded.last_price,
-             alpaca_tradable = excluded.alpaca_tradable,
-             alpaca_status = excluded.alpaca_status,
-             eligible = excluded.eligible,
-             checked_at = excluded.checked_at",
-        rusqlite::params![ticker, market_cap, last_price, alpaca_tradable as i64, alpaca_status, eligible as i64],
-    );
+    // A verdict built on a failed call is not cached: CYTK ($9B) was rejected
+    // for a week because one Finnhub quote was rate-limited.
+    if universe_checks_complete(!finnhub_key.is_empty(), finnhub_profile_ok, finnhub_quote_ok, alpaca_ok) {
+        let _ = conn.execute(
+            "INSERT INTO ticker_eligibility_cache
+                 (ticker, market_cap_millions, last_price, alpaca_tradable, alpaca_status, eligible, checked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+             ON CONFLICT(ticker) DO UPDATE SET
+                 market_cap_millions = excluded.market_cap_millions,
+                 last_price = excluded.last_price,
+                 alpaca_tradable = excluded.alpaca_tradable,
+                 alpaca_status = excluded.alpaca_status,
+                 eligible = excluded.eligible,
+                 checked_at = excluded.checked_at",
+            rusqlite::params![ticker, market_cap, last_price, alpaca_tradable as i64, alpaca_status, eligible as i64],
+        );
+    }
 
     if !eligible {
         tracing::info!(
@@ -702,6 +725,12 @@ pub async fn check_ticker_universe_eligibility(
     }
 
     eligible
+}
+
+/// Whether every check the universe rule needs got an answer, so the verdict
+/// can be cached for a week. A 404 from Alpaca counts as an answer.
+fn universe_checks_complete(has_finnhub: bool, profile_ok: bool, quote_ok: bool, alpaca_ok: bool) -> bool {
+    alpaca_ok && quote_ok && (!has_finnhub || profile_ok)
 }
 
 /// Universe rule when there is no Finnhub key, so no market cap. It stands in
@@ -1183,6 +1212,15 @@ mod candle_write_tests {
 #[cfg(test)]
 mod no_market_cap_gate_tests {
     use super::*;
+
+    #[test]
+    fn a_verdict_built_on_a_failed_call_is_not_cached() {
+        assert!(universe_checks_complete(true, true, true, true));
+        assert!(universe_checks_complete(false, false, true, true));
+        assert!(!universe_checks_complete(true, true, false, true));
+        assert!(!universe_checks_complete(true, false, true, true));
+        assert!(!universe_checks_complete(true, true, true, false));
+    }
 
     #[test]
     fn listed_marginable_names_above_five_dollars_pass() {

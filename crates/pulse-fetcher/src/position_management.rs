@@ -401,6 +401,28 @@ pub fn check_signal_decay(
     signal_has_decayed(original_score, latest_fresh, pipeline_ran_recently)
 }
 
+/// The journal's "because ..." for an exit reason as the exit path writes it
+/// ("trailing_stop (-4.2%, ...)", "signal_decay (orig 0.40, ...)", ...). It
+/// used to be guessed from the row status, so any profitable close read
+/// "profit target was reached", signal-decay exits included.
+pub(crate) fn describe_exit(reason: &str) -> String {
+    const KNOWN: [(&str, &str); 8] = [
+        ("trailing_stop", "the trailing stop was hit"),
+        ("hard_stop", "the hard stop-loss was hit"),
+        ("fixed_stop", "the fixed stop-loss was hit"),
+        ("broker_stop", "the broker stop order sold it"),
+        ("signal_decay", "the signal behind it faded"),
+        ("profit_target", "the profit target was reached"),
+        ("closed_between_runs", "it was sold outside Pulse's own runs"),
+        ("reconcile", "it was missing at the broker and was reconciled"),
+    ];
+    KNOWN
+        .iter()
+        .find(|(prefix, _)| reason.starts_with(prefix))
+        .map(|(_, text)| text.to_string())
+        .unwrap_or_else(|| if reason.is_empty() { "the position was closed".to_string() } else { format!("it closed ({reason})") })
+}
+
 /// Write a human-readable trade journal entry on close.
 ///
 /// Moved here from calibration.rs (2026-07-15): it is a position-lifecycle
@@ -415,7 +437,7 @@ pub fn generate_trade_journal(
     entry_date: &str, exit_date: &str,
     entry_price: f64, exit_price: f64,
     position_size: f64, pnl_pct: f64, pnl_dollars: f64,
-    status: &str,
+    exit_reason: &str,
 ) {
     // Get signal profile and entity name
     let profile: String = conn.query_row(
@@ -452,22 +474,14 @@ pub fn generate_trade_journal(
             .join(", ")
     };
 
-    let holding_days = chrono::NaiveDate::parse_from_str(entry_date, "%Y-%m-%d")
-        .and_then(|e| chrono::NaiveDate::parse_from_str(exit_date, "%Y-%m-%d").map(|x| (x - e).num_days()))
+    // Entry dates carry a time ("2026-09-30T09:33:20"); parsing the whole
+    // string as a date failed and every journal said "after 0 days".
+    let day = |d: &str| chrono::NaiveDate::parse_from_str(d.get(..10).unwrap_or(d), "%Y-%m-%d");
+    let holding_days = day(entry_date)
+        .and_then(|e| day(exit_date).map(|x| (x - e).num_days()))
         .unwrap_or(0);
 
-    // 'expired' no longer describes anything this engine does — the 90-day
-    // calendar limit it used to name was removed on 2026-07-15 (see
-    // evaluate_position, which has no time-based exit at all) and nothing has
-    // written the status since. Left mapped rather than dropped so an older
-    // database still renders, but it no longer claims a rule that was deleted.
-    let exit_reason = match status {
-        "stopped_out" => "trailing stop was hit",
-        "expired" => "the retired calendar-expiry engine closed it (that rule no longer exists)",
-        "closed" if pnl_pct > 0.0 => "profit target was reached",
-        "closed" => "signal decay triggered an exit",
-        _ => "position was closed",
-    };
+    let exit_reason = describe_exit(exit_reason);
 
     let journal = format!(
         "Entered {} long on {} at ${:.2} driven by {}. Position size: ${:.0}. \
@@ -816,5 +830,19 @@ mod state_write_tests {
         assert!((stop_level_from(100.0, f64::NAN, 2.0) - 94.0).abs() < 1e-9);
         assert_eq!(stop_level_from(0.0, 10.0, 1.0), 0.0);
         assert_eq!(stop_level_from(f64::NAN, 10.0, 1.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod journal_reason_tests {
+    use super::describe_exit;
+
+    #[test]
+    fn the_journal_names_the_exit_that_actually_fired() {
+        assert_eq!(describe_exit("signal_decay (orig 0.40, pnl 3.1%)"), "the signal behind it faded");
+        assert_eq!(describe_exit("trailing_stop (-4.2%, ATR=1.10)"), "the trailing stop was hit");
+        assert_eq!(describe_exit("broker_stop (stop $41.00)"), "the broker stop order sold it");
+        assert_eq!(describe_exit("manual"), "it closed (manual)");
+        assert_eq!(describe_exit(""), "the position was closed");
     }
 }
