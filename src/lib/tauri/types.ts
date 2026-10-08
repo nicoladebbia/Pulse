@@ -585,6 +585,10 @@ export interface LearningSource {
 	avg_excess: number;
 	shrunk_excess: number;
 	t: number;
+	/** Excess minus that of all buy-grade signals, shrunk. */
+	vs_all?: number;
+	vs_all_t?: number;
+	days?: number;
 	win_rate: number;
 	trades: number;
 	trade_avg_excess: number | null;

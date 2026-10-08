@@ -11,10 +11,14 @@
 //!   not, the scorecard's episodes) and its 10-day excess over SPY, per signal
 //!   dimension. Means are shrunk toward zero (`PRIOR_N` pseudo-signals), so a
 //!   handful of lucky signals cannot look like an edge.
-//! - **Weights.** A live dimension whose shrunk excess is clearly positive or
-//!   negative (|t| >= `MIN_T` on >= `MIN_SIGNALS` episodes) moves its weight by
-//!   `STEP`, at most once a week, never outside `BOUND` of its code default and
-//!   never onto a dimension the code has zeroed. Off with
+//! - **Weights.** A dimension is judged against all buy-grade signals, not
+//!   against SPY (a generally weak strategy would otherwise mark every source a
+//!   loser), and its t-statistic is taken over trading days, since signals on
+//!   the same day share the market's move. Only signals since the last change
+//!   count, so one reading cannot move a weight twice. A clear winner or loser
+//!   (|t| >= `MIN_T` on >= `MIN_SIGNALS` new signals over >= `MIN_DAYS` days)
+//!   moves its weight by `STEP`, at most once a week; every weight stays within
+//!   `BOUND` of its code default and a zeroed dimension stays zero. Off with
 //!   `LEARNING_AUTO_APPLY=false` (proposals are still reported).
 //!
 //! The report is stored daily; nothing here places or changes an order.
@@ -33,6 +37,8 @@ pub const PRIOR_N: f64 = 20.0;
 pub const MIN_SIGNALS: usize = 30;
 /// |t-statistic| a dimension's excess needs before its weight may move.
 pub const MIN_T: f64 = 2.0;
+/// Distinct signal days behind a weight move.
+pub const MIN_DAYS: usize = 10;
 /// Relative weight change per adjustment.
 pub const STEP: f64 = 0.10;
 /// Weights stay within this factor of their code default (0.5x to 1.5x).
@@ -111,15 +117,21 @@ pub fn review(t: &ClosedTrade, bars: &[DailyBar], spy: &[DailyBar]) -> Option<Re
     if exit_i < entry_i || t.entry_price <= 0.0 || t.exit_price <= 0.0 {
         return None;
     }
-    let held = &bars[entry_i..=exit_i];
-    let mfe = held.iter().map(|b| b.high).fold(f64::MIN, f64::max);
-    let mae = held.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+    // The entry day's range partly comes before the buy and the exit day's
+    // after the sale, so those two days count only through their known
+    // prices (entry close, exit price); full ranges in between.
+    let between = if exit_i > entry_i + 1 { &bars[entry_i + 1..exit_i] } else { &[][..] };
+    let known = [bars[entry_i].close, t.exit_price];
+    let mfe = between.iter().map(|b| b.high).chain(known).fold(f64::MIN, f64::max);
+    let mae = between.iter().map(|b| b.low).chain(known).fold(f64::MAX, f64::min);
     let mfe_pct = (mfe > 0.0).then(|| pct(mfe, t.entry_price));
     let mae_pct = (mae.is_finite() && mae > 0.0).then(|| pct(mae, t.entry_price));
     let after = |n: usize| bars.get(exit_i + n).map(|b| pct(b.close, t.exit_price));
 
+    // Buys happen intraday, so SPY is measured from the entry day's open.
+    let spy_open = |day: &str| spy.iter().find(|b| b.date.as_str() >= day).map(|b| b.open);
     let spy_close = |day: &str| spy.iter().rev().find(|b| b.date.as_str() <= day).map(|b| b.close);
-    let spy_pct = match (spy_close(&t.entry_day), spy_close(&t.exit_day)) {
+    let spy_pct = match (spy_open(&t.entry_day), spy_close(&t.exit_day)) {
         (Some(a), Some(b)) if a > 0.0 => Some(pct(b, a)),
         _ => None,
     };
@@ -350,6 +362,11 @@ pub struct SourceResult {
     pub avg_excess: f64,
     pub shrunk_excess: f64,
     pub t: f64,
+    /// Average excess minus that of all buy-grade signals, shrunk.
+    pub vs_all: f64,
+    /// t-statistic of `vs_all` over signal days.
+    pub vs_all_t: f64,
+    pub days: usize,
     /// Share of signals beating SPY, shrunk toward 50% (Beta(10,10) prior).
     pub win_rate: f64,
     pub trades: usize,
@@ -404,13 +421,44 @@ fn mean(xs: &[f64]) -> Option<f64> {
     (!xs.is_empty()).then(|| xs.iter().sum::<f64>() / xs.len() as f64)
 }
 
-/// Per-dimension results from the signal episodes `(fired dims, excess %)`
-/// and the reviewed trades `(fired dims, excess %)`.
-pub fn source_results(episodes: &[(Vec<&'static str>, f64)], trades: &[(Vec<&'static str>, f64)]) -> Vec<SourceResult> {
+/// One measured signal: its day, the dimensions that fired, its 10-day
+/// excess over SPY in points.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Episode {
+    pub date: String,
+    pub fired: Vec<&'static str>,
+    pub excess: f64,
+}
+
+/// Mean and t-statistic of `(day, value)` pairs, with each day's values
+/// averaged first: signals of one day share the market's move and are not
+/// independent. Returns `(mean of days, t, days)`.
+pub fn by_day(xs: &[(&str, f64)]) -> (f64, f64, usize) {
+    let mut days: std::collections::BTreeMap<&str, (f64, usize)> = Default::default();
+    for (d, x) in xs {
+        let e = days.entry(d).or_default();
+        e.0 += x;
+        e.1 += 1;
+    }
+    let means: Vec<f64> = days.values().map(|(s, n)| s / *n as f64).collect();
+    match Stats::of(&means) {
+        Some(s) => (s.mean, s.t(), s.n),
+        None => (0.0, 0.0, 0),
+    }
+}
+
+/// Per-dimension results from the signal episodes and the reviewed trades
+/// `(fired dims, excess %)`.
+pub fn source_results(episodes: &[Episode], trades: &[(Vec<&'static str>, f64)]) -> Vec<SourceResult> {
+    let all = mean(&episodes.iter().map(|e| e.excess).collect::<Vec<_>>()).unwrap_or(0.0);
     let mut out = Vec::new();
     for (_, dim) in scorecard::DIMENSIONS {
-        let xs: Vec<f64> = episodes.iter().filter(|(f, _)| f.contains(&dim)).map(|(_, x)| *x).collect();
+        let mine: Vec<&Episode> = episodes.iter().filter(|e| e.fired.contains(&dim)).collect();
+        let xs: Vec<f64> = mine.iter().map(|e| e.excess).collect();
         let Some(s) = Stats::of(&xs) else { continue };
+        let rel: Vec<(&str, f64)> = mine.iter().map(|e| (e.date.as_str(), e.excess - all)).collect();
+        let (_, vs_all_t, days) = by_day(&rel);
+        let vs_all = (s.mean - all) * s.n as f64 / (s.n as f64 + PRIOR_N);
         let wins = xs.iter().filter(|x| **x > 0.0).count() as f64;
         let tx: Vec<f64> = trades.iter().filter(|(f, _)| f.contains(&dim)).map(|(_, x)| *x).collect();
         out.push(SourceResult {
@@ -419,6 +467,9 @@ pub fn source_results(episodes: &[(Vec<&'static str>, f64)], trades: &[(Vec<&'st
             avg_excess: s.mean,
             shrunk_excess: s.shrunk(),
             t: s.t(),
+            vs_all,
+            vs_all_t,
+            days,
             win_rate: (wins + 10.0) / (s.n as f64 + 20.0),
             trades: tx.len(),
             trade_avg_excess: mean(&tx),
@@ -466,6 +517,28 @@ pub fn load_decisions(conn: &Connection, since: &str) -> rusqlite::Result<Vec<(S
     rows.collect()
 }
 
+/// One decision per ticker, outcome and reason every `scorecard::HORIZON`
+/// trading days: a name skipped as too calm 20 days running is one signal
+/// with overlapping windows, not 20.
+pub fn dedup_decisions(
+    rows: &[(String, String, String, String)],
+    trading_days: &[String],
+) -> Vec<(String, String, String, String)> {
+    let index = |d: &str| trading_days.partition_point(|t| t.as_str() < d);
+    let mut last: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    let mut out = Vec::new();
+    for r in rows {
+        let i = index(&r.1);
+        let key = (r.0.as_str(), r.2.as_str(), r.3.as_str());
+        if last.get(&key).is_some_and(|prev| i < prev + scorecard::HORIZON) {
+            continue;
+        }
+        last.insert(key, i);
+        out.push(r.clone());
+    }
+    out
+}
+
 /// Group decisions `(outcome, reason, excess %)` into results, biggest first.
 pub fn gate_results(rows: &[(String, String, f64)]) -> Vec<GateResult> {
     let mut by: HashMap<(&str, &str), Vec<f64>> = HashMap::new();
@@ -491,10 +564,10 @@ pub fn propose_weights(current: &[f64; 8], defaults: &[f64; 8], sources: &[Sourc
     let mut why: Vec<(usize, String)> = Vec::new();
     for s in sources {
         let Some(i) = dimension_index(&s.dimension) else { continue };
-        if defaults[i] <= 0.0 || s.signals < MIN_SIGNALS || s.t.abs() < MIN_T {
+        if defaults[i] <= 0.0 || s.signals < MIN_SIGNALS || s.days < MIN_DAYS || s.vs_all_t.abs() < MIN_T {
             continue;
         }
-        let factor = if s.t > 0.0 { 1.0 + STEP } else { 1.0 - STEP };
+        let factor = if s.vs_all_t > 0.0 { 1.0 + STEP } else { 1.0 - STEP };
         let lo = defaults[i] * (1.0 - BOUND);
         let hi = defaults[i] * (1.0 + BOUND);
         let moved = (current[i] * factor).clamp(lo, hi);
@@ -503,8 +576,8 @@ pub fn propose_weights(current: &[f64; 8], defaults: &[f64; 8], sources: &[Sourc
             why.push((
                 i,
                 format!(
-                    "{} signals averaged {:+.1} points vs the S&P 500 over 10 days (t = {:.1})",
-                    s.signals, s.avg_excess, s.t
+                    "{} new signals did {:+.1} points vs all buy-grade signals over 10 days (t = {:.1} over {} days)",
+                    s.signals, s.vs_all, s.vs_all_t, s.days
                 ),
             ));
         }
@@ -512,12 +585,43 @@ pub fn propose_weights(current: &[f64; 8], defaults: &[f64; 8], sources: &[Sourc
     if why.is_empty() {
         return (*current, Vec::new());
     }
-    let sum: f64 = next.iter().sum();
+    // Renormalize to 1 while keeping EVERY weight inside its band: pin the
+    // ones that would leave it and share the rest among the others. A plain
+    // rescale lets dimensions without evidence drift a little every week.
+    let lo: Vec<f64> = defaults.iter().map(|d| d * (1.0 - BOUND)).collect();
+    let hi: Vec<f64> = defaults.iter().map(|d| d * (1.0 + BOUND)).collect();
+    let mut pinned = [false; 8];
+    for _ in 0..16 {
+        let fixed: f64 = (0..8).filter(|i| pinned[*i]).map(|i| next[i]).sum();
+        let free: f64 = (0..8).filter(|i| !pinned[*i]).map(|i| next[i]).sum();
+        if free <= 0.0 {
+            break;
+        }
+        let k = (1.0 - fixed) / free;
+        let mut changed = false;
+        let was = pinned;
+        for i in (0..8).filter(|i| !was[*i]) {
+            next[i] *= k;
+            if defaults[i] > 0.0 && (next[i] < lo[i] || next[i] > hi[i]) {
+                next[i] = next[i].clamp(lo[i], hi[i]);
+                pinned[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if (next.iter().sum::<f64>() - 1.0).abs() > 1e-6 {
+        // No vector inside every band sums to 1 with this move: keep the old one.
+        return (*current, Vec::new());
+    }
     for w in next.iter_mut() {
-        *w = (*w / sum * 10_000.0).round() / 10_000.0;
+        *w = (*w * 10_000.0).round() / 10_000.0;
     }
     // Rounding can leave the sum a hair off 1; give the remainder to the
-    // largest weight so the vector passes the sum check.
+    // largest weight so the vector passes the sum check (a 1e-4 nudge, well
+    // inside its band).
     let drift = 1.0 - next.iter().sum::<f64>();
     if let Some(i) = (0..8).max_by(|a, b| next[*a].partial_cmp(&next[*b]).unwrap_or(std::cmp::Ordering::Equal)) {
         next[i] += drift;
@@ -544,16 +648,10 @@ fn auto_apply() -> bool {
     std::env::var("LEARNING_AUTO_APPLY").map(|v| !(v.eq_ignore_ascii_case("false") || v == "0")).unwrap_or(true)
 }
 
-/// Days since the learner last changed the weights, if ever.
-fn days_since_last_change(conn: &Connection) -> Option<i64> {
-    conn.query_row(
-        "SELECT CAST(julianday('now', 'localtime') - julianday(MAX(computed_at)) AS INTEGER)
-         FROM learning_reports WHERE weights_applied = 1",
-        [],
-        |r| r.get::<_, Option<i64>>(0),
-    )
-    .ok()
-    .flatten()
+/// The day the learner last changed the weights, if ever. An unreadable
+/// table is an error, not "never": it must not let a change through.
+fn last_change(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT MAX(computed_at) FROM learning_reports WHERE weights_applied = 1", [], |r| r.get(0))
 }
 
 pub fn headline(total: Option<&Stats>, sources: &[SourceResult], reviews: &[Review], gates: &[GateResult]) -> Vec<String> {
@@ -573,13 +671,14 @@ pub fn headline(total: Option<&Stats>, sources: &[SourceResult], reviews: &[Revi
             }
         ));
     }
-    if let Some(best) = sources.iter().find(|s| s.signals >= 10) {
+    let rated: Vec<&SourceResult> = sources.iter().filter(|s| s.signals >= 10).collect();
+    if let Some(best) = rated.first() {
         out.push(format!(
             "Best source so far: {} ({} signals, {:+.1} points after shrinking for sample size).",
             best.dimension, best.signals, best.shrunk_excess
         ));
     }
-    if let Some(worst) = sources.iter().rev().find(|s| s.signals >= 10) {
+    if let Some(worst) = rated.last().filter(|_| rated.len() >= 2) {
         out.push(format!(
             "Worst source: {} ({} signals, {:+.1} points).",
             worst.dimension, worst.signals, worst.shrunk_excess
@@ -699,16 +798,18 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<Report> {
     }
 
     let calendar: Vec<String> = spy.iter().map(|b| b.date.clone()).collect();
-    let episodes: Vec<(Vec<&'static str>, f64)> = scorecard::episodes(samples, &calendar)
+    // Buy-grade only before the 10-day dedup, so a 0.25 near miss cannot
+    // hide a real signal on the same ticker.
+    let buy_grade: Vec<scorecard::Sample> = samples.into_iter().filter(|s| s.score >= 0.30).collect();
+    let episodes: Vec<Episode> = scorecard::episodes(buy_grade, &calendar)
         .into_iter()
-        .filter(|s| s.score >= 0.30)
         .filter_map(|s| {
             let (entry, exit, ret) = scorecard::forward(bars.get(&s.ticker)?, &s.date)?;
             let spy_ret = scorecard::spy_return(&spy, &entry, &exit)?;
-            Some((s.fired, (ret - spy_ret) * 100.0))
+            Some(Episode { date: s.date, fired: s.fired, excess: (ret - spy_ret) * 100.0 })
         })
         .collect();
-    let gate_rows: Vec<(String, String, f64)> = decisions
+    let gate_rows: Vec<(String, String, f64)> = dedup_decisions(&decisions, &calendar)
         .iter()
         .filter_map(|(ticker, day, outcome, reason)| {
             let (entry, exit, ret) = scorecard::forward(bars.get(ticker)?, day)?;
@@ -716,7 +817,7 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<Report> {
             Some((outcome.clone(), reason.clone(), (ret - spy_ret) * 100.0))
         })
         .collect();
-    let total = Stats::of(&episodes.iter().map(|(_, x)| *x).collect::<Vec<_>>());
+    let total = Stats::of(&episodes.iter().map(|e| e.excess).collect::<Vec<_>>());
     let sources = source_results(&episodes, &reviewed_trades(&conn)?);
     let reviews = load_reviews(&conn)?;
     let mut lesson_counts: HashMap<&str, usize> = HashMap::new();
@@ -728,9 +829,18 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<Report> {
     let mut lessons: Vec<(String, usize)> = lesson_counts.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     lessons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
+    // Weights move only on signals since the last change.
+    let last = last_change(&conn)?;
+    let fresh: Vec<Episode> =
+        episodes.iter().filter(|e| last.as_deref().is_none_or(|d| e.date.as_str() > d)).cloned().collect();
     let current = crate::pipeline::signals::load_calibrated_weights(&conn);
-    let (next, weight_changes) = propose_weights(&current, &pulse_weights::default_vector(), &sources);
-    let due = days_since_last_change(&conn).is_none_or(|d| d >= ADJUST_EVERY_DAYS);
+    let (next, weight_changes) =
+        propose_weights(&current, &pulse_weights::default_vector(), &source_results(&fresh, &[]));
+    let due = match last.as_deref().and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()) {
+        None if last.is_some() => false,
+        None => true,
+        Some(d) => (chrono::Local::now().date_naive() - d).num_days() >= ADJUST_EVERY_DAYS,
+    };
     let weights_applied = !weight_changes.is_empty() && due && auto_apply();
     if weights_applied {
         let pairs: Vec<(String, f64)> =
@@ -759,7 +869,7 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<Report> {
     conn.execute(
         "INSERT INTO learning_reports (computed_at, weights_applied, body) VALUES (?1, ?2, ?3)
          ON CONFLICT(computed_at) DO UPDATE SET weights_applied = MAX(weights_applied, excluded.weights_applied),
-             body = excluded.body",
+             body = CASE WHEN weights_applied = 1 AND excluded.weights_applied = 0 THEN body ELSE excluded.body END",
         rusqlite::params![today, weights_applied, serde_json::to_string(&report)?],
     )?;
     tracing::info!(
@@ -861,6 +971,9 @@ mod tests {
             avg_excess: mean,
             shrunk_excess: mean,
             t,
+            vs_all: mean,
+            vs_all_t: t,
+            days: signals / 2,
             win_rate: 0.5,
             trades: 0,
             trade_avg_excess: None,
@@ -900,6 +1013,60 @@ mod tests {
     }
 
     #[test]
+    fn every_weight_stays_in_its_band_over_many_weeks() {
+        // The reviewer's case: three sources keep losing, one has no
+        // evidence. Renormalizing must not pile the freed weight onto it.
+        let d = pulse_weights::default_vector();
+        for signs in [[-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, 1.0]] {
+            let sources = [
+                source("insider", 200, signs[0] * 3.0, signs[0] * 4.0),
+                source("news", 200, signs[1] * 3.0, signs[1] * 4.0),
+                source("government", 200, signs[2] * 3.0, signs[2] * 4.0),
+            ];
+            let mut w = d;
+            for _ in 0..30 {
+                w = propose_weights(&w, &d, &sources).0;
+                assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+                for i in 0..8 {
+                    if d[i] == 0.0 {
+                        assert_eq!(w[i], 0.0);
+                    } else {
+                        assert!(w[i] >= d[i] * 0.5 - 2e-4 && w[i] <= d[i] * 1.5 + 2e-4, "{signs:?}: dim {i} = {} (default {})", w[i], d[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_day_signals_count_as_one_day() {
+        // 20 signals on one day are one draw of the market, not 20.
+        let xs: Vec<(&str, f64)> = (0..20).map(|i| ("2026-09-01", 1.0 + i as f64 * 0.01)).collect();
+        let (_, t, days) = by_day(&xs);
+        assert_eq!((days, t), (1, 0.0));
+        let (m, t, days) = by_day(&[("a", 1.0), ("a", 3.0), ("b", 2.0), ("c", 2.5)]);
+        assert_eq!(days, 3);
+        assert!((m - 2.1666).abs() < 1e-3 && t > 5.0);
+    }
+
+    #[test]
+    fn repeated_skips_count_once_per_ten_trading_days() {
+        let cal: Vec<String> = days(&[1.0; 30]).into_iter().map(|b| b.date).collect();
+        let row = |i: usize, reason: &str| ("AAA".to_string(), cal[i].clone(), "skipped".to_string(), reason.to_string());
+        let rows: Vec<_> = (0..25).map(|i| row(i, "too_calm")).chain([row(3, "earnings")]).collect();
+        let kept = dedup_decisions(&rows, &cal);
+        let calm: Vec<&String> = kept.iter().filter(|r| r.3 == "too_calm").map(|r| &r.1).collect();
+        assert_eq!(calm, vec![&cal[0], &cal[10], &cal[20]]);
+        assert_eq!(kept.len(), 4);
+    }
+
+    #[test]
+    fn one_rated_source_is_not_both_best_and_worst() {
+        let h = headline(None, &[source("news", 40, 1.0, 1.0)], &[], &[]);
+        assert_eq!(h.len(), 1, "{h:?}");
+    }
+
+    #[test]
     fn no_evidence_means_no_change() {
         let d = pulse_weights::default_vector();
         let (next, changes) = propose_weights(&d, &d, &[]);
@@ -913,10 +1080,16 @@ mod tests {
         assert!(lucky.shrunk() < 1.2);
         let many = Stats::of(&vec![2.0; 200]).unwrap();
         assert!(many.shrunk() > 1.8);
-        let r = source_results(&[(vec!["news"], 4.0), (vec!["news", "search"], -2.0)], &[(vec!["news"], 1.0)]);
+        let ep = |d: &str, f: Vec<&'static str>, x: f64| Episode { date: d.into(), fired: f, excess: x };
+        let r = source_results(
+            &[ep("2026-09-01", vec!["news"], 4.0), ep("2026-09-01", vec!["news", "search"], -2.0), ep("2026-09-02", vec!["insider"], -5.0)],
+            &[(vec!["news"], 1.0)],
+        );
         let news = r.iter().find(|s| s.dimension == "news").unwrap();
-        assert_eq!((news.signals, news.trades), (2, 1));
+        assert_eq!((news.signals, news.trades, news.days), (2, 1, 1));
         assert!((news.win_rate - 11.0 / 22.0).abs() < 1e-9);
+        // All signals averaged -1; news averaged +1, so +2 before shrinking.
+        assert!((news.vs_all - 2.0 * 2.0 / 22.0).abs() < 1e-9);
     }
 
     #[test]
