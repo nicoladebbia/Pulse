@@ -5,6 +5,7 @@ use crate::services::analytics::{self, PortfolioAnalytics, TradeJournal};
 use crate::services::backtester::{self, BacktestConfig, BacktestResult};
 use crate::services::live_prices::{self, LivePriceState, StreamStatus};
 use std::sync::Arc;
+use rusqlite::OptionalExtension;
 
 /// Get full portfolio: account info + positions + trade history.
 #[tauri::command]
@@ -1426,4 +1427,69 @@ pub fn get_signal_scorecard(db: State<'_, DbState>) -> Result<SignalScorecard, S
         .filter_map(|r| r.ok())
         .collect();
     Ok(SignalScorecard { computed_at, rows })
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TradeReviewRow {
+    pub trade_id: i64,
+    pub ticker: String,
+    pub exit_date: Option<String>,
+    pub return_pct: f64,
+    pub excess_pct: Option<f64>,
+    pub exit_kind: String,
+    pub lessons: Vec<String>,
+    pub story: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LearningReport {
+    pub computed_at: Option<String>,
+    pub weights_applied: bool,
+    /// The report `pulse-fetcher --mode learn` stored (learning.rs `Report`).
+    pub report: Option<serde_json::Value>,
+    pub reviews: Vec<TradeReviewRow>,
+}
+
+/// The latest daily learning report and the most recent trade reviews.
+#[tauri::command]
+pub fn get_learning_report(db: State<'_, DbState>, limit: Option<i64>) -> Result<LearningReport, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let latest: Option<(String, bool, String)> = conn
+        .query_row(
+            "SELECT computed_at, weights_applied, body FROM learning_reports ORDER BY computed_at DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.trade_id, pt.ticker, substr(pt.exit_date, 1, 10), r.return_pct, r.excess_pct, r.exit_kind,
+                    r.lessons, r.story
+             FROM trade_reviews r JOIN paper_trades pt ON pt.id = r.trade_id
+             ORDER BY pt.exit_date DESC LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let reviews = stmt
+        .query_map([limit.unwrap_or(8).clamp(1, 50)], |r| {
+            let lessons: String = r.get(6)?;
+            Ok(TradeReviewRow {
+                trade_id: r.get(0)?,
+                ticker: r.get(1)?,
+                exit_date: r.get(2)?,
+                return_pct: r.get(3)?,
+                excess_pct: r.get(4)?,
+                exit_kind: r.get(5)?,
+                lessons: serde_json::from_str(&lessons).unwrap_or_default(),
+                story: r.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    let (computed_at, weights_applied, report) = match latest {
+        Some((at, applied, body)) => (Some(at), applied, serde_json::from_str(&body).ok()),
+        None => (None, false, None),
+    };
+    Ok(LearningReport { computed_at, weights_applied, report, reviews })
 }

@@ -147,6 +147,31 @@ pub(crate) fn apply_entry_settlement(
     }
 }
 
+/// Bump when an entry or exit rule changes, so `entry_context` tells which
+/// rules a trade was bought under.
+pub(crate) const RULES_VERSION: &str = "2026-10-08";
+
+/// Append to a trade's history (`trade_events`, read by learning.rs). Best
+/// effort: an event that cannot be written must never stop a booking.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn log_trade_event(
+    conn: &rusqlite::Connection,
+    trade_id: i64,
+    at: &str,
+    kind: &str,
+    price: Option<f64>,
+    qty: Option<f64>,
+    reason: &str,
+    detail: Option<&str>,
+) {
+    if let Err(e) = conn.execute(
+        "INSERT INTO trade_events (trade_id, at, kind, price, qty, reason, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![trade_id, at, kind, price, qty, reason, detail],
+    ) {
+        tracing::debug!("Trade event {} for #{} not logged: {}", kind, trade_id, e);
+    }
+}
+
 /// Close a trade in full and return the P&L booked for the shares sold now.
 ///
 /// The final `pnl` is `realized_pnl` (booked by an earlier half close) plus the
@@ -170,6 +195,7 @@ pub(crate) fn record_full_close(
          WHERE id = ?6",
         rusqlite::params![exit_price, exit_at, pnl_now, pnl_pct, reason, trade_id, exit_status(reason)],
     )?;
+    log_trade_event(conn, trade_id, exit_at, "close", Some(exit_price), Some(qty_sold), reason, None);
     Ok(pnl_now)
 }
 
@@ -203,6 +229,7 @@ pub(crate) fn book_stop_sale(
          WHERE id = ?5",
         rusqlite::params![pnl_now, left_fraction, qty_left, filled_at, trade_id],
     )?;
+    log_trade_event(conn, trade_id, filled_at, "stop_sale", Some(stop_price), Some(qty_sold), "broker_stop", None);
     Ok(pnl_now)
 }
 
@@ -232,6 +259,8 @@ pub(crate) fn book_partial_sale(
          WHERE id = ?6",
         rusqlite::params![pnl_now, left_fraction, qty_left, half, at, trade_id],
     )?;
+    let kind = if half { "half_close" } else { "partial_sale" };
+    log_trade_event(conn, trade_id, at, kind, Some(price), Some(qty_sold), if half { "profit_target" } else { "" }, None);
     Ok(pnl_now)
 }
 
@@ -299,6 +328,8 @@ pub(crate) fn resync_sold_shares(
          WHERE id = ?5",
         rusqlite::params![realized, held_qty, !sells.is_empty(), now, trade_id],
     )?;
+    let detail = serde_json::json!({ "sells": sells, "held": held_qty }).to_string();
+    log_trade_event(conn, trade_id, now, "resync", None, Some(held_qty), "broker_fills", Some(&detail));
     Ok(realized)
 }
 
@@ -822,7 +853,10 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     // of what would have shown up as a meaningful BUY signal.
     const INSIDER_VETO_THRESHOLD: f64 = -1_000_000.0;
 
-    for (entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political, insider_raw) in &candidates {
+    let weights = crate::pipeline::signals::load_calibrated_weights(&conn);
+    for (rank, (entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political, insider_raw)) in
+        candidates.iter().enumerate()
+    {
         if *insider_raw < INSIDER_VETO_THRESHOLD {
             tracing::info!(
                 "Auto-trade: vetoing {} ({}) — heavy insider selling (net ${:.0})",
@@ -859,6 +893,8 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         }
 
         // Liquidity and price from the consolidated tape. Fails closed.
+        // Set on the one path that goes on to buy.
+        let (last_close, adv_dollars, atr_frac): (f64, f64, f64);
         match ef::recent_bars(&client, &creds, ticker, 40).await {
             Ok(mut bars) => {
                 // Today's bar is partial (half an hour of volume at 10:00).
@@ -866,6 +902,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 let last = bars.last().map(|b| b.close).unwrap_or(0.0);
                 bars.retain(|b| b.date < today_str);
                 let adv = ef::avg_dollar_volume(&bars, 20);
+                (last_close, adv_dollars) = (last, adv.unwrap_or(0.0));
                 if adv.is_none_or(|v| v < ef::MIN_DOLLAR_VOLUME) || last < ef::MIN_PRICE {
                     tracing::info!(
                         "Auto-trade: skipping {} ({}) — too thin or cheap (avg ${:.1}M/day, last ${:.2})",
@@ -876,7 +913,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 }
                 // The signal has only paid on stocks that move (see entry_filters).
                 match ef::atr_pct(&bars, ef::ATR_DAYS) {
-                    Some(v) if v >= ef::MIN_ATR_PCT => {}
+                    Some(v) if v >= ef::MIN_ATR_PCT => atr_frac = v,
                     Some(v) => {
                         tracing::info!(
                             "Auto-trade: skipping {} ({}) — too calm (ATR {:.1}% of price, floor {:.0}%)",
@@ -1126,9 +1163,10 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             // point, so a story-lookup failure must never skip recording the
             // trade — every error path degrades to an empty list, never
             // `continue`.
-            let story_refs: Vec<(i64, String, String)> = conn
+            #[allow(clippy::type_complexity)]
+            let story_refs: Vec<(i64, String, String, Option<f64>, Option<String>)> = conn
                 .prepare(
-                    "SELECT s.id, s.headline, s.source_name
+                    "SELECT s.id, s.headline, s.source_name, em.sentiment, substr(em.mentioned_at, 1, 10)
                      FROM entity_mentions em
                      JOIN stories s ON s.id = em.story_id
                      WHERE em.entity_id IN (
@@ -1143,7 +1181,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 .and_then(|mut stmt| {
                     stmt.query_map(
                         rusqlite::params![entity_id, ticker.as_str()],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                     )
                     .ok()
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -1162,8 +1200,8 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 "patent": patent,
                 "supply_chain": supply,
                 "political": political,
-                "stories": story_refs.iter().map(|(id, head, src)| {
-                    serde_json::json!({"id": id, "headline": head, "source": src})
+                "stories": story_refs.iter().map(|(id, head, src, sentiment, day)| {
+                    serde_json::json!({"id": id, "headline": head, "source": src, "sentiment": sentiment, "date": day})
                 }).collect::<Vec<_>>(),
             });
 
@@ -1183,17 +1221,47 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                 continue;
             }
 
+            // Everything the system knew when it decided, for the learning
+            // loop: why this name, against what competition, in what market,
+            // sized how, under which rules.
+            let entry_context = serde_json::json!({
+                "score": score,
+                "rank": rank + 1,
+                "candidates": candidates.len(),
+                "dims": &signal_profile,
+                "weights": pulse_weights::DIMENSIONS.iter().zip(weights.iter())
+                    .map(|(d, w)| (d.to_string(), serde_json::json!(w)))
+                    .collect::<serde_json::Map<_, _>>(),
+                "insider_net_usd": insider_raw,
+                "last_close": last_close,
+                "adv_usd": adv_dollars,
+                "atr_pct": atr_frac * 100.0,
+                "regime": regime,
+                "notional": notional,
+                "qty": qty,
+                "sizing": sized_risk.as_ref().map(|s| serde_json::json!({
+                    "risk": s.risk, "stop_pct": s.stop_pct, "dd_mult": s.dd_mult, "edge_mult": s.edge_mult,
+                })),
+                "industry": industry,
+                "open_positions": open_positions,
+                "rules": RULES_VERSION,
+            });
+
             // Record in paper_trades with position management columns
-            if let Err(e) = conn.execute(
-                "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status, high_water_mark, original_compound_score, order_status, filled_qty)
-                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6, ?9, ?10)",
+            match conn.execute(
+                "INSERT INTO paper_trades (entity_id, ticker, direction, entry_price, entry_date, position_size, confidence, signal_profile, alpaca_order_id, status, high_water_mark, original_compound_score, order_status, filled_qty, entry_context)
+                 VALUES (?1, ?2, 'long', ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?3, ?6, ?9, ?10, ?11)",
                 rusqlite::params![
                     entity_id, ticker, filled_price, fill_time, notional, score,
                     signal_profile.to_string(), order_id, order_status,
-                    (filled_qty > 0.0).then_some(filled_qty),
+                    (filled_qty > 0.0).then_some(filled_qty), entry_context.to_string(),
                 ],
             ) {
-                tracing::warn!("Auto-trade: failed to record trade for {}: {}", ticker, e);
+                Ok(_) => log_trade_event(
+                    &conn, conn.last_insert_rowid(), &fill_time, "open", Some(filled_price),
+                    Some(if filled_qty > 0.0 { filled_qty } else { qty as f64 }), order_status, None,
+                ),
+                Err(e) => tracing::warn!("Auto-trade: failed to record trade for {}: {}", ticker, e),
             }
 
             tracing::info!("Auto-trade: placed order {} for {} (${:.2} @ ${:.2}, qty {:.4})", order_id, ticker, notional, filled_price, filled_qty);
@@ -1347,6 +1415,8 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                          filled_qty = CASE WHEN filled_qty IS NULL THEN NULL ELSE filled_qty + ?4 END WHERE id = ?3",
                         rusqlite::params![scale_notional, basis, trade_id, add_qty],
                     ).ok();
+                    let at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                    log_trade_event(&conn, *trade_id, &at, "scale_in", add_price, Some(add_qty), "", None);
                     tracing::info!(
                         "Scale-in: added ${:.2} to {} at ${:.2} — basis ${:.2} -> ${:.2}",
                         scale_notional, ticker, add_price.unwrap_or(0.0), held_entry, basis
@@ -1364,6 +1434,9 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                          filled_qty = CASE WHEN filled_qty IS NULL THEN NULL ELSE filled_qty + ?3 END WHERE id = ?2",
                         rusqlite::params![scale_notional, trade_id, add_qty],
                     ).ok();
+                    let at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                    let detail = format!("{{\"notional\":{scale_notional}}}");
+                    log_trade_event(&conn, *trade_id, &at, "scale_in", None, Some(add_qty), "", Some(&detail));
                     tracing::warn!(
                         "Scale-in: added ${:.2} to {} but no fill price (order {}) — \
                          size recorded, basis left at ${:.2} and now understated",
@@ -2528,6 +2601,32 @@ mod ledger_tests {
         let after: Option<String> =
             conn.query_row("SELECT score_rebase_after FROM paper_trades WHERE id = ?1", [id], |r| r.get(0)).unwrap();
         assert_eq!(after, None);
+    }
+
+    #[test]
+    fn every_booking_leaves_an_event() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        book_partial_sale(&conn, id, 20.0, 24.0, 50.0, 45.0, "2026-10-01T10:00:00", true).unwrap();
+        book_stop_sale(&conn, id, 20.0, 22.0, 44.0, 1.0, "2026-10-02T10:00:00").unwrap();
+        resync_sold_shares(&conn, id, 20.0, &[(50.0, 24.0), (44.0, 22.0)], 1.0, "2026-10-03T10:00:00").unwrap();
+        record_full_close(&conn, id, 20.0, 21.0, 1.0, "2026-10-04T10:00:00", "trailing_stop").unwrap();
+        let kinds: Vec<(String, Option<f64>, String)> = conn
+            .prepare("SELECT kind, qty, reason FROM trade_events WHERE trade_id = ?1 ORDER BY at")
+            .unwrap()
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("half_close".into(), Some(50.0), "profit_target".into()),
+                ("stop_sale".into(), Some(44.0), "broker_stop".into()),
+                ("resync".into(), Some(1.0), "broker_fills".into()),
+                ("close".into(), Some(1.0), "trailing_stop".into()),
+            ]
+        );
     }
 
     fn insert(conn: &Connection, order_status: &str) -> i64 {

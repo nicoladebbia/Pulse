@@ -55,6 +55,7 @@ const MIGRATION_039: &str = include_str!("../../../migrations/039_ticker_industr
 const MIGRATION_040: &str = include_str!("../../../migrations/040_signals_page.sql");
 const MIGRATION_041: &str = include_str!("../../../migrations/041_api_usage_calls.sql");
 const MIGRATION_042: &str = include_str!("../../../migrations/042_trading_health.sql");
+const MIGRATION_043: &str = include_str!("../../../migrations/043_trade_learning.sql");
 const MIGRATION_044: &str = include_str!("../../../migrations/044_rebase_open_scores.sql");
 
 /// Check if a column exists on a table via PRAGMA table_info.
@@ -748,6 +749,13 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_042)?;
         tx.execute("INSERT INTO schema_migrations (version) VALUES (42)", [])?;
+        tx.commit()?;
+    }
+
+    if !applied.contains(&43) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_043)?;
+        tx.execute("INSERT INTO schema_migrations (version) VALUES (43)", [])?;
         tx.commit()?;
     }
 
