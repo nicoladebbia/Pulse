@@ -171,6 +171,7 @@ pub fn load_edge_stats(conn: &rusqlite::Connection, limit: usize) -> pulse_weigh
         .prepare(
             "SELECT pnl_pct FROM paper_trades
              WHERE status IN ('closed', 'stopped_out') AND pnl_pct IS NOT NULL
+               AND entry_trigger = 'convergence'
              ORDER BY exit_date DESC LIMIT ?1",
         )
         .and_then(|mut stmt| {

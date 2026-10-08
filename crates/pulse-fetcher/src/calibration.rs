@@ -171,6 +171,7 @@ fn analyze_signal_performance(conn: &Connection) -> anyhow::Result<SignalAnalysi
         "SELECT signal_profile, pnl_pct FROM paper_trades
          WHERE status IN ('closed', 'stopped_out', 'expired')
          AND pnl_pct IS NOT NULL
+         AND entry_trigger = 'convergence'
          AND COALESCE(exit_reason, '') NOT LIKE 'merged_into%'"
     )?;
 

@@ -14,7 +14,8 @@
 //!   "opportunistic" buys earned excess returns over the following months).
 //!   Six months of our Form 4s showed no edge on 9-20 events.
 //!
-//! Event trades are `EVENT_SIZE` of a normal entry, skip signal decay (they
+//! Event trades are `EVENT_SIZE` of the smallest normal entry (sized as a
+//! `SIZING_SCORE` signal, whatever their strength), skip signal decay (they
 //! have no compound score to decay from) and close after `max_hold_days`.
 //! `EVENT_TRADES_ENABLED=false` stops them; events are still recorded.
 
@@ -30,6 +31,10 @@ pub const CLUSTER_BUYERS: i64 = 2;
 pub const CLUSTER_DOLLARS: f64 = 100_000.0;
 /// Fraction of a normal entry an event trade gets.
 pub const EVENT_SIZE: f64 = 0.5;
+/// The compound score an event trade is sized as: the bottom tier. Strength
+/// is not a compound score, and an unproven signal must not size like a
+/// strong proven one.
+pub const SIZING_SCORE: f64 = 0.30;
 
 pub const NEWS_SURPRISE: &str = "news_surprise";
 pub const INSIDER_CLUSTER: &str = "insider_cluster";
@@ -169,15 +174,18 @@ pub fn insider_clusters(conn: &Connection) -> rusqlite::Result<Vec<Event>> {
     rows.collect()
 }
 
-/// Record events; the first sighting of a (kind, ticker, day) wins. Returns
-/// how many were new.
+/// Record events. A later sighting the same day replaces the reading (more of
+/// the day's news is in by then) but keeps the first detection time. Returns
+/// how many were new or changed.
 pub fn record(conn: &Connection, events: &[Event]) -> rusqlite::Result<usize> {
     let mut n = 0;
     for e in events {
         n += conn.execute(
             "INSERT INTO event_signals (kind, ticker, entity_id, day, direction, strength, detail, detected_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now', 'localtime'))
-             ON CONFLICT(kind, ticker, day) DO NOTHING",
+             ON CONFLICT(kind, ticker, day) DO UPDATE SET direction = excluded.direction,
+                 strength = excluded.strength, detail = excluded.detail
+             WHERE event_signals.strength != excluded.strength OR event_signals.direction != excluded.direction",
             rusqlite::params![e.kind, e.ticker, e.entity_id, e.day, e.direction, e.strength, e.detail.to_string()],
         )?;
     }
@@ -224,19 +232,20 @@ pub struct EventCandidate {
     pub detail: String,
 }
 
-/// Events from today or yesterday that no trade has acted on, strongest
-/// first, in `directions`.
+/// Events first seen today or yesterday (a Form 4 can be found days after
+/// it was filed) that no trade has acted on, strongest first, in
+/// `directions`, at most 10.
 pub fn candidates(conn: &Connection, directions: &[&str]) -> rusqlite::Result<Vec<EventCandidate>> {
     let mut stmt = conn.prepare(
         "SELECT ev.kind, ev.ticker, ev.entity_id, COALESCE(e.name, ev.ticker), ev.direction, ev.strength, ev.detail
          FROM event_signals ev
          LEFT JOIN entities e ON e.id = ev.entity_id
-         WHERE ev.day >= date('now', 'localtime', '-1 day')
+         WHERE (ev.day >= date('now', 'localtime', '-1 day')
+                OR ev.detected_at >= date('now', 'localtime', '-1 day'))
            AND ev.ticker NOT IN (SELECT ticker FROM paper_trades WHERE status = 'open')
            AND NOT EXISTS (SELECT 1 FROM paper_trades pt WHERE pt.ticker = ev.ticker
                            AND pt.entry_trigger = ev.kind AND substr(pt.entry_date, 1, 10) >= ev.day)
-         ORDER BY ev.strength DESC, ev.id
-         LIMIT 10",
+         ORDER BY ev.strength DESC, ev.id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(EventCandidate {
@@ -249,7 +258,11 @@ pub fn candidates(conn: &Connection, directions: &[&str]) -> rusqlite::Result<Ve
             detail: r.get(6)?,
         })
     })?;
-    Ok(rows.filter_map(Result::ok).filter(|c| directions.contains(&c.direction.as_str())).collect())
+    Ok(rows
+        .filter_map(Result::ok)
+        .filter(|c| directions.contains(&c.direction.as_str()))
+        .take(10)
+        .collect())
 }
 
 /// Weekdays from `from` (exclusive) to `to` (inclusive): trading days held,
@@ -343,7 +356,34 @@ mod tests {
 
         let ev = news_surprises(&rows, "2026-10-08");
         assert_eq!(record(&conn, &ev).unwrap(), 1);
-        assert_eq!(record(&conn, &ev).unwrap(), 0, "first sighting wins");
+        assert_eq!(record(&conn, &ev).unwrap(), 0, "the same reading changes nothing");
+    }
+
+    #[test]
+    fn a_later_reading_replaces_the_first_and_late_or_crowded_events_still_trade() {
+        let conn = db();
+        let ev = |t: &str, day: String, dir: &'static str, s: f64| Event {
+            kind: INSIDER_CLUSTER,
+            ticker: t.into(),
+            entity_id: None,
+            day,
+            direction: dir,
+            strength: s,
+            detail: serde_json::json!({}),
+        };
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        // A Form 4 filed four days ago, found today.
+        let old = (chrono::Local::now().date_naive() - chrono::Duration::days(4)).to_string();
+        record(&conn, &[ev("LATE", old.clone(), "long", 0.5)]).unwrap();
+        assert_eq!(record(&conn, &[ev("LATE", old, "long", 0.75)]).unwrap(), 1);
+        let strength: f64 = conn.query_row("SELECT strength FROM event_signals WHERE ticker = 'LATE'", [], |r| r.get(0)).unwrap();
+        assert_eq!(strength, 0.75);
+        // Twelve stronger shorts do not push the long out of the ten slots.
+        let shorts: Vec<Event> = (0..12).map(|i| ev(&format!("S{i}"), today.clone(), "short", 0.9)).collect();
+        record(&conn, &shorts).unwrap();
+        let c = candidates(&conn, &["long"]).unwrap();
+        assert_eq!(c.iter().map(|c| c.ticker.as_str()).collect::<Vec<_>>(), vec!["LATE"]);
+        assert_eq!(candidates(&conn, &["long", "short"]).unwrap().len(), 10);
     }
 
     #[test]

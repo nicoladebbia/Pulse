@@ -463,6 +463,8 @@ fn find_scale_in_candidates(
            AND pt.order_status = 'filled'
            AND pt.pnl_pct > 0.0
            AND COALESCE(pt.scale_in_count, 0) < 1
+           -- Event trades are small on purpose and their score is a strength.
+           AND pt.entry_trigger = 'convergence'
            AND cs.computed_at >= date('now', '-1 day')
            AND cs.compound_score > COALESCE(pt.original_compound_score, pt.confidence) * 1.2
            AND cs.convergence_detected = 1
@@ -1028,10 +1030,15 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             }
         }
 
+        let sizing_score = if c.trigger != "convergence" {
+            crate::event_signals::SIZING_SCORE
+        } else {
+            *score
+        };
         let notional = match crate::position_sizing::entry_notional(
             portfolio_value,
             buying_power,
-            *score,
+            sizing_score,
         ) {
             Some(n) => n * regime * c.size,
             None => {
@@ -2497,7 +2504,8 @@ mod scale_in_tests {
                  status TEXT NOT NULL DEFAULT 'open',
                  pnl_pct REAL, original_compound_score REAL,
                  scale_in_count INTEGER DEFAULT 0,
-                 order_status TEXT NOT NULL DEFAULT 'filled');
+                 order_status TEXT NOT NULL DEFAULT 'filled',
+                 entry_trigger TEXT NOT NULL DEFAULT 'convergence');
              CREATE TABLE cross_signals (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  entity_id INTEGER, ticker TEXT, compound_score REAL NOT NULL,
@@ -2543,6 +2551,15 @@ mod scale_in_tests {
         assert_eq!(got[0].1, "AAA");
         assert!((got[0].2 - 0.30).abs() < 1e-9, "original score");
         assert!((got[0].3 - 0.50).abs() < 1e-9, "current score");
+    }
+
+    #[test]
+    fn an_event_trade_is_never_scaled_into() {
+        let conn = db();
+        open_trade(&conn, "EVT", 0.30);
+        conn.execute("UPDATE paper_trades SET entry_trigger = 'news_surprise'", []).unwrap();
+        signal(&conn, 1, "EVT", 0.80, 0);
+        assert!(find_scale_in_candidates(&conn).is_empty());
     }
 
     /// The AIRI bug, first half: April's peak triggering a July position.

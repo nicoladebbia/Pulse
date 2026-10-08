@@ -152,7 +152,8 @@ pub fn load_trades(conn: &Connection) -> rusqlite::Result<Vec<(f64, Vec<&'static
     let mut stmt = conn.prepare(
         "SELECT COALESCE(original_compound_score, confidence, 0), signal_profile, COALESCE(realized_pnl, pnl, 0)
          FROM paper_trades
-         WHERE status != 'open' AND pnl_pct IS NOT NULL AND entry_date >= date('now', ?1)",
+         WHERE status != 'open' AND pnl_pct IS NOT NULL AND entry_date >= date('now', ?1)
+           AND entry_trigger = 'convergence'",
     )?;
     let rows = stmt.query_map([format!("-{LOOKBACK_DAYS} days")], |r| {
         let profile: Option<String> = r.get(1)?;

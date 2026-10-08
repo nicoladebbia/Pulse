@@ -396,8 +396,8 @@ pub struct GateResult {
     pub t: f64,
 }
 
-/// Every recorded event signal of a kind and direction, held from the next
-/// open for the kind's maximum hold, vs SPY. For shorts the sign is flipped,
+/// Every recorded event signal of a kind and direction, held from the close
+/// of the day it became known for the kind's maximum hold, vs SPY. For shorts the sign is flipped,
 /// so positive always means the trade would have made money.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EventResult {
@@ -411,18 +411,27 @@ pub struct EventResult {
     pub trade_avg_excess: Option<f64>,
 }
 
-/// Buy at the open after `date`, sell at the close `h` bars later: `(entry
-/// day, exit day, return)`.
+/// From the close of the day an event became known (or the next trading
+/// day) to the close `h` bars later: `(entry day, exit day, return)`. The bot
+/// buys that day after the open, so this leaves out part of the first day's
+/// move rather than counting a move it could not have caught.
 fn forward_n(bars: &[DailyBar], date: &str, h: usize) -> Option<(String, String, f64)> {
-    let i = bars.partition_point(|b| b.date.as_str() <= date);
+    let i = bars.partition_point(|b| b.date.as_str() < date);
     let entry = bars.get(i)?;
-    let exit = bars.get(i + h.max(1) - 1)?;
-    (entry.open > 0.0).then(|| (entry.date.clone(), exit.date.clone(), exit.close / entry.open - 1.0))
+    let exit = bars.get(i + h.max(1))?;
+    (entry.close > 0.0).then(|| (entry.date.clone(), exit.date.clone(), exit.close / entry.close - 1.0))
+}
+
+/// SPY close to close over the same days.
+fn spy_close_return(spy: &[DailyBar], entry: &str, exit: &str) -> Option<f64> {
+    let e = spy.iter().find(|b| b.date == entry)?;
+    let x = spy.iter().find(|b| b.date == exit)?;
+    (e.close > 0.0).then(|| x.close / e.close - 1.0)
 }
 
 /// Group `(kind, direction, day, signed excess %)` into results, and attach
-/// the bot's own trades `(kind, excess %)`.
-pub fn event_results(rows: &[(String, String, String, f64)], trades: &[(String, f64)]) -> Vec<EventResult> {
+/// the bot's own trades `(kind, direction, excess %)`.
+pub fn event_results(rows: &[(String, String, String, f64)], trades: &[(String, String, f64)]) -> Vec<EventResult> {
     let mut by: std::collections::BTreeMap<(&str, &str), Vec<(&str, f64)>> = Default::default();
     for (k, d, day, x) in rows {
         by.entry((k.as_str(), d.as_str())).or_default().push((day.as_str(), *x));
@@ -431,7 +440,7 @@ pub fn event_results(rows: &[(String, String, String, f64)], trades: &[(String, 
         .filter_map(|((k, d), xs)| {
             let s = Stats::of(&xs.iter().map(|(_, x)| *x).collect::<Vec<_>>())?;
             let (_, t, _) = by_day(&xs);
-            let tx: Vec<f64> = trades.iter().filter(|(tk, _)| tk == k).map(|(_, x)| *x).collect();
+            let tx: Vec<f64> = trades.iter().filter(|(tk, td, _)| tk == k && td == d).map(|(_, _, x)| *x).collect();
             Some(EventResult {
                 kind: k.to_string(),
                 direction: d.to_string(),
@@ -823,7 +832,12 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<Report> {
     // Record today's event signals even when auto-trade is off.
     crate::event_signals::detect(&conn);
     let events: Vec<(String, String, String, String)> = conn
-        .prepare("SELECT kind, direction, ticker, day FROM event_signals WHERE day >= ?1 ORDER BY day")?
+        // Measured from when it became known: an old Form 4 found late counts
+        // from the day it was found.
+        .prepare(
+            "SELECT kind, direction, ticker, MAX(day, substr(detected_at, 1, 10)) FROM event_signals
+             WHERE day >= ?1 ORDER BY day",
+        )?
         .query_map([&lookback], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut symbols: Vec<String> = pending
@@ -881,17 +895,18 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<Report> {
         .filter_map(|(kind, dir, ticker, day)| {
             let h = crate::event_signals::max_hold_days(kind).unwrap_or(10) as usize;
             let (entry, exit, ret) = forward_n(bars.get(ticker)?, day, h)?;
-            let spy_ret = scorecard::spy_return(&spy, &entry, &exit)?;
+            let spy_ret = spy_close_return(&spy, &entry, &exit)?;
             let x = (ret - spy_ret) * 100.0;
             Some((kind.clone(), dir.clone(), day.clone(), if dir == "short" { -x } else { x }))
         })
         .collect();
-    let event_trades: Vec<(String, f64)> = conn
+    let event_trades: Vec<(String, String, f64)> = conn
         .prepare(
-            "SELECT pt.entry_trigger, r.excess_pct FROM trade_reviews r JOIN paper_trades pt ON pt.id = r.trade_id
+            "SELECT pt.entry_trigger, COALESCE(pt.direction, 'long'), r.excess_pct
+             FROM trade_reviews r JOIN paper_trades pt ON pt.id = r.trade_id
              WHERE r.excess_pct IS NOT NULL AND pt.entry_trigger != 'convergence'",
         )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let total = Stats::of(&episodes.iter().map(|e| e.excess).collect::<Vec<_>>());
     let sources = source_results(&episodes, &reviewed_trades(&conn)?);
@@ -1146,15 +1161,16 @@ mod tests {
             r("news_surprise", "short", "2026-09-01", -1.0),
             r("news_surprise", "short", "2026-09-03", 3.0),
         ];
-        let out = event_results(&rows, &[("news_surprise".into(), 1.5)]);
+        let out = event_results(&rows, &[("news_surprise".into(), "short".into(), 1.5)]);
         assert_eq!(out.len(), 2);
         assert_eq!((out[0].direction.as_str(), out[0].signals, out[0].hold_days), ("long", 2, 5));
         assert!((out[0].avg_excess - 3.0).abs() < 1e-9);
-        assert_eq!(out[1].trades, 1);
+        assert_eq!((out[0].trades, out[1].trades), (0, 1), "a trade shows on its own direction only");
         let bars = days(&[10.0, 11.0, 12.0, 13.0]);
         let (entry, exit, ret) = forward_n(&bars, &bars[0].date, 2).unwrap();
-        assert_eq!((entry, exit), (bars[1].date.clone(), bars[2].date.clone()));
-        assert!((ret - (12.0 / 11.0 - 1.0)).abs() < 1e-9);
+        assert_eq!((entry, exit), (bars[0].date.clone(), bars[2].date.clone()));
+        let c = |i: usize| bars[i].close;
+        assert!((ret - (c(2) / c(0) - 1.0)).abs() < 1e-9);
     }
 
     #[test]
