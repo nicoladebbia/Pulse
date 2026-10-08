@@ -343,7 +343,7 @@
 								<span class="text-text-muted"> ({distPct(plan.live_trailing_stop, plan.current_price)})</span>
 								— closes ALL. High-water {fmt$(plan.high_water_mark ?? t.entry_price)} −
 								ATR {fmt$(plan.atr)} × {plan.atr_mult.toFixed(1)}
-								<span class="text-text-muted">(flat — does not tighten with age; long-term design)</span>
+								<span class="text-text-muted">(flat — does not tighten with age)</span>
 							</span>
 						</div>
 					{/if}
@@ -375,8 +375,7 @@
 								<span class="font-mono text-text">{plan.max_hold_date}</span>
 								— {plan.days_remaining} trading day{plan.days_remaining === 1 ? '' : 's'} remain, then closes ALL.
 							{:else}
-								No hard time limit — long-term design. Held {plan.days_held} day{plan.days_held === 1 ? '' : 's'} so far;
-								only the stop, profit target, or signal decay ever close this position.
+								Unknown: the entry date couldn't be read. Held {plan.days_held} day{plan.days_held === 1 ? '' : 's'} so far.
 							{/if}
 						</span>
 					</div>

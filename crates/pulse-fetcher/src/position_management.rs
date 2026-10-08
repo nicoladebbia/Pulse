@@ -45,8 +45,8 @@ use rusqlite::Connection;
 
 // Position management: ATR-based trailing stops, profit targets, signal decay.
 //
-// Long-term design (2026-07-23): no calendar-based max hold — a position is
-// held indefinitely until a stop, target, or signal decay closes it. The
+// Every trade also has a maximum hold by signal type (2026-10-08,
+// `event_signals::max_hold_days`, enforced in pipeline/trading.rs). The
 // trailing stop is flat (does not tighten with age) so short-term volatility
 // doesn't shake out a long-term thesis.
 // - Trailing stop at 3x ATR below high-water mark (flat, no time-based tightening)
@@ -138,7 +138,7 @@ pub fn compute_atr(conn: &Connection, ticker: &str, period: usize) -> f64 {
 
 /// Evaluate an open position and decide what to do.
 ///
-/// Long-term design — no calendar-based expiry. Returns a `PositionAction`
+/// The max hold is applied by the caller. Returns a `PositionAction`
 /// based on:
 /// - ATR-based trailing stop, flat 3x ATR regardless of how long it's been held
 /// - Profit target at 3x ATR
@@ -166,8 +166,7 @@ pub fn evaluate_position(
     // Compute ATR for this ticker
     let atr = compute_atr(conn, ticker, 14);
     if atr <= 0.0 {
-        // No ATR data — fall back to fixed stop-loss. No time-based fallback
-        // expiry anymore (long-term design has no calendar-based max hold).
+        // No ATR data — fall back to fixed stop-loss (the max hold is the caller's).
         if pnl_pct <= -10.0 {
             return PositionAction::CloseAll {
                 reason: format!("fixed_stop_loss ({:.1}%, no ATR data)", pnl_pct),

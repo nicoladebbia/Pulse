@@ -554,7 +554,6 @@ fn compute_atr(conn: &rusqlite::Connection, ticker: &str, period: usize) -> f64 
     true_ranges.iter().sum::<f64>() / true_ranges.len() as f64
 }
 
-/// Days between entry_date and today, tolerating both date and datetime strings.
 /// Trading-day limits, mirroring pulse-fetcher's `event_signals::max_hold_days`
 /// and `position_management::DECAY_MIN_HELD_DAYS`.
 const DECAY_MIN_HELD_DAYS: i64 = 5;
@@ -596,6 +595,7 @@ fn add_weekdays(from: chrono::NaiveDate, n: i64) -> chrono::NaiveDate {
     d
 }
 
+/// Days between entry_date and today, tolerating both date and datetime strings.
 fn detail_days_held(entry_date: &str, today: &str) -> Option<i64> {
     let entry_str = entry_date.split('T').next().unwrap_or(entry_date);
     let today_str = today.split('T').next().unwrap_or(today);
