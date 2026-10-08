@@ -343,7 +343,7 @@
 								<span class="text-text-muted"> ({distPct(plan.live_trailing_stop, plan.current_price)})</span>
 								— closes ALL. High-water {fmt$(plan.high_water_mark ?? t.entry_price)} −
 								ATR {fmt$(plan.atr)} × {plan.atr_mult.toFixed(1)}
-								<span class="text-text-muted">(flat — does not tighten with age; long-term design)</span>
+								<span class="text-text-muted">(flat — does not tighten with age)</span>
 							</span>
 						</div>
 					{/if}
@@ -373,20 +373,27 @@
 						<span class="text-text-secondary leading-relaxed">
 							{#if plan.max_hold_date}
 								<span class="font-mono text-text">{plan.max_hold_date}</span>
-								— {plan.days_remaining} days remain, then closes ALL.
+								— {plan.days_remaining} trading day{plan.days_remaining === 1 ? '' : 's'} remain, then closes ALL.
 							{:else}
-								No hard time limit — long-term design. Held {plan.days_held} day{plan.days_held === 1 ? '' : 's'} so far;
-								only the stop, profit target, or signal decay ever close this position.
+								Unknown: the entry date couldn't be read. Held {plan.days_held} day{plan.days_held === 1 ? '' : 's'} so far.
 							{/if}
 						</span>
 					</div>
 					<div class="py-2.5 grid grid-cols-[9rem_1fr] gap-x-4">
 						<span class="text-text-muted font-medium">Signal decay</span>
 						<span class="text-text-secondary leading-relaxed">
+							{#if !plan.decay_applies}
+								Doesn't apply: only stock-picker (convergence) buys close when their score fades. This trade
+								exits on its stops, profit target or max hold.
+							{:else}
+							{#if plan.decay_wait_days > 0}
+								Off for the first week: can fire in {plan.decay_wait_days} more trading day{plan.decay_wait_days === 1 ? '' : 's'}.
+							{/if}
 							Closes ALL if the compound score falls below
 							<span class="font-mono text-text">{plan.decay_threshold.toFixed(2)}</span>
 							(30% of the {plan.decay_original_score.toFixed(2)} entry score, min 0.05).
-							Latest score: <span class="font-mono {plan.decay_triggered ? 'text-rose-400' : 'text-text'}">{plan.decay_current_score.toFixed(2)}</span>{plan.decay_triggered ? ' — below threshold, exit expected on the next run' : ''}.
+							Latest score: <span class="font-mono {plan.decay_triggered ? 'text-rose-400' : 'text-text'}">{plan.decay_current_score.toFixed(2)}</span>{plan.decay_triggered && plan.decay_wait_days === 0 ? ' — below threshold, exit expected on the next run' : ''}.
+							{/if}
 						</span>
 					</div>
 				</div>

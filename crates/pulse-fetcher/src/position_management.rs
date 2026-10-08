@@ -45,8 +45,8 @@ use rusqlite::Connection;
 
 // Position management: ATR-based trailing stops, profit targets, signal decay.
 //
-// Long-term design (2026-07-23): no calendar-based max hold — a position is
-// held indefinitely until a stop, target, or signal decay closes it. The
+// Every trade also has a maximum hold by signal type (2026-10-08,
+// `event_signals::max_hold_days`, enforced in pipeline/trading.rs). The
 // trailing stop is flat (does not tighten with age) so short-term volatility
 // doesn't shake out a long-term thesis.
 // - Trailing stop at 3x ATR below high-water mark (flat, no time-based tightening)
@@ -138,7 +138,7 @@ pub fn compute_atr(conn: &Connection, ticker: &str, period: usize) -> f64 {
 
 /// Evaluate an open position and decide what to do.
 ///
-/// Long-term design — no calendar-based expiry. Returns a `PositionAction`
+/// The max hold is applied by the caller. Returns a `PositionAction`
 /// based on:
 /// - ATR-based trailing stop, flat 3x ATR regardless of how long it's been held
 /// - Profit target at 3x ATR
@@ -166,8 +166,7 @@ pub fn evaluate_position(
     // Compute ATR for this ticker
     let atr = compute_atr(conn, ticker, 14);
     if atr <= 0.0 {
-        // No ATR data — fall back to fixed stop-loss. No time-based fallback
-        // expiry anymore (long-term design has no calendar-based max hold).
+        // No ATR data — fall back to fixed stop-loss (the max hold is the caller's).
         if pnl_pct <= -10.0 {
             return PositionAction::CloseAll {
                 reason: format!("fixed_stop_loss ({:.1}%, no ATR data)", pnl_pct),
@@ -375,6 +374,19 @@ pub fn broker_cover_stop_level(conn: &Connection, trade_id: i64, ticker: &str, e
 /// current signal, and the old query had no bound at all: it would happily
 /// return a reading from months earlier as "current".
 const SIGNAL_STALE_AFTER_DAYS: i64 = 3;
+
+/// Trading days a trade is held before signal decay may close it. Of 20
+/// decay exits up to 2026-10-08, 6 came within a week of the buy, on the
+/// day-to-day noise of a score that had just crossed the line; the scorecard
+/// measures signals over 10 days, so a week is the least a thesis gets.
+pub const DECAY_MIN_HELD_DAYS: i64 = 5;
+
+/// Whether signal decay may close this trade now. Only convergence longs
+/// have a compound score to decay from; event trades end on their maximum
+/// hold instead.
+pub fn decay_allowed(trigger: &str, short: bool, held_days: i64) -> bool {
+    trigger == "convergence" && !short && held_days >= DECAY_MIN_HELD_DAYS
+}
 
 /// The share of a normal day's signal output the recent window must reach before
 /// a missing reading may be believed.
@@ -756,8 +768,16 @@ mod tests {
 
 #[cfg(test)]
 mod signal_decay_tests {
-    use super::{check_signal_decay, pipeline_output_is_healthy, signal_has_decayed};
+    use super::{check_signal_decay, decay_allowed, pipeline_output_is_healthy, signal_has_decayed, DECAY_MIN_HELD_DAYS};
     use rusqlite::Connection;
+
+    #[test]
+    fn decay_waits_a_week_and_only_applies_to_convergence_longs() {
+        assert!(!decay_allowed("convergence", false, DECAY_MIN_HELD_DAYS - 1));
+        assert!(decay_allowed("convergence", false, DECAY_MIN_HELD_DAYS));
+        assert!(!decay_allowed("news_surprise", false, 30));
+        assert!(!decay_allowed("convergence", true, 30));
+    }
 
     const ORIG: f64 = 0.3408; // AIRI's stored entry score; threshold is 0.1022
 

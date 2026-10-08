@@ -39,13 +39,18 @@ pub const SIZING_SCORE: f64 = 0.30;
 pub const NEWS_SURPRISE: &str = "news_surprise";
 pub const INSIDER_CLUSTER: &str = "insider_cluster";
 
-/// Trading days an event trade is held at most. `None` for convergence
-/// trades, which exit on decay and stops.
+/// Trading days a convergence trade is held at most: the 90 calendar days
+/// the backtester's strategy has always assumed (`pulse-weights` strategy
+/// `max_hold_days`). Stops and decay usually end it well before; this only
+/// retires a position that drifted on with neither firing.
+pub const CONVERGENCE_MAX_HOLD: i64 = 60;
+
+/// Trading days a trade is held at most, by what opened it.
 pub fn max_hold_days(trigger: &str) -> Option<i64> {
     match trigger {
         NEWS_SURPRISE => Some(5),
         INSIDER_CLUSTER => Some(20),
-        _ => None,
+        _ => Some(CONVERGENCE_MAX_HOLD),
     }
 }
 
@@ -431,6 +436,6 @@ mod tests {
         assert_eq!(weekdays_between(d("2026-10-05"), d("2026-10-12")), 5);
         assert_eq!(weekdays_between(d("2026-10-05"), d("2026-10-05")), 0);
         assert_eq!(max_hold_days(NEWS_SURPRISE), Some(5));
-        assert_eq!(max_hold_days("convergence"), None);
+        assert_eq!(max_hold_days("convergence"), Some(CONVERGENCE_MAX_HOLD));
     }
 }
