@@ -302,6 +302,25 @@ pub(crate) fn resync_sold_shares(
     Ok(realized)
 }
 
+/// Re-anchor a trade's original score to the first one computed after
+/// `after` (migration 044). Returns the new anchor once there is one.
+pub(crate) fn rebase_original_score(conn: &rusqlite::Connection, trade_id: i64, ticker: &str, after: &str) -> Option<f64> {
+    let score: f64 = conn
+        .query_row(
+            "SELECT compound_score FROM cross_signals WHERE ticker = ?1 AND computed_at > ?2
+             ORDER BY computed_at LIMIT 1",
+            rusqlite::params![ticker, after],
+            |r| r.get(0),
+        )
+        .ok()?;
+    conn.execute(
+        "UPDATE paper_trades SET original_compound_score = ?1, score_rebase_after = NULL WHERE id = ?2",
+        rusqlite::params![score, trade_id],
+    )
+    .ok()?;
+    Some(score)
+}
+
 /// Whether broker sells account for the shares missing from the ledger, give
 /// or take a share's rounding.
 pub(crate) fn sells_explain_gap(sells: &[(f64, f64)], expected: f64, held: f64) -> bool {
@@ -1451,6 +1470,9 @@ struct OpenTrade {
     exit_order_reason: Option<String>,
     /// "half" or "full".
     exit_order_kind: Option<String>,
+    /// Set (migration 044) on trades scored under the old news formula until
+    /// their original score is re-anchored.
+    score_rebase_after: Option<String>,
 }
 
 fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTrade>> {
@@ -1459,7 +1481,7 @@ fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTra
                 COALESCE(original_compound_score, confidence, 0.30),
                 half_closed_at, position_size, order_status, alpaca_order_id,
                 stop_order_id, broker_stop_filled_at, filled_qty,
-                exit_order_id, exit_order_reason, exit_order_kind
+                exit_order_id, exit_order_reason, exit_order_kind, score_rebase_after
          FROM paper_trades WHERE status = 'open'",
     )?;
     let rows = stmt
@@ -1480,6 +1502,7 @@ fn load_open_trades(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<OpenTra
                 exit_order_id: row.get::<_, Option<String>>(12).unwrap_or(None),
                 exit_order_reason: row.get::<_, Option<String>>(13).unwrap_or(None),
                 exit_order_kind: row.get::<_, Option<String>>(14).unwrap_or(None),
+                score_rebase_after: row.get::<_, Option<String>>(15).unwrap_or(None),
             })
         })?
         .filter_map(|r| r.ok())
@@ -1967,7 +1990,20 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         } else {
             // Signal decay check first — cheapest, and a decayed thesis means
             // exit regardless of price action.
-            let decayed = crate::position_management::check_signal_decay(&conn, ticker, t.orig_score);
+            // A trade scored under the old formula first takes its anchor
+            // from the corrected one; decay waits until it has.
+            let rebased = match t.score_rebase_after.as_deref() {
+                None => true,
+                Some(after) => match rebase_original_score(&conn, t.id, ticker, after) {
+                    Some(s) => {
+                        tracing::info!("Position mgmt: {} original score re-anchored {:.2} -> {:.2}", ticker, t.orig_score, s);
+                        t.orig_score = s;
+                        false
+                    }
+                    None => false,
+                },
+            };
+            let decayed = rebased && crate::position_management::check_signal_decay(&conn, ticker, t.orig_score);
             let action = crate::position_management::evaluate_position(
                 &conn, t.id, ticker, *entry_price, current_price,
             );
@@ -2462,6 +2498,36 @@ mod ledger_tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::run_migrations(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn old_scores_wait_for_a_corrected_reading() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        conn.execute("UPDATE paper_trades SET original_compound_score = 0.40, score_rebase_after = '2026-10-08' WHERE id = ?1", [id]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO entities (id, name, name_normalized, entity_type, first_seen, last_seen) VALUES (1,'n','n','company','2026-01-01','2026-01-01');
+             INSERT INTO cross_signals (entity_id, ticker, compound_score, convergence_detected, computed_at) VALUES (1, 'NAVN', 0.05, 0, '2026-10-08');",
+        )
+        .unwrap();
+        assert_eq!(super::rebase_original_score(&conn, id, "NAVN", "2026-10-08"), None, "same-day rows may be old-formula");
+        conn.execute("INSERT INTO cross_signals (entity_id, ticker, compound_score, convergence_detected, computed_at) VALUES (1, 'NAVN', 0.06, 0, '2026-10-09')", []).unwrap();
+        assert_eq!(super::rebase_original_score(&conn, id, "NAVN", "2026-10-08"), Some(0.06));
+        let (orig, after): (f64, Option<String>) = conn
+            .query_row("SELECT original_compound_score, score_rebase_after FROM paper_trades WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((orig, after), (0.06, None));
+    }
+
+    #[test]
+    fn the_rebase_migration_marks_only_open_trades() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        // Rows inserted after the migration are new-formula trades: unmarked.
+        let id = insert(&conn, "filled");
+        let after: Option<String> =
+            conn.query_row("SELECT score_rebase_after FROM paper_trades WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(after, None);
     }
 
     fn insert(conn: &Connection, order_status: &str) -> i64 {
