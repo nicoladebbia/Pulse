@@ -555,6 +555,47 @@ fn compute_atr(conn: &rusqlite::Connection, ticker: &str, period: usize) -> f64 
 }
 
 /// Days between entry_date and today, tolerating both date and datetime strings.
+/// Trading-day limits, mirroring pulse-fetcher's `event_signals::max_hold_days`
+/// and `position_management::DECAY_MIN_HELD_DAYS`.
+const DECAY_MIN_HELD_DAYS: i64 = 5;
+
+fn max_hold_trading_days(trigger: &str) -> i64 {
+    match trigger {
+        "news_surprise" => 5,
+        "insider_cluster" => 20,
+        _ => 60,
+    }
+}
+
+/// Weekdays after `from` up to and including `to` (holidays ignored, as in the fetcher).
+fn weekdays_between(from: chrono::NaiveDate, to: chrono::NaiveDate) -> i64 {
+    use chrono::Datelike;
+    let mut d = from;
+    let mut n = 0;
+    while d < to {
+        d = d.succ_opt().unwrap_or(to);
+        if d.weekday().number_from_monday() <= 5 {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The weekday `n` trading days after `from`.
+fn add_weekdays(from: chrono::NaiveDate, n: i64) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let mut d = from;
+    let mut left = n;
+    while left > 0 {
+        let Some(next) = d.succ_opt() else { break };
+        d = next;
+        if d.weekday().number_from_monday() <= 5 {
+            left -= 1;
+        }
+    }
+    d
+}
+
 fn detail_days_held(entry_date: &str, today: &str) -> Option<i64> {
     let entry_str = entry_date.split('T').next().unwrap_or(entry_date);
     let today_str = today.split('T').next().unwrap_or(today);
@@ -599,6 +640,10 @@ pub struct TradeExitPlan {
     pub days_held: i64,
     pub max_hold_date: Option<String>,
     pub days_remaining: Option<i64>,
+    /// Signal decay can close this trade at all (convergence longs only).
+    pub decay_applies: bool,
+    /// Trading days left before signal decay may fire (0 once allowed).
+    pub decay_wait_days: i64,
     pub decay_original_score: f64,
     pub decay_current_score: f64,
     pub decay_threshold: f64,
@@ -795,9 +840,26 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
 
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let days = detail_days_held(&trade.entry_date, &today).unwrap_or(0);
+        // Mirrors the fetcher's exits (2026-10-08): every trade has a maximum
+        // hold in trading days by signal type, and signal decay applies only to
+        // convergence longs held at least DECAY_MIN_HELD_DAYS trading days.
+        let trigger: String = conn
+            .query_row(
+                "SELECT COALESCE(entry_trigger, 'convergence') FROM paper_trades WHERE id = ?1",
+                [trade_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "convergence".to_string());
+        let max_hold = max_hold_trading_days(&trigger);
+        let entry_day = chrono::NaiveDate::parse_from_str(trade.entry_date.get(..10).unwrap_or(""), "%Y-%m-%d").ok();
+        let today_day = chrono::Local::now().date_naive();
+        let held_trading = entry_day.map(|d| weekdays_between(d, today_day)).unwrap_or(0);
+        let max_hold_date = entry_day.map(|d| add_weekdays(d, max_hold).format("%Y-%m-%d").to_string());
+        let days_remaining = (max_hold - held_trading).max(0);
+        let decay_applies = trigger == "convergence" && trade.direction != "short";
+        let decay_wait_days = (DECAY_MIN_HELD_DAYS - held_trading).max(0);
         let atr = compute_atr(&conn, &trade.ticker, 14);
-        // Long-term design (2026-07-23): flat 3x ATR, no time-based tightening,
-        // no calendar-based max hold — mirrors position_management.rs.
+        // Flat 3x ATR, no time-based tightening — mirrors position_management.rs.
         let atr_mult = 3.0;
         // Mirror the engine: HWM is the max of the stored mark and the latest
         // price. A short (evaluate_short) keeps its low in the same column and
@@ -830,8 +892,10 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
             profit_target_price,
             half_closed_at,
             days_held: days,
-            max_hold_date: None,
-            days_remaining: None,
+            max_hold_date,
+            days_remaining: Some(days_remaining),
+            decay_applies,
+            decay_wait_days,
             decay_original_score: score,
             decay_current_score,
             decay_threshold,
@@ -1514,4 +1578,25 @@ pub fn get_learning_report(db: State<'_, DbState>, limit: Option<i64>) -> Result
         None => (None, false, None),
     };
     Ok(LearningReport { computed_at, weights_applied, report, reviews })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn the_max_hold_date_counts_trading_days_like_the_fetcher() {
+        // Thursday + 5 trading days = next Thursday; the weekend doesn't count.
+        let entry = day("2026-10-08");
+        assert_eq!(add_weekdays(entry, 5), day("2026-10-15"));
+        assert_eq!(weekdays_between(entry, day("2026-10-15")), 5);
+        assert_eq!(weekdays_between(entry, day("2026-10-11")), 1);
+        assert_eq!(max_hold_trading_days("news_surprise"), 5);
+        assert_eq!(max_hold_trading_days("insider_cluster"), 20);
+        assert_eq!(max_hold_trading_days("convergence"), 60);
+    }
 }

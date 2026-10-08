@@ -694,6 +694,8 @@ export interface TradeExitPlan {
 	days_held: number;
 	max_hold_date: string | null;
 	days_remaining: number | null;
+	decay_applies: boolean;
+	decay_wait_days: number;
 	decay_original_score: number;
 	decay_current_score: number;
 	decay_threshold: number;
