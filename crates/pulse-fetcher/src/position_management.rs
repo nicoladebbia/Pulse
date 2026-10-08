@@ -406,12 +406,13 @@ pub fn check_signal_decay(
 /// used to be guessed from the row status, so any profitable close read
 /// "profit target was reached", signal-decay exits included.
 pub(crate) fn describe_exit(reason: &str) -> String {
-    const KNOWN: [(&str, &str); 8] = [
+    const KNOWN: [(&str, &str); 9] = [
         ("trailing_stop", "the trailing stop was hit"),
         ("hard_stop", "the hard stop-loss was hit"),
         ("fixed_stop", "the fixed stop-loss was hit"),
         ("broker_stop", "the broker stop order sold it"),
         ("signal_decay", "the signal behind it faded"),
+        ("max_hold", "it reached the longest it is held for its signal type"),
         ("profit_target", "the profit target was reached"),
         ("closed_between_runs", "it was sold outside Pulse's own runs"),
         ("reconcile", "it was missing at the broker and was reconciled"),

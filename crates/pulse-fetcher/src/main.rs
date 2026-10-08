@@ -16,6 +16,7 @@ pub(crate) mod decisions;
 pub(crate) mod entry_filters;
 pub(crate) mod scorecard;
 pub(crate) mod learning;
+pub(crate) mod event_signals;
 pub(crate) mod position_sizing;
 pub(crate) mod edge_report;
 pub(crate) mod research;

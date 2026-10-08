@@ -58,6 +58,11 @@
 		no_cash: 'Skipped: no cash',
 	};
 
+	const EVENTS: Record<string, string> = {
+		news_surprise: 'News tone jump',
+		insider_cluster: 'Insider cluster buy',
+	};
+
 	const body = $derived(learning?.report ?? null);
 	const pts = (v: number | null | undefined) => (v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(1)}`);
 	const tone = (v: number | null | undefined) =>
@@ -147,6 +152,32 @@
 				</table>
 			</div>
 		</div>
+
+		{#if body.events && body.events.length > 0}
+			<div class="mb-4">
+				<div class="text-[11px] text-text-secondary font-medium mb-1.5">Event signals, over their holding period</div>
+				<table class="w-full text-[11px]">
+					<thead>
+						<tr class="text-text-muted text-left">
+							<th class="font-normal pb-1"></th>
+							<th class="font-normal pb-1 text-right">Signals</th>
+							<th class="font-normal pb-1 text-right" title="Average result vs SPY if every one had been traded (shorts counted as shorts)">If all traded</th>
+							<th class="font-normal pb-1 text-right">Bot trades</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each body.events as e}
+							<tr class="border-t border-border/40 {sure(e.t, e.signals) ? '' : 'opacity-60'}">
+								<td class="py-1 text-text-secondary">{EVENTS[e.kind] ?? e.kind} · {e.direction} · {e.hold_days}d</td>
+								<td class="py-1 text-right font-mono text-text-muted">{e.signals}</td>
+								<td class="py-1 text-right font-mono {tone(e.avg_excess)}">{pts(e.avg_excess)}</td>
+								<td class="py-1 text-right font-mono {tone(e.trade_avg_excess)}">{e.trades ? `${e.trades} · ${pts(e.trade_avg_excess)}` : '—'}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{/if}
 
 		{#if body.gates && body.gates.length > 0}
 			<div class="mb-4">
