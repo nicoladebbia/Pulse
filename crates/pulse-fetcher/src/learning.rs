@@ -579,9 +579,16 @@ pub fn exit_results(reviews: &[Review]) -> Vec<ExitResult> {
 /// One decision per ticker, day and outcome from `trade_decisions` since
 /// `since`: `(ticker, day, outcome, reason)`. Later runs of the same day
 /// repeat the first one's verdict and would count the signal twice.
+/// Marks a short candidate's decision reason (`load_decisions`).
+pub const SHORT_SUFFIX: &str = " (short)";
+
 pub fn load_decisions(conn: &Connection, since: &str) -> rusqlite::Result<Vec<(String, String, String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT ticker, substr(run_at, 1, 10), outcome, reason FROM trade_decisions
+        // A short candidate's reason carries SHORT_SUFFIX, so its filters are
+        // scored apart from the longs' and from the short's side.
+        "SELECT ticker, substr(run_at, 1, 10), outcome,
+                reason || CASE WHEN direction = 'short' THEN ' (short)' ELSE '' END
+         FROM trade_decisions
          WHERE id IN (SELECT MIN(id) FROM trade_decisions
                       WHERE ticker != '' AND outcome IN ('bought', 'skipped') AND run_at >= ?1
                       GROUP BY ticker, substr(run_at, 1, 10), outcome)
@@ -900,7 +907,9 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<Report> {
         .filter_map(|(ticker, day, outcome, reason)| {
             let (entry, exit, ret) = scorecard::forward(bars.get(ticker)?, day)?;
             let spy_ret = scorecard::spy_return(&spy, &entry, &exit)?;
-            Some((outcome.clone(), reason.clone(), (ret - spy_ret) * 100.0))
+            let x = (ret - spy_ret) * 100.0;
+            // From the candidate's side: a short gains when the stock lags.
+            Some((outcome.clone(), reason.clone(), if reason.ends_with(SHORT_SUFFIX) { -x } else { x }))
         })
         .collect();
     let event_rows: Vec<(String, String, String, f64)> = events
@@ -1265,12 +1274,19 @@ mod tests {
                  ('2026-09-01T10:00:00', 'BBB', 'skipped', 'too_thin');",
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO trade_decisions (run_at, ticker, outcome, reason, direction)
+             VALUES ('2026-10-03T10:00:00', 'CCC', 'skipped', 'not_shortable', 'short')",
+            [],
+        )
+        .unwrap();
         let d = load_decisions(&conn, "2026-09-15").unwrap();
         assert_eq!(
             d,
             vec![
                 ("AAA".into(), "2026-10-01".into(), "skipped".into(), "too_calm".into()),
                 ("AAA".into(), "2026-10-02".into(), "bought".into(), "bought".into()),
+                ("CCC".into(), "2026-10-03".into(), "skipped".into(), "not_shortable (short)".into()),
             ]
         );
     }

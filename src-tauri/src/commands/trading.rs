@@ -799,12 +799,19 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         // Long-term design (2026-07-23): flat 3x ATR, no time-based tightening,
         // no calendar-based max hold — mirrors position_management.rs.
         let atr_mult = 3.0;
-        // Mirror the engine: HWM is the max of the stored mark and the latest price.
-        let hwm_eff = high_water_mark
-            .unwrap_or(trade.entry_price)
-            .max(current_price.max(0.0));
-        let live_trailing_stop = if atr > 0.0 { Some(hwm_eff - atr * atr_mult) } else { None };
-        let profit_target_price = if atr > 0.0 { Some(trade.entry_price + atr * 3.0) } else { None };
+        // Mirror the engine: HWM is the max of the stored mark and the latest
+        // price. A short (evaluate_short) keeps its low in the same column and
+        // every level is mirrored above the price.
+        let short = trade.direction == "short";
+        let sign = if short { -1.0 } else { 1.0 };
+        let stored = high_water_mark.unwrap_or(trade.entry_price);
+        let hwm_eff = if short {
+            if current_price > 0.0 { stored.min(trade.entry_price).min(current_price) } else { stored.min(trade.entry_price) }
+        } else {
+            stored.max(current_price.max(0.0))
+        };
+        let live_trailing_stop = if atr > 0.0 { Some(hwm_eff - sign * atr * atr_mult) } else { None };
+        let profit_target_price = if atr > 0.0 { Some(trade.entry_price + sign * atr * 3.0) } else { None };
 
         let decay_current_score = current_signals.as_ref().map(|s| s.compound_score).unwrap_or(0.0);
         let decay_threshold = (score * 0.3).max(0.05);
@@ -812,8 +819,8 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         Some(TradeExitPlan {
             current_price,
             price_date,
-            hard_stop_price: trade.entry_price * 0.85,
-            fixed_stop_price: trade.entry_price * 0.90,
+            hard_stop_price: trade.entry_price * (1.0 - sign * 0.15),
+            fixed_stop_price: trade.entry_price * (1.0 - sign * 0.10),
             no_atr_fallback: atr <= 0.0,
             atr,
             atr_mult,
@@ -857,6 +864,8 @@ pub struct TradeRationale {
 /// Kept separate from the DB row so the async LLM call below never holds the lock.
 struct RationaleFacts {
     ticker: String,
+    /// "long" or "short".
+    direction: String,
     entity_name: Option<String>,
     entry_date: String,
     entry_price: f64,
@@ -921,6 +930,10 @@ fn parse_signal_profile_facts(profile_json: &str) -> SignalProfileFacts {
 fn build_rationale_prompt(f: &RationaleFacts) -> String {
     let mut lines = vec![
         format!("Ticker: {}", f.ticker),
+        format!(
+            "Direction: {}",
+            if f.direction == "short" { "short (sold short: it gains if the price falls)" } else { "long (bought)" }
+        ),
         format!("Entity: {}", f.entity_name.as_deref().unwrap_or(&f.ticker)),
         format!("Entry date: {}", f.entry_date.split('T').next().unwrap_or(&f.entry_date)),
         format!("Entry price: ${:.2}", f.entry_price),
@@ -976,14 +989,17 @@ pub async fn get_trade_rationale(
             }
         }
 
-        let (ticker, entity_id, entry_date, entry_price, position_size, status, pnl_pct, signal_profile): (
-            String, i64, String, f64, f64, String, Option<f64>, String,
+        // entity_id is NULL on event trades with no matched entity.
+        #[allow(clippy::type_complexity)]
+        let (ticker, entity_id, entry_date, entry_price, position_size, status, pnl_pct, signal_profile, direction): (
+            String, Option<i64>, String, f64, f64, String, Option<f64>, String, String,
         ) = conn
             .query_row(
-                "SELECT ticker, entity_id, entry_date, entry_price, position_size, status, pnl_pct, signal_profile
+                "SELECT ticker, entity_id, entry_date, entry_price, position_size, status, pnl_pct,
+                        COALESCE(signal_profile, '{}'), COALESCE(direction, 'long')
                  FROM paper_trades WHERE id = ?1",
                 [trade_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
             )
             .map_err(|_| format!("No trade with id {}", trade_id))?;
         let entity_name: Option<String> = conn
@@ -992,7 +1008,7 @@ pub async fn get_trade_rationale(
         let (signals, stories) = parse_signal_profile_facts(&signal_profile);
 
         RationaleFacts {
-            ticker, entity_name, entry_date, entry_price, position_size, status, pnl_pct, signals, stories,
+            ticker, direction, entity_name, entry_date, entry_price, position_size, status, pnl_pct, signals, stories,
         }
     };
     // Lock dropped above — safe to await from here.
@@ -1029,7 +1045,7 @@ async fn call_haiku_for_rationale(api_key: &str, facts: &str) -> Result<String, 
         person reviewing their own portfolio. Write 3-4 plain-English sentences: \
         (1) why THIS trade fired — the specific signal categories and their strength; \
         (2) the algorithmic thesis — why the system treats that signal combination as \
-        bullish in general (e.g. lobbying/political activity and government contract \
+        bullish in general (bearish if the facts say the trade is a short) (e.g. lobbying/political activity and government contract \
         signals are treated as leading indicators of future revenue for a small-cap; \
         news momentum signals attention/flow). Use ONLY the facts given — never invent \
         news, catalysts, financials, or company details not listed, and never claim this \

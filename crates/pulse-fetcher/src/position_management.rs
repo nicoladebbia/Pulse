@@ -583,10 +583,13 @@ pub fn generate_trade_journal(
 
     let exit_reason = describe_exit(exit_reason);
 
+    let direction: String = conn
+        .query_row("SELECT COALESCE(direction, 'long') FROM paper_trades WHERE id = ?1", [trade_id], |r| r.get(0))
+        .unwrap_or_else(|_| "long".to_string());
     let journal = format!(
-        "Entered {} long on {} at ${:.2} driven by {}. Position size: ${:.0}. \
+        "Entered {} {} on {} at ${:.2} driven by {}. Position size: ${:.0}. \
          Exited after {} days at ${:.2} — {}{:.1}% (${}{:.0}) because {}.",
-        name, entry_date, entry_price, drivers, position_size,
+        name, direction, entry_date, entry_price, drivers, position_size,
         holding_days, exit_price,
         if pnl_pct >= 0.0 { "+" } else { "" }, pnl_pct,
         if pnl_dollars >= 0.0 { "+" } else { "" }, pnl_dollars,

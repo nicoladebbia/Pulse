@@ -40,6 +40,9 @@ pub struct ClosedTrade {
     pub entry_price: f64,
     pub exit_price: f64,
     pub pnl_pct: f64,
+    /// Sold short: every figure is read from the position's side, so a
+    /// falling price is a gain.
+    pub short: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -132,16 +135,18 @@ pub fn review_trade(t: &ClosedTrade, bars: &[Bar]) -> TradeReview {
         .iter()
         .filter(|b| b.0.as_str() >= entry_day && b.0.as_str() <= exit_day)
         .collect();
-    let max_gain_pct = during
-        .iter()
-        .map(|b| b.2)
-        .fold(None, |m: Option<f64>, h| Some(m.map_or(h, |m| m.max(h))))
-        .map(|h| pct(t.entry_price, h));
-    let max_loss_pct = during
-        .iter()
-        .map(|b| b.3)
-        .fold(None, |m: Option<f64>, l| Some(m.map_or(l, |m| m.min(l))))
-        .map(|l| pct(t.entry_price, l));
+    let sign = if t.short { -1.0 } else { 1.0 };
+    fn highest(bs: &[&Bar]) -> Option<f64> {
+        bs.iter().map(|b| b.2).fold(None, |m: Option<f64>, h| Some(m.map_or(h, |m| m.max(h))))
+    }
+    fn lowest(bs: &[&Bar]) -> Option<f64> {
+        bs.iter().map(|b| b.3).fold(None, |m: Option<f64>, l| Some(m.map_or(l, |m| m.min(l))))
+    }
+    // The best and worst prices for the position: highs and lows, swapped for a short.
+    type Pick = fn(&[&Bar]) -> Option<f64>;
+    let (best, worst): (Pick, Pick) = if t.short { (lowest, highest) } else { (highest, lowest) };
+    let max_gain_pct = best(&during).map(|p| sign * pct(t.entry_price, p));
+    let max_loss_pct = worst(&during).map(|p| sign * pct(t.entry_price, p));
     let gave_back_pct = max_gain_pct.map(|g| (g - t.pnl_pct).max(0.0));
 
     let after: Vec<&Bar> = bars
@@ -149,20 +154,14 @@ pub fn review_trade(t: &ClosedTrade, bars: &[Bar]) -> TradeReview {
         .filter(|b| b.0.as_str() > exit_day)
         .take(HORIZON_DAYS)
         .collect();
-    let after_n = |n: usize| after.get(n - 1).map(|b| pct(t.exit_price, b.1));
-    let best_after_pct = after
-        .iter()
-        .map(|b| b.2)
-        .fold(None, |m: Option<f64>, h| Some(m.map_or(h, |m| m.max(h))))
-        .map(|h| pct(t.exit_price, h));
-    let worst_after_pct = after
-        .iter()
-        .map(|b| b.3)
-        .fold(None, |m: Option<f64>, l| Some(m.map_or(l, |m| m.min(l))))
-        .map(|l| pct(t.exit_price, l));
+    let after_n = |n: usize| after.get(n - 1).map(|b| sign * pct(t.exit_price, b.1));
+    let best_after_pct = best(&after).map(|p| sign * pct(t.exit_price, p));
+    let worst_after_pct = worst(&after).map(|p| sign * pct(t.exit_price, p));
 
-    let stop = t.entry_price * (1.0 - HELD_STOP_PCT);
-    let target = t.entry_price * (1.0 + HELD_TARGET_PCT);
+    let stop = t.entry_price * (1.0 - sign * HELD_STOP_PCT);
+    let target = t.entry_price * (1.0 + sign * HELD_TARGET_PCT);
+    let stop_hit = |b: &Bar| if t.short { b.2 >= stop } else { b.3 <= stop };
+    let target_hit = |b: &Bar| if t.short { b.3 <= target } else { b.2 >= target };
     let if_held = if after.is_empty() {
         if bars.is_empty() { "no_data" } else { "pending" }
     } else {
@@ -171,9 +170,9 @@ pub fn review_trade(t: &ClosedTrade, bars: &[Bar]) -> TradeReview {
         after
             .iter()
             .find_map(|b| {
-                if b.3 <= stop {
+                if stop_hit(b) {
                     Some("stop_first")
-                } else if b.2 >= target {
+                } else if target_hit(b) {
                     Some("target_first")
                 } else {
                     None
@@ -248,7 +247,7 @@ fn load_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, ticker, status, exit_reason, entry_date, exit_date,
-                    entry_price, exit_price, pnl_pct
+                    entry_price, exit_price, pnl_pct, COALESCE(direction, 'long') = 'short'
              FROM paper_trades
              WHERE status IN ('closed', 'stopped_out')
                AND exit_price IS NOT NULL AND exit_price > 0
@@ -269,6 +268,7 @@ fn load_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
                 entry_price: row.get(6)?,
                 exit_price: row.get(7)?,
                 pnl_pct: row.get(8)?,
+                short: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -355,6 +355,7 @@ mod tests {
             entry_price: entry,
             exit_price: exit,
             pnl_pct: pct(entry, exit),
+            short: false,
         }
     }
 
@@ -381,6 +382,23 @@ mod tests {
         assert!(close(r.max_gain_pct, 13.0));
         assert!(close(r.max_loss_pct, -1.0));
         assert!(close(r.gave_back_pct, 9.0), "13% seen, 4% kept");
+    }
+
+    #[test]
+    fn a_short_is_reviewed_from_its_own_side() {
+        // Shorted at 100, fell to close 90 (low 89), covered at 95, then rallied.
+        let mut b = bars(0, &[100.0, 90.0, 95.0]);
+        b.extend(bars(3, &[100.0, 108.0, 116.0]));
+        let mut t = trade(None, 100.0, 95.0, 2);
+        t.short = true;
+        t.pnl_pct = 5.0;
+        let r = review_trade(&t, &b);
+        assert!(close(r.max_gain_pct, 11.0), "{:?}", r.max_gain_pct);
+        assert!(close(r.max_loss_pct, -1.0), "{:?}", r.max_loss_pct);
+        assert!(close(r.gave_back_pct, 6.0));
+        // The rally after the cover is a loss from the short's side.
+        assert!(r.worst_after_pct.unwrap() < -20.0);
+        assert_eq!(r.if_held, "stop_first", "116 + 1 crosses the +15% stop at 115");
     }
 
     /// Stopped out at 90, then the price recovered: holding was better, and it
@@ -474,7 +492,8 @@ mod tests {
                  (2, 'A', 'expired', 'merged_into_1', '2026-09-01', '2026-09-01', 100, NULL, NULL),
                  (3, 'A', 'open', NULL, '2026-09-10', NULL, 100, NULL, 1),
                  (4, 'B', 'stopped_out', NULL, '2026-09-01', '2026-09-03', 50, 45, -10);
-             INSERT INTO entity_prices VALUES ('A', '2026-09-01', 100, NULL, NULL);",
+             INSERT INTO entity_prices VALUES ('A', '2026-09-01', 100, NULL, NULL);
+             ALTER TABLE paper_trades ADD COLUMN direction TEXT;",
         )
         .unwrap();
         let review = compute_exit_review(&conn).unwrap();

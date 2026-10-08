@@ -576,18 +576,22 @@ async fn open_book_risk(
     let mut total = 0.0;
     for pos in &positions {
         let symbol = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-        let stop: Option<f64> = conn
+        let (stop, entry): (Option<f64>, Option<f64>) = conn
             .query_row(
-                "SELECT trailing_stop FROM paper_trades
+                "SELECT trailing_stop, entry_price FROM paper_trades
                  WHERE ticker = ?1 AND status = 'open' ORDER BY id DESC LIMIT 1",
                 [symbol],
-                |row| row.get::<_, Option<f64>>(0),
+                |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?)),
             )
-            .ok()
-            .flatten();
+            .unwrap_or((None, None));
         let (qty, price) = (order_num(pos, "qty"), order_num(pos, "current_price"));
         total += if qty < 0.0 {
-            // A short loses as the price rises to its buy stop.
+            // A short loses as the price rises to its buy stop, which the
+            // +15% hard stop caps.
+            let stop = match (stop, entry) {
+                (Some(s), Some(e)) if e > 0.0 => Some(s.min(e * 1.15)),
+                (s, _) => s,
+            };
             match stop {
                 Some(s) if s > 0.0 && s.is_finite() && price > 0.0 => -qty * (s - price).max(0.0),
                 _ => -qty * price * params.max_stop_pct,
@@ -963,6 +967,8 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     if regime < 1.0 {
         tracing::info!("Auto-trade: SPY below its 50-day average — new buys at {:.0}% size", regime * 100.0);
     }
+    // A falling market is the wind at a short's back, not a reason to shrink it.
+    let regime_for = |short: bool| if short { 1.0 } else { regime };
     if finnhub_key.is_empty() {
         tracing::warn!("Auto-trade: no FINNHUB_API_KEY — sector cap and earnings blackout are OFF");
     }
@@ -993,6 +999,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let Candidate {
             entity_id, ticker, score, name, insider, inst, news, gov, search, patent, supply, political, insider_raw, ..
         } = c;
+        log.direction(c.short);
         // Insider selling backs a short; it only vetoes buys.
         if !c.short && *insider_raw < INSIDER_VETO_THRESHOLD {
             tracing::info!(
@@ -1090,7 +1097,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             buying_power,
             sizing_score,
         ) {
-            Some(n) => n * regime * c.size,
+            Some(n) => n * regime_for(c.short) * c.size,
             None => {
                 tracing::info!("Auto-trade: skipping {} — buying power below entry floor", ticker);
                 log.skip(ticker, name, *score, "no_cash", "Not enough buying power");
@@ -1151,7 +1158,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let mut sized_risk = None;
         let notional = match risk_book.as_ref() {
             None => notional,
-            Some(rb) => match rb.size(&conn, ticker, existing_exposure, regime * c.size) {
+            Some(rb) => match rb.size(&conn, ticker, existing_exposure, regime_for(c.short) * c.size) {
                 Some(s) => {
                     tracing::info!(
                         "Auto-trade: {} ({}) risk-sized ${:.0} — risks ${:.0} to a {:.1}% stop",
@@ -2314,6 +2321,10 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                         // Already took profit on half — don't keep peeling. Hold the rest.
                         tracing::info!("Position mgmt: {} CloseHalf suppressed (already half-closed)", ticker);
                         (0.0, String::new())
+                    } else if t.short {
+                        // Alpaca has no fractional shorts: cover whole shares.
+                        let half = (held_qty / 2.0).floor();
+                        if half >= 1.0 { (half, reason) } else { (0.0, String::new()) }
                     } else {
                         (held_qty / 2.0, reason)
                     }
