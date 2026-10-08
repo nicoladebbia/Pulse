@@ -690,9 +690,7 @@ pub async fn check_ticker_universe_eligibility(
         );
     }
 
-    // Without a market cap (no Finnhub key, or its profile call failed) the
-    // Alpaca-only rule stands in, as it does for a missing key.
-    let eligible = if finnhub_key.is_empty() || !finnhub_profile_ok {
+    let eligible = if finnhub_key.is_empty() {
         eligible_without_market_cap(last_price, alpaca_tradable, &alpaca_status, &alpaca_exchange, alpaca_marginable)
     } else {
         market_cap.map(|m| m >= MIN_MARKET_CAP_MILLIONS).unwrap_or(false)
