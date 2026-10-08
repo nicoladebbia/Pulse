@@ -12,6 +12,8 @@ const KEEP_DAYS: i64 = 180;
 pub struct DecisionLog<'a> {
     conn: &'a Connection,
     run_at: String,
+    /// Which way the candidate being logged points ("long" or "short").
+    direction: std::cell::Cell<&'static str>,
 }
 
 impl<'a> DecisionLog<'a> {
@@ -23,14 +25,19 @@ impl<'a> DecisionLog<'a> {
         )
         .ok();
         let run_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        Self { conn, run_at }
+        Self { conn, run_at, direction: std::cell::Cell::new("long") }
+    }
+
+    /// Rows written from now on are for a short (or long) candidate.
+    pub fn direction(&self, short: bool) {
+        self.direction.set(if short { "short" } else { "long" });
     }
 
     fn write(&self, ticker: &str, name: &str, score: Option<f64>, outcome: &str, reason: &str, detail: &str) {
         if let Err(e) = self.conn.execute(
-            "INSERT INTO trade_decisions (run_at, ticker, name, score, outcome, reason, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![self.run_at, ticker, name, score, outcome, reason, detail],
+            "INSERT INTO trade_decisions (run_at, ticker, name, score, outcome, reason, detail, direction)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![self.run_at, ticker, name, score, outcome, reason, detail, self.direction.get()],
         ) {
             tracing::debug!("trade_decisions write failed: {}", e);
         }
@@ -62,6 +69,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../../../migrations/040_signals_page.sql").split("ALTER TABLE").next().unwrap())
             .unwrap();
+        conn.execute_batch(include_str!("../../../migrations/046_decision_direction.sql")).unwrap();
         conn
     }
 
@@ -75,8 +83,18 @@ mod tests {
         .unwrap();
         let log = DecisionLog::start(&conn);
         log.skip("AAA", "Aaa Inc", 0.4, "earnings", "reports Thursday");
+        log.direction(true);
         log.bought("BBB", "Bbb Inc", 0.5, "10 shares");
+        log.direction(false);
         log.stopped("max_positions", "40 open");
+        let dirs: Vec<String> = conn
+            .prepare("SELECT direction FROM trade_decisions ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(dirs, vec!["long", "short", "long"]);
         let rows: Vec<(String, String, String)> = conn
             .prepare("SELECT run_at, ticker, reason FROM trade_decisions ORDER BY id")
             .unwrap()

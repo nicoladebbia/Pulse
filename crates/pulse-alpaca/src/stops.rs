@@ -9,6 +9,9 @@
 //!   state before selling — and a stop can fill while the cancel is in flight.
 //! - `PATCH /orders/{id}` replaces an order under a new id, but is refused
 //!   while the order is `accepted` or `pending_*`; cancel + new is the fallback.
+//!
+//! A long is protected by a sell stop below the price, a short by a buy stop
+//! above it (`Side`). The plain functions are the long side.
 
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -18,6 +21,27 @@ use crate::{Credentials, PAPER_URL};
 /// `client_order_id` prefix of every stop Pulse places. Anything else open on
 /// the account is left alone.
 pub const STOP_ID_PREFIX: &str = "pulse-stop-";
+
+/// Which way a stop trades: `Sell` protects a long, `Buy` covers a short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Sell,
+    Buy,
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Sell => "sell",
+            Side::Buy => "buy",
+        }
+    }
+
+    /// The stop side that protects a position of this direction.
+    pub fn protecting(short: bool) -> Self {
+        if short { Side::Buy } else { Side::Sell }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StopOrder {
@@ -70,12 +94,21 @@ pub fn parse_order(v: &Value) -> Option<StopOrder> {
 /// A stop price Alpaca accepts, rounded DOWN so rounding never lifts the stop
 /// into the market: cents at $1 and above, four decimals below.
 pub fn round_stop_price(p: f64) -> f64 {
+    round_stop_price_for(Side::Sell, p)
+}
+
+/// A valid stop price, rounded away from the market: down for a sell stop,
+/// up for a buy stop.
+pub fn round_stop_price_for(side: Side, p: f64) -> f64 {
     if !p.is_finite() || p <= 0.0 {
         return 0.0;
     }
     let scale = if p >= 1.0 { 100.0 } else { 10_000.0 };
     // The epsilon keeps 12.34 (stored as 12.3399999…) from flooring to 12.33.
-    ((p * scale) + 1e-6).floor() / scale
+    match side {
+        Side::Sell => ((p * scale) + 1e-6).floor() / scale,
+        Side::Buy => ((p * scale) - 1e-6).ceil() / scale,
+    }
 }
 
 /// What to do with a position's broker stop.
@@ -95,8 +128,15 @@ pub enum StopPlan {
 /// wanted stop of `want_price`. A stop is never lowered: if the wanted price
 /// is below the live one, the live price is kept.
 pub fn plan_stop(live: Option<&StopOrder>, held_qty: f64, want_price: f64) -> StopPlan {
+    plan_stop_for(Side::Sell, live, held_qty, want_price)
+}
+
+/// `plan_stop` for either side. `held_qty` is the share count (positive for a
+/// short too). A stop only ever moves toward the market: a sell stop up, a
+/// buy stop down.
+pub fn plan_stop_for(side: Side, live: Option<&StopOrder>, held_qty: f64, want_price: f64) -> StopPlan {
     let qty = if held_qty.is_finite() && held_qty > 0.0 { (held_qty + 1e-9).floor() as u64 } else { 0 };
-    let want = round_stop_price(want_price);
+    let want = round_stop_price_for(side, want_price);
     let live = live.filter(|o| !o.is_final());
     if qty == 0 || want <= 0.0 {
         return if live.is_some() && qty == 0 { StopPlan::Cancel } else { StopPlan::Keep };
@@ -104,9 +144,12 @@ pub fn plan_stop(live: Option<&StopOrder>, held_qty: f64, want_price: f64) -> St
     match live {
         None => StopPlan::Place { qty, stop_price: want },
         Some(o) => {
-            let price = want.max(o.stop_price);
+            let price = match side {
+                Side::Sell => want.max(o.stop_price),
+                Side::Buy => want.min(o.stop_price),
+            };
             let same_qty = (o.qty - qty as f64).abs() < 1e-9;
-            if same_qty && price <= o.stop_price + 1e-9 {
+            if same_qty && (price - o.stop_price).abs() <= 1e-9 {
                 StopPlan::Keep
             } else {
                 StopPlan::Replace { qty, stop_price: price }
@@ -144,9 +187,14 @@ pub async fn get_order(client: &reqwest::Client, creds: &Credentials, id: &str) 
 
 /// Pulse's open stop orders for a symbol.
 pub async fn open_stops(client: &reqwest::Client, creds: &Credentials, symbol: &str) -> Result<Vec<StopOrder>, String> {
+    open_stops_for(Side::Sell, client, creds, symbol).await
+}
+
+/// Pulse's open stop orders on one side for a symbol.
+pub async fn open_stops_for(side: Side, client: &reqwest::Client, creds: &Credentials, symbol: &str) -> Result<Vec<StopOrder>, String> {
     let resp = creds
         .auth(client.get(format!("{PAPER_URL}/orders")))
-        .query(&[("status", "open"), ("symbols", symbol), ("side", "sell"), ("limit", "100")])
+        .query(&[("status", "open"), ("symbols", symbol), ("side", side.as_str()), ("limit", "100")])
         .send()
         .await
         .map_err(|e| format!("open orders request failed: {e}"))?;
@@ -169,10 +217,23 @@ pub async fn place_stop(
     stop_price: f64,
     client_order_id: &str,
 ) -> Result<StopOrder, String> {
+    place_stop_for(Side::Sell, client, creds, symbol, qty, stop_price, client_order_id).await
+}
+
+/// Place a GTC stop on either side for whole shares.
+pub async fn place_stop_for(
+    side: Side,
+    client: &reqwest::Client,
+    creds: &Credentials,
+    symbol: &str,
+    qty: u64,
+    stop_price: f64,
+    client_order_id: &str,
+) -> Result<StopOrder, String> {
     let body = json!({
         "symbol": symbol,
         "qty": qty.to_string(),
-        "side": "sell",
+        "side": side.as_str(),
         "type": "stop",
         "time_in_force": "gtc",
         "stop_price": price_str(stop_price),
@@ -239,7 +300,18 @@ pub async fn clear_stops(
     symbol: &str,
     known: Option<&str>,
 ) -> Result<Vec<StopOrder>, String> {
-    let mut ids: Vec<String> = open_stops(client, creds, symbol).await?.into_iter().map(|o| o.id).collect();
+    clear_stops_for(Side::Sell, client, creds, symbol, known).await
+}
+
+/// `clear_stops` for either side.
+pub async fn clear_stops_for(
+    side: Side,
+    client: &reqwest::Client,
+    creds: &Credentials,
+    symbol: &str,
+    known: Option<&str>,
+) -> Result<Vec<StopOrder>, String> {
+    let mut ids: Vec<String> = open_stops_for(side, client, creds, symbol).await?.into_iter().map(|o| o.id).collect();
     if let Some(k) = known.filter(|k| !k.is_empty())
         && !ids.iter().any(|i| i == k)
     {
@@ -291,6 +363,18 @@ mod tests {
         assert_eq!(plan_stop(Some(&o), 25.2, 92.5), StopPlan::Replace { qty: 25, stop_price: 92.5 });
         // A size change keeps the higher live price even when a lower one is wanted.
         assert_eq!(plan_stop(Some(&o), 12.6, 85.0), StopPlan::Replace { qty: 12, stop_price: 90.0 });
+    }
+
+    #[test]
+    fn a_short_cover_stop_rounds_up_and_is_lowered_but_never_raised() {
+        assert_eq!(round_stop_price_for(Side::Buy, 12.341), 12.35);
+        assert_eq!(round_stop_price_for(Side::Buy, 12.34), 12.34);
+        assert_eq!(plan_stop_for(Side::Buy, None, 10.0, 55.001), StopPlan::Place { qty: 10, stop_price: 55.01 });
+        let o = live(10.0, 55.0);
+        assert_eq!(plan_stop_for(Side::Buy, Some(&o), 10.0, 57.0), StopPlan::Keep);
+        assert_eq!(plan_stop_for(Side::Buy, Some(&o), 10.0, 53.0), StopPlan::Replace { qty: 10, stop_price: 53.0 });
+        assert_eq!(plan_stop_for(Side::Buy, Some(&o), 6.0, 58.0), StopPlan::Replace { qty: 6, stop_price: 55.0 });
+        assert_eq!(Side::protecting(true), Side::Buy);
     }
 
     #[test]

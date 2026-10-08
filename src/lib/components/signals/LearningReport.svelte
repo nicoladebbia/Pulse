@@ -56,11 +56,20 @@
 		untracked_holding: 'Skipped: untracked holding',
 		open_order: 'Skipped: order already open',
 		no_cash: 'Skipped: no cash',
+		not_shortable: "Skipped: can't be shorted",
 	};
 
 	const EVENTS: Record<string, string> = {
 		news_surprise: 'News tone jump',
 		insider_cluster: 'Insider cluster buy',
+	};
+
+	/** Short candidates' reasons end in " (short)" and are scored from the short's side. */
+	const gateLabel = (outcome: string, reason: string) => {
+		const short = reason.endsWith(' (short)');
+		const base = short ? reason.slice(0, -' (short)'.length) : reason;
+		const label = GATES[base] ?? (outcome === 'bought' ? 'Bought' : `Skipped: ${base}`);
+		return short ? `${label} (short)` : label;
 	};
 
 	const body = $derived(learning?.report ?? null);
@@ -186,7 +195,7 @@
 					<tbody>
 						{#each body.gates as g}
 							<tr class="border-t border-border/40 {sure(g.t, g.signals) ? '' : 'opacity-60'}">
-								<td class="py-1 text-text-secondary">{GATES[g.reason] ?? (g.outcome === 'bought' ? 'Bought' : `Skipped: ${g.reason}`)}</td>
+								<td class="py-1 text-text-secondary">{gateLabel(g.outcome, g.reason)}</td>
 								<td class="py-1 text-right font-mono text-text-muted">{g.signals}</td>
 								<td class="py-1 text-right font-mono {tone(g.avg_excess)}">{pts(g.avg_excess)} vs S&amp;P</td>
 							</tr>

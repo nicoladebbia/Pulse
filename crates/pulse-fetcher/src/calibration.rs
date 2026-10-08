@@ -76,7 +76,7 @@ pub struct SignalAnalysis {
 async fn evaluate_open_positions(conn: &Connection, _today: &str) -> anyhow::Result<usize> {
     let open_trades: Vec<(i64, String, f64, String, f64, f64)> = {
         let mut stmt = conn.prepare(
-            "SELECT id, ticker, entry_price, entry_date, COALESCE(original_compound_score, confidence), position_size
+            "SELECT id, ticker, entry_price, COALESCE(direction, 'long'), COALESCE(original_compound_score, confidence), position_size
              FROM paper_trades WHERE status = 'open'"
         )?;
         stmt.query_map([], |row| {
@@ -105,7 +105,7 @@ async fn evaluate_open_positions(conn: &Connection, _today: &str) -> anyhow::Res
     // entity_prices — would fight Phase 13.6's writes from fresh Alpaca prices,
     // corrupting the exact stop 13.6 depends on. Raw P&L from last close only.
     let mut evaluated = 0;
-    for (trade_id, ticker, entry_price, _entry_date, _original_score, position_size) in &open_trades {
+    for (trade_id, ticker, entry_price, direction, _original_score, position_size) in &open_trades {
         let current_price: f64 = conn
             .query_row(
                 "SELECT close FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1",
@@ -118,7 +118,8 @@ async fn evaluate_open_positions(conn: &Connection, _today: &str) -> anyhow::Res
             continue;
         }
 
-        let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
+        let sign = if direction == "short" { -1.0 } else { 1.0 };
+        let pnl_pct = sign * ((current_price - entry_price) / entry_price) * 100.0;
         let pnl_dollars = pnl_pct / 100.0 * position_size;
 
         // On top of realized_pnl: a half-closed trade has already booked the
