@@ -214,13 +214,6 @@ pub fn store(conn: &Connection, today: &str, groups: &HashMap<(&'static str, Str
     Ok(groups.len())
 }
 
-/// `AAPL`, `BRK.B`: what Alpaca's multi-symbol bars endpoint accepts.
-pub fn plain_ticker(t: &str) -> bool {
-    let (base, class) = t.split_once('.').unwrap_or((t, ""));
-    (1..=5).contains(&base.len())
-        && base.bytes().all(|b| b.is_ascii_uppercase())
-        && (class.is_empty() || (class.len() == 1 && class.bytes().all(|b| b.is_ascii_uppercase())))
-}
 
 /// Fetch, compute and store. Returns the number of groups written.
 pub async fn run(db_path: &std::path::Path) -> anyhow::Result<usize> {
@@ -238,7 +231,7 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<usize> {
     let trades = load_trades(&conn)?;
     // Alpaca rejects the whole request over one odd symbol (ASB-PE, a
     // preferred share), so only plain tickers are asked for.
-    let mut symbols: Vec<String> = samples.iter().map(|s| s.ticker.clone()).filter(|t| plain_ticker(t)).collect();
+    let mut symbols: Vec<String> = samples.iter().map(|s| s.ticker.clone()).filter(|t| pulse_alpaca::plain_symbol(t)).collect();
     symbols.sort();
     symbols.dedup();
     symbols.push("SPY".into());
@@ -324,16 +317,6 @@ mod tests {
         assert!(near_miss.excess[0].abs() < 1e-9);
         assert_eq!(g[&("dimension", "insider".to_string())].trade_pnl, -50.0);
         assert_eq!(g[&("dimension", "all buy-grade".to_string())].trades, 2);
-    }
-
-    #[test]
-    fn only_plain_tickers_are_requested() {
-        for t in ["AAPL", "BRK.B", "F"] {
-            assert!(plain_ticker(t), "{t}");
-        }
-        for t in ["ASB-PE", "", "TOOLONG", "aapl", "BRK.BB", "X1"] {
-            assert!(!plain_ticker(t), "{t}");
-        }
     }
 
     #[test]

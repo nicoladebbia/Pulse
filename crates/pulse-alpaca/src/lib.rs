@@ -133,6 +133,16 @@ pub fn client(timeout: Duration) -> Result<reqwest::Client, String> {
 /// Latest prices for many symbols, a hundred per request. A failed chunk is
 /// skipped so one bad batch doesn't lose the rest; only when every chunk fails
 /// is it an error.
+/// `AAPL`, `BRK.B`: symbols Alpaca's multi-symbol endpoints accept. One
+/// symbol outside this (a preferred share like `ASB-PE`) fails the whole
+/// request with 400, so callers drop the rest before asking.
+pub fn plain_symbol(t: &str) -> bool {
+    let (base, class) = t.split_once('.').unwrap_or((t, ""));
+    (1..=5).contains(&base.len())
+        && base.bytes().all(|b| b.is_ascii_uppercase())
+        && (class.is_empty() || (class.len() == 1 && class.bytes().all(|b| b.is_ascii_uppercase())))
+}
+
 pub async fn snapshots(
     client: &reqwest::Client,
     creds: &Credentials,
@@ -140,6 +150,7 @@ pub async fn snapshots(
 ) -> Result<HashMap<String, Snapshot>, String> {
     let mut out = HashMap::new();
     let mut first_error = None;
+    let symbols: Vec<String> = symbols.iter().filter(|s| plain_symbol(s)).cloned().collect();
     for chunk in symbols.chunks(SNAPSHOT_CHUNK) {
         match snapshot_chunk(client, creds, chunk).await {
             Ok(map) => out.extend(map),
@@ -231,6 +242,7 @@ pub async fn daily_bars_multi(
 ) -> Result<std::collections::HashMap<String, Vec<DailyBar>>, String> {
     let end = (chrono::Utc::now() - chrono::Duration::minutes(16)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut out: std::collections::HashMap<String, Vec<DailyBar>> = std::collections::HashMap::new();
+    let symbols: Vec<String> = symbols.iter().filter(|s| plain_symbol(s)).cloned().collect();
     for chunk in symbols.chunks(100) {
         let joined = chunk.join(",");
         let mut page: Option<String> = None;
@@ -393,6 +405,16 @@ pub fn parse_stream(text: &str) -> StreamBatch {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_plain_symbols_are_requested() {
+        for t in ["AAPL", "BRK.B", "F"] {
+            assert!(plain_symbol(t), "{t}");
+        }
+        for t in ["ASB-PE", "", "TOOLONG", "aapl", "BRK.BB", "X1"] {
+            assert!(!plain_symbol(t), "{t}");
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
