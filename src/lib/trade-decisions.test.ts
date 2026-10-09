@@ -3,7 +3,7 @@ import { decisionLabel, groupRuns, skipCounts } from './trade-decisions';
 import type { TradeDecision } from '$lib/tauri/types';
 
 const d = (run_at: string, ticker: string, outcome: string, reason: string): TradeDecision => ({
-	run_at, ticker, name: null, score: 0.4, outcome, reason, detail: null,
+	run_at, ticker, name: null, score: 0.4, outcome, reason, detail: null, direction: 'long',
 });
 
 describe('trade decisions', () => {
@@ -32,5 +32,8 @@ describe('trade decisions', () => {
 	it('labels known reasons and humanizes unknown ones', () => {
 		expect(decisionLabel('sector_full')).toBe('Sector full');
 		expect(decisionLabel('some_new_reason')).toBe('some new reason');
+		expect(decisionLabel('bought', 'short')).toBe('Shorted');
+		expect(decisionLabel('preview', 'short')).toBe('Would short (preview)');
+		expect(decisionLabel('too_calm', 'short')).toBe('Too calm');
 	});
 });

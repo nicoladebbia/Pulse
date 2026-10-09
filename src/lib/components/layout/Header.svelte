@@ -2,19 +2,28 @@
 	import { currentBriefing, isLoading } from '$lib/stores/briefing';
 	import { isFetching, fetchProgress } from '$lib/stores/fetch';
 
-	const today = new Date().toLocaleDateString('en-US', {
-		weekday: 'long',
-		year: 'numeric',
-		month: 'long',
-		day: 'numeric'
+	// The app stays open for days: tick so the date and the briefing age keep up.
+	let now = $state(new Date());
+	$effect(() => {
+		const id = setInterval(() => (now = new Date()), 60_000);
+		return () => clearInterval(id);
 	});
 
+	const today = $derived(
+		now.toLocaleDateString('en-US', {
+			weekday: 'long',
+			year: 'numeric',
+			month: 'long',
+			day: 'numeric'
+		})
+	);
+
 	// Compute briefing age for staleness display
-	function getBriefingAge(): string | null {
+	function getBriefingAge(at: Date): string | null {
 		const createdAt = $currentBriefing?.briefing?.created_at;
 		if (!createdAt) return null;
 		const created = new Date(createdAt + 'Z');
-		const hours = Math.floor((Date.now() - created.getTime()) / (1000 * 60 * 60));
+		const hours = Math.floor((at.getTime() - created.getTime()) / (1000 * 60 * 60));
 		if (hours < 1) return null;
 		if (hours === 1) return '1h ago';
 		return `${hours}h ago`;
@@ -42,7 +51,7 @@
 				<span class="header-stage-label">{$fetchProgress?.stage_label ?? 'Fetching...'}</span>
 			</div>
 		{:else if $currentBriefing}
-			{@const age = getBriefingAge()}
+			{@const age = getBriefingAge(now)}
 			{#if age}
 				<div class="flex items-center gap-2 text-sm text-text-muted">
 					<div class="w-2 h-2 rounded-full bg-amber-400"></div>
