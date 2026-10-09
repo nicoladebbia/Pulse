@@ -566,6 +566,15 @@ fn max_hold_trading_days(trigger: &str) -> i64 {
     }
 }
 
+/// Stop distances by trigger, mirroring `position_management::ExitRules`:
+/// (ATR multiple, hard stop, stop without ATR, half closed at 3x ATR).
+fn exit_rules(trigger: &str) -> (f64, f64, f64, bool) {
+    match trigger {
+        "insider_director_buy" => (6.0, 0.30, 0.20, false),
+        _ => (3.0, 0.15, 0.10, true),
+    }
+}
+
 /// Weekdays after `from` up to and including `to` (holidays ignored, as in the fetcher).
 fn weekdays_between(from: chrono::NaiveDate, to: chrono::NaiveDate) -> i64 {
     use chrono::Datelike;
@@ -859,8 +868,8 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         let decay_applies = trigger == "convergence" && trade.direction != "short";
         let decay_wait_days = (DECAY_MIN_HELD_DAYS - held_trading).max(0);
         let atr = compute_atr(&conn, &trade.ticker, 14);
-        // Flat 3x ATR, no time-based tightening — mirrors position_management.rs.
-        let atr_mult = 3.0;
+        // Flat ATR multiple by trigger, no time-based tightening — mirrors position_management.rs.
+        let (atr_mult, hard_stop, fixed_stop, take_half) = exit_rules(&trigger);
         // Mirror the engine: HWM is the max of the stored mark and the latest
         // price. A short (evaluate_short) keeps its low in the same column and
         // every level is mirrored above the price.
@@ -873,7 +882,7 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
             stored.max(current_price.max(0.0))
         };
         let live_trailing_stop = if atr > 0.0 { Some(hwm_eff - sign * atr * atr_mult) } else { None };
-        let profit_target_price = if atr > 0.0 { Some(trade.entry_price + sign * atr * 3.0) } else { None };
+        let profit_target_price = if atr > 0.0 && take_half { Some(trade.entry_price + sign * atr * 3.0) } else { None };
 
         let decay_current_score = current_signals.as_ref().map(|s| s.compound_score).unwrap_or(0.0);
         let decay_threshold = (score * 0.3).max(0.05);
@@ -881,8 +890,8 @@ pub fn get_trade_detail(db: State<'_, DbState>, trade_id: i64) -> Result<TradeDe
         Some(TradeExitPlan {
             current_price,
             price_date,
-            hard_stop_price: trade.entry_price * (1.0 - sign * 0.15),
-            fixed_stop_price: trade.entry_price * (1.0 - sign * 0.10),
+            hard_stop_price: trade.entry_price * (1.0 - sign * hard_stop),
+            fixed_stop_price: trade.entry_price * (1.0 - sign * fixed_stop),
             no_atr_fallback: atr <= 0.0,
             atr,
             atr_mult,
@@ -1600,6 +1609,9 @@ mod tests {
         assert_eq!(weekdays_between(entry, day("2026-10-11")), 1);
         assert_eq!(max_hold_trading_days("news_surprise"), 5);
         assert_eq!(max_hold_trading_days("insider_cluster"), 20);
+        assert_eq!(max_hold_trading_days("insider_director_buy"), 60);
+        assert_eq!(exit_rules("insider_director_buy"), (6.0, 0.30, 0.20, false));
+        assert_eq!(exit_rules("convergence"), (3.0, 0.15, 0.10, true));
         assert_eq!(max_hold_trading_days("convergence"), 60);
     }
 }

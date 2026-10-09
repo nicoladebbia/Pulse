@@ -613,7 +613,7 @@ export interface LearningGate {
 }
 
 export interface LearningEvent {
-	kind: 'news_surprise' | 'insider_cluster' | string;
+	kind: 'news_surprise' | 'insider_cluster' | 'insider_director_buy' | string;
 	direction: 'long' | 'short' | string;
 	hold_days: number;
 	signals: number;

@@ -576,15 +576,24 @@ async fn open_book_risk(
     let mut total = 0.0;
     for pos in &positions {
         let symbol = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-        let (stop, entry): (Option<f64>, Option<f64>) = conn
+        let (stop, entry, trigger): (Option<f64>, Option<f64>, String) = conn
             .query_row(
-                "SELECT trailing_stop, entry_price FROM paper_trades
+                "SELECT trailing_stop, entry_price, COALESCE(entry_trigger, 'convergence') FROM paper_trades
                  WHERE ticker = ?1 AND status = 'open' ORDER BY id DESC LIMIT 1",
                 [symbol],
-                |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?)),
+                |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?, row.get(2)?)),
             )
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, "convergence".to_string()));
         let (qty, price) = (order_num(pos, "qty"), order_num(pos, "current_price"));
+        // No trailing stop yet: a wide-stop trade risks its own hard stop,
+        // not the standard 15%.
+        let rules = crate::position_management::ExitRules::for_trigger(&trigger);
+        let stop = match stop {
+            None if qty > 0.0 && rules != crate::position_management::ExitRules::STANDARD => {
+                Some(price * (1.0 - rules.hard_stop_pct / 100.0))
+            }
+            s => s,
+        };
         total += if qty < 0.0 {
             // A short loses as the price rises to its buy stop, which the
             // +15% hard stop caps.
@@ -1084,8 +1093,10 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
                     continue;
                 }
                 // The signal has only paid on stocks that move (see entry_filters).
+                // Director buys paid more on calm stocks, so they skip the floor.
+                let atr_floor = if c.trigger == crate::event_signals::INSIDER_DIRECTOR { 0.0 } else { ef::MIN_ATR_PCT };
                 match ef::atr_pct(&bars, ef::ATR_DAYS) {
-                    Some(v) if v >= ef::MIN_ATR_PCT => atr_frac = v,
+                    Some(v) if v >= atr_floor => atr_frac = v,
                     Some(v) => {
                         tracing::info!(
                             "Auto-trade: skipping {} ({}) — too calm (ATR {:.1}% of price, floor {:.0}%)",
@@ -1186,7 +1197,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let mut sized_risk = None;
         let notional = match risk_book.as_ref() {
             None => notional,
-            Some(rb) => match rb.size(&conn, ticker, existing_exposure, regime_for(c.short) * c.size) {
+            Some(rb) => match rb.size(&conn, ticker, existing_exposure, regime_for(c.short) * c.size, &crate::position_management::ExitRules::for_trigger(&c.trigger)) {
                 Some(s) => {
                     tracing::info!(
                         "Auto-trade: {} ({}) risk-sized ${:.0} — risks ${:.0} to a {:.1}% stop",
@@ -1545,7 +1556,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         let mut sized_risk = None;
         let scale_notional = match risk_book.as_ref() {
             None => scale_notional,
-            Some(rb) => match rb.size(&conn, ticker, scale_exposure, rb.params.scale_in_fraction) {
+            Some(rb) => match rb.size(&conn, ticker, scale_exposure, rb.params.scale_in_fraction, &crate::position_management::ExitRules::STANDARD) {
                 Some(s) => {
                     sized_risk = Some(s);
                     s.notional
@@ -1770,12 +1781,16 @@ impl OpenTrade {
         pulse_alpaca::stops::Side::protecting(self.short)
     }
 
+    fn exit_rules(&self) -> crate::position_management::ExitRules {
+        crate::position_management::ExitRules::for_trigger(&self.entry_trigger)
+    }
+
     /// The broker stop level wanted now.
     fn stop_level(&self, conn: &rusqlite::Connection) -> f64 {
         if self.short {
             crate::position_management::broker_cover_stop_level(conn, self.id, &self.ticker, self.entry_price)
         } else {
-            crate::position_management::broker_stop_level(conn, self.id, &self.ticker, self.entry_price)
+            crate::position_management::broker_stop_level(conn, self.id, &self.ticker, self.entry_price, &self.exit_rules())
         }
     }
 }
@@ -2336,7 +2351,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             let action = if t.short {
                 crate::position_management::evaluate_short(&conn, t.id, ticker, *entry_price, current_price)
             } else {
-                crate::position_management::evaluate_position(&conn, t.id, ticker, *entry_price, current_price)
+                crate::position_management::evaluate_position_with(&conn, t.id, ticker, *entry_price, current_price, &t.exit_rules())
             };
             // Decide final action: signal decay forces a full close (overrides Hold).
             match action {

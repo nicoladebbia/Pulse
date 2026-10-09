@@ -311,6 +311,8 @@ pub(crate) async fn enrich_form4_stories(db_path: &Path) -> anyhow::Result<usize
         let owner_name = extract_xml_value_simple(&xml, "rptOwnerName").unwrap_or_default();
         let is_officer = xml.contains("<isOfficer>1</isOfficer>") || xml.contains("<isOfficer>true</isOfficer>");
         let is_director = xml.contains("<isDirector>1</isDirector>") || xml.contains("<isDirector>true</isDirector>");
+        let is_ten_percent_owner =
+            xml.contains("<isTenPercentOwner>1</isTenPercentOwner>") || xml.contains("<isTenPercentOwner>true</isTenPercentOwner>");
         let officer_title = extract_xml_value_simple(&xml, "officerTitle").unwrap_or_default();
         let post_shares = extract_nested_val(&xml, "sharesOwnedFollowingTransaction").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
 
@@ -326,6 +328,7 @@ pub(crate) async fn enrich_form4_stories(db_path: &Path) -> anyhow::Result<usize
         updated["owner_name"] = serde_json::json!(owner_name);
         updated["is_officer"] = serde_json::json!(is_officer);
         updated["is_director"] = serde_json::json!(is_director);
+        updated["is_ten_percent_owner"] = serde_json::json!(is_ten_percent_owner);
         updated["officer_title"] = serde_json::json!(officer_title);
         updated["post_transaction_shares"] = serde_json::json!(post_shares);
         updated["trade_classification"] = serde_json::json!(classification);

@@ -240,6 +240,7 @@ async fn fetch_filing_type(
             metadata["total_value"] = serde_json::json!(f4.total_value);
             metadata["is_officer"] = serde_json::json!(f4.is_officer);
             metadata["is_director"] = serde_json::json!(f4.is_director);
+            metadata["is_ten_percent_owner"] = serde_json::json!(f4.is_ten_percent_owner);
             metadata["officer_title"] = serde_json::json!(f4.officer_title);
             metadata["owner_name"] = serde_json::json!(f4.owner_name);
             metadata["post_transaction_shares"] = serde_json::json!(f4.post_transaction_shares);
@@ -418,6 +419,7 @@ struct Form4Data {
     total_value: f64,
     is_officer: bool,
     is_director: bool,
+    is_ten_percent_owner: bool,
     officer_title: String,
     owner_name: String,
     post_transaction_shares: f64,
@@ -503,6 +505,8 @@ fn parse_form4_xml(xml: &str) -> anyhow::Result<Form4Data> {
         || xml.contains("<isOfficer>true</isOfficer>");
     let is_director = xml.contains("<isDirector>1</isDirector>")
         || xml.contains("<isDirector>true</isDirector>");
+    let is_ten_percent_owner = xml.contains("<isTenPercentOwner>1</isTenPercentOwner>")
+        || xml.contains("<isTenPercentOwner>true</isTenPercentOwner>");
     let officer_title = extract_xml_field(xml, "officerTitle")
         .unwrap_or_default();
 
@@ -543,6 +547,7 @@ fn parse_form4_xml(xml: &str) -> anyhow::Result<Form4Data> {
         total_value,
         is_officer,
         is_director,
+        is_ten_percent_owner,
         officer_title,
         owner_name,
         post_transaction_shares: post_shares,
