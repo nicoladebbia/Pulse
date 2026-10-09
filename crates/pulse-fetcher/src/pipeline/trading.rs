@@ -3231,7 +3231,7 @@ mod ledger_tests {
 
     #[test]
     fn entries_buy_whole_shares_within_the_budget() {
-        let t = test_short_candidate("hood");
+        let t = super::test_short_candidate("hood");
         assert!(t.short && t.trigger == "news_surprise" && t.ticker == "hood");
         assert_eq!(whole_shares(1_000.0, 30.0), Some((33, 990.0)));
         assert_eq!(whole_shares(1_000.0, 1_000.0), Some((1, 1_000.0)));
