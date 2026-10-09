@@ -235,11 +235,24 @@ impl RiskBook {
         ticker: &str,
         existing_exposure: f64,
         unit: f64,
+        rules: &crate::position_management::ExitRules,
     ) -> Option<pulse_weights::risk_sizing::Sized> {
         let (price, atr) = price_and_atr(conn, ticker);
         pulse_weights::risk_sizing::size_order(
-            &self.book, price, atr, existing_exposure, &self.edge, unit, &self.params,
+            &self.book, price, atr, existing_exposure, &self.edge, unit, &self.params_for(rules),
         )
+    }
+
+    /// The sizing params with a trade's own stop distances, so a wide-stop
+    /// trade risks the same as any other instead of a bigger loss.
+    fn params_for(&self, rules: &crate::position_management::ExitRules) -> pulse_weights::risk_sizing::RiskParams {
+        let mut p = self.params.clone();
+        if *rules != crate::position_management::ExitRules::STANDARD {
+            p.atr_mult = rules.atr_mult;
+            p.max_stop_pct = rules.hard_stop_pct / 100.0;
+            p.fallback_stop_pct = rules.fixed_stop_pct / 100.0;
+        }
+        p
     }
 
     pub fn commit(&mut self, sized: &pulse_weights::risk_sizing::Sized) {
@@ -519,11 +532,27 @@ mod risk_book_tests {
             edge: Default::default(),
         };
         // No prices on file: 10% fallback stop. $300 of heat left -> $3,000.
-        let s = rb.size(&conn, "NOPE", 0.0, 1.0).unwrap();
+        let s = rb.size(&conn, "NOPE", 0.0, 1.0, &crate::position_management::ExitRules::STANDARD).unwrap();
         assert!((s.notional - 3_000.0).abs() < 1e-6);
         rb.commit(&s);
         assert!((rb.book.open_risk - 10_000.0).abs() < 1e-6);
         assert!((rb.book.buying_power - 17_000.0).abs() < 1e-6);
-        assert!(rb.size(&conn, "NOPE", 0.0, 1.0).is_none(), "heat is spent");
+        assert!(rb.size(&conn, "NOPE", 0.0, 1.0, &crate::position_management::ExitRules::STANDARD).is_none(), "heat is spent");
+    }
+
+    #[test]
+    fn a_wide_stop_trade_gets_a_smaller_position_for_the_same_risk() {
+        let conn = db();
+        let rb = RiskBook {
+            params: pulse_weights::risk_sizing::RiskParams::default(),
+            book: pulse_weights::risk_sizing::Book {
+                equity: 100_000.0, buying_power: 50_000.0, drawdown: 0.0, open_risk: 9_700.0,
+            },
+            edge: Default::default(),
+        };
+        // $300 of heat left: a 10% fallback stop buys $3,000, a 20% one $1,500.
+        let loose = rb.size(&conn, "NOPE", 0.0, 1.0, &crate::position_management::ExitRules::LOOSE).unwrap();
+        assert!((loose.notional - 1_500.0).abs() < 1e-6);
+        assert!((loose.stop_pct - 0.20).abs() < 1e-9);
     }
 }

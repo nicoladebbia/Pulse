@@ -62,6 +62,7 @@
 	const EVENTS: Record<string, string> = {
 		news_surprise: 'News tone jump',
 		insider_cluster: 'Insider cluster buy',
+		insider_director_buy: 'Outside director buy',
 	};
 
 	/** Short candidates' reasons end in " (short)" and are scored from the short's side. */

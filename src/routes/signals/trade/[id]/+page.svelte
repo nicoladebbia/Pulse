@@ -317,7 +317,7 @@
 
 				{#if plan.no_atr_fallback}
 					<div class="mb-3 text-[11px] text-amber-400/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
-						No ATR price data for {t.ticker} — the engine falls back to a fixed −10% stop
+						No ATR price data for {t.ticker} — the engine falls back to a fixed −{Math.round(Math.abs(plan.fixed_stop_price / t.entry_price - 1) * 100)}% stop
 						({fmt$(plan.fixed_stop_price)}) instead of ATR-based levels.
 					</div>
 				{/if}
@@ -365,7 +365,7 @@
 						<span class="text-text-secondary leading-relaxed">
 							<span class="font-mono text-text">{fmt$(plan.hard_stop_price)}</span>
 							<span class="text-text-muted"> ({distPct(plan.hard_stop_price, plan.current_price)})</span>
-							— −15% safety net, closes ALL regardless of ATR.
+							— −{Math.round(Math.abs(plan.hard_stop_price / t.entry_price - 1) * 100)}% safety net, closes ALL regardless of ATR.
 						</span>
 					</div>
 					<div class="py-2.5 grid grid-cols-[9rem_1fr] gap-x-4">

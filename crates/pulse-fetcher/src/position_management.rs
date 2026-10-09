@@ -136,6 +136,32 @@ pub fn compute_atr(conn: &Connection, ticker: &str, period: usize) -> f64 {
     true_ranges.iter().sum::<f64>() / true_ranges.len() as f64
 }
 
+/// Stop distances for a long position. Most trades use `STANDARD`; insider
+/// director buys hold for months and only paid with a looser stop in the
+/// 2018-2026 backtest (`research/event-backtest`): a 3x ATR trail cut them
+/// to nothing, 6x ATR with a -30% floor kept the edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExitRules {
+    /// Trailing stop distance below the high-water mark, in ATRs.
+    pub atr_mult: f64,
+    /// Close everything at this loss (%), whatever the ATR.
+    pub hard_stop_pct: f64,
+    /// Stop without ATR data (%).
+    pub fixed_stop_pct: f64,
+    /// Close half at 3x ATR of profit.
+    pub take_half: bool,
+}
+
+impl ExitRules {
+    pub const STANDARD: ExitRules = ExitRules { atr_mult: 3.0, hard_stop_pct: 15.0, fixed_stop_pct: 10.0, take_half: true };
+    pub const LOOSE: ExitRules = ExitRules { atr_mult: 6.0, hard_stop_pct: 30.0, fixed_stop_pct: 20.0, take_half: false };
+
+    /// The rules for a trade's `entry_trigger`.
+    pub fn for_trigger(trigger: &str) -> ExitRules {
+        if trigger == crate::event_signals::INSIDER_DIRECTOR { ExitRules::LOOSE } else { ExitRules::STANDARD }
+    }
+}
+
 /// Evaluate an open position and decide what to do.
 ///
 /// The max hold is applied by the caller. Returns a `PositionAction`
@@ -143,6 +169,7 @@ pub fn compute_atr(conn: &Connection, ticker: &str, period: usize) -> f64 {
 /// - ATR-based trailing stop, flat 3x ATR regardless of how long it's been held
 /// - Profit target at 3x ATR
 /// - Hard stop-loss at -15% (safety net if ATR is too wide)
+#[cfg(test)]
 pub fn evaluate_position(
     conn: &Connection,
     trade_id: i64,
@@ -150,14 +177,26 @@ pub fn evaluate_position(
     entry_price: f64,
     current_price: f64,
 ) -> PositionAction {
+    evaluate_position_with(conn, trade_id, ticker, entry_price, current_price, &ExitRules::STANDARD)
+}
+
+/// `evaluate_position` with this trade's `ExitRules`.
+pub fn evaluate_position_with(
+    conn: &Connection,
+    trade_id: i64,
+    ticker: &str,
+    entry_price: f64,
+    current_price: f64,
+    rules: &ExitRules,
+) -> PositionAction {
     if current_price <= 0.0 || entry_price <= 0.0 {
         return PositionAction::Hold;
     }
 
     let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
 
-    // Hard stop-loss safety net at -15% (in case ATR is very wide)
-    if pnl_pct <= -15.0 {
+    // Hard stop-loss safety net (-15% standard, in case ATR is very wide)
+    if pnl_pct <= -rules.hard_stop_pct {
         return PositionAction::CloseAll {
             reason: format!("hard_stop_loss ({:.1}%)", pnl_pct),
         };
@@ -167,7 +206,7 @@ pub fn evaluate_position(
     let atr = compute_atr(conn, ticker, 14);
     if atr <= 0.0 {
         // No ATR data — fall back to fixed stop-loss (the max hold is the caller's).
-        if pnl_pct <= -10.0 {
+        if pnl_pct <= -rules.fixed_stop_pct {
             return PositionAction::CloseAll {
                 reason: format!("fixed_stop_loss ({:.1}%, no ATR data)", pnl_pct),
             };
@@ -199,7 +238,7 @@ pub fn evaluate_position(
 
     // Flat trailing stop — does not tighten with age (long-term design:
     // short-term volatility shouldn't shake out a long-term thesis).
-    let atr_mult = 3.0;
+    let atr_mult = rules.atr_mult;
     let trailing_stop = hwm - (atr * atr_mult);
 
     // Update trailing_stop in DB
@@ -224,7 +263,7 @@ pub fn evaluate_position(
 
     // Profit target: close half at 3x ATR from entry
     let profit_target = entry_price + (atr * 3.0);
-    if current_price >= profit_target && pnl_pct >= 10.0 {
+    if rules.take_half && current_price >= profit_target && pnl_pct >= 10.0 {
         return PositionAction::CloseHalf {
             reason: format!(
                 "profit_target ({:.1}%, target={:.2}, 3x ATR from entry)",
@@ -242,21 +281,27 @@ pub fn evaluate_position(
 ///
 /// With an ATR it is the trailing stop, `hwm - 3*ATR`, but never below the
 /// -15% hard stop. Without one it is the fixed -10% stop.
+#[cfg(test)]
 pub fn stop_level_from(entry_price: f64, high_water_mark: f64, atr: f64) -> f64 {
+    stop_level_from_with(entry_price, high_water_mark, atr, &ExitRules::STANDARD)
+}
+
+/// `stop_level_from` with this trade's `ExitRules`.
+pub fn stop_level_from_with(entry_price: f64, high_water_mark: f64, atr: f64, rules: &ExitRules) -> f64 {
     if entry_price.is_nan() || entry_price <= 0.0 {
         return 0.0;
     }
     if atr > 0.0 && atr.is_finite() {
         let hwm = if high_water_mark.is_finite() { high_water_mark.max(entry_price) } else { entry_price };
-        (hwm - atr * 3.0).max(entry_price * 0.85)
+        (hwm - atr * rules.atr_mult).max(entry_price * (1.0 - rules.hard_stop_pct / 100.0))
     } else {
-        entry_price * 0.90
+        entry_price * (1.0 - rules.fixed_stop_pct / 100.0)
     }
 }
 
 /// `stop_level_from` with this trade's stored high-water mark and current ATR.
 /// Call after `evaluate_position`, which moves the high-water mark.
-pub fn broker_stop_level(conn: &Connection, trade_id: i64, ticker: &str, entry_price: f64) -> f64 {
+pub fn broker_stop_level(conn: &Connection, trade_id: i64, ticker: &str, entry_price: f64, rules: &ExitRules) -> f64 {
     let hwm: f64 = conn
         .query_row(
             "SELECT COALESCE(high_water_mark, entry_price) FROM paper_trades WHERE id = ?1",
@@ -264,7 +309,7 @@ pub fn broker_stop_level(conn: &Connection, trade_id: i64, ticker: &str, entry_p
             |row| row.get(0),
         )
         .unwrap_or(entry_price);
-    stop_level_from(entry_price, hwm, compute_atr(conn, ticker, 14))
+    stop_level_from_with(entry_price, hwm, compute_atr(conn, ticker, 14), rules)
 }
 
 /// `evaluate_position` for a short: the mirror image. The best price is the
@@ -958,7 +1003,7 @@ mod signal_decay_tests {
 
 #[cfg(test)]
 mod state_write_tests {
-    use super::{classify_state_write, stop_level_from, StateWrite};
+    use super::{classify_state_write, stop_level_from, stop_level_from_with, ExitRules, StateWrite};
 
     #[test]
     fn an_error_is_a_failure_not_a_success() {
@@ -989,6 +1034,13 @@ mod state_write_tests {
         assert!((stop_level_from(100.0, f64::NAN, 2.0) - 94.0).abs() < 1e-9);
         assert_eq!(stop_level_from(0.0, 10.0, 1.0), 0.0);
         assert_eq!(stop_level_from(f64::NAN, 10.0, 1.0), 0.0);
+        // Director buys: 6x ATR, floored at -30%, -20% without an ATR.
+        let loose = ExitRules::for_trigger(crate::event_signals::INSIDER_DIRECTOR);
+        assert_eq!(loose, ExitRules::LOOSE);
+        assert_eq!(ExitRules::for_trigger("convergence"), ExitRules::STANDARD);
+        assert!((stop_level_from_with(100.0, 120.0, 3.0, &loose) - 102.0).abs() < 1e-9);
+        assert!((stop_level_from_with(100.0, 100.0, 10.0, &loose) - 70.0).abs() < 1e-9);
+        assert!((stop_level_from_with(100.0, 130.0, 0.0, &loose) - 80.0).abs() < 1e-9);
     }
 }
 

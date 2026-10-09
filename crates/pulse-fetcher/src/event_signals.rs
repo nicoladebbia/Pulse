@@ -12,7 +12,21 @@
 //! - **insider_cluster**: two or more insiders buying on the open market
 //!   within 30 days, $100k+ together (Cohen, Malloy and Pomorski 2012: such
 //!   "opportunistic" buys earned excess returns over the following months).
-//!   Six months of our Form 4s showed no edge on 9-20 events.
+//!   Six months of our Form 4s showed no edge on 9-20 events, and neither
+//!   did 2018-2026 (SEC insider data sets, `research/event-backtest`): no
+//!   longer detected; trades already open keep their 20-day hold.
+//! - **insider_director_buy**: an outside director (not an officer, not a 10%
+//!   owner) buying $10k+ on the open market, filed in the last 3 days. The
+//!   one insider rule that held up in 2018-2026: about +1.2% over the
+//!   following 60 trading days vs stocks of the same size (t 2.5), +0.5%
+//!   after a 6x ATR trailing stop (t 2.2; weaker in 2023-26 alone). Held 60
+//!   trading days with loose stops (`ExitRules::LOOSE`) and no ATR floor: the
+//!   bot's 3x ATR exits and the calm-stock filter both erased it.
+//!
+//! News was tested again on 2023-2026 Benzinga headlines (next-day, 10:00
+//! and dip entries, both directions): nothing beat the trading cost, so news
+//! events are recorded and scored but only traded with
+//! `NEWS_TRADES_ENABLED=true`.
 //!
 //! Event trades are `EVENT_SIZE` of the smallest normal entry (sized as a
 //! `SIZING_SCORE` signal, whatever their strength), skip signal decay (they
@@ -26,9 +40,8 @@ pub const SURPRISE_MIN: f64 = 0.5;
 /// Average tone of all news mentions, the baseline for a company with no
 /// recent coverage (0.24 over six months).
 pub const TYPICAL_TONE: f64 = 0.24;
-/// Insiders and dollars that make a cluster.
-pub const CLUSTER_BUYERS: i64 = 2;
-pub const CLUSTER_DOLLARS: f64 = 100_000.0;
+/// Smallest director buy that counts (bigger ones did no better).
+pub const DIRECTOR_DOLLARS: f64 = 10_000.0;
 /// Fraction of a normal entry an event trade gets.
 pub const EVENT_SIZE: f64 = 0.5;
 /// The compound score an event trade is sized as: the bottom tier. Strength
@@ -38,6 +51,7 @@ pub const SIZING_SCORE: f64 = 0.30;
 
 pub const NEWS_SURPRISE: &str = "news_surprise";
 pub const INSIDER_CLUSTER: &str = "insider_cluster";
+pub const INSIDER_DIRECTOR: &str = "insider_director_buy";
 
 /// Trading days a convergence trade is held at most: the 90 calendar days
 /// the backtester's strategy has always assumed (`pulse-weights` strategy
@@ -50,12 +64,24 @@ pub fn max_hold_days(trigger: &str) -> Option<i64> {
     match trigger {
         NEWS_SURPRISE => Some(5),
         INSIDER_CLUSTER => Some(20),
+        INSIDER_DIRECTOR => Some(60),
         _ => Some(CONVERGENCE_MAX_HOLD),
     }
 }
 
 pub fn enabled() -> bool {
     std::env::var("EVENT_TRADES_ENABLED").map(|v| !(v.eq_ignore_ascii_case("false") || v == "0")).unwrap_or(true)
+}
+
+/// Whether events of `kind` are traded. News is off unless
+/// `NEWS_TRADES_ENABLED=true` (no backtest edge); the rest follow `enabled`.
+pub fn kind_traded(kind: &str) -> bool {
+    let news_on = std::env::var("NEWS_TRADES_ENABLED").map(|v| v.eq_ignore_ascii_case("true") || v == "1").unwrap_or(false);
+    kind_traded_with(kind, news_on)
+}
+
+fn kind_traded_with(kind: &str, news_on: bool) -> bool {
+    kind != NEWS_SURPRISE || news_on
 }
 
 /// Whether short events are traded (sold short) as well as long ones.
@@ -155,8 +181,11 @@ pub fn load_tone(conn: &Connection) -> rusqlite::Result<Vec<ToneRow>> {
     rows.collect()
 }
 
-/// Insider cluster buys whose latest purchase was filed in the last 3 days.
-pub fn insider_clusters(conn: &Connection) -> rusqlite::Result<Vec<Event>> {
+/// Open-market buys by outside directors (not officers, not 10% owners) of
+/// at least `DIRECTOR_DOLLARS`, filed in the last 3 days: one event per
+/// ticker and filing day. Filings stored before the 10% owner flag was parsed
+/// count as not 10% owners.
+pub fn director_buys(conn: &Connection) -> rusqlite::Result<Vec<Event>> {
     let mut stmt = conn.prepare(
         "WITH p AS (
              SELECT UPPER(json_extract(financial_metadata, '$.ticker')) AS ticker,
@@ -166,25 +195,30 @@ pub fn insider_clusters(conn: &Connection) -> rusqlite::Result<Vec<Event>> {
              FROM stories
              WHERE source_type = 'financial' AND json_valid(financial_metadata)
                AND json_extract(financial_metadata, '$.transaction_code') = 'P'
-               AND json_extract(financial_metadata, '$.filing_date') >= date('now', '-30 days')
+               AND COALESCE(json_extract(financial_metadata, '$.is_director'), 0) = 1
+               AND COALESCE(json_extract(financial_metadata, '$.is_officer'), 0) = 0
+               AND COALESCE(json_extract(financial_metadata, '$.is_ten_percent_owner'), 0) = 0
+               AND json_extract(financial_metadata, '$.filing_date') >= date('now', '-3 days')
          )
-         SELECT p.ticker, MAX(p.day), COUNT(DISTINCT p.owner), SUM(p.value),
+         SELECT p.ticker, p.day, COUNT(DISTINCT p.owner), SUM(p.value), GROUP_CONCAT(DISTINCT p.owner),
                 (SELECT entity_id FROM entity_tickers et WHERE et.ticker = p.ticker LIMIT 1)
-         FROM p WHERE p.ticker IS NOT NULL
-         GROUP BY p.ticker
-         HAVING COUNT(DISTINCT p.owner) >= ?1 AND SUM(p.value) >= ?2 AND MAX(p.day) >= date('now', '-3 days')",
+         FROM p WHERE p.ticker IS NOT NULL AND p.day IS NOT NULL
+         GROUP BY p.ticker, p.day
+         HAVING SUM(p.value) >= ?1",
     )?;
-    let rows = stmt.query_map(rusqlite::params![CLUSTER_BUYERS, CLUSTER_DOLLARS], |r| {
-        let buyers: i64 = r.get(2)?;
+    let rows = stmt.query_map([DIRECTOR_DOLLARS], |r| {
+        let directors: i64 = r.get(2)?;
         let dollars: f64 = r.get(3)?;
+        let names: Option<String> = r.get(4)?;
         Ok(Event {
-            kind: INSIDER_CLUSTER,
+            kind: INSIDER_DIRECTOR,
             ticker: r.get(0)?,
-            entity_id: r.get(4)?,
+            entity_id: r.get(5)?,
             day: r.get(1)?,
             direction: "long",
-            strength: (buyers as f64 / 4.0).min(1.0),
-            detail: serde_json::json!({ "buyers": buyers, "dollars": dollars }),
+            // Size did not predict the return: every buy ranks the same.
+            strength: 0.5,
+            detail: serde_json::json!({ "directors": directors, "dollars": dollars, "names": names }),
         })
     })?;
     rows.collect()
@@ -218,9 +252,9 @@ pub fn detect(conn: &Connection) -> usize {
             Vec::new()
         }
     };
-    match insider_clusters(conn) {
-        Ok(c) => events.extend(c),
-        Err(e) => tracing::warn!("Event signals: insider clusters unreadable: {}", e),
+    match director_buys(conn) {
+        Ok(d) => events.extend(d),
+        Err(e) => tracing::warn!("Event signals: director buys unreadable: {}", e),
     }
     match record(conn, &events) {
         Ok(n) => {
@@ -249,21 +283,27 @@ pub struct EventCandidate {
 }
 
 /// Events first seen today or yesterday (a Form 4 can be found days after
-/// it was filed) that no trade has acted on, strongest first, in
-/// `directions`, at most 10.
+/// it was filed; a director buy waits 4 days, so one found after Friday's
+/// last run is still bought Monday) that no trade has acted on, strongest
+/// first, of kinds that are traded (`kind_traded`) in `directions`, at most 10.
 pub fn candidates(conn: &Connection, directions: &[&str]) -> rusqlite::Result<Vec<EventCandidate>> {
+    candidates_with(conn, directions, kind_traded)
+}
+
+fn candidates_with(conn: &Connection, directions: &[&str], traded: impl Fn(&str) -> bool) -> rusqlite::Result<Vec<EventCandidate>> {
     let mut stmt = conn.prepare(
         "SELECT ev.kind, ev.ticker, ev.entity_id, COALESCE(e.name, ev.ticker), ev.direction, ev.strength, ev.detail
          FROM event_signals ev
          LEFT JOIN entities e ON e.id = ev.entity_id
          WHERE (ev.day >= date('now', 'localtime', '-1 day')
-                OR ev.detected_at >= date('now', 'localtime', '-1 day'))
+                OR ev.detected_at >= date('now', 'localtime', '-1 day')
+                OR (ev.kind = ?1 AND ev.detected_at >= date('now', 'localtime', '-4 days')))
            AND ev.ticker NOT IN (SELECT ticker FROM paper_trades WHERE status = 'open')
            AND NOT EXISTS (SELECT 1 FROM paper_trades pt WHERE pt.ticker = ev.ticker
                            AND pt.entry_trigger = ev.kind AND substr(pt.entry_date, 1, 10) >= ev.day)
          ORDER BY ev.strength DESC, ev.id",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map([INSIDER_DIRECTOR], |r| {
         Ok(EventCandidate {
             kind: r.get(0)?,
             ticker: r.get(1)?,
@@ -276,7 +316,7 @@ pub fn candidates(conn: &Connection, directions: &[&str]) -> rusqlite::Result<Ve
     })?;
     Ok(rows
         .filter_map(Result::ok)
-        .filter(|c| directions.contains(&c.direction.as_str()))
+        .filter(|c| directions.contains(&c.direction.as_str()) && traded(&c.kind))
         .take(10)
         .collect())
 }
@@ -423,10 +463,78 @@ mod tests {
             [],
         )
         .unwrap();
-        let c = candidates(&conn, &["long"]).unwrap();
+        let c = candidates_with(&conn, &["long"], |_| true).unwrap();
         assert_eq!(c.iter().map(|c| c.ticker.as_str()).collect::<Vec<_>>(), vec!["ACME"]);
         assert_eq!(c[0].name, "Acme");
-        assert_eq!(candidates(&conn, &["long", "short"]).unwrap().len(), 2);
+        assert_eq!(candidates_with(&conn, &["long", "short"], |_| true).unwrap().len(), 2);
+    }
+
+    fn form4(conn: &Connection, ticker: &str, owner: &str, code: &str, value: f64, roles: (bool, bool, Option<bool>), filed: &str) {
+        let (director, officer, ten) = roles;
+        let mut meta = serde_json::json!({
+            "ticker": ticker, "owner_name": owner, "transaction_code": code, "total_value": value,
+            "is_director": director, "is_officer": officer, "filing_date": filed,
+        });
+        if let Some(t) = ten {
+            meta["is_ten_percent_owner"] = serde_json::json!(t);
+        }
+        conn.execute(
+            "INSERT INTO stories (briefing_id, sector, original_title, original_url, source_name, headline, summary,
+                 key_facts, why_it_matters, what_to_watch, url_hash, title_hash, source_type, financial_metadata)
+             VALUES (1, 'finance', 't', 'u', 'SEC', 'Form 4', '', '[]', '', '', hex(randomblob(8)), hex(randomblob(8)), 'financial', ?1)",
+            [meta.to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_outside_director_buys_of_10k_are_events() {
+        let conn = db();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let old = (chrono::Local::now().date_naive() - chrono::Duration::days(10)).to_string();
+        form4(&conn, "ACME", "Ann", "P", 6_000.0, (true, false, Some(false)), &today);
+        form4(&conn, "ACME", "Bob", "P", 5_000.0, (true, false, None), &today); // old row, no flag
+        form4(&conn, "CEO", "Cat", "P", 90_000.0, (true, true, Some(false)), &today); // also an officer
+        form4(&conn, "OWN", "Fund", "P", 90_000.0, (true, false, Some(true)), &today); // 10% owner
+        form4(&conn, "SELL", "Dan", "S", 90_000.0, (true, false, Some(false)), &today);
+        form4(&conn, "SMALL", "Eve", "P", 9_000.0, (true, false, Some(false)), &today);
+        form4(&conn, "STALE", "Fay", "P", 90_000.0, (true, false, Some(false)), &old);
+        let ev = director_buys(&conn).unwrap();
+        assert_eq!(ev.iter().map(|e| e.ticker.as_str()).collect::<Vec<_>>(), vec!["ACME"]);
+        assert_eq!((ev[0].kind, ev[0].direction, ev[0].entity_id), (INSIDER_DIRECTOR, "long", Some(1)));
+        assert_eq!(ev[0].detail["directors"], 2);
+        assert_eq!(ev[0].detail["dollars"], 11_000.0);
+        // Insider clusters are no longer detected.
+        form4(&conn, "ACME", "Cat", "P", 200_000.0, (false, true, Some(false)), &today);
+        detect(&conn);
+        let kinds: Vec<String> = conn
+            .prepare("SELECT DISTINCT kind FROM event_signals").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(kinds, vec![INSIDER_DIRECTOR.to_string()]);
+    }
+
+    #[test]
+    fn news_events_trade_only_when_switched_on() {
+        assert!(!kind_traded_with(NEWS_SURPRISE, false));
+        assert!(kind_traded_with(NEWS_SURPRISE, true));
+        assert!(kind_traded_with(INSIDER_DIRECTOR, false));
+        // Untraded news cannot crowd a director buy out of the ten slots.
+        let conn = db();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let ev = |t: &str, kind: &'static str, s: f64, day: String| Event {
+            kind, ticker: t.into(), entity_id: None, day, direction: "long", strength: s, detail: serde_json::json!({}),
+        };
+        let news: Vec<Event> = (0..12).map(|i| ev(&format!("N{i}"), NEWS_SURPRISE, 0.9, today.clone())).collect();
+        record(&conn, &news).unwrap();
+        record(&conn, &[ev("DIR", INSIDER_DIRECTOR, 0.5, today.clone())]).unwrap();
+        let c = candidates_with(&conn, &["long"], |k| kind_traded_with(k, false)).unwrap();
+        assert_eq!(c.iter().map(|c| c.ticker.as_str()).collect::<Vec<_>>(), vec!["DIR"]);
+        // A director buy found three days ago (Friday evening) is still a candidate.
+        let filed = (chrono::Local::now().date_naive() - chrono::Duration::days(4)).to_string();
+        record(&conn, &[ev("WKND", INSIDER_DIRECTOR, 0.5, filed)]).unwrap();
+        conn.execute("UPDATE event_signals SET detected_at = datetime('now', 'localtime', '-3 days') WHERE ticker = 'WKND'", []).unwrap();
+        let c = candidates_with(&conn, &["long"], |k| kind_traded_with(k, false)).unwrap();
+        assert!(c.iter().any(|c| c.ticker == "WKND"));
     }
 
     #[test]
@@ -436,6 +544,7 @@ mod tests {
         assert_eq!(weekdays_between(d("2026-10-05"), d("2026-10-12")), 5);
         assert_eq!(weekdays_between(d("2026-10-05"), d("2026-10-05")), 0);
         assert_eq!(max_hold_days(NEWS_SURPRISE), Some(5));
+        assert_eq!(max_hold_days(INSIDER_DIRECTOR), Some(60));
         assert_eq!(max_hold_days("convergence"), Some(CONVERGENCE_MAX_HOLD));
     }
 }
