@@ -19,3 +19,9 @@ src-tauri/binaries/
 .claude/*
 !.claude/skills/
 .serena/
+
+research/event-backtest/bars/
+research/event-backtest/news/
+research/event-backtest/f345/
+research/event-backtest/*.parquet
+research/event-backtest/*.pkl

@@ -656,11 +656,31 @@ async fn whole_share_order(
         tracing::info!("Auto-trade: skipping {} — ${:.2} is under the ${:.0} price floor", ticker, price, crate::entry_filters::MIN_PRICE);
         return None;
     }
-    let sized = whole_shares(notional, price);
+    let sized = whole_shares(notional, price).map(|(q, cost)| if test_short_ticker().is_some() { (1, cost / q as f64) } else { (q, cost) });
     if sized.is_none() {
         tracing::info!("Auto-trade: skipping {} — one share (${:.2}) is over the ${:.0} budget", ticker, price, notional);
     }
     sized
+}
+
+/// `AUTO_TRADE_TEST_SHORT`: the stock to short 1 share of in a test run.
+fn test_short_ticker() -> Option<String> {
+    std::env::var("AUTO_TRADE_TEST_SHORT").ok().map(|t| t.trim().to_uppercase()).filter(|t| !t.is_empty())
+}
+
+fn test_short_candidate(ticker: &str) -> Candidate {
+    Candidate::from_event(
+        crate::event_signals::EventCandidate {
+            kind: crate::event_signals::NEWS_SURPRISE.to_string(),
+            ticker: ticker.to_string(),
+            entity_id: None,
+            name: ticker.to_string(),
+            direction: "short".to_string(),
+            strength: 1.0,
+            detail: r#"{"test":true}"#.to_string(),
+        },
+        0.0,
+    )
 }
 
 /// One stock an auto-trade run considers: a converging cross-signal score, or
@@ -838,6 +858,13 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
         .collect();
     drop(stmt);
 
+    // One-share end-to-end short test: `AUTO_TRADE_TEST_SHORT=HOOD` replaces
+    // every candidate with a 1-share short of that stock, booked as a news
+    // trade (so the 5-day max hold covers it), through every entry check.
+    if let Some(ticker) = test_short_ticker() {
+        tracing::warn!("Auto-trade: TEST SHORT of 1 share of {} — no other candidate is considered", ticker);
+        candidates = vec![test_short_candidate(&ticker)];
+    } else {
     // Event signals (news tone surprises, insider clusters): found here so
     // the morning briefing's news is acted on at the first run after it.
     crate::event_signals::detect(&conn);
@@ -861,6 +888,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
             }
             Err(e) => tracing::warn!("Auto-trade: event signals unreadable: {}", e),
         }
+    }
     }
 
     if candidates.is_empty() {
@@ -3203,6 +3231,8 @@ mod ledger_tests {
 
     #[test]
     fn entries_buy_whole_shares_within_the_budget() {
+        let t = super::test_short_candidate("hood");
+        assert!(t.short && t.trigger == "news_surprise" && t.ticker == "hood");
         assert_eq!(whole_shares(1_000.0, 30.0), Some((33, 990.0)));
         assert_eq!(whole_shares(1_000.0, 1_000.0), Some((1, 1_000.0)));
         assert_eq!(whole_shares(999.0, 1_000.0), None);
