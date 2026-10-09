@@ -52,7 +52,7 @@
 					<div class="space-y-1">
 						{#each run.rows as d}
 							<div class="flex items-start gap-2 text-[11px]">
-								<span class="shrink-0 px-1.5 py-0.5 rounded font-medium {chip(d.outcome)}">{label(d.reason)}</span>
+								<span class="shrink-0 px-1.5 py-0.5 rounded font-medium {chip(d.outcome)}">{label(d.reason, d.direction)}</span>
 								{#if d.ticker}
 									<span class="font-mono font-semibold text-text shrink-0">{d.ticker}</span>
 									{#if d.score != null}<span class="font-mono text-text-muted shrink-0">{d.score.toFixed(2)}</span>{/if}

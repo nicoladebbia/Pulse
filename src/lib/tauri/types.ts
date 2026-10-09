@@ -556,6 +556,7 @@ export interface TradeDecision {
 	outcome: 'bought' | 'preview' | 'skipped' | 'run_stopped' | string;
 	reason: string;
 	detail: string | null;
+	direction: 'long' | 'short' | string;
 }
 
 // === Weekly signal scorecard ===

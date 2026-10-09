@@ -25,7 +25,13 @@ const LABELS: Record<string, string> = {
 	bars_refused: 'Price data refused',
 };
 
-export function decisionLabel(reason: string): string {
+const SHORT_LABELS: Record<string, string> = {
+	bought: 'Shorted',
+	preview: 'Would short (preview)',
+};
+
+export function decisionLabel(reason: string, direction = 'long'): string {
+	if (direction === 'short' && SHORT_LABELS[reason]) return SHORT_LABELS[reason];
 	return LABELS[reason] ?? reason.replace(/_/g, ' ');
 }
 

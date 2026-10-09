@@ -1427,6 +1427,8 @@ pub struct TradeDecision {
     pub outcome: String,
     pub reason: String,
     pub detail: Option<String>,
+    /// "long" or "short" (migration 046).
+    pub direction: String,
 }
 
 /// What the auto-trader did with each candidate in its recent runs, newest
@@ -1437,7 +1439,7 @@ pub fn get_trade_decisions(db: State<'_, DbState>, days: Option<i64>) -> Result<
     let window = format!("-{} days", days.unwrap_or(3).clamp(1, 30));
     let mut stmt = conn
         .prepare(
-            "SELECT run_at, ticker, name, score, outcome, reason, detail FROM trade_decisions
+            "SELECT run_at, ticker, name, score, outcome, reason, detail, COALESCE(direction, 'long') FROM trade_decisions
              WHERE run_at >= datetime('now', 'localtime', ?1)
              ORDER BY run_at DESC, (outcome = 'run_stopped') DESC, score DESC LIMIT 300",
         )
@@ -1452,6 +1454,7 @@ pub fn get_trade_decisions(db: State<'_, DbState>, days: Option<i64>) -> Result<
                 outcome: r.get(4)?,
                 reason: r.get(5)?,
                 detail: r.get(6)?,
+                direction: r.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?

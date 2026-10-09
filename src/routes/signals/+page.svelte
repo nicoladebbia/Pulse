@@ -1442,11 +1442,11 @@
 									</div>
 								</div>
 								<div class="flex items-center justify-between mt-1.5 text-[11px] text-text-muted">
-									<span>Bought @ ${trade.entry_price.toFixed(2)} &middot; {fmtPrice(trade.position_size)} invested &middot; {trade.entry_date.slice(0, 10)}</span>
+									<span>{trade.direction === 'short' ? 'Shorted' : 'Bought'} @ ${trade.entry_price.toFixed(2)} &middot; {fmtPrice(trade.position_size)} {trade.direction === 'short' ? 'sold short' : 'invested'} &middot; {trade.entry_date.slice(0, 10)}</span>
 									{#if trade.exit_price}
 										{@const spy = vsSpy.get(trade.id)}
 										<span>
-											Sold @ ${trade.exit_price.toFixed(2)} &middot; {trade.exit_date?.slice(0, 10)}
+											{trade.direction === 'short' ? 'Bought back' : 'Sold'} @ ${trade.exit_price.toFixed(2)} &middot; {trade.exit_date?.slice(0, 10)}
 											{#if spy}
 												&middot; <span class="font-mono {spy.excess_pct >= 0 ? 'text-emerald-400/80' : 'text-rose-400/80'}" title="S&P 500 over the same days: {spy.spy_pct >= 0 ? '+' : ''}{spy.spy_pct.toFixed(1)}%">{spy.excess_pct >= 0 ? '+' : ''}{spy.excess_pct.toFixed(1)} pts vs S&amp;P</span>
 											{/if}
