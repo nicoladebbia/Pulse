@@ -29,6 +29,26 @@ pub async fn get_portfolio(db: State<'_, DbState>) -> Result<Portfolio, String> 
     result
 }
 
+/// Plain-language "why Pulse bought it" for every open trade and the latest closed ones, keyed
+/// by trade id. `live_pct` is each open ticker's return right now (in %), which the page
+/// already has from the broker. Costs nothing: built from what the trade stored when opened.
+#[tauri::command]
+pub fn get_trade_explanations(
+    db: State<'_, DbState>,
+    live_pct: std::collections::HashMap<String, f64>,
+) -> Result<std::collections::HashMap<i64, pulse_snapshot::explain::Explanation>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut out = std::collections::HashMap::new();
+    for mut t in pulse_snapshot::explain::load_open(&conn).map_err(|e| e.to_string())? {
+        t.current_pct = live_pct.get(&t.ticker.to_uppercase()).copied().filter(|p| p.is_finite());
+        out.insert(t.id, pulse_snapshot::explain::explain(&t));
+    }
+    for t in pulse_snapshot::explain::load_closed(&conn, 200).map_err(|e| e.to_string())? {
+        out.insert(t.id, pulse_snapshot::explain::explain(&t));
+    }
+    Ok(out)
+}
+
 /// Get paper trades by status.
 #[tauri::command]
 pub fn get_paper_trades(db: State<'_, DbState>, status: Option<String>) -> Result<Vec<PaperTrade>, String> {

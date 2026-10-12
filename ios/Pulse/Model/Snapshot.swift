@@ -38,6 +38,8 @@ struct Snapshot: Codable, Sendable, Equatable {
         let unrealizedPlPct: Double?
         let stopPrice: Double?
         let industry: String?
+        /// Why Pulse bought it, in plain words. Nil for a position Pulse has no trade for.
+        let explanation: Explanation?
         var id: String {
             symbol
         }
@@ -77,6 +79,16 @@ struct Snapshot: Codable, Sendable, Equatable {
         }
     }
 
+    /// Plain-language account of a trade, written by the Mac from what the trade stored.
+    struct Explanation: Codable, Sendable, Equatable {
+        /// A few words: what kind of buy this was.
+        let headline: String
+        let why: String
+        let size: String?
+        let plan: String?
+        let now: String?
+    }
+
     struct ClosedTrade: Codable, Sendable, Equatable, Identifiable {
         let ticker: String
         let direction: String
@@ -84,6 +96,7 @@ struct Snapshot: Codable, Sendable, Equatable {
         let exitDate: String
         let pnl: Double?
         let pnlPct: Double?
+        let explanation: Explanation?
         var id: String {
             "\(ticker)-\(exitDate)-\(entryDate)"
         }

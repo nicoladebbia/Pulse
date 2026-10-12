@@ -133,6 +133,7 @@ pub fn run() {
             commands::trading::get_trade_journal,
             commands::trading::get_trade_detail,
             commands::trading::get_trade_rationale,
+            commands::trading::get_trade_explanations,
             commands::trading::run_backtest,
             commands::trading::get_backtest_range,
             commands::research::get_research_papers,

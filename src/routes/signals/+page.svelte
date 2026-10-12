@@ -5,16 +5,17 @@
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
 		executeTrade, closePosition, getFinancialEvents, getSignalEvidence, getSourceHealth,
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getExitReview, getTradeJournal,
-		startPriceStream, stopPriceStream, getTradeRationale,
+		startPriceStream, stopPriceStream, getTradeRationale, getTradeExplanations,
 		getPendingCalibration, applyPendingCalibration, rejectPendingCalibration, getCalibrationGateStatus,
 		getBenchmark, getTradeDecisions, getSignalScorecard, getLearningReport
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics, ExitReview,
-		TradeJournal, PriceUpdate, TradeRationale,
+		TradeJournal, PriceUpdate, TradeRationale, TradeExplanation as Explanation,
 		PendingCalibrationRow, CalibrationGateStatus, Benchmark, TradeDecision, SignalScorecard as Scorecard, LearningReport as Learning
 	} from '$lib/tauri/types';
+	import TradeExplanation from '$lib/components/signals/TradeExplanation.svelte';
 	import BenchmarkCard from '$lib/components/signals/BenchmarkCard.svelte';
 	import TradeDecisions from '$lib/components/signals/TradeDecisions.svelte';
 	import SignalScorecard from '$lib/components/signals/SignalScorecard.svelte';
@@ -47,6 +48,8 @@
 	let exitReview = $state<ExitReview | null>(null);
 	let showExitTrades = $state(false);
 	let expandedTradeId = $state<number | null>(null);
+	let explanations = $state<Record<number, Explanation>>({});
+	let explanationOpen = $state<Record<number, boolean>>({});
 	let tradeJournals = $state<Record<number, TradeJournal>>({});
 	let aiRationales = $state<Record<number, TradeRationale>>({});
 	let aiRationaleFailed = $state<Record<number, boolean>>({});
@@ -143,6 +146,34 @@
 				aiRationalesInFlight.delete(t.id);
 			});
 		}
+	});
+
+	// Plain-language "why Pulse bought it" for every trade on the page. Free (built from
+	// what the trade stored), so it refreshes when the set of trades changes and once a
+	// minute for the open positions' "how it is going" line, not on every price tick.
+	let explainKey = '';
+	function loadExplanations() {
+		const p = portfolio;
+		if (!p) return;
+		const livePct: Record<string, number> = {};
+		for (const pos of p.positions) {
+			if (Number.isFinite(pos.unrealized_pl_pct)) livePct[pos.symbol.toUpperCase()] = pos.unrealized_pl_pct * 100; // Alpaca sends a fraction
+		}
+		getTradeExplanations(livePct)
+			.then(e => { explanations = e; })
+			.catch(() => {});
+	}
+	$effect(() => {
+		const p = portfolio;
+		if (!p) return;
+		const key = [...p.open_trades, ...p.closed_trades].map(t => `${t.id}:${t.status}`).join(',');
+		if (key === explainKey) return;
+		explainKey = key;
+		loadExplanations();
+	});
+	$effect(() => {
+		const timer = setInterval(loadExplanations, 60_000);
+		return () => clearInterval(timer);
 	});
 
 	// The rationale prompt structures sentence 1 as the mechanical "what fired"
@@ -1245,6 +1276,9 @@
 									</ul>
 								{/if}
 							{/if}
+							{#if dbTrade && explanations[dbTrade.id]}
+								<TradeExplanation explanation={explanations[dbTrade.id]} bind:open={explanationOpen[dbTrade.id]} />
+							{/if}
 							<!-- P&L bar -->
 							<div class="mt-2 h-1 bg-border rounded-full overflow-hidden">
 								<div class="h-full rounded-full {isWinning ? 'bg-emerald-400' : 'bg-rose-400'}" style="width: {Math.min(Math.abs(pnlPct) * 5, 100)}%"></div>
@@ -1331,6 +1365,9 @@
 										<div class="bg-bg border border-border rounded-lg p-3">
 											<p class="text-xs text-text-secondary leading-relaxed">{tradeJournals[trade.id].journal}</p>
 										</div>
+									{/if}
+									{#if explanations[trade.id]}
+										<TradeExplanation explanation={explanations[trade.id]} bind:open={explanationOpen[trade.id]} />
 									{/if}
 									<a href="/signals/trade/{trade.id}" class="inline-block mt-2 text-[11px] text-blue-400 hover:text-blue-300 transition-colors">Full trade details &rarr;</a>
 								</div>

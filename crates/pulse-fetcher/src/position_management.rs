@@ -1056,4 +1056,23 @@ mod journal_reason_tests {
         assert_eq!(describe_exit("manual"), "it closed (manual)");
         assert_eq!(describe_exit(""), "the position was closed");
     }
+
+    /// The trade explanations (`pulse_snapshot::explain`) quote the exit rules in words; they
+    /// must say what the bot really does.
+    #[test]
+    fn the_explanations_quote_the_real_exit_rules() {
+        use crate::event_signals::{INSIDER_CLUSTER, INSIDER_DIRECTOR, NEWS_SURPRISE, max_hold_days};
+        for trigger in [NEWS_SURPRISE, INSIDER_CLUSTER, INSIDER_DIRECTOR, "convergence"] {
+            let said = pulse_snapshot::explain::rules_for(trigger);
+            let real = super::ExitRules::for_trigger(trigger);
+            assert_eq!(said.atr_mult, real.atr_mult, "{trigger}");
+            assert_eq!(said.hard_stop_pct, real.hard_stop_pct, "{trigger}");
+            assert_eq!(said.fixed_stop_pct, real.fixed_stop_pct, "{trigger}");
+            assert_eq!(said.take_half, real.take_half, "{trigger}");
+            assert_eq!(Some(said.max_hold_days), max_hold_days(trigger), "{trigger}");
+        }
+        assert!(pulse_snapshot::explain::rules_for("convergence").decay_exit);
+        assert!(!pulse_snapshot::explain::rules_for(INSIDER_DIRECTOR).decay_exit);
+        assert_eq!(super::DECAY_MIN_HELD_DAYS, 5, "the explanation says signals can fade after 5 trading days");
+    }
 }

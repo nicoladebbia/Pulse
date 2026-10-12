@@ -187,3 +187,61 @@ struct DebugScroll: ViewModifier {
         #endif
     }
 }
+
+/// Launch arguments for screenshots and manual checks; ignored in a release build.
+enum Debug {
+    static var expandExplanations: Bool {
+        #if DEBUG
+            ProcessInfo.processInfo.arguments.contains("-PulseExpandAll")
+        #else
+            false
+        #endif
+    }
+}
+
+/// "Why Pulse bought this" under a position or closed trade: tap to read the plain-language account.
+struct ExplanationToggle: View {
+    let explanation: Snapshot.Explanation
+    @Binding var expanded: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.bold))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Text("\(explanation.headline) — why Pulse bought this").font(.caption.weight(.medium))
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(Theme.blue)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Why Pulse bought this: \(explanation.headline)")
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+            if expanded {
+                VStack(alignment: .leading, spacing: 10) {
+                    section("Why Pulse bought it", explanation.why)
+                    section("How much, and why", explanation.size)
+                    section("When it will sell", explanation.plan)
+                    section("How it is going", explanation.now)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.cardRaised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+        }
+    }
+
+    @ViewBuilder private func section(_ title: String, _ text: String?) -> some View {
+        if let text, !text.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(Theme.textMuted)
+                Text(text).font(.footnote).foregroundStyle(Theme.textSecondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
