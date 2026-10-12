@@ -4,7 +4,7 @@
 	// was opened, so it never invents a catalyst.
 	import type { TradeExplanation } from '$lib/tauri/types';
 
-	let { explanation, open = $bindable(false) }: { explanation: TradeExplanation; open?: boolean } = $props();
+	let { explanation, open, ontoggle }: { explanation: TradeExplanation; open: boolean; ontoggle: () => void } = $props();
 
 	const rows = $derived(
 		[
@@ -21,7 +21,7 @@
 		type="button"
 		class="text-[11px] text-blue-400 hover:text-blue-300 transition-colors"
 		aria-expanded={open}
-		onclick={() => (open = !open)}
+		onclick={ontoggle}
 	>
 		{open ? '▾' : '▸'} {explanation.headline} — why Pulse bought this
 	</button>
