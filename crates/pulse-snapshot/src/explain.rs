@@ -84,6 +84,8 @@ pub struct TradeFacts {
     pub entry_trigger: String,
     pub stop_price: Option<f64>,
     pub scale_in_count: i64,
+    /// Half of the position has already been sold at the profit target.
+    pub half_closed: bool,
     /// Open trades: the live return in % (the caller has the price). Closed trades use `pnl_pct`.
     pub current_pct: Option<f64>,
 }
@@ -333,13 +335,17 @@ fn size(f: &TradeFacts, ctx: &Value) -> Option<String> {
         ));
     }
     s.push('.');
-    s.push_str(" Pulse sizes each trade by how much the stock normally swings, so wilder stocks get less money");
     let sizing = ctx.get("sizing").unwrap_or(&Value::Null);
+    if sizing.is_object() {
+        s.push_str(" Pulse sizes each trade by how much the stock normally swings, so wilder stocks get less money");
+    } else {
+        s.push_str(" Pulse sizes each trade as a fixed share of the account");
+    }
     let mut cuts = vec![];
     if num(sizing, "edge_mult").is_some_and(|m| m < 1.0) {
         cuts.push("it is a smaller bet because this kind of signal is less proven");
     }
-    if num(ctx, "regime").is_some_and(|m| m < 1.0) {
+    if !is_short(f) && num(ctx, "regime").is_some_and(|m| m < 1.0) {
         cuts.push(
             "it was cut in half because the S&P 500 was below its 50-day average, a weak market",
         );
@@ -393,10 +399,14 @@ fn plan(f: &TradeFacts, ctx: &Value) -> Option<String> {
         )),
     }
     if r.take_half {
-        s.push_str(&format!(
-            " It closes half the position once the gain reaches {}× the stock’s normal daily swing.",
-            r.atr_mult
-        ));
+        if f.half_closed {
+            s.push_str(" Half of it has already been sold to lock in a gain.");
+        } else {
+            s.push_str(&format!(
+                " It closes half the position once it is up at least 10% and the gain reaches {}× the stock’s normal daily swing.",
+                r.atr_mult
+            ));
+        }
     }
     if r.decay_exit {
         s.push_str(
@@ -416,7 +426,10 @@ fn plan(f: &TradeFacts, ctx: &Value) -> Option<String> {
     Some(s)
 }
 
-fn exit_words(reason: &str) -> &'static str {
+fn exit_words(reason: &str, short: bool) -> &'static str {
+    if reason.starts_with("trailing_stop") && short {
+        return "the price rose far enough from its low to trigger the trailing stop";
+    }
     const KNOWN: [(&str, &str); 9] = [
         (
             "trailing_stop",
@@ -483,7 +496,7 @@ fn now(f: &TradeFacts) -> Option<String> {
         .exit_reason
         .as_deref()
         .filter(|r| !r.starts_with("merged_into"))
-        .map(|r| format!(" Why it ended: {}.", exit_words(r)))
+        .map(|r| format!(" Why it ended: {}.", exit_words(r, is_short(f))))
         .unwrap_or_default();
     Some(
         format!(
@@ -510,7 +523,7 @@ pub fn explain(f: &TradeFacts) -> Explanation {
 
 const COLUMNS: &str = "pt.id, pt.ticker, e.name, pt.direction, pt.entry_price, pt.entry_date, pt.position_size, pt.status,
     pt.exit_price, pt.exit_date, pt.exit_reason, pt.pnl_pct, pt.signal_profile, pt.entry_context, pt.entry_trigger,
-    pt.broker_stop_price, COALESCE(pt.scale_in_count, 0)";
+    pt.broker_stop_price, COALESCE(pt.scale_in_count, 0), pt.half_closed_at IS NOT NULL";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<TradeFacts> {
     Ok(TradeFacts {
@@ -533,6 +546,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<TradeFacts> {
             .unwrap_or_else(|| "convergence".into()),
         stop_price: r.get(15)?,
         scale_in_count: r.get(16)?,
+        half_closed: r.get(17)?,
         current_pct: None,
     })
 }
@@ -659,10 +673,8 @@ mod tests {
         let e = explain(&f);
         assert!(e.why.contains("fall") && e.why.contains("Acme sued"));
         let size = e.size.unwrap();
-        assert!(
-            size.contains("sold short") && size.contains("less proven") && size.contains("S&P 500"),
-            "{size}"
-        );
+        assert!(size.contains("sold short") && size.contains("less proven"), "{size}");
+        assert!(!size.contains("S&P 500"), "a falling market does not shrink a short: {size}");
         assert!(e.plan.unwrap().contains("rises 15%"));
     }
 

@@ -157,7 +157,7 @@
 		if (!p) return;
 		const livePct: Record<string, number> = {};
 		for (const pos of p.positions) {
-			if (Number.isFinite(pos.unrealized_pl_pct)) livePct[pos.symbol.toUpperCase()] = pos.unrealized_pl_pct;
+			if (Number.isFinite(pos.unrealized_pl_pct)) livePct[pos.symbol.toUpperCase()] = pos.unrealized_pl_pct * 100; // Alpaca sends a fraction
 		}
 		getTradeExplanations(livePct)
 			.then(e => { explanations = e; })

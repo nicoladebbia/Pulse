@@ -30,7 +30,7 @@ fn setup() -> Connection {
            entry_date TEXT, exit_date TEXT, pnl REAL, pnl_pct REAL, stop_order_id TEXT, broker_stop_price REAL,
            entity_id INTEGER, entry_price REAL NOT NULL DEFAULT 100, exit_price REAL, position_size REAL NOT NULL DEFAULT 1000,
            exit_reason TEXT, signal_profile TEXT, entry_context TEXT, entry_trigger TEXT NOT NULL DEFAULT 'convergence',
-           scale_in_count INTEGER DEFAULT 0);
+           scale_in_count INTEGER DEFAULT 0, half_closed_at TEXT);
          CREATE TABLE portfolio_snapshots (id INTEGER PRIMARY KEY, date TEXT NOT NULL UNIQUE, total_value REAL NOT NULL);
          CREATE TABLE ticker_industry (ticker TEXT PRIMARY KEY, industry TEXT, checked_at TEXT NOT NULL DEFAULT '');
          CREATE TABLE earnings_calendar (
