@@ -71,12 +71,15 @@ fn held(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
     rows.collect()
 }
 
-fn scores(conn: &Connection) -> rusqlite::Result<HashMap<String, f64>> {
+fn scores(conn: &Connection, today: NaiveDate) -> rusqlite::Result<HashMap<String, f64>> {
     let mut stmt = conn.prepare(
-        "SELECT UPPER(ticker), MAX(compound_score) FROM cross_signals
-         WHERE ticker IS NOT NULL AND computed_at >= datetime('now', '-3 days') GROUP BY UPPER(ticker)",
+        // Most rows carry only an entity id; the ticker comes from `entity_tickers`.
+        "SELECT UPPER(COALESCE(et.ticker, cs.ticker)), MAX(cs.compound_score) FROM cross_signals cs
+         LEFT JOIN entity_tickers et ON et.entity_id = cs.entity_id
+         WHERE COALESCE(et.ticker, cs.ticker) IS NOT NULL AND date(cs.computed_at) >= date(?1, '-3 days')
+         GROUP BY UPPER(COALESCE(et.ticker, cs.ticker))",
     )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?)))?;
+    let rows = stmt.query_map([today.to_string()], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?)))?;
     let mut out = HashMap::new();
     for row in rows {
         let (t, s) = row?;
@@ -93,7 +96,7 @@ pub fn build_calendar(conn: &Connection, today: NaiveDate, days: i64) -> Result<
     let to = today + chrono::Duration::days(days);
     let names = names(conn).map_err(|e| e.to_string())?;
     let held = held(conn).map_err(|e| e.to_string())?;
-    let scores = scores(conn).map_err(|e| e.to_string())?;
+    let scores = scores(conn, today).map_err(|e| e.to_string())?;
 
     let mut stmt = conn
         .prepare(
@@ -257,5 +260,20 @@ mod tests {
         let conn = setup();
         assert_eq!(build_calendar(&conn, d("2026-10-11"), 9999).unwrap().days, MAX_DAYS);
         assert_eq!(build_calendar(&conn, d("2026-10-11"), -5).unwrap().days, 1);
+    }
+
+    #[test]
+    fn signal_score_finds_tickers_through_the_entity_and_counts_from_today() {
+        let conn = setup();
+        conn.execute_batch(
+            "INSERT INTO cross_signals (entity_id, ticker, compound_score, computed_at) VALUES
+               (2, NULL, 0.45, '2026-10-10 07:00:00'), (1, 'AAPL', 0.3, '2026-10-11 07:00:00'),
+               (2, NULL, 0.9, '2026-10-01 07:00:00');",
+        )
+        .unwrap();
+        let cal = build_calendar(&conn, d("2026-10-11"), 30).unwrap();
+        let score = |t: &str| cal.earnings.iter().find(|e| e.ticker == t).and_then(|e| e.signal_score);
+        assert_eq!(score("MSFT"), Some(0.45), "entity-only row, and the 10-01 row is outside the 3 days");
+        assert_eq!(score("AAPL"), Some(0.3));
     }
 }
