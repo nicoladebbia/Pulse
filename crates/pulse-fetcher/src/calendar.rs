@@ -4,7 +4,8 @@
 //! Finnhub's earnings calendar covers every company but returns at most
 //! `ROW_CAP` rows per request and does not say when it cut the list (a busy
 //! week has more), so the range is fetched in windows and any window that comes
-//! back full is split until it fits. Only tickers Pulse tracks or holds are kept.
+//! back full is split until it fits (a full response is missing its earliest
+//! days). Only tickers Pulse tracks or holds are kept.
 //! Future rows of a ticker are replaced each time because report dates move.
 //! Refreshed at most every `REFRESH_HOURS`, so every scheduled run can call
 //! `refresh_if_stale` without spending the rate limit.
@@ -17,7 +18,9 @@ use std::future::Future;
 /// How far ahead to look.
 pub const WINDOW_DAYS: i64 = 60;
 /// Rows Finnhub returns per request at most. Measured 2026-10: a 60-day range
-/// and each busy 7-day range all came back as exactly this many.
+/// and each busy 7-day range all came back as exactly this many. A full
+/// response is missing its EARLIEST days (10-28..11-07 came back as
+/// 11-02..11-07), which is the end the earnings blackout cares about.
 pub const ROW_CAP: usize = 1500;
 /// First window size; a window that comes back full is halved.
 const FIRST_WINDOW_DAYS: i64 = 15;
@@ -130,7 +133,7 @@ where
     Ok((out, full_days))
 }
 
-async fn fetch_window(client: &reqwest::Client, key: &str, from: NaiveDate, to: NaiveDate) -> anyhow::Result<Vec<EarningsRow>> {
+pub(crate) async fn fetch_window(client: &reqwest::Client, key: &str, from: NaiveDate, to: NaiveDate) -> anyhow::Result<Vec<EarningsRow>> {
     tokio::time::sleep(CALL_GAP).await;
     let resp = client
         .get("https://finnhub.io/api/v1/calendar/earnings")

@@ -114,9 +114,9 @@ pub async fn recent_bars(
     pulse_alpaca::daily_bars(client, creds, symbol, &start).await
 }
 
-/// Every US report date in the coming ~10 days, by symbol, from one call to
-/// Finnhub's earnings calendar (one call per run instead of one per
-/// candidate, which the free 60/minute limit would not survive).
+/// Every US report date in the coming ~10 days, by symbol. Finnhub cuts a
+/// response at 1500 rows and drops the earliest days, which in a busy week are
+/// the ones the blackout needs, so `calendar::collect` splits full windows.
 pub async fn upcoming_earnings(
     client: &reqwest::Client,
     finnhub_key: &str,
@@ -126,27 +126,18 @@ pub async fn upcoming_earnings(
         return Err("no FINNHUB_API_KEY".into());
     }
     let to = today + chrono::Duration::days(10);
-    let resp = client
-        .get("https://finnhub.io/api/v1/calendar/earnings")
-        .query(&[("from", today.to_string()), ("to", to.to_string()), ("token", finnhub_key.to_string())])
-        .send()
-        .await
-        .map_err(|e| format!("earnings calendar request failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("earnings calendar returned {}", resp.status()));
-    }
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(parse_earnings_dates(&body))
+    let (rows, _) = crate::calendar::collect(today, to, crate::calendar::ROW_CAP, |a, b| {
+        crate::calendar::fetch_window(client, finnhub_key, a, b)
+    })
+    .await
+    .map_err(|e| format!("earnings calendar request failed: {e}"))?;
+    Ok(group_dates(rows))
 }
 
-pub fn parse_earnings_dates(body: &serde_json::Value) -> HashMap<String, Vec<NaiveDate>> {
+fn group_dates(rows: Vec<crate::calendar::EarningsRow>) -> HashMap<String, Vec<NaiveDate>> {
     let mut out: HashMap<String, Vec<NaiveDate>> = HashMap::new();
-    for e in body.get("earningsCalendar").and_then(|v| v.as_array()).map(Vec::as_slice).unwrap_or_default() {
-        let symbol = e.get("symbol").and_then(|v| v.as_str());
-        let date = e.get("date").and_then(|v| v.as_str()).and_then(|d| d.parse::<NaiveDate>().ok());
-        if let (Some(symbol), Some(date)) = (symbol, date) {
-            out.entry(symbol.to_string()).or_default().push(date);
-        }
+    for r in rows {
+        out.entry(r.ticker).or_default().push(r.date);
     }
     out
 }
@@ -303,14 +294,11 @@ mod tests {
     }
 
     #[test]
-    fn earnings_dates_parse_from_finnhub() {
-        let body = serde_json::json!({"earningsCalendar": [
-            {"symbol": "PEP", "date": "2026-10-08", "hour": "bmo"},
-            {"symbol": "PEP", "date": "bad"}
-        ]});
-        let parsed = parse_earnings_dates(&body);
-        assert_eq!(parsed.get("PEP"), Some(&vec![d("2026-10-08")]));
-        assert_eq!(parsed.len(), 1);
-        assert!(parse_earnings_dates(&serde_json::json!({})).is_empty());
+    fn report_dates_group_by_symbol() {
+        let row = |t: &str, day: &str| crate::calendar::EarningsRow { ticker: t.into(), date: d(day), hour: None, eps_estimate: None, revenue_estimate: None };
+        let grouped = group_dates(vec![row("PEP", "2026-10-08"), row("PEP", "2026-10-09"), row("KO", "2026-10-08")]);
+        assert_eq!(grouped.get("PEP"), Some(&vec![d("2026-10-08"), d("2026-10-09")]));
+        assert_eq!(grouped.len(), 2);
+        assert!(group_dates(vec![]).is_empty());
     }
 }
