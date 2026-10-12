@@ -8,7 +8,7 @@ macOS dock app that delivers AI-curated daily news at 8 AM. Tauri 2.0 + SvelteKi
 - `src-tauri/` — Rust backend (Tauri 2.0, rusqlite, sqlite-vec)
 - `crates/pulse-fetcher/` — Standalone fetch binary (runs via launchd at 8 AM)
 - `crates/pulse-snapshot/` — Builds the phone snapshot (risk logic lives in `risk.rs`; `src-tauri/src/services/risk.rs` re-exports it); `crates/pulse-calendar/` — earnings + macro calendar view
-- `ios/` — SwiftUI companion (XcodeGen: `cd ios && xcodegen generate`; read-only, iOS 17). Set your signing team in Xcode before a device install.
+- `ios/` — SwiftUI companion (XcodeGen: `cd ios && xcodegen generate`; read-only, iOS 17). Signing uses the team in `ios/project.yml` (`DEVELOPMENT_TEAM`); change it there if it is not yours.
 - `migrations/` — SQLite schema migrations
 
 ## Commands

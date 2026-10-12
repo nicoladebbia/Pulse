@@ -568,6 +568,7 @@ async fn main() -> anyhow::Result<()> {
         "snapshot" => {
             // Build and write the phone snapshot only: no AI, no orders. The safe
             // way to test it (`--db-path <copy>` and PULSE_SNAPSHOT_DIR=<folder>).
+            snapshot::migrate(&db_path);
             match snapshot::refresh(&db_path).await? {
                 Some(path) => tracing::info!("Phone snapshot written to {}", path.display()),
                 None => tracing::info!("Phone snapshot is switched off (PULSE_SNAPSHOT=off)"),
