@@ -1,8 +1,11 @@
 //! Upcoming earnings reports for the tickers Pulse follows (table
 //! `earnings_calendar`, shown on the Calendar page).
 //!
-//! One call to Finnhub's earnings calendar covers every company, so the whole
-//! refresh costs a single request. Only tickers Pulse tracks or holds are kept.
+//! Finnhub's earnings calendar covers every company but returns at most
+//! `ROW_CAP` rows per request and does not say when it cut the list (a busy
+//! week has more), so the range is fetched in windows and any window that comes
+//! back full is split until it fits (a full response is missing its earliest
+//! days). Only tickers Pulse tracks or holds are kept.
 //! Future rows of a ticker are replaced each time because report dates move.
 //! Refreshed at most every `REFRESH_HOURS`, so every scheduled run can call
 //! `refresh_if_stale` without spending the rate limit.
@@ -10,9 +13,21 @@
 use chrono::NaiveDate;
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
+use std::future::Future;
 
 /// How far ahead to look.
 pub const WINDOW_DAYS: i64 = 60;
+/// Rows Finnhub returns per request at most. Measured 2026-10: a 60-day range
+/// and each busy 7-day range all came back as exactly this many. A full
+/// response is missing its EARLIEST days (10-28..11-07 came back as
+/// 11-02..11-07), which is the end the earnings blackout cares about.
+pub const ROW_CAP: usize = 1500;
+/// First window size; a window that comes back full is halved.
+const FIRST_WINDOW_DAYS: i64 = 15;
+/// Requests per refresh at most (the free tier allows 60 a minute).
+const MAX_CALLS: usize = 40;
+/// Pause between requests so the fetcher's other Finnhub calls keep their share.
+const CALL_GAP: std::time::Duration = std::time::Duration::from_millis(400);
 /// Skip the call when the table was filled more recently than this.
 pub const REFRESH_HOURS: i64 = 6;
 
@@ -78,6 +93,60 @@ pub fn store(conn: &Connection, rows: &[EarningsRow], followed: &HashSet<String>
     Ok(n)
 }
 
+/// Fetch `from..=to` through `fetch`, splitting any window that returns `cap`
+/// rows, since the feed may have cut it short. Returns the rows, and the days
+/// that were still full at a single day (rows for that day may be missing).
+/// Fails rather than returning a partial calendar: the caller replaces what it
+/// has stored with the result.
+pub async fn collect<F, Fut>(from: NaiveDate, to: NaiveDate, cap: usize, mut fetch: F) -> anyhow::Result<(Vec<EarningsRow>, Vec<NaiveDate>)>
+where
+    F: FnMut(NaiveDate, NaiveDate) -> Fut,
+    Fut: Future<Output = anyhow::Result<Vec<EarningsRow>>>,
+{
+    let mut windows: Vec<(NaiveDate, NaiveDate)> = Vec::new();
+    let mut start = from;
+    while start <= to {
+        let end = (start + chrono::Duration::days(FIRST_WINDOW_DAYS - 1)).min(to);
+        windows.push((start, end));
+        start = end + chrono::Duration::days(1);
+    }
+    windows.reverse();
+
+    let (mut out, mut full_days, mut calls) = (Vec::new(), Vec::new(), 0);
+    while let Some((a, b)) = windows.pop() {
+        if calls >= MAX_CALLS {
+            anyhow::bail!("earnings calendar needed more than {MAX_CALLS} requests");
+        }
+        calls += 1;
+        let rows = fetch(a, b).await?;
+        if rows.len() >= cap && a < b {
+            let mid = a + chrono::Duration::days((b - a).num_days() / 2);
+            windows.push((mid + chrono::Duration::days(1), b));
+            windows.push((a, mid));
+            continue;
+        }
+        if rows.len() >= cap {
+            full_days.push(a);
+        }
+        out.extend(rows);
+    }
+    Ok((out, full_days))
+}
+
+pub(crate) async fn fetch_window(client: &reqwest::Client, key: &str, from: NaiveDate, to: NaiveDate) -> anyhow::Result<Vec<EarningsRow>> {
+    tokio::time::sleep(CALL_GAP).await;
+    let resp = client
+        .get("https://finnhub.io/api/v1/calendar/earnings")
+        .query(&[("from", from.to_string()), ("to", to.to_string()), ("token", key.to_string())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("earnings calendar returned {}", resp.status());
+    }
+    let body: serde_json::Value = resp.json().await?;
+    Ok(parse_rows(&body))
+}
+
 fn fresh(conn: &Connection) -> bool {
     conn.query_row(
         "SELECT COUNT(*) FROM earnings_calendar WHERE fetched_at >= datetime('now', ?1)",
@@ -101,28 +170,32 @@ pub async fn refresh_if_stale(db_path: &std::path::Path) -> anyhow::Result<Optio
     if fresh(&conn) {
         return Ok(None);
     }
+    // Nothing to keep (no tracked tickers yet): leave the table alone.
+    let followed = followed_tickers(&conn)?;
+    if followed.is_empty() {
+        return Ok(None);
+    }
     let today = chrono::Local::now().date_naive();
     let to = today + chrono::Duration::days(WINDOW_DAYS);
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
-    let resp = client
-        .get("https://finnhub.io/api/v1/calendar/earnings")
-        .query(&[("from", today.to_string()), ("to", to.to_string()), ("token", key.trim().to_string())])
-        .send()
-        .await?;
-    crate::db::log_fetch_calls(&conn, "finnhub", "earnings_calendar", 1);
-    if !resp.status().is_success() {
-        anyhow::bail!("earnings calendar returned {}", resp.status());
-    }
-    let body: serde_json::Value = resp.json().await?;
-    let rows = parse_rows(&body);
+    let calls = std::cell::Cell::new(0u32);
+    let result = collect(today, to, ROW_CAP, |a, b| {
+        calls.set(calls.get() + 1);
+        fetch_window(&client, key.trim(), a, b)
+    })
+    .await;
+    crate::db::log_fetch_calls(&conn, "finnhub", "earnings_calendar", calls.get() as _);
+    let (rows, full_days) = result?;
     // A reply with no rows at all is a failed fetch, not an empty calendar:
     // keep what we have instead of wiping it.
     if rows.is_empty() {
         anyhow::bail!("earnings calendar came back empty");
     }
-    let followed = followed_tickers(&conn)?;
+    if !full_days.is_empty() {
+        tracing::warn!("Earnings calendar: {} day(s) returned a full page, some reports may be missing: {:?}", full_days.len(), full_days);
+    }
     let n = store(&conn, &rows, &followed, today)?;
-    tracing::info!("Earnings calendar: {n} reports stored ({} in the feed)", rows.len());
+    tracing::info!("Earnings calendar: {n} reports stored ({} in the feed, {} request(s))", rows.len(), calls.get());
     Ok(Some(n))
 }
 
@@ -192,5 +265,69 @@ mod tests {
         assert!(fresh(&c));
         c.execute("UPDATE earnings_calendar SET fetched_at = datetime('now', '-7 hours')", []).unwrap();
         assert!(!fresh(&c));
+    }
+
+    fn row(t: &str, day: NaiveDate) -> EarningsRow {
+        EarningsRow { ticker: t.into(), date: day, hour: None, eps_estimate: None, revenue_estimate: None }
+    }
+
+    /// A feed with `per_day(date)` reports a day that returns the first `cap` rows of a window, as Finnhub does.
+    fn feed(per_day: impl Fn(NaiveDate) -> usize, cap: usize) -> impl FnMut(NaiveDate, NaiveDate) -> std::future::Ready<anyhow::Result<Vec<EarningsRow>>> {
+        move |a, b| {
+            let mut rows = Vec::new();
+            let mut day = a;
+            while day <= b {
+                rows.extend((0..per_day(day)).map(|i| row(&format!("T{i}"), day)));
+                day += chrono::Duration::days(1);
+            }
+            rows.truncate(cap);
+            std::future::ready(Ok(rows))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_window_is_split_until_nothing_is_cut() {
+        let busy = d("2026-10-25");
+        // 1 report a day, 4 on the busy day; the cap of 5 cuts any window holding it plus a couple of days.
+        let per_day = move |day: NaiveDate| if day == busy { 4 } else { 1 };
+        let (rows, full) = collect(d("2026-10-11"), d("2026-12-09"), 5, feed(per_day, 5)).await.unwrap();
+        assert_eq!(rows.len(), 59 + 4, "60 days: 59 with one report, the busy day with four");
+        assert!(full.is_empty());
+        let on_busy = rows.iter().filter(|r| r.date == busy).count();
+        assert_eq!(on_busy, 4);
+    }
+
+    #[tokio::test]
+    async fn a_single_day_that_is_still_full_is_reported_not_lost() {
+        let busy = d("2026-10-25");
+        let per_day = move |day: NaiveDate| if day == busy { 9 } else { 1 };
+        let (rows, full) = collect(d("2026-10-11"), d("2026-11-09"), 5, feed(per_day, 5)).await.unwrap();
+        assert_eq!(full, vec![busy]);
+        assert_eq!(rows.iter().filter(|r| r.date == busy).count(), 5, "what the feed gave for that day is kept");
+    }
+
+    #[tokio::test]
+    async fn no_duplicates_across_windows_and_one_request_per_quiet_window() {
+        let calls = std::cell::Cell::new(0);
+        let mut inner = feed(|_| 1, 1500);
+        let (rows, _) = collect(d("2026-10-11"), d("2026-12-09"), 1500, |a, b| {
+            calls.set(calls.get() + 1);
+            inner(a, b)
+        })
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 60);
+        assert_eq!(calls.get(), 4, "60 days in 15-day windows");
+        let dates: HashSet<NaiveDate> = rows.iter().map(|r| r.date).collect();
+        assert_eq!(dates.len(), 60);
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_fails_the_whole_fetch_and_too_many_requests_stop_it() {
+        let failing = |_: NaiveDate, _: NaiveDate| std::future::ready(Err::<Vec<EarningsRow>, _>(anyhow::anyhow!("429")));
+        assert!(collect(d("2026-10-11"), d("2026-12-09"), 5, failing).await.is_err());
+        // Every day over the cap: it would split down to single days, far past the request limit.
+        let err = collect(d("2026-10-11"), d("2026-12-09"), 1, feed(|_| 3, 1)).await.unwrap_err();
+        assert!(err.to_string().contains("more than"), "{err}");
     }
 }
