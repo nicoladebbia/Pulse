@@ -11,6 +11,10 @@ fn num(s: &str) -> f64 {
     s.parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0)
 }
 
+fn parse(s: &str) -> Option<f64> {
+    s.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
 /// Where the account stands on risk: exposure, concentration, money at stake if
 /// every stop fills, sensitivity to the S&P 500 and drawdown. Beta is
 /// best-effort: if the price history can't be fetched the rest still shows.
@@ -26,22 +30,34 @@ pub async fn get_risk_report(db: State<'_, DbState>) -> Result<RiskReport, Strin
     };
 
     let account = paper_trading::get_account().await.map_err(|e| e.to_string())?;
+    let mut skipped: Vec<String> = Vec::new();
     let held: Vec<HeldPosition> = paper_trading::get_positions()
         .await
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|p| HeldPosition {
-            symbol: p.symbol,
-            qty: num(&p.qty),
-            price: num(&p.current_price),
-            market_value: num(&p.market_value),
-            unrealized_pl: num(&p.unrealized_pl),
+        .filter_map(|p| match (parse(&p.qty), parse(&p.market_value), parse(&p.current_price)) {
+            (Some(qty), Some(market_value), Some(price)) => Some(HeldPosition {
+                symbol: p.symbol,
+                qty,
+                price,
+                market_value,
+                unrealized_pl: num(&p.unrealized_pl),
+            }),
+            _ => {
+                skipped.push(p.symbol);
+                None
+            }
         })
         .collect();
 
-    let bars = fetch_bars(&held).await.unwrap_or_default();
+    let (bars, bars_error) = match fetch_bars(&held).await {
+        Ok(b) => (b, None),
+        Err(e) => (HashMap::new(), Some(e)),
+    };
     let equity = num(&account.equity);
-    let report = risk::build_report(&RiskInputs {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let history = risk::with_live_equity(&history, &today, equity);
+    let mut report = risk::build_report(&RiskInputs {
         equity,
         cash: num(&account.cash),
         positions: &held,
@@ -50,7 +66,12 @@ pub async fn get_risk_report(db: State<'_, DbState>) -> Result<RiskReport, Strin
         bars: &bars,
         equity_history: &history,
     });
-    if let Ok(conn) = db.0.lock() {
+    if !skipped.is_empty() {
+        report.warnings.push(format!("Left out {} with unreadable data from Alpaca", skipped.join(", ")));
+    }
+    if let Some(e) = bars_error {
+        report.warnings.push(format!("Price history unavailable, so market sensitivity is assumed: {e}"));
+    } else if let Ok(conn) = db.0.lock() {
         crate::services::api_usage::log_usage(&conn, "alpaca", "data_api", "risk_bars", 1, 0).ok();
     }
     Ok(report)

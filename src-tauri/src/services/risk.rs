@@ -170,6 +170,16 @@ fn pct(part: f64, whole: f64) -> f64 {
     }
 }
 
+/// The snapshots plus today's live equity, so a new high that has not been
+/// snapshotted yet does not read as a drawdown.
+pub fn with_live_equity(history: &[(String, f64)], today: &str, equity: f64) -> Vec<(String, f64)> {
+    let mut out: Vec<(String, f64)> = history.iter().filter(|(d, _)| d.as_str() != today).cloned().collect();
+    if equity.is_finite() && equity > 0.0 {
+        out.push((today.to_string(), equity));
+    }
+    out
+}
+
 pub fn drawdown(history: &[(String, f64)]) -> DrawdownInfo {
     let mut info = DrawdownInfo::default();
     let mut peak = 0.0_f64;
@@ -374,21 +384,30 @@ pub fn build_report(inp: &RiskInputs) -> RiskReport {
     }
 }
 
-/// Live broker stop price per ticker for the open trades.
+/// Live broker stop price per ticker for the open trades. A stop only counts
+/// while its order id is set: the fetcher clears the id (not the price) when a
+/// stop is cancelled or gone. With several open trades in one ticker the
+/// tightest stop wins: highest for longs, lowest for shorts.
 pub fn load_stops(conn: &Connection) -> rusqlite::Result<HashMap<String, f64>> {
     let mut stmt = conn.prepare(
-        "SELECT ticker, broker_stop_price FROM paper_trades
-         WHERE status = 'open' AND broker_stop_price IS NOT NULL",
+        "SELECT ticker, direction, broker_stop_price FROM paper_trades
+         WHERE status = 'open' AND stop_order_id IS NOT NULL AND broker_stop_price IS NOT NULL",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?))
-    })?;
-    let mut out = HashMap::new();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?)))?;
+    let mut out: HashMap<String, f64> = HashMap::new();
     for row in rows {
-        let (ticker, stop) = row?;
-        if let Some(s) = stop {
-            out.insert(ticker, s);
+        let (ticker, direction, stop) = row?;
+        if !stop.is_finite() || stop <= 0.0 {
+            continue;
         }
+        let short = direction == "short";
+        out.entry(ticker)
+            .and_modify(|cur| {
+                if (short && stop < *cur) || (!short && stop > *cur) {
+                    *cur = stop;
+                }
+            })
+            .or_insert(stop);
     }
     Ok(out)
 }
@@ -609,6 +628,33 @@ mod tests {
         assert_eq!(d.peak_date.as_deref(), Some("b"));
         assert!((d.max_pct - -25.0).abs() < 1e-9);
         assert!((d.current_pct - -10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_live_stops_count_and_the_tightest_wins() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE paper_trades (ticker TEXT, direction TEXT, status TEXT, stop_order_id TEXT, broker_stop_price REAL);
+             INSERT INTO paper_trades VALUES ('AAA','long','open','o1',90.0), ('AAA','long','open','o2',95.0),
+               ('BBB','short','open','o3',120.0), ('BBB','short','open','o4',110.0),
+               ('CCC','long','open',NULL,50.0),
+               ('DDD','long','closed','o5',70.0);",
+        )
+        .unwrap();
+        let stops = load_stops(&c).unwrap();
+        assert_eq!(stops.get("AAA"), Some(&95.0));
+        assert_eq!(stops.get("BBB"), Some(&110.0));
+        assert!(!stops.contains_key("CCC"), "a cancelled stop leaves its price behind");
+        assert!(!stops.contains_key("DDD"));
+    }
+
+    #[test]
+    fn live_equity_replaces_todays_snapshot() {
+        let h = vec![("2026-10-09".to_string(), 100.0), ("2026-10-10".to_string(), 90.0)];
+        let merged = with_live_equity(&h, "2026-10-10", 105.0);
+        assert_eq!(merged, vec![("2026-10-09".to_string(), 100.0), ("2026-10-10".to_string(), 105.0)]);
+        assert_eq!(drawdown(&merged).current_pct, 0.0);
+        assert_eq!(with_live_equity(&h, "2026-10-11", f64::NAN).len(), 2);
     }
 
     #[test]
