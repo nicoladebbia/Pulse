@@ -1,4 +1,4 @@
-import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest } from './types';
+import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, CalendarData } from './types';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -633,3 +633,36 @@ export const mockProposalBacktest: ProposalBacktest = {
 	},
 	hypotheses_tested: 1
 };
+
+// === Calendar fixture (dates are relative to the day the page opens) ===
+function mockDay(offset: number): string {
+	const d = new Date();
+	d.setDate(d.getDate() + offset);
+	return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+const mockEarning = (ticker: string, name: string, offset: number, hour: string | null, eps: number | null, held = false, score: number | null = null, blackout = offset >= 0 && offset <= 3) => ({
+	ticker, name, date: mockDay(offset), hour, eps_estimate: eps, revenue_estimate: eps == null ? null : eps * 5e9,
+	days_until: offset, held, blackout, signal_score: score
+});
+export function buildMockCalendar(): CalendarData {
+	return {
+		today: mockDay(0), days: 30, has_earnings_data: true, earnings_updated_at: `${mockDay(0)} 06:12:00`,
+		held_in_blackout: ['TENB'],
+		earnings: [
+			mockEarning('ACN', 'Accenture', -1, 'bmo', 2.78, true),
+			mockEarning('TENB', 'Tenable Holdings', 2, 'amc', 0.31, true, 0.42),
+			mockEarning('JPM', 'JPMorgan Chase', 3, 'bmo', 4.88, false, 0.27),
+			mockEarning('NFLX', 'Netflix', 9, 'amc', 5.12, false),
+			mockEarning('TSLA', 'Tesla', 11, 'amc', 0.58, false, 0.33),
+			mockEarning('MSFT', 'Microsoft', 18, 'amc', 3.34, true),
+			mockEarning('NVDA', 'NVIDIA', 19, 'amc', 1.08, false, 0.51),
+			mockEarning('XOM', 'Exxon Mobil', 21, 'bmo', null, false)
+		],
+		macro_events: [
+			{ date: mockDay(3), kind: 'cpi', title: 'Consumer prices (CPI)', time_et: '8:30 AM', note: null, days_until: 3 },
+			{ date: mockDay(4), kind: 'ppi', title: 'Producer prices (PPI)', time_et: '8:30 AM', note: null, days_until: 4 },
+			{ date: mockDay(17), kind: 'fomc', title: 'Fed interest-rate decision', time_et: '2:00 PM', note: 'Two-day meeting starting 2 days before', days_until: 17 },
+			{ date: mockDay(26), kind: 'jobs', title: 'Jobs report', time_et: '8:30 AM', note: null, days_until: 26 }
+		]
+	};
+}

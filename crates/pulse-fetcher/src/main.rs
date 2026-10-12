@@ -15,6 +15,7 @@ pub(crate) mod position_management;
 pub(crate) mod decisions;
 pub(crate) mod entry_filters;
 pub(crate) mod scorecard;
+pub(crate) mod calendar;
 pub(crate) mod learning;
 pub(crate) mod event_signals;
 pub(crate) mod position_sizing;
@@ -522,6 +523,7 @@ async fn main() -> anyhow::Result<()> {
         "learn" => {
             // Daily: review closed trades, report what each signal source and
             // exit rule earned, and nudge weights within bounds (learning.rs).
+            refresh_calendar(&db_path).await;
             match learning::run(&db_path).await {
                 Ok(r) => tracing::info!("Learning complete: {} trades reviewed", r.trades_reviewed),
                 Err(e) => {
@@ -542,6 +544,9 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(75);
                 }
             };
+            if args.full_sources {
+                refresh_calendar(&db_path).await;
+            }
             let report = pipeline::run_live_signals(&db_path, args.full_sources).await?;
             tracing::info!(
                 "Live signals: {} new Form 4, {} enriched, {} new filings{}, {} scores, newly buy-grade: [{}]",
@@ -583,6 +588,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Pulse fetch complete");
     Ok(())
+}
+
+/// Refresh upcoming earnings dates (at most every few hours). A failure only
+/// costs the Calendar page some freshness, so it is logged, never fatal.
+async fn refresh_calendar(db_path: &std::path::Path) {
+    if let Err(e) = calendar::refresh_if_stale(db_path).await {
+        tracing::warn!("Earnings calendar refresh failed: {e}");
+    }
 }
 
 /// Fire a macOS notification when a scheduled fetch fails or produces a degraded
