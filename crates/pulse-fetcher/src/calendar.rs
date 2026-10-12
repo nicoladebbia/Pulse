@@ -41,6 +41,20 @@ pub struct EarningsRow {
     pub revenue_estimate: Option<f64>,
 }
 
+/// One response: the rows that parsed, and how many entries the feed sent. The
+/// cap check needs the second number, since an entry without a usable symbol or
+/// date is dropped from the first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Page {
+    pub rows: Vec<EarningsRow>,
+    pub raw: usize,
+}
+
+pub fn parse_page(body: &serde_json::Value) -> Page {
+    let raw = body.get("earningsCalendar").and_then(|v| v.as_array()).map_or(0, Vec::len);
+    Page { rows: parse_rows(body), raw }
+}
+
 pub fn parse_rows(body: &serde_json::Value) -> Vec<EarningsRow> {
     body.get("earningsCalendar")
         .and_then(|v| v.as_array())
@@ -93,15 +107,23 @@ pub fn store(conn: &Connection, rows: &[EarningsRow], followed: &HashSet<String>
     Ok(n)
 }
 
+/// What `collect` got: the rows, the days that were still full at a single day
+/// (rows for that day may be missing), and why it stopped early, if it did.
+pub struct Collected {
+    pub rows: Vec<EarningsRow>,
+    pub full_days: Vec<NaiveDate>,
+    pub error: Option<anyhow::Error>,
+}
+
 /// Fetch `from..=to` through `fetch`, splitting any window that returns `cap`
-/// rows, since the feed may have cut it short. Returns the rows, and the days
-/// that were still full at a single day (rows for that day may be missing).
-/// Fails rather than returning a partial calendar: the caller replaces what it
-/// has stored with the result.
-pub async fn collect<F, Fut>(from: NaiveDate, to: NaiveDate, cap: usize, mut fetch: F) -> anyhow::Result<(Vec<EarningsRow>, Vec<NaiveDate>)>
+/// entries, since the feed may have cut it short. Windows go earliest first, so
+/// when a request fails the rows already in `rows` cover the days up to the
+/// failure; the caller decides whether a partial calendar is good enough (the
+/// stored calendar is not replaced by one, the trader's blackout uses it).
+pub async fn collect<F, Fut>(from: NaiveDate, to: NaiveDate, cap: usize, mut fetch: F) -> Collected
 where
     F: FnMut(NaiveDate, NaiveDate) -> Fut,
-    Fut: Future<Output = anyhow::Result<Vec<EarningsRow>>>,
+    Fut: Future<Output = anyhow::Result<Page>>,
 {
     let mut windows: Vec<(NaiveDate, NaiveDate)> = Vec::new();
     let mut start = from;
@@ -112,28 +134,36 @@ where
     }
     windows.reverse();
 
-    let (mut out, mut full_days, mut calls) = (Vec::new(), Vec::new(), 0);
+    let mut out = Collected { rows: Vec::new(), full_days: Vec::new(), error: None };
+    let mut calls = 0;
     while let Some((a, b)) = windows.pop() {
         if calls >= MAX_CALLS {
-            anyhow::bail!("earnings calendar needed more than {MAX_CALLS} requests");
+            out.error = Some(anyhow::anyhow!("earnings calendar needed more than {MAX_CALLS} requests"));
+            break;
         }
         calls += 1;
-        let rows = fetch(a, b).await?;
-        if rows.len() >= cap && a < b {
+        let page = match fetch(a, b).await {
+            Ok(p) => p,
+            Err(e) => {
+                out.error = Some(e);
+                break;
+            }
+        };
+        if page.raw >= cap && a < b {
             let mid = a + chrono::Duration::days((b - a).num_days() / 2);
             windows.push((mid + chrono::Duration::days(1), b));
             windows.push((a, mid));
             continue;
         }
-        if rows.len() >= cap {
-            full_days.push(a);
+        if page.raw >= cap {
+            out.full_days.push(a);
         }
-        out.extend(rows);
+        out.rows.extend(page.rows);
     }
-    Ok((out, full_days))
+    out
 }
 
-pub(crate) async fn fetch_window(client: &reqwest::Client, key: &str, from: NaiveDate, to: NaiveDate) -> anyhow::Result<Vec<EarningsRow>> {
+pub(crate) async fn fetch_window(client: &reqwest::Client, key: &str, from: NaiveDate, to: NaiveDate) -> anyhow::Result<Page> {
     tokio::time::sleep(CALL_GAP).await;
     let resp = client
         .get("https://finnhub.io/api/v1/calendar/earnings")
@@ -144,7 +174,7 @@ pub(crate) async fn fetch_window(client: &reqwest::Client, key: &str, from: Naiv
         anyhow::bail!("earnings calendar returned {}", resp.status());
     }
     let body: serde_json::Value = resp.json().await?;
-    Ok(parse_rows(&body))
+    Ok(parse_page(&body))
 }
 
 fn fresh(conn: &Connection) -> bool {
@@ -185,7 +215,11 @@ pub async fn refresh_if_stale(db_path: &std::path::Path) -> anyhow::Result<Optio
     })
     .await;
     crate::db::log_fetch_calls(&conn, "finnhub", "earnings_calendar", calls.get() as _);
-    let (rows, full_days) = result?;
+    // The stored calendar is replaced as a whole, so a partial fetch keeps it.
+    let Collected { rows, full_days, error } = result;
+    if let Some(e) = error {
+        return Err(e);
+    }
     // A reply with no rows at all is a failed fetch, not an empty calendar:
     // keep what we have instead of wiping it.
     if rows.is_empty() {
@@ -272,7 +306,7 @@ mod tests {
     }
 
     /// A feed with `per_day(date)` reports a day that returns the first `cap` rows of a window, as Finnhub does.
-    fn feed(per_day: impl Fn(NaiveDate) -> usize, cap: usize) -> impl FnMut(NaiveDate, NaiveDate) -> std::future::Ready<anyhow::Result<Vec<EarningsRow>>> {
+    fn feed(per_day: impl Fn(NaiveDate) -> usize, cap: usize) -> impl FnMut(NaiveDate, NaiveDate) -> std::future::Ready<anyhow::Result<Page>> {
         move |a, b| {
             let mut rows = Vec::new();
             let mut day = a;
@@ -281,7 +315,8 @@ mod tests {
                 day += chrono::Duration::days(1);
             }
             rows.truncate(cap);
-            std::future::ready(Ok(rows))
+            let raw = rows.len();
+            std::future::ready(Ok(Page { rows, raw }))
         }
     }
 
@@ -290,7 +325,8 @@ mod tests {
         let busy = d("2026-10-25");
         // 1 report a day, 4 on the busy day; the cap of 5 cuts any window holding it plus a couple of days.
         let per_day = move |day: NaiveDate| if day == busy { 4 } else { 1 };
-        let (rows, full) = collect(d("2026-10-11"), d("2026-12-09"), 5, feed(per_day, 5)).await.unwrap();
+        let Collected { rows, full_days: full, error } = collect(d("2026-10-11"), d("2026-12-09"), 5, feed(per_day, 5)).await;
+        assert!(error.is_none());
         assert_eq!(rows.len(), 59 + 4, "60 days: 59 with one report, the busy day with four");
         assert!(full.is_empty());
         let on_busy = rows.iter().filter(|r| r.date == busy).count();
@@ -301,7 +337,7 @@ mod tests {
     async fn a_single_day_that_is_still_full_is_reported_not_lost() {
         let busy = d("2026-10-25");
         let per_day = move |day: NaiveDate| if day == busy { 9 } else { 1 };
-        let (rows, full) = collect(d("2026-10-11"), d("2026-11-09"), 5, feed(per_day, 5)).await.unwrap();
+        let Collected { rows, full_days: full, .. } = collect(d("2026-10-11"), d("2026-11-09"), 5, feed(per_day, 5)).await;
         assert_eq!(full, vec![busy]);
         assert_eq!(rows.iter().filter(|r| r.date == busy).count(), 5, "what the feed gave for that day is kept");
     }
@@ -310,12 +346,11 @@ mod tests {
     async fn no_duplicates_across_windows_and_one_request_per_quiet_window() {
         let calls = std::cell::Cell::new(0);
         let mut inner = feed(|_| 1, 1500);
-        let (rows, _) = collect(d("2026-10-11"), d("2026-12-09"), 1500, |a, b| {
+        let Collected { rows, .. } = collect(d("2026-10-11"), d("2026-12-09"), 1500, |a, b| {
             calls.set(calls.get() + 1);
             inner(a, b)
         })
-        .await
-        .unwrap();
+        .await;
         assert_eq!(rows.len(), 60);
         assert_eq!(calls.get(), 4, "60 days in 15-day windows");
         let dates: HashSet<NaiveDate> = rows.iter().map(|r| r.date).collect();
@@ -323,11 +358,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_request_fails_the_whole_fetch_and_too_many_requests_stop_it() {
-        let failing = |_: NaiveDate, _: NaiveDate| std::future::ready(Err::<Vec<EarningsRow>, _>(anyhow::anyhow!("429")));
-        assert!(collect(d("2026-10-11"), d("2026-12-09"), 5, failing).await.is_err());
+    async fn a_failed_request_stops_the_fetch_but_keeps_the_earlier_days() {
+        let mut inner = feed(|_| 1, 1500);
+        let got = collect(d("2026-10-11"), d("2026-12-09"), 1500, |a, b| {
+            if a > d("2026-11-09") {
+                return std::future::ready(Err(anyhow::anyhow!("429")));
+            }
+            inner(a, b)
+        })
+        .await;
+        assert!(got.error.is_some());
+        assert_eq!(got.rows.len(), 30, "the first two 15-day windows arrived before the failure");
+        assert!(got.rows.iter().all(|r| r.date <= d("2026-11-09")));
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_stop_it() {
         // Every day over the cap: it would split down to single days, far past the request limit.
-        let err = collect(d("2026-10-11"), d("2026-12-09"), 1, feed(|_| 3, 1)).await.unwrap_err();
-        assert!(err.to_string().contains("more than"), "{err}");
+        let got = collect(d("2026-10-11"), d("2026-12-09"), 1, feed(|_| 3, 1)).await;
+        let err = got.error.expect("stopped").to_string();
+        assert!(err.contains("more than"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_cap_counts_what_the_feed_sent_not_what_parsed() {
+        // 5 entries came back (the cap), but one has no symbol and is dropped: the window was still cut.
+        let body = serde_json::json!({"earningsCalendar": [
+            {"symbol": "A", "date": "2026-10-20"}, {"symbol": "B", "date": "2026-10-20"},
+            {"symbol": "C", "date": "2026-10-20"}, {"symbol": "D", "date": "2026-10-20"},
+            {"symbol": "", "date": "2026-10-20"}]});
+        let page = parse_page(&body);
+        assert_eq!((page.rows.len(), page.raw), (4, 5));
+        let calls = std::cell::Cell::new(0);
+        let got = collect(d("2026-10-11"), d("2026-10-12"), 5, |_, _| {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok(page.clone()))
+        })
+        .await;
+        assert!(calls.get() > 1, "a full window is split even though only 4 rows parsed");
+        assert!(got.error.is_none());
     }
 }
