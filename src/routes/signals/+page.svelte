@@ -555,7 +555,7 @@
 		if (e.key === '5') activeTab = 'research';
 		if (e.key === 'r') loadData();
 		if (e.key === 'a') { activeTab = 'portfolio'; showAnalytics = !showAnalytics; }
-		if (e.key === 'b') { goto('/backtest'); }
+		if (e.key === 'b') { goto('/backtest').catch(() => {}); }
 		if (e.key === 'c') { activeTab = 'portfolio'; showCalibration = !showCalibration; }
 	}
 

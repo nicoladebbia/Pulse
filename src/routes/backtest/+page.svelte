@@ -42,6 +42,8 @@
 
 	let form = $state<FormState>(liveBotForm('', ''));
 	let running = $state(false);
+	// Backend runs still going, including ones the user has navigated away from by opening a past run.
+	let inFlight = $state(0);
 	let error = $state<string | null>(null);
 	let run = $state<BacktestRun | null>(null);
 	let loadedFromHistory = $state(false);
@@ -78,9 +80,21 @@
 			.finally(() => (historyLoading = false));
 	});
 
+	let historySeq = 0;
+	/** Reload past runs; only the newest request may write the list. */
+	function refreshHistory() {
+		const mine = ++historySeq;
+		fetchHistory()
+			.then((h) => {
+				if (mine === historySeq) history = h;
+			})
+			.catch(() => {});
+	}
+
 	async function start() {
-		if (running || Object.keys(validate(form)).length) return;
+		if (running || inFlight > 0 || Object.keys(validate(form)).length) return;
 		running = true;
+		inFlight++;
 		error = null;
 		const seq = ++runSeq;
 		const cfg = toConfig(form);
@@ -95,10 +109,11 @@
 		} catch (e) {
 			if (seq === runSeq) error = errMsg(e);
 		} finally {
+			inFlight--;
 			if (seq === runSeq) running = false;
 		}
 		// The backend saved the run even if the user has since opened a past one.
-		if (saved) fetchHistory().then((h) => (history = h)).catch(() => {});
+		if (saved) refreshHistory();
 	}
 
 	function loadPast(h: BacktestResult) {
@@ -148,7 +163,7 @@
 		</p>
 	</details>
 
-	<SettingsCard bind:form {range} {running} onrun={start} />
+	<SettingsCard bind:form {range} running={running || inFlight > 0} onrun={start} />
 
 	<!-- Results -->
 	<section aria-label="Results" aria-busy={running} class="relative">
@@ -198,7 +213,7 @@
 					</div>
 					<div class="bg-bg-card border border-border rounded-xl p-4">
 						<p class="text-xs text-text-secondary">Hit rate</p>
-						<p class="text-xl font-semibold font-mono tabular-nums mt-1 text-text">{Number.isFinite(res.hit_rate) ? res.hit_rate.toFixed(1) : '—'}%</p>
+						<p class="text-xl font-semibold font-mono tabular-nums mt-1 text-text">{Number.isFinite(res.hit_rate) ? `${res.hit_rate.toFixed(1)}%` : '—'}</p>
 						<p class="text-xs font-mono tabular-nums text-text-muted mt-0.5">{res.trades_won}W / {res.trades_lost}L</p>
 					</div>
 					<div class="bg-bg-card border border-border rounded-xl p-4">
@@ -290,7 +305,7 @@
 						<button type="button" onclick={() => loadPast(h)} class="w-full flex items-center gap-4 py-2 text-left rounded hover:bg-bg-card-hover transition-colors duration-150 focus-visible:outline-2 focus-visible:outline-ai">
 							<span class="flex-1 min-w-0 truncate text-xs text-text-secondary" title={h.config_summary}>{h.config_summary}</span>
 							<span class="w-16 text-right font-mono tabular-nums text-xs {tone(h.total_return_pct)}">{pct(h.total_return_pct)}</span>
-							<span class="w-16 shrink-0 whitespace-nowrap text-right font-mono tabular-nums text-xs text-text-secondary">{Number.isFinite(h.hit_rate) ? h.hit_rate.toFixed(0) : '—'}% hit</span>
+							<span class="w-16 shrink-0 whitespace-nowrap text-right font-mono tabular-nums text-xs text-text-secondary">{Number.isFinite(h.hit_rate) ? `${h.hit_rate.toFixed(0)}% hit` : '— hit'}</span>
 							<span class="w-20 shrink-0 whitespace-nowrap text-right font-mono tabular-nums text-xs text-text-secondary">{h.trades_taken} trades</span>
 							<span class="w-24 shrink-0 whitespace-nowrap text-right font-mono tabular-nums text-xs text-text-secondary">Sharpe {Number.isFinite(h.sharpe_ratio) ? h.sharpe_ratio.toFixed(2) : '—'}</span>
 						</button>
