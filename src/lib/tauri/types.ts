@@ -816,6 +816,40 @@ export interface BacktestConfig {
 	max_hold_days: number;
 	max_positions: number;
 	position_size_pct: number;
+	/** Serde's external tagging: the string "FixedPct", or an object for the ATR trail. */
+	exit_model?: BacktestExitModel;
+	/** Size each entry by the live score tiers instead of position_size_pct. */
+	use_live_tiers?: boolean;
+	/** Size by stop-out risk; fields left out take the live defaults. Wins over tiers and position_size_pct. */
+	risk_sizing?: Partial<BacktestRiskParams> | null;
+}
+
+export type BacktestExitModel =
+	| 'FixedPct'
+	| { AtrTrail: { atr_mult: number; hard_stop_pct: number; activate_pct: number } };
+
+/** The knobs the page exposes; the rest of the backend's RiskParams keep their live defaults. */
+export interface BacktestRiskParams {
+	/** Fraction of equity a trade may lose at its stop (0.005 = 0.5%). */
+	risk_per_trade: number;
+	/** Cap on summed open risk, as a fraction of equity. */
+	max_heat: number;
+	/** Cap on dollars in one ticker, as a fraction of equity. */
+	max_ticker_pct: number;
+}
+
+export interface BacktestRun {
+	result: BacktestResult;
+	/** SPY held from the first day with the same starting money, one point per equity-curve date. */
+	spy_curve: BacktestEquityPoint[];
+	spy_return_pct: number | null;
+	spy_error: string | null;
+}
+
+export interface BacktestRange {
+	first_signal_date: string | null;
+	last_price_date: string | null;
+	price_days: number;
 }
 
 export interface BacktestEquityPoint {

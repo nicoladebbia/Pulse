@@ -172,7 +172,7 @@ pub fn compute(trades: &[TradeRow], equity: &[(String, f64)], bars: &[DailyBar],
 /// only change once a day.
 static CACHE: Mutex<Option<(std::time::Instant, String, Vec<DailyBar>)>> = Mutex::new(None);
 
-async fn spy_bars(client: &reqwest::Client, creds: &pulse_alpaca::Credentials, start: &str) -> Result<Vec<DailyBar>, String> {
+pub(crate) async fn spy_bars(client: &reqwest::Client, creds: &pulse_alpaca::Credentials, start: &str) -> Result<Vec<DailyBar>, String> {
     if let Ok(guard) = CACHE.lock()
         && let Some((at, s, bars)) = guard.as_ref()
         && s.as_str() <= start
@@ -180,7 +180,11 @@ async fn spy_bars(client: &reqwest::Client, creds: &pulse_alpaca::Credentials, s
     {
         return Ok(bars.clone());
     }
-    let bars = pulse_alpaca::daily_bars(client, creds, "SPY", start).await?;
+    // The multi-symbol call follows Alpaca's pages; the single-symbol one stops at 1000 bars (about 4 years).
+    let bars = pulse_alpaca::daily_bars_multi(client, creds, &["SPY".to_string()], start)
+        .await?
+        .remove("SPY")
+        .unwrap_or_default();
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some((std::time::Instant::now(), start.to_string(), bars.clone()));
     }

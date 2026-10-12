@@ -20,7 +20,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// `#[serde(default)]`: a caller (the backtest page) may send only the knobs it
+/// changes and take the live defaults for the rest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RiskParams {
     /// Fraction of equity a trade may lose if its stop is hit (0.005 = 0.5%).
     pub risk_per_trade: f64,
