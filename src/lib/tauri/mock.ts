@@ -1,4 +1,4 @@
-import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest } from './types';
+import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, BacktestRun, BacktestRange } from './types';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -633,3 +633,54 @@ export const mockProposalBacktest: ProposalBacktest = {
 	},
 	hypotheses_tested: 1
 };
+
+// === Backtest page fixture ===
+export const mockBacktestRange: BacktestRange = { first_signal_date: '2026-04-14', last_price_date: '2026-10-09', price_days: 125 };
+export function buildMockBacktestRun(): BacktestRun {
+	// Deterministic wiggle so screenshots are stable: bot ends ahead of SPY with a visible drawdown.
+	const days: string[] = [];
+	for (let d = new Date('2026-05-01T12:00:00Z'); days.length < 110; d.setDate(d.getDate() + 1)) {
+		if (d.getDay() !== 0 && d.getDay() !== 6) days.push(d.toISOString().slice(0, 10));
+	}
+	let bot = 10000;
+	let spy = 10000;
+	const equity_curve = days.map((date, i) => {
+		bot *= 1 + 0.0016 + Math.sin(i / 4.2) * 0.004 - (i > 60 && i < 75 ? 0.004 : 0);
+		return { date, value: Math.round(bot * 100) / 100 };
+	});
+	const spy_curve = days.map((date, i) => {
+		spy *= 1 + 0.0007 + Math.sin(i / 6.1) * 0.003;
+		return { date, value: Math.round(spy * 100) / 100 };
+	});
+	const trade = (ticker: string, name: string, entry: string, exit: string, pnl: number, reason: string, score: number) => ({
+		ticker, entity_name: name, entry_date: entry, entry_price: 100, exit_date: exit, exit_price: 100 * (1 + pnl / 100),
+		pnl_pct: pnl, pnl_dollars: pnl * 5, holding_days: 21, exit_reason: reason, compound_score: score, signal_profile: '{}'
+	});
+	const last = equity_curve[equity_curve.length - 1].value;
+	return {
+		result: {
+			config_summary: 'score>=0.4, ATR trail 3x / -15% hard stop, 10 positions, 5% size',
+			total_signals: 309, tickers_signalled: 142, tickers_tradable: 118, trades_taken: 38, open_at_end: 6,
+			trades_won: 21, trades_lost: 17, hit_rate: 55.3, avg_return_pct: 1.9, total_return_pct: (last / 10000 - 1) * 100,
+			max_drawdown_pct: 6.4, sharpe_ratio: 1.12, avg_holding_days: 17.4, starting_equity: 10000, ending_equity: last,
+			trades: [
+				trade('NVDA', 'NVIDIA', '2026-05-12', '2026-06-09', 12.4, 'atr_trail', 0.52),
+				trade('TENB', 'Tenable Holdings', '2026-05-20', '2026-06-04', -6.1, 'stop_loss', 0.44),
+				trade('ACN', 'Accenture', '2026-06-02', '2026-07-01', 8.7, 'max_hold', 0.47),
+				trade('DDOG', 'Datadog', '2026-06-18', '2026-07-09', -3.2, 'atr_trail', 0.41),
+				trade('AMD', 'Advanced Micro Devices', '2026-07-07', '2026-08-04', 15.3, 'atr_trail', 0.58)
+			],
+			equity_curve,
+			monthly_returns: [
+				{ month: '2026-05', pnl_dollars: 310, pnl_pct: 3.1, trade_count: 7 },
+				{ month: '2026-06', pnl_dollars: 180, pnl_pct: 1.7, trade_count: 9 },
+				{ month: '2026-07', pnl_dollars: -240, pnl_pct: -2.2, trade_count: 8 },
+				{ month: '2026-08', pnl_dollars: 520, pnl_pct: 4.8, trade_count: 8 },
+				{ month: '2026-09', pnl_dollars: 150, pnl_pct: 1.3, trade_count: 6 }
+			]
+		},
+		spy_curve,
+		spy_return_pct: (spy_curve[spy_curve.length - 1].value / 10000 - 1) * 100,
+		spy_error: null
+	};
+}

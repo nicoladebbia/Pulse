@@ -1,17 +1,18 @@
 <script lang="ts">
 	import { isTauri } from '$lib/tauri/mock';
+	import { goto } from '$app/navigation';
 	import {
 		getCrossSignals, getConvergenceAlerts, getEntityPrices, getPortfolio,
 		executeTrade, closePosition, getFinancialEvents, getSignalEvidence, getSourceHealth,
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getExitReview, getTradeJournal,
-		runBacktest, startPriceStream, stopPriceStream, getTradeRationale,
+		startPriceStream, stopPriceStream, getTradeRationale,
 		getPendingCalibration, applyPendingCalibration, rejectPendingCalibration, getCalibrationGateStatus,
 		getBenchmark, getTradeDecisions, getSignalScorecard, getLearningReport
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics, ExitReview,
-		TradeJournal, BacktestConfig, BacktestResult, PriceUpdate, TradeRationale,
+		TradeJournal, PriceUpdate, TradeRationale,
 		PendingCalibrationRow, CalibrationGateStatus, Benchmark, TradeDecision, SignalScorecard as Scorecard, LearningReport as Learning
 	} from '$lib/tauri/types';
 	import BenchmarkCard from '$lib/components/signals/BenchmarkCard.svelte';
@@ -49,19 +50,8 @@
 	let tradeJournals = $state<Record<number, TradeJournal>>({});
 	let aiRationales = $state<Record<number, TradeRationale>>({});
 	let aiRationaleFailed = $state<Record<number, boolean>>({});
-	let showBacktest = $state(false);
-	let backtestRunning = $state(false);
-	let backtestResult = $state<BacktestResult | null>(null);
-	let backtestError = $state<string | null>(null);
-	let expandedBtTrade = $state<number | null>(null);
 	let streaming = $state(false);
 	let streamError = $state<string | null>(null);
-	let btMinScore = $state(0.4);
-	let btStopLoss = $state(-10);
-	let btTakeProfit = $state(15);
-	let btMaxHold = $state(90);
-	let btMaxPositions = $state(10);
-	let btPositionSize = $state(5);
 	let showCalibration = $state(false);
 	let pendingCalibration = $state<PendingCalibrationRow[]>([]);
 	let calibrationGate = $state<CalibrationGateStatus | null>(null);
@@ -277,26 +267,6 @@
 			streaming = true;
 		} catch (e: any) {
 			streamError = String(e?.message ?? e);
-		}
-	}
-
-	async function handleBacktest() {
-		backtestRunning = true;
-		backtestError = null;
-		try {
-			const end = new Date().toISOString().slice(0, 10);
-			const start = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-			const config: BacktestConfig = {
-				start_date: start, end_date: end, min_score: btMinScore,
-				stop_loss_pct: btStopLoss, take_profit_pct: btTakeProfit,
-				max_hold_days: btMaxHold, max_positions: btMaxPositions,
-				position_size_pct: btPositionSize,
-			};
-			backtestResult = await runBacktest(config);
-		} catch (e: any) {
-			backtestError = String(e?.message ?? e);
-		} finally {
-			backtestRunning = false;
 		}
 	}
 
@@ -585,7 +555,7 @@
 		if (e.key === '5') activeTab = 'research';
 		if (e.key === 'r') loadData();
 		if (e.key === 'a') { activeTab = 'portfolio'; showAnalytics = !showAnalytics; }
-		if (e.key === 'b') { activeTab = 'portfolio'; showBacktest = !showBacktest; }
+		if (e.key === 'b') { goto('/backtest'); }
 		if (e.key === 'c') { activeTab = 'portfolio'; showCalibration = !showCalibration; }
 	}
 
@@ -1108,105 +1078,6 @@
 				<div class="bg-bg-card border border-border rounded-xl p-6 mb-5 text-center">
 					<p class="text-sm text-text-muted">No closed trades yet — analytics appear after your first trade closes.</p>
 				</div>
-			{/if}
-
-			<!-- Backtester Toggle -->
-			<button onclick={() => showBacktest = !showBacktest}
-				class="w-full text-left mb-5 flex items-center justify-between px-4 py-2.5 bg-bg-card border border-border rounded-xl hover:border-ai/30 transition-colors">
-				<span class="text-xs font-semibold text-text-muted uppercase tracking-wider">Backtester</span>
-				<span class="text-xs text-text-muted">{showBacktest ? '▾' : '▸'} <kbd class="text-[10px] px-1 py-0.5 bg-bg rounded border border-border ml-1">b</kbd></span>
-			</button>
-
-			{#if showBacktest}
-				<div class="bg-bg-card border border-border rounded-xl p-4 mb-5">
-					<div class="grid grid-cols-3 gap-3 mb-3">
-						<div><label for="bt-min-score" class="text-[10px] text-text-muted block mb-1">Min Score</label><input id="bt-min-score" type="number" bind:value={btMinScore} min="0.1" max="1.0" step="0.05" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
-						<div><label for="bt-stop-loss" class="text-[10px] text-text-muted block mb-1">Stop Loss %</label><input id="bt-stop-loss" type="number" bind:value={btStopLoss} max="0" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
-						<div><label for="bt-take-profit" class="text-[10px] text-text-muted block mb-1">Take Profit %</label><input id="bt-take-profit" type="number" bind:value={btTakeProfit} min="1" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
-						<div><label for="bt-max-hold" class="text-[10px] text-text-muted block mb-1">Max Hold (days)</label><input id="bt-max-hold" type="number" bind:value={btMaxHold} min="1" max="365" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
-						<div><label for="bt-max-pos" class="text-[10px] text-text-muted block mb-1">Max Positions</label><input id="bt-max-pos" type="number" bind:value={btMaxPositions} min="1" max="50" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
-						<div><label for="bt-pos-size" class="text-[10px] text-text-muted block mb-1">Position Size %</label><input id="bt-pos-size" type="number" bind:value={btPositionSize} min="1" max="25" step="1" class="w-full bg-bg border border-border rounded-lg px-2 py-1.5 text-xs text-text font-mono focus:outline-none focus:border-ai" /></div>
-					</div>
-					<button onclick={handleBacktest} disabled={backtestRunning}
-						class="px-4 py-2 bg-ai/10 text-ai border border-ai/25 rounded-lg text-xs font-medium hover:bg-ai/20 transition-colors disabled:opacity-50">{backtestRunning ? 'Running...' : 'Run Backtest (30 days)'}</button>
-				</div>
-				{#if backtestError}<div class="bg-rose-500/10 border border-rose-500/20 rounded-xl p-3 mb-5"><p class="text-xs text-rose-400">{backtestError}</p></div>{/if}
-				{#if backtestResult}
-					<div class="mb-5">
-						<div class="grid grid-cols-4 gap-2 mb-3">
-							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Hit Rate</div><div class="text-lg font-mono font-bold {backtestResult.hit_rate >= 50 ? 'text-emerald-400' : 'text-rose-400'}">{backtestResult.hit_rate.toFixed(0)}%</div><div class="text-[10px] text-text-muted">{backtestResult.trades_won}W / {backtestResult.trades_lost}L</div></div>
-							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Total Return</div><div class="text-lg font-mono font-bold {backtestResult.total_return_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}">{backtestResult.total_return_pct >= 0 ? '+' : ''}{backtestResult.total_return_pct.toFixed(1)}%</div></div>
-							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Sharpe</div><div class="text-lg font-mono font-bold {backtestResult.sharpe_ratio >= 1 ? 'text-emerald-400' : 'text-amber-400'}">{backtestResult.sharpe_ratio.toFixed(2)}</div></div>
-							<div class="bg-bg border border-border rounded-lg p-2.5 text-center"><div class="text-[10px] text-text-muted">Max DD</div><div class="text-lg font-mono font-bold text-rose-400">-{backtestResult.max_drawdown_pct.toFixed(1)}%</div></div>
-						</div>
-						{#if backtestResult.equity_curve && backtestResult.equity_curve.length >= 2}
-							{@const curve = backtestResult.equity_curve}
-							{@const minV = Math.min(...curve.map(p => p.value))}
-							{@const maxV = Math.max(...curve.map(p => p.value))}
-							{@const range = (maxV - minV) || 1}
-							{@const start = backtestResult.starting_equity}
-							<div class="bg-bg border border-border rounded-xl p-3 mb-3">
-								<div class="flex items-center justify-between mb-2">
-									<span class="text-[10px] text-text-muted uppercase tracking-wider">Equity Curve</span>
-									<span class="text-[10px] font-mono text-text-muted">${Math.round(curve[0].value).toLocaleString()} → ${Math.round(curve[curve.length - 1].value).toLocaleString()}</span>
-								</div>
-								<svg viewBox="0 0 200 40" preserveAspectRatio="none" class="w-full h-10">
-									<polyline
-										fill="none"
-										stroke-width="1.2"
-										class="{backtestResult.total_return_pct >= 0 ? 'stroke-emerald-400' : 'stroke-rose-400'}"
-										points={curve.map((p, i) => `${(i / (curve.length - 1)) * 200},${40 - ((p.value - minV) / range) * 38 - 1}`).join(' ')}
-									/>
-									<line x1="0" x2="200" y1={40 - ((start - minV) / range) * 38 - 1} y2={40 - ((start - minV) / range) * 38 - 1} stroke="currentColor" stroke-dasharray="2,2" class="text-text-muted/40" stroke-width="0.5" />
-								</svg>
-							</div>
-						{/if}
-						{#if backtestResult.monthly_returns && backtestResult.monthly_returns.length > 0}
-							{@const months = backtestResult.monthly_returns}
-							{@const maxAbs = Math.max(...months.map(m => Math.abs(m.pnl_pct)), 0.01)}
-							<div class="bg-bg border border-border rounded-xl p-3 mb-3">
-								<div class="text-[10px] text-text-muted uppercase tracking-wider mb-2">Monthly Returns</div>
-								<div class="flex items-end gap-1 h-14">
-									{#each months as m}
-										{@const heightPct = (Math.abs(m.pnl_pct) / maxAbs) * 100}
-										<div class="flex-1 flex flex-col items-center gap-0.5" title="{m.month}: {m.pnl_pct >= 0 ? '+' : ''}{m.pnl_pct.toFixed(1)}% · {m.trade_count} trade{m.trade_count === 1 ? '' : 's'} closed">
-											<div class="w-full flex items-end justify-center" style="height: {heightPct}%">
-												<div class="w-full rounded-t {m.pnl_pct >= 0 ? 'bg-emerald-400/70' : 'bg-rose-400/70'}" style="height: 100%"></div>
-											</div>
-											<span class="text-[8px] font-mono text-text-muted">{m.month.slice(5)}</span>
-										</div>
-									{/each}
-								</div>
-							</div>
-						{/if}
-						{#if backtestResult.trades.length > 0}
-							<div class="bg-bg-card border border-border rounded-xl divide-y divide-border/50">
-								{#each backtestResult.trades as bt, i}
-									{@const isWin = bt.pnl_pct > 0}
-									<button class="w-full text-left px-4 py-2.5 hover:bg-white/[0.02] transition-colors" onclick={() => expandedBtTrade = expandedBtTrade === i ? null : i}>
-										<div class="flex items-center justify-between">
-											<div class="flex items-center gap-2">
-												<span class="w-1.5 h-1.5 rounded-full {isWin ? 'bg-emerald-400' : 'bg-rose-400'}"></span>
-												<span class="text-xs font-mono font-semibold text-text">{bt.ticker}</span>
-												<span class="text-[10px] px-1.5 py-0.5 rounded font-medium {bt.exit_reason === 'take_profit' ? 'bg-emerald-500/15 text-emerald-400' : bt.exit_reason === 'stop_loss' ? 'bg-rose-500/15 text-rose-400' : 'bg-zinc-500/15 text-zinc-400'}">{bt.exit_reason.replace('_', ' ')}</span>
-											</div>
-											<span class="text-xs font-mono font-bold {isWin ? 'text-emerald-400' : 'text-rose-400'}">{isWin ? '+' : ''}{bt.pnl_pct.toFixed(1)}%</span>
-										</div>
-										{#if expandedBtTrade === i}
-											<div class="mt-1 text-[11px] text-text-muted flex gap-4">
-												<span>Entry: {bt.entry_date} @ ${bt.entry_price.toFixed(2)}</span>
-												<span>Exit: {bt.exit_date} @ ${bt.exit_price.toFixed(2)}</span>
-												<span>{bt.holding_days}d</span>
-											</div>
-										{/if}
-									</button>
-								{/each}
-							</div>
-						{:else}
-							<p class="text-xs text-text-muted text-center py-3">No signals matched criteria.</p>
-						{/if}
-					</div>
-				{/if}
 			{/if}
 
 			<!-- Calibration Review -->

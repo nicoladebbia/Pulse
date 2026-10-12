@@ -172,7 +172,7 @@ pub fn compute(trades: &[TradeRow], equity: &[(String, f64)], bars: &[DailyBar],
 /// only change once a day.
 static CACHE: Mutex<Option<(std::time::Instant, String, Vec<DailyBar>)>> = Mutex::new(None);
 
-async fn spy_bars(client: &reqwest::Client, creds: &pulse_alpaca::Credentials, start: &str) -> Result<Vec<DailyBar>, String> {
+pub(crate) async fn spy_bars(client: &reqwest::Client, creds: &pulse_alpaca::Credentials, start: &str) -> Result<Vec<DailyBar>, String> {
     if let Ok(guard) = CACHE.lock()
         && let Some((at, s, bars)) = guard.as_ref()
         && s.as_str() <= start

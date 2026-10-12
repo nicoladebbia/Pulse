@@ -1,6 +1,6 @@
 import { invoke, Channel, type InvokeArgs } from '@tauri-apps/api/core';
 import { trackChatMessage } from '$lib/engagement';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, TrendDossier, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, ExitReview, Benchmark, TradeDecision, SignalScorecard, LearningReport, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, TrendDossier, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, ExitReview, Benchmark, TradeDecision, SignalScorecard, LearningReport, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, BacktestRun, BacktestRange } from './types';
 
 export function safeInvoke<T>(cmd: string, args?: InvokeArgs): Promise<T | null>;
 export function safeInvoke<T>(cmd: string, args: InvokeArgs | undefined, fallback: T): Promise<T>;
@@ -260,8 +260,12 @@ export async function getCalibrationGateStatus(): Promise<CalibrationGateStatus>
 	return invoke('get_calibration_gate_status');
 }
 
-export async function runBacktest(config: BacktestConfig): Promise<BacktestResult> {
+export async function runBacktest(config: BacktestConfig): Promise<BacktestRun> {
 	return invoke('run_backtest', { config });
+}
+
+export async function getBacktestRange(): Promise<BacktestRange> {
+	return invoke('get_backtest_range');
 }
 
 export async function getBacktestHistory(): Promise<BacktestResult[]> {
