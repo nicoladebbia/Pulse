@@ -1,6 +1,6 @@
 import { invoke, Channel, type InvokeArgs } from '@tauri-apps/api/core';
 import { trackChatMessage } from '$lib/engagement';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, TrendDossier, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, ExitReview, Benchmark, TradeDecision, SignalScorecard, LearningReport, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, TrendDossier, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, ExitReview, Benchmark, TradeDecision, SignalScorecard, LearningReport, TradeJournal, TradeDetail, TradeRationale, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, RiskReport } from './types';
 
 export function safeInvoke<T>(cmd: string, args?: InvokeArgs): Promise<T | null>;
 export function safeInvoke<T>(cmd: string, args: InvokeArgs | undefined, fallback: T): Promise<T>;
@@ -326,4 +326,8 @@ export async function backtestProposal(proposalId: number): Promise<ProposalBack
 
 export async function setProposalStatus(proposalId: number, status: 'kept' | 'rejected' | 'proposed' | 'tested'): Promise<void> {
 	return invoke('set_proposal_status', { proposalId, status });
+}
+
+export async function getRiskReport(): Promise<RiskReport> {
+	return invoke('get_risk_report');
 }
