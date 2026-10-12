@@ -314,25 +314,18 @@ pub struct BacktestRun {
 }
 
 /// SPY buy-and-hold on the dates of `curve`, scaled to `starting_equity`. Each
-/// date uses the latest bar on or before it. The base is the close just before
-/// the first date, the same moment `starting_equity` is measured at, so the
-/// first day's move counts for SPY as it does for the bot's own curve; with no
-/// earlier bar it is the first date's own close. Dates before the first bar are
-/// left out so the line never starts from a made-up price.
+/// date uses the latest bar on or before it. The backtester enters at the signal
+/// day's close, so the first point carries no day-one P&L and SPY's base is that
+/// same day's close. Dates before the first bar are left out so the line never
+/// starts from a made-up price.
 pub fn spy_curve(
     bars: &[pulse_alpaca::DailyBar],
     curve: &[backtester::EquityPoint],
     starting_equity: f64,
 ) -> Vec<backtester::EquityPoint> {
-    let before_first = curve.first().and_then(|p| {
-        let i = bars.partition_point(|b| b.date.as_str() < p.date.as_str());
-        i.checked_sub(1).map(|i| bars[i].close)
-    });
-    let first = before_first.filter(|b| *b > 0.0 && b.is_finite()).or_else(|| {
-        curve.iter().find_map(|p| {
-            let i = bars.partition_point(|b| b.date.as_str() <= p.date.as_str());
-            (i > 0).then(|| bars[i - 1].close)
-        })
+    let first = curve.iter().find_map(|p| {
+        let i = bars.partition_point(|b| b.date.as_str() <= p.date.as_str());
+        (i > 0).then(|| bars[i - 1].close)
     });
     let Some(base) = first.filter(|b| *b > 0.0 && b.is_finite()) else { return Vec::new() };
     curve
@@ -365,9 +358,8 @@ pub async fn run_backtest(db_path: State<'_, crate::db::DbPath>, config: Backtes
         (Some(first), Some(_)) => match spy_bars_since(&first.date).await {
             Ok(bars) => {
                 let curve = spy_curve(&bars, &result.equity_curve, result.starting_equity);
-                // From the starting equity, like the bot's own total return.
-                let ret = match curve.last() {
-                    Some(b) if result.starting_equity > 0.0 => Some((b.value / result.starting_equity - 1.0) * 100.0),
+                let ret = match (curve.first(), curve.last()) {
+                    (Some(a), Some(b)) if a.value > 0.0 => Some((b.value / a.value - 1.0) * 100.0),
                     _ => None,
                 };
                 (curve, ret, None)
@@ -1737,14 +1729,6 @@ mod backtest_page_tests {
         let values: Vec<f64> = spy.iter().map(|p| p.value).collect();
         // 09-03 has no bar of its own: it carries 09-02's close.
         assert_eq!(values, vec![10_000.0, 11_000.0, 11_000.0, 9_900.0]);
-    }
-
-    #[test]
-    fn spy_line_counts_the_first_days_move_from_the_close_before_it() {
-        let bars = [bar("2026-08-31", 100.0), bar("2026-09-01", 102.0), bar("2026-09-02", 110.0)];
-        let curve = [pt("2026-09-01", 10_050.0), pt("2026-09-02", 10_100.0)];
-        let values: Vec<f64> = spy_curve(&bars, &curve, 10_000.0).iter().map(|p| p.value).collect();
-        assert_eq!(values, vec![10_200.0, 11_000.0], "scaled from 08-31's close, like starting_equity");
     }
 
     #[test]
