@@ -99,6 +99,8 @@
 		{ href: '/trends', label: 'Trends', icon: '◈' },
 		{ href: '/signals', label: 'Signals', icon: '⬡' },
 		{ href: '/backtest', label: 'Backtest', icon: '⟲' },
+		{ href: '/calendar', label: 'Calendar', icon: '▦' },
+		{ href: '/risk', label: 'Risk', icon: '△' },
 		{ href: '/freedoms', label: 'Freedoms', icon: '◇' },
 		{ href: '/journal', label: 'Journal', icon: '☰' },
 		{ href: '/ask', label: 'Ask Pulse', icon: '◎' },

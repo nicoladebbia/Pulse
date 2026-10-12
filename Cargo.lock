@@ -2860,6 +2860,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "pulse-alpaca",
+ "pulse-calendar",
  "pulse-llm",
  "pulse-pricing",
  "pulse-weights",
@@ -2890,6 +2891,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulse-calendar"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+]
+
+[[package]]
 name = "pulse-fetcher"
 version = "0.1.0"
 dependencies = [
@@ -2903,6 +2912,7 @@ dependencies = [
  "futures",
  "libc",
  "pulse-alpaca",
+ "pulse-calendar",
  "pulse-llm",
  "pulse-pricing",
  "pulse-weights",
