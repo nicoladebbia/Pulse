@@ -1159,3 +1159,45 @@ export interface RiskReport {
 	drawdown: DrawdownInfo;
 	warnings: string[];
 }
+
+// === Calendar (earnings + macro dates) ===
+
+export interface EarningsEvent {
+	ticker: string;
+	name: string | null;
+	/** YYYY-MM-DD */
+	date: string;
+	/** bmo = before the open, amc = after the close, dmh = during hours. */
+	hour: 'bmo' | 'amc' | 'dmh' | string | null;
+	eps_estimate: number | null;
+	revenue_estimate: number | null;
+	/** Negative once reported. */
+	days_until: number;
+	held: boolean;
+	/** Inside the window where the auto-trader will not open a position. */
+	blackout: boolean;
+	signal_score: number | null;
+}
+
+export type MacroKind = 'fomc' | 'cpi' | 'ppi' | 'jobs';
+
+export interface MacroEventView {
+	date: string;
+	kind: MacroKind;
+	title: string;
+	/** US Eastern. */
+	time_et: string;
+	note: string | null;
+	days_until: number;
+}
+
+export interface CalendarData {
+	today: string;
+	days: number;
+	earnings: EarningsEvent[];
+	macro_events: MacroEventView[];
+	/** False when the fetcher has never filled the earnings table. */
+	has_earnings_data: boolean;
+	earnings_updated_at: string | null;
+	held_in_blackout: string[];
+}

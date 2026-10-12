@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{Datelike, NaiveDate, Weekday};
+use chrono::NaiveDate;
 use pulse_alpaca::DailyBar;
 use rusqlite::Connection;
 
@@ -34,8 +34,7 @@ pub const MIN_PRICE: f64 = 5.0;
 pub const MIN_DOLLAR_VOLUME: f64 = 10_000_000.0;
 /// Largest share of equity in one industry, counting the new buy.
 pub const MAX_SECTOR_PCT: f64 = 0.30;
-/// No buys this many trading days before an earnings report.
-pub const EARNINGS_BLACKOUT_DAYS: u32 = 3;
+pub use pulse_calendar::{EARNINGS_BLACKOUT_DAYS, add_trading_days};
 /// Size multiplier while SPY is below its 50-day average.
 pub const WEAK_MARKET_SIZE: f64 = 0.5;
 /// Lowest 14-day ATR as a share of price.
@@ -87,19 +86,6 @@ pub fn atr_pct(bars: &[DailyBar], n: usize) -> Option<f64> {
         / n as f64;
     let last = recent.last()?.close;
     (last > 0.0).then(|| atr / last)
-}
-
-/// `today` plus `n` weekdays (holidays are ignored — erring a day long).
-pub fn add_trading_days(today: NaiveDate, n: u32) -> NaiveDate {
-    let mut d = today;
-    let mut left = n;
-    while left > 0 {
-        d = d.succ_opt().unwrap_or(d);
-        if !matches!(d.weekday(), Weekday::Sat | Weekday::Sun) {
-            left -= 1;
-        }
-    }
-    d
 }
 
 /// Whether any report date falls from today through the blackout window.
