@@ -1,7 +1,8 @@
 //! Writes the phone snapshot (`pulse-snapshot` crate) after the runs that change
-//! what the phone shows. It only reads: the database is opened read-only and the
-//! broker is asked for the account, never to trade. A failure is logged and
-//! never fails the run that called it.
+//! what the phone shows. It only reads: apart from bringing the schema up to
+//! date, the database is opened read-only and the broker is asked for the
+//! account, never to trade. A failure is logged and never fails the run that
+//! called it.
 
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,14 @@ pub async fn refresh(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
             None
         }
     };
+    // A database the app has not opened since an update lacks the newest tables
+    // (the snapshot reads the calendar's); the schema step is idempotent and is
+    // what every other mode runs before it touches the data.
+    {
+        let writable = Connection::open(db_path)?;
+        writable.busy_timeout(std::time::Duration::from_secs(10))?;
+        crate::db::run_migrations(&writable)?;
+    }
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     let today = chrono::Local::now().date_naive();
