@@ -136,7 +136,7 @@ pub fn beta(asset: &[DailyBar], market: &[DailyBar]) -> Option<f64> {
         let Some(&m) = market_by_date.get(b.date.as_str()) else {
             continue;
         };
-        if !(b.close > 0.0) || !(m > 0.0) {
+        if !b.close.is_finite() || !m.is_finite() || b.close <= 0.0 || m <= 0.0 {
             continue;
         }
         if let Some((pa, pm)) = prev {

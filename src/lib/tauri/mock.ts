@@ -668,6 +668,6 @@ export const mockRiskReport: RiskReport = {
 		{ label: 'S&P 500 +5%', spy_move_pct: 5, pnl_dollars: 3200, pnl_pct: 2.9 },
 		{ label: 'S&P 500 +10%', spy_move_pct: 10, pnl_dollars: 6400, pnl_pct: 5.8 }
 	],
-	drawdown: { current_pct: 0, max_pct: -2.6, peak_equity: 109600, peak_date: '2026-09-12', points: mockDrawdownPoints },
+	drawdown: { current_pct: 0, max_pct: -4.7, peak_equity: 109600, peak_date: '2026-09-12', points: mockDrawdownPoints },
 	warnings: ['NVDA is 14% of the account', '1 position(s) have no stop at the broker', 'Market sensitivity measured for 81% of the book; the rest is assumed to move 1:1 with the S&P 500']
 };
