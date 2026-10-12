@@ -118,6 +118,7 @@ pub fn run() {
             commands::cross_signals::get_signal_evidence,
             commands::cross_signals::get_source_health,
             commands::trading::get_portfolio,
+            commands::risk::get_risk_report,
             commands::trading::get_paper_trades,
             commands::trading::execute_trade,
             commands::trading::close_position,

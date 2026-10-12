@@ -24,6 +24,7 @@
 			{ key: '/', desc: 'Focus search' },
 			{ key: 'f', desc: 'Go to Freedoms' },
 			{ key: 'p', desc: 'Go to Ask Pulse' },
+			{ key: 'r', desc: 'Reload (Risk page)' },
 			{ key: '?', desc: 'Show this help' },
 		]},
 		{ section: 'Sectors (home only)', items: [
