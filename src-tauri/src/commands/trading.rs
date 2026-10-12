@@ -301,11 +301,112 @@ pub fn get_trade_journal(db: State<'_, DbState>, trade_id: i64) -> Result<TradeJ
     analytics::get_or_generate_journal(&conn, trade_id)
 }
 
-/// Run a backtest against historical cross-signals.
+/// A finished backtest plus what holding the S&P 500 over the same days would
+/// have done with the same starting money.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BacktestRun {
+    pub result: BacktestResult,
+    /// SPY held from the first day, one point per equity-curve date. Empty when
+    /// SPY prices could not be fetched (see `spy_error`).
+    pub spy_curve: Vec<backtester::EquityPoint>,
+    pub spy_return_pct: Option<f64>,
+    pub spy_error: Option<String>,
+}
+
+/// SPY buy-and-hold on the dates of `curve`, scaled to `starting_equity`. Each
+/// date uses the latest bar on or before it. The base is the close just before
+/// the first date, the same moment `starting_equity` is measured at, so the
+/// first day's move counts for SPY as it does for the bot's own curve; with no
+/// earlier bar it is the first date's own close. Dates before the first bar are
+/// left out so the line never starts from a made-up price.
+pub fn spy_curve(
+    bars: &[pulse_alpaca::DailyBar],
+    curve: &[backtester::EquityPoint],
+    starting_equity: f64,
+) -> Vec<backtester::EquityPoint> {
+    let before_first = curve.first().and_then(|p| {
+        let i = bars.partition_point(|b| b.date.as_str() < p.date.as_str());
+        i.checked_sub(1).map(|i| bars[i].close)
+    });
+    let first = before_first.filter(|b| *b > 0.0 && b.is_finite()).or_else(|| {
+        curve.iter().find_map(|p| {
+            let i = bars.partition_point(|b| b.date.as_str() <= p.date.as_str());
+            (i > 0).then(|| bars[i - 1].close)
+        })
+    });
+    let Some(base) = first.filter(|b| *b > 0.0 && b.is_finite()) else { return Vec::new() };
+    curve
+        .iter()
+        .filter_map(|p| {
+            let i = bars.partition_point(|b| b.date.as_str() <= p.date.as_str());
+            let close = bars.get(i.checked_sub(1)?)?.close;
+            (close > 0.0 && close.is_finite())
+                .then(|| backtester::EquityPoint { date: p.date.clone(), value: starting_equity * close / base })
+        })
+        .collect()
+}
+
+/// Run a backtest against historical cross-signals. Runs on its own connection
+/// off the UI thread: a multi-month walk would otherwise hold the database lock
+/// and freeze every other command. The result is saved to `backtest_results`.
 #[tauri::command]
-pub fn run_backtest(db: State<'_, DbState>, config: BacktestConfig) -> Result<BacktestResult, String> {
+pub async fn run_backtest(db_path: State<'_, crate::db::DbPath>, config: BacktestConfig) -> Result<BacktestRun, String> {
+    let path = db_path.0.clone();
+    let cfg = config.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<BacktestResult, String> {
+        let conn = rusqlite::Connection::open(&path).map_err(|e| e.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+        backtester::run_backtest(&conn, cfg)
+    })
+    .await
+    .map_err(|e| format!("backtest task failed: {e}"))??;
+
+    let (spy, spy_return_pct, spy_error) = match (result.equity_curve.first(), result.equity_curve.last()) {
+        (Some(first), Some(_)) => match spy_bars_since(&first.date).await {
+            Ok(bars) => {
+                let curve = spy_curve(&bars, &result.equity_curve, result.starting_equity);
+                // From the starting equity, like the bot's own total return.
+                let ret = match curve.last() {
+                    Some(b) if result.starting_equity > 0.0 => Some((b.value / result.starting_equity - 1.0) * 100.0),
+                    _ => None,
+                };
+                (curve, ret, None)
+            }
+            Err(e) => (Vec::new(), None, Some(e)),
+        },
+        _ => (Vec::new(), None, None),
+    };
+    Ok(BacktestRun { result, spy_curve: spy, spy_return_pct, spy_error })
+}
+
+async fn spy_bars_since(start: &str) -> Result<Vec<pulse_alpaca::DailyBar>, String> {
+    let creds = pulse_alpaca::credentials().ok_or("Alpaca keys are not set")?;
+    let client = pulse_alpaca::client(std::time::Duration::from_secs(15))?;
+    let from = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
+        .map(|d| (d - chrono::Duration::days(7)).to_string())
+        .unwrap_or_else(|_| start.to_string());
+    crate::services::benchmark::spy_bars(&client, &creds, &from).await
+}
+
+/// What history a backtest can use: the first day with a convergence signal
+/// and the last day with prices.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BacktestRange {
+    pub first_signal_date: Option<String>,
+    pub last_price_date: Option<String>,
+    pub price_days: i64,
+}
+
+#[tauri::command]
+pub fn get_backtest_range(db: State<'_, DbState>) -> Result<BacktestRange, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    backtester::run_backtest(&conn, config)
+    let first_signal_date: Option<String> = conn
+        .query_row("SELECT MIN(date(computed_at)) FROM cross_signals WHERE convergence_detected = 1", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let (last_price_date, price_days): (Option<String>, i64) = conn
+        .query_row("SELECT MAX(date), COUNT(DISTINCT date) FROM entity_prices", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?;
+    Ok(BacktestRange { first_signal_date, last_price_date, price_days })
 }
 
 /// Get past backtest results.
@@ -1613,5 +1714,105 @@ mod tests {
         assert_eq!(exit_rules("insider_director_buy"), (6.0, 0.30, 0.20, false));
         assert_eq!(exit_rules("convergence"), (3.0, 0.15, 0.10, true));
         assert_eq!(max_hold_trading_days("convergence"), 60);
+    }
+}
+
+#[cfg(test)]
+mod backtest_page_tests {
+    use super::*;
+    use pulse_alpaca::DailyBar;
+
+    fn bar(date: &str, close: f64) -> DailyBar {
+        DailyBar { date: date.into(), open: close, high: close, low: close, close, volume: 1.0 }
+    }
+    fn pt(date: &str, value: f64) -> backtester::EquityPoint {
+        backtester::EquityPoint { date: date.into(), value }
+    }
+
+    #[test]
+    fn spy_line_starts_at_the_starting_equity_and_follows_the_closes() {
+        let bars = [bar("2026-09-01", 100.0), bar("2026-09-02", 110.0), bar("2026-09-04", 99.0)];
+        let curve = [pt("2026-09-01", 10_000.0), pt("2026-09-02", 10_100.0), pt("2026-09-03", 10_050.0), pt("2026-09-04", 9_900.0)];
+        let spy = spy_curve(&bars, &curve, 10_000.0);
+        let values: Vec<f64> = spy.iter().map(|p| p.value).collect();
+        // 09-03 has no bar of its own: it carries 09-02's close.
+        assert_eq!(values, vec![10_000.0, 11_000.0, 11_000.0, 9_900.0]);
+    }
+
+    #[test]
+    fn spy_line_counts_the_first_days_move_from_the_close_before_it() {
+        let bars = [bar("2026-08-31", 100.0), bar("2026-09-01", 102.0), bar("2026-09-02", 110.0)];
+        let curve = [pt("2026-09-01", 10_050.0), pt("2026-09-02", 10_100.0)];
+        let values: Vec<f64> = spy_curve(&bars, &curve, 10_000.0).iter().map(|p| p.value).collect();
+        assert_eq!(values, vec![10_200.0, 11_000.0], "scaled from 08-31's close, like starting_equity");
+    }
+
+    #[test]
+    fn spy_line_skips_dates_before_the_first_bar_and_survives_no_data() {
+        let bars = [bar("2026-09-02", 100.0), bar("2026-09-03", 101.0)];
+        let curve = [pt("2026-09-01", 10_000.0), pt("2026-09-02", 10_000.0), pt("2026-09-03", 10_000.0)];
+        let spy = spy_curve(&bars, &curve, 10_000.0);
+        assert_eq!(spy.iter().map(|p| p.date.as_str()).collect::<Vec<_>>(), vec!["2026-09-02", "2026-09-03"]);
+        assert!(spy_curve(&[], &curve, 10_000.0).is_empty());
+        assert!(spy_curve(&bars, &[], 10_000.0).is_empty());
+        assert!(spy_curve(&[bar("2026-09-02", f64::NAN)], &curve, 10_000.0).is_empty());
+    }
+
+    #[test]
+    fn the_config_the_page_sends_deserializes() {
+        // Exactly the JSON shape src/lib/tauri/types.ts BacktestConfig produces.
+        let json = serde_json::json!({
+            "start_date": "2026-05-01", "end_date": "2026-10-01", "min_score": 0.3,
+            "stop_loss_pct": -10.0, "take_profit_pct": 15.0, "max_hold_days": 60,
+            "max_positions": 10, "position_size_pct": 5.0,
+            "exit_model": { "AtrTrail": { "atr_mult": 3.0, "hard_stop_pct": 15.0, "activate_pct": 0.0 } },
+            "use_live_tiers": false,
+            "risk_sizing": { "risk_per_trade": 0.01, "max_heat": 0.2 }
+        });
+        let cfg: BacktestConfig = serde_json::from_value(json).unwrap();
+        assert!(matches!(cfg.exit_model, backtester::ExitModel::AtrTrail { atr_mult, .. } if atr_mult == 3.0));
+        let risk = cfg.risk_sizing.unwrap();
+        assert_eq!(risk.risk_per_trade, 0.01);
+        assert_eq!(risk.atr_mult, 3.0, "knobs the page leaves out keep the live default");
+
+        let fixed = serde_json::json!({
+            "start_date": "a", "end_date": "b", "min_score": 0.3, "stop_loss_pct": -10.0, "take_profit_pct": 15.0,
+            "max_hold_days": 60, "max_positions": 10, "position_size_pct": 5.0, "exit_model": "FixedPct"
+        });
+        let cfg: BacktestConfig = serde_json::from_value(fixed).unwrap();
+        assert_eq!(cfg.exit_model, backtester::ExitModel::FixedPct);
+        assert!(cfg.risk_sizing.is_none() && !cfg.use_live_tiers);
+    }
+
+    /// The exact JSON `src/lib/components/backtest/config.ts` sends for each preset.
+    #[test]
+    fn page_configs_deserialize() {
+        use crate::services::backtester::{BacktestConfig, ExitModel};
+        let live: BacktestConfig = serde_json::from_str(
+            r#"{"start_date":"2026-05-01","end_date":"2026-10-01","min_score":0.4,"max_positions":10,"max_hold_days":60,
+                "stop_loss_pct":-10,"take_profit_pct":15,"position_size_pct":5,
+                "exit_model":{"AtrTrail":{"atr_mult":3,"hard_stop_pct":15,"activate_pct":0}},
+                "risk_sizing":{"risk_per_trade":0.005,"max_heat":0.1,"max_ticker_pct":0.08}}"#,
+        )
+        .unwrap();
+        assert_eq!(live.exit_model, ExitModel::AtrTrail { atr_mult: 3.0, hard_stop_pct: 15.0, activate_pct: 0.0 });
+        let sizing = live.risk_sizing.unwrap();
+        assert_eq!((sizing.risk_per_trade, sizing.max_heat, sizing.max_ticker_pct), (0.005, 0.1, 0.08));
+        assert_eq!(sizing.atr_mult, pulse_weights::risk_sizing::RiskParams::default().atr_mult, "unsent knobs keep the live defaults");
+
+        let simple: BacktestConfig = serde_json::from_str(
+            r#"{"start_date":"2026-05-01","end_date":"2026-10-01","min_score":0.4,"max_positions":10,"max_hold_days":90,
+                "stop_loss_pct":-10,"take_profit_pct":15,"position_size_pct":5,"exit_model":"FixedPct"}"#,
+        )
+        .unwrap();
+        assert_eq!(simple.exit_model, ExitModel::FixedPct);
+        assert!(simple.risk_sizing.is_none() && !simple.use_live_tiers);
+
+        let tiers: BacktestConfig = serde_json::from_str(
+            r#"{"start_date":"2026-05-01","end_date":"2026-10-01","min_score":0.4,"max_positions":10,"max_hold_days":90,
+                "stop_loss_pct":-10,"take_profit_pct":15,"position_size_pct":5,"exit_model":"FixedPct","use_live_tiers":true}"#,
+        )
+        .unwrap();
+        assert!(tiers.use_live_tiers);
     }
 }

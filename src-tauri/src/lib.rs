@@ -67,6 +67,7 @@ pub fn run() {
                     eprintln!("Expired {} stale predictions", expired);
                 }
 
+            app.manage(db::DbPath(db_path.clone()));
             app.manage(db::DbState(std::sync::Mutex::new(conn)));
             app.manage(ChatAbortFlag(Arc::new(AtomicBool::new(false))));
             app.manage(Arc::new(services::live_prices::LivePriceState::new()));
@@ -118,8 +119,8 @@ pub fn run() {
             commands::cross_signals::get_signal_evidence,
             commands::cross_signals::get_source_health,
             commands::trading::get_portfolio,
-            commands::risk::get_risk_report,
             commands::calendar::get_calendar,
+            commands::risk::get_risk_report,
             commands::trading::get_paper_trades,
             commands::trading::execute_trade,
             commands::trading::close_position,
@@ -133,6 +134,7 @@ pub fn run() {
             commands::trading::get_trade_detail,
             commands::trading::get_trade_rationale,
             commands::trading::run_backtest,
+            commands::trading::get_backtest_range,
             commands::research::get_research_papers,
             commands::research::get_research_stats,
             commands::research::get_research_paper,

@@ -816,6 +816,40 @@ export interface BacktestConfig {
 	max_hold_days: number;
 	max_positions: number;
 	position_size_pct: number;
+	/** Serde's external tagging: the string "FixedPct", or an object for the ATR trail. */
+	exit_model?: BacktestExitModel;
+	/** Size each entry by the live score tiers instead of position_size_pct. */
+	use_live_tiers?: boolean;
+	/** Size by stop-out risk; fields left out take the live defaults. Wins over tiers and position_size_pct. */
+	risk_sizing?: Partial<BacktestRiskParams> | null;
+}
+
+export type BacktestExitModel =
+	| 'FixedPct'
+	| { AtrTrail: { atr_mult: number; hard_stop_pct: number; activate_pct: number } };
+
+/** The knobs the page exposes; the rest of the backend's RiskParams keep their live defaults. */
+export interface BacktestRiskParams {
+	/** Fraction of equity a trade may lose at its stop (0.005 = 0.5%). */
+	risk_per_trade: number;
+	/** Cap on summed open risk, as a fraction of equity. */
+	max_heat: number;
+	/** Cap on dollars in one ticker, as a fraction of equity. */
+	max_ticker_pct: number;
+}
+
+export interface BacktestRun {
+	result: BacktestResult;
+	/** SPY held from the first day with the same starting money, one point per equity-curve date. */
+	spy_curve: BacktestEquityPoint[];
+	spy_return_pct: number | null;
+	spy_error: string | null;
+}
+
+export interface BacktestRange {
+	first_signal_date: string | null;
+	last_price_date: string | null;
+	price_days: number;
 }
 
 export interface BacktestEquityPoint {
@@ -1090,6 +1124,48 @@ export interface ExitReview {
 }
 
 
+// === Calendar (earnings + macro dates) ===
+
+export interface EarningsEvent {
+	ticker: string;
+	name: string | null;
+	/** YYYY-MM-DD */
+	date: string;
+	/** bmo = before the open, amc = after the close, dmh = during hours. */
+	hour: 'bmo' | 'amc' | 'dmh' | string | null;
+	eps_estimate: number | null;
+	revenue_estimate: number | null;
+	/** Negative once reported. */
+	days_until: number;
+	held: boolean;
+	/** Inside the window where the auto-trader will not open a position. */
+	blackout: boolean;
+	signal_score: number | null;
+}
+
+export type MacroKind = 'fomc' | 'cpi' | 'ppi' | 'jobs';
+
+export interface MacroEventView {
+	date: string;
+	kind: MacroKind;
+	title: string;
+	/** US Eastern. */
+	time_et: string;
+	note: string | null;
+	days_until: number;
+}
+
+export interface CalendarData {
+	today: string;
+	days: number;
+	earnings: EarningsEvent[];
+	macro_events: MacroEventView[];
+	/** False when the fetcher has never filled the earnings table. */
+	has_earnings_data: boolean;
+	earnings_updated_at: string | null;
+	held_in_blackout: string[];
+}
+
 // === Risk dashboard ===
 
 export interface PositionRisk {
@@ -1158,46 +1234,4 @@ export interface RiskReport {
 	stress: StressScenario[];
 	drawdown: DrawdownInfo;
 	warnings: string[];
-}
-
-// === Calendar (earnings + macro dates) ===
-
-export interface EarningsEvent {
-	ticker: string;
-	name: string | null;
-	/** YYYY-MM-DD */
-	date: string;
-	/** bmo = before the open, amc = after the close, dmh = during hours. */
-	hour: 'bmo' | 'amc' | 'dmh' | string | null;
-	eps_estimate: number | null;
-	revenue_estimate: number | null;
-	/** Negative once reported. */
-	days_until: number;
-	held: boolean;
-	/** Inside the window where the auto-trader will not open a position. */
-	blackout: boolean;
-	signal_score: number | null;
-}
-
-export type MacroKind = 'fomc' | 'cpi' | 'ppi' | 'jobs';
-
-export interface MacroEventView {
-	date: string;
-	kind: MacroKind;
-	title: string;
-	/** US Eastern. */
-	time_et: string;
-	note: string | null;
-	days_until: number;
-}
-
-export interface CalendarData {
-	today: string;
-	days: number;
-	earnings: EarningsEvent[];
-	macro_events: MacroEventView[];
-	/** False when the fetcher has never filled the earnings table. */
-	has_earnings_data: boolean;
-	earnings_updated_at: string | null;
-	held_in_blackout: string[];
 }
