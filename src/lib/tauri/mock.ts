@@ -664,11 +664,11 @@ export function buildMockBacktestRun(): BacktestRun {
 			trades_won: 21, trades_lost: 17, hit_rate: 55.3, avg_return_pct: 1.9, total_return_pct: (last / 10000 - 1) * 100,
 			max_drawdown_pct: 6.4, sharpe_ratio: 1.12, avg_holding_days: 17.4, starting_equity: 10000, ending_equity: last,
 			trades: [
-				trade('NVDA', 'NVIDIA', '2026-05-12', '2026-06-09', 12.4, 'atr_trail', 0.52),
+				trade('NVDA', 'NVIDIA', '2026-05-12', '2026-06-09', 12.4, 'trailing_stop', 0.52),
 				trade('TENB', 'Tenable Holdings', '2026-05-20', '2026-06-04', -6.1, 'stop_loss', 0.44),
 				trade('ACN', 'Accenture', '2026-06-02', '2026-07-01', 8.7, 'max_hold', 0.47),
-				trade('DDOG', 'Datadog', '2026-06-18', '2026-07-09', -3.2, 'atr_trail', 0.41),
-				trade('AMD', 'Advanced Micro Devices', '2026-07-07', '2026-08-04', 15.3, 'atr_trail', 0.58)
+				trade('DDOG', 'Datadog', '2026-06-18', '2026-07-09', -3.2, 'trailing_stop', 0.41),
+				trade('AMD', 'Advanced Micro Devices', '2026-07-07', '2026-08-04', 15.3, 'trailing_stop', 0.58)
 			],
 			equity_curve,
 			monthly_returns: [
