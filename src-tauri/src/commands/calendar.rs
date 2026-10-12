@@ -14,8 +14,6 @@ use crate::db::DbState;
 const LOOKBACK_DAYS: i64 = 2;
 const DEFAULT_DAYS: i64 = 30;
 const MAX_DAYS: i64 = 90;
-/// A tracked name this strong is worth a place on the "Mine" list.
-const SIGNAL_SCORE: f64 = 0.2;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct EarningsEvent {
