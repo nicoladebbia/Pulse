@@ -1765,4 +1765,36 @@ mod backtest_page_tests {
         assert_eq!(cfg.exit_model, backtester::ExitModel::FixedPct);
         assert!(cfg.risk_sizing.is_none() && !cfg.use_live_tiers);
     }
+
+    /// The exact JSON `src/lib/components/backtest/config.ts` sends for each preset.
+    #[test]
+    fn page_configs_deserialize() {
+        use crate::services::backtester::{BacktestConfig, ExitModel};
+        let live: BacktestConfig = serde_json::from_str(
+            r#"{"start_date":"2026-05-01","end_date":"2026-10-01","min_score":0.4,"max_positions":10,"max_hold_days":60,
+                "stop_loss_pct":-10,"take_profit_pct":15,"position_size_pct":5,
+                "exit_model":{"AtrTrail":{"atr_mult":3,"hard_stop_pct":15,"activate_pct":0}},
+                "risk_sizing":{"risk_per_trade":0.005,"max_heat":0.1,"max_ticker_pct":0.08}}"#,
+        )
+        .unwrap();
+        assert_eq!(live.exit_model, ExitModel::AtrTrail { atr_mult: 3.0, hard_stop_pct: 15.0, activate_pct: 0.0 });
+        let sizing = live.risk_sizing.unwrap();
+        assert_eq!((sizing.risk_per_trade, sizing.max_heat, sizing.max_ticker_pct), (0.005, 0.1, 0.08));
+        assert_eq!(sizing.atr_mult, pulse_weights::risk_sizing::RiskParams::default().atr_mult, "unsent knobs keep the live defaults");
+
+        let simple: BacktestConfig = serde_json::from_str(
+            r#"{"start_date":"2026-05-01","end_date":"2026-10-01","min_score":0.4,"max_positions":10,"max_hold_days":90,
+                "stop_loss_pct":-10,"take_profit_pct":15,"position_size_pct":5,"exit_model":"FixedPct"}"#,
+        )
+        .unwrap();
+        assert_eq!(simple.exit_model, ExitModel::FixedPct);
+        assert!(simple.risk_sizing.is_none() && !simple.use_live_tiers);
+
+        let tiers: BacktestConfig = serde_json::from_str(
+            r#"{"start_date":"2026-05-01","end_date":"2026-10-01","min_score":0.4,"max_positions":10,"max_hold_days":90,
+                "stop_loss_pct":-10,"take_profit_pct":15,"position_size_pct":5,"exit_model":"FixedPct","use_live_tiers":true}"#,
+        )
+        .unwrap();
+        assert!(tiers.use_live_tiers);
+    }
 }

@@ -84,17 +84,21 @@
 		error = null;
 		const seq = ++runSeq;
 		const cfg = toConfig(form);
+		let saved = false;
 		try {
 			const r = await execute(cfg);
-			if (seq !== runSeq) return;
-			run = r;
-			loadedFromHistory = false;
+			saved = true;
+			if (seq === runSeq) {
+				run = r;
+				loadedFromHistory = false;
+			}
 		} catch (e) {
 			if (seq === runSeq) error = errMsg(e);
 		} finally {
 			if (seq === runSeq) running = false;
 		}
-		if (seq === runSeq && !error) fetchHistory().then((h) => (history = h)).catch(() => {});
+		// The backend saved the run even if the user has since opened a past one.
+		if (saved) fetchHistory().then((h) => (history = h)).catch(() => {});
 	}
 
 	function loadPast(h: BacktestResult) {
