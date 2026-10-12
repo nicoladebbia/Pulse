@@ -126,12 +126,22 @@ pub async fn upcoming_earnings(
         return Err("no FINNHUB_API_KEY".into());
     }
     let to = today + chrono::Duration::days(10);
-    let (rows, _) = crate::calendar::collect(today, to, crate::calendar::ROW_CAP, |a, b| {
+    let got = crate::calendar::collect(today, to, crate::calendar::ROW_CAP, |a, b| {
         crate::calendar::fetch_window(client, finnhub_key, a, b)
     })
-    .await
-    .map_err(|e| format!("earnings calendar request failed: {e}"))?;
-    Ok(group_dates(rows))
+    .await;
+    if let Some(e) = got.error {
+        // Windows run earliest first, so what arrived covers the days nearest
+        // to today, which is what the blackout needs most. Better than none.
+        if got.rows.is_empty() {
+            return Err(format!("earnings calendar request failed: {e}"));
+        }
+        tracing::warn!("Earnings calendar incomplete ({e}); using the days fetched before it failed");
+    }
+    if !got.full_days.is_empty() {
+        tracing::warn!("Earnings calendar: {} day(s) came back full, some reports may be missing", got.full_days.len());
+    }
+    Ok(group_dates(got.rows))
 }
 
 fn group_dates(rows: Vec<crate::calendar::EarningsRow>) -> HashMap<String, Vec<NaiveDate>> {
