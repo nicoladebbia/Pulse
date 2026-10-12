@@ -1,0 +1,250 @@
+{
+  "account": {
+    "cash": 98000.0,
+    "day_change": 500.0,
+    "day_change_pct": 0.501002004008016,
+    "equity": 100300.0,
+    "open_pl": 150.0
+  },
+  "briefing": {
+    "date": "2026-10-11",
+    "executive_summary": "Chips lead; rates wait for Wednesday.",
+    "stories": [
+      {
+        "headline": "Chipmakers rally on demand",
+        "id": 10,
+        "is_hero": true,
+        "sector": "ai",
+        "source_name": "Example Wire",
+        "summary": "Orders rose.",
+        "url": "https://example.com/a",
+        "why_it_matters": "Supply is tight."
+      },
+      {
+        "headline": "Rates stay put",
+        "id": 11,
+        "is_hero": false,
+        "sector": "tech",
+        "source_name": "Example Daily",
+        "summary": "No change expected.",
+        "url": "https://example.com/b",
+        "why_it_matters": null
+      }
+    ],
+    "time_label": "Morning"
+  },
+  "calendar": {
+    "days": 21,
+    "earnings": [
+      {
+        "blackout": false,
+        "date": "2026-10-20",
+        "days_until": 9,
+        "eps_estimate": 3.1,
+        "held": false,
+        "hour": "amc",
+        "name": "Microsoft",
+        "revenue_estimate": 65000000000.0,
+        "signal_score": 0.35,
+        "ticker": "MSFT"
+      },
+      {
+        "blackout": false,
+        "date": "2026-10-22",
+        "days_until": 11,
+        "eps_estimate": 1.62,
+        "held": true,
+        "hour": "amc",
+        "name": "Apple Inc",
+        "revenue_estimate": 94000000000.0,
+        "signal_score": 0.62,
+        "ticker": "AAPL"
+      }
+    ],
+    "earnings_updated_at": "2026-10-11 05:00:00",
+    "has_earnings_data": true,
+    "held_in_blackout": [],
+    "macro_events": [
+      {
+        "date": "2026-10-14",
+        "days_until": 3,
+        "kind": "cpi",
+        "note": null,
+        "time_et": "8:30 AM",
+        "title": "Consumer prices (CPI)"
+      },
+      {
+        "date": "2026-10-15",
+        "days_until": 4,
+        "kind": "ppi",
+        "note": null,
+        "time_et": "8:30 AM",
+        "title": "Producer prices (PPI)"
+      },
+      {
+        "date": "2026-10-28",
+        "days_until": 17,
+        "kind": "fomc",
+        "note": "Two-day meeting starting 2026-10-27",
+        "time_et": "2:00 PM",
+        "title": "Fed interest-rate decision"
+      }
+    ],
+    "today": "2026-10-11"
+  },
+  "generated_at": "2026-10-11T12:00:00Z",
+  "positions": [
+    {
+      "industry": "Technology",
+      "market_value": 2050.0,
+      "price": 205.0,
+      "qty": 10.0,
+      "side": "long",
+      "stop_price": 190.0,
+      "symbol": "AAPL",
+      "unrealized_pl": 50.0,
+      "unrealized_pl_pct": 2.5
+    },
+    {
+      "industry": "Automobiles",
+      "market_value": -1200.0,
+      "price": 240.0,
+      "qty": -5.0,
+      "side": "short",
+      "stop_price": 270.0,
+      "symbol": "TSLA",
+      "unrealized_pl": 100.0,
+      "unrealized_pl_pct": 7.6923076923076925
+    }
+  ],
+  "recent_trades": [
+    {
+      "direction": "long",
+      "entry_date": "2026-09-05",
+      "exit_date": "2026-09-25",
+      "pnl": -150.0,
+      "pnl_pct": -3.0,
+      "ticker": "AMD"
+    },
+    {
+      "direction": "long",
+      "entry_date": "2026-09-01",
+      "exit_date": "2026-09-20",
+      "pnl": 420.5,
+      "pnl_pct": 8.4,
+      "ticker": "NVDA"
+    }
+  ],
+  "risk": {
+    "beta_coverage_pct": 100.0,
+    "beta_exposure_pct": -0.34895314057826704,
+    "cash": 98000.0,
+    "cash_pct": 97.70687936191426,
+    "drawdown": {
+      "current_pct": -0.6930693069306937,
+      "max_pct": -1.1881188118811892,
+      "peak_date": "2026-10-07",
+      "peak_equity": 101000.0,
+      "points": [
+        {
+          "date": "2026-10-06",
+          "drawdown_pct": 0.0,
+          "equity": 99000.0
+        },
+        {
+          "date": "2026-10-07",
+          "drawdown_pct": 0.0,
+          "equity": 101000.0
+        },
+        {
+          "date": "2026-10-08",
+          "drawdown_pct": -0.4950495049504955,
+          "equity": 100500.0
+        },
+        {
+          "date": "2026-10-09",
+          "drawdown_pct": -1.1881188118811892,
+          "equity": 99800.0
+        },
+        {
+          "date": "2026-10-11",
+          "drawdown_pct": -0.6930693069306937,
+          "equity": 100300.0
+        }
+      ]
+    },
+    "equity": 100300.0,
+    "gross_pct": 3.2402791625124627,
+    "industries": [
+      {
+        "count": 1,
+        "gross_pct": 2.0438683948155534,
+        "industry": "Technology",
+        "long_value": 2050.0,
+        "net_value": 2050.0,
+        "short_value": 0.0
+      },
+      {
+        "count": 1,
+        "gross_pct": 1.1964107676969093,
+        "industry": "Automobiles",
+        "long_value": 0.0,
+        "net_value": -1200.0,
+        "short_value": 1200.0
+      }
+    ],
+    "largest_position_pct": 2.0438683948155534,
+    "long_value": 2050.0,
+    "net_pct": 0.847457627118644,
+    "position_count": 2,
+    "positions": [],
+    "positions_without_stop": 0,
+    "short_value": 1200.0,
+    "stop_loss_dollars": 300.0,
+    "stop_loss_pct": 0.29910269192422734,
+    "stress": [
+      {
+        "label": "S&P 500 -10%",
+        "pnl_dollars": 35.00000000000017,
+        "pnl_pct": 0.03489531405782669,
+        "spy_move_pct": -10.0
+      },
+      {
+        "label": "S&P 500 -5%",
+        "pnl_dollars": 17.500000000000085,
+        "pnl_pct": 0.017447657028913346,
+        "spy_move_pct": -5.0
+      },
+      {
+        "label": "S&P 500 +5%",
+        "pnl_dollars": -17.500000000000085,
+        "pnl_pct": -0.017447657028913346,
+        "spy_move_pct": 5.0
+      },
+      {
+        "label": "S&P 500 +10%",
+        "pnl_dollars": -35.00000000000017,
+        "pnl_pct": -0.03489531405782669,
+        "spy_move_pct": 10.0
+      }
+    ],
+    "warnings": []
+  },
+  "signals": [
+    {
+      "convergence": true,
+      "held": true,
+      "name": "Apple Inc",
+      "score": 0.62,
+      "ticker": "AAPL"
+    },
+    {
+      "convergence": false,
+      "held": false,
+      "name": "Microsoft",
+      "score": 0.35,
+      "ticker": "MSFT"
+    }
+  ],
+  "version": 1
+}

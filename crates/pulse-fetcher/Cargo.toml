@@ -25,6 +25,7 @@ pulse-weights = { path = "../pulse-weights" }
 pulse-llm = { path = "../pulse-llm" }
 pulse-alpaca = { path = "../pulse-alpaca" }
 pulse-calendar = { path = "../pulse-calendar" }
+pulse-snapshot = { path = "../pulse-snapshot" }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }

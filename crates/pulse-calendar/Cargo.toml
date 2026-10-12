@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
