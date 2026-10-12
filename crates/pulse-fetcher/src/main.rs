@@ -16,6 +16,7 @@ pub(crate) mod decisions;
 pub(crate) mod entry_filters;
 pub(crate) mod scorecard;
 pub(crate) mod calendar;
+pub(crate) mod snapshot;
 pub(crate) mod learning;
 pub(crate) mod event_signals;
 pub(crate) mod position_sizing;
@@ -564,6 +565,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        "snapshot" => {
+            // Build and write the phone snapshot only: no AI, no orders. The safe
+            // way to test it (`--db-path <copy>` and PULSE_SNAPSHOT_DIR=<folder>).
+            snapshot::migrate(&db_path);
+            match snapshot::refresh(&db_path).await? {
+                Some(path) => tracing::info!("Phone snapshot written to {}", path.display()),
+                None => tracing::info!("Phone snapshot is switched off (PULSE_SNAPSHOT=off)"),
+            }
+        }
         "edge-report" => {
             // Step 6: re-measure the paper-trading edge on REAL fills placed after
             // the 2026-07-15 ticker fix + arming. Reads ONLY paper_trades, applies an
@@ -584,6 +594,14 @@ async fn main() -> anyhow::Result<()> {
             // ran a whole briefing. Refuse instead.
             anyhow::bail!("unknown --mode {other}");
         }
+    }
+
+    // The runs that change the account, the briefing or the signals refresh the
+    // phone's copy. live-signals does so only on its hourly all-sources run.
+    if matches!(args.mode.as_str(), "daily" | "manage-positions" | "auto-trade" | "learn")
+        || (args.mode == "live-signals" && args.full_sources)
+    {
+        snapshot::refresh_nonfatal(&db_path).await;
     }
 
     tracing::info!("Pulse fetch complete");

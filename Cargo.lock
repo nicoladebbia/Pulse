@@ -2863,6 +2863,7 @@ dependencies = [
  "pulse-calendar",
  "pulse-llm",
  "pulse-pricing",
+ "pulse-snapshot",
  "pulse-weights",
  "reqwest 0.12.28",
  "rusqlite",
@@ -2895,7 +2896,9 @@ name = "pulse-calendar"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "rusqlite",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2915,6 +2918,7 @@ dependencies = [
  "pulse-calendar",
  "pulse-llm",
  "pulse-pricing",
+ "pulse-snapshot",
  "pulse-weights",
  "quick-xml 0.37.5",
  "regex",
@@ -2948,6 +2952,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "pulse-snapshot"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pulse-alpaca",
+ "pulse-calendar",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

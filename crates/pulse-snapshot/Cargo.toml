@@ -1,0 +1,13 @@
+[package]
+name = "pulse-snapshot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { workspace = true }
+pulse-alpaca = { path = "../pulse-alpaca" }
+pulse-calendar = { path = "../pulse-calendar" }

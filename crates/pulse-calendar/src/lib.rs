@@ -8,8 +8,10 @@
 //! bls.gov/schedule/news_release/{cpi,ppi,empsit}.htm. A test fails when the
 //! table runs within 90 days of its end, which is the reminder to extend it.
 
+pub mod view;
+
 use chrono::{Datelike, NaiveDate, Weekday};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// No buys this many trading days before an earnings report.
 pub const EARNINGS_BLACKOUT_DAYS: u32 = 3;
@@ -32,7 +34,7 @@ pub fn in_earnings_blackout(report_date: NaiveDate, today: NaiveDate) -> bool {
     report_date >= today && report_date <= add_trading_days(today, EARNINGS_BLACKOUT_DAYS)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MacroKind {
     Fomc,
@@ -41,7 +43,7 @@ pub enum MacroKind {
     Jobs,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MacroEvent {
     /// `YYYY-MM-DD`
     pub date: String,
