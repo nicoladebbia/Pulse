@@ -1277,7 +1277,7 @@
 								{/if}
 							{/if}
 							{#if dbTrade && explanations[dbTrade.id]}
-								<TradeExplanation explanation={explanations[dbTrade.id]} bind:open={explanationOpen[dbTrade.id]} />
+								<TradeExplanation explanation={explanations[dbTrade.id]} open={explanationOpen[dbTrade.id] ?? false} ontoggle={() => (explanationOpen[dbTrade.id] = !explanationOpen[dbTrade.id])} />
 							{/if}
 							<!-- P&L bar -->
 							<div class="mt-2 h-1 bg-border rounded-full overflow-hidden">
@@ -1367,7 +1367,7 @@
 										</div>
 									{/if}
 									{#if explanations[trade.id]}
-										<TradeExplanation explanation={explanations[trade.id]} bind:open={explanationOpen[trade.id]} />
+										<TradeExplanation explanation={explanations[trade.id]} open={explanationOpen[trade.id] ?? false} ontoggle={() => (explanationOpen[trade.id] = !explanationOpen[trade.id])} />
 									{/if}
 									<a href="/signals/trade/{trade.id}" class="inline-block mt-2 text-[11px] text-blue-400 hover:text-blue-300 transition-colors">Full trade details &rarr;</a>
 								</div>
