@@ -12,4 +12,5 @@ pub mod cross_signals;
 pub mod trading;
 pub mod engagement;
 pub mod research;
+pub mod calendar;
 pub mod risk;
