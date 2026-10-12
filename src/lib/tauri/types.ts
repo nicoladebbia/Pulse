@@ -1131,3 +1131,73 @@ export interface CalendarData {
 	earnings_updated_at: string | null;
 	held_in_blackout: string[];
 }
+
+// === Risk dashboard ===
+
+export interface PositionRisk {
+	symbol: string;
+	side: 'long' | 'short';
+	industry: string;
+	/** Negative for a short. */
+	market_value: number;
+	pct_of_equity: number;
+	unrealized_pl: number;
+	stop_price: number | null;
+	/** Dollars lost if the stop fills at its price. */
+	stop_loss_dollars: number | null;
+	beta: number | null;
+}
+
+export interface IndustryRisk {
+	industry: string;
+	count: number;
+	long_value: number;
+	short_value: number;
+	net_value: number;
+	/** Long + short as a share of equity. */
+	gross_pct: number;
+}
+
+export interface StressScenario {
+	label: string;
+	spy_move_pct: number;
+	pnl_dollars: number;
+	pnl_pct: number;
+}
+
+export interface DrawdownPoint {
+	date: string;
+	equity: number;
+	/** 0 at a new high, negative below it, in %. */
+	drawdown_pct: number;
+}
+
+export interface DrawdownInfo {
+	current_pct: number;
+	max_pct: number;
+	peak_equity: number;
+	peak_date: string | null;
+	points: DrawdownPoint[];
+}
+
+export interface RiskReport {
+	equity: number;
+	cash: number;
+	long_value: number;
+	short_value: number;
+	gross_pct: number;
+	net_pct: number;
+	cash_pct: number;
+	position_count: number;
+	largest_position_pct: number;
+	positions: PositionRisk[];
+	industries: IndustryRisk[];
+	stop_loss_dollars: number;
+	stop_loss_pct: number;
+	positions_without_stop: number;
+	beta_exposure_pct: number | null;
+	beta_coverage_pct: number;
+	stress: StressScenario[];
+	drawdown: DrawdownInfo;
+	warnings: string[];
+}

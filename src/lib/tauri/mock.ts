@@ -1,4 +1,4 @@
-import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, CalendarData } from './types';
+import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, CalendarData, RiskReport } from './types';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -666,3 +666,40 @@ export function buildMockCalendar(): CalendarData {
 		]
 	};
 }
+// === Risk dashboard fixture ===
+const mockDrawdownPoints = [100000, 102400, 104100, 101800, 99200, 103300, 107800, 106100, 108900, 105200, 104700, 109600].map(
+	(equity, i, all) => {
+		const peak = Math.max(...all.slice(0, i + 1));
+		return { date: `2026-09-${String(i + 1).padStart(2, '0')}`, equity, drawdown_pct: (equity / peak - 1) * 100 };
+	}
+);
+export const mockRiskReport: RiskReport = {
+	equity: 109600, cash: 41200, long_value: 62300, short_value: 6100,
+	gross_pct: 62.4, net_pct: 51.2, cash_pct: 37.6, position_count: 6, largest_position_pct: 14.2,
+	positions: [
+		{ symbol: 'NVDA', side: 'long', industry: 'Semiconductors', market_value: 15560, pct_of_equity: 14.2, unrealized_pl: 1820, stop_price: 118.4, stop_loss_dollars: 1190, beta: 1.74 },
+		{ symbol: 'MSFT', side: 'long', industry: 'Technology', market_value: 12900, pct_of_equity: 11.8, unrealized_pl: 640, stop_price: 401.5, stop_loss_dollars: 980, beta: 1.08 },
+		{ symbol: 'JPM', side: 'long', industry: 'Banking', market_value: 11300, pct_of_equity: 10.3, unrealized_pl: -210, stop_price: null, stop_loss_dollars: null, beta: 0.96 },
+		{ symbol: 'XOM', side: 'long', industry: 'Oil & Gas', market_value: 9800, pct_of_equity: 8.9, unrealized_pl: 310, stop_price: 104.2, stop_loss_dollars: 640, beta: 0.71 },
+		{ symbol: 'LLY', side: 'long', industry: 'Pharmaceuticals', market_value: 12740, pct_of_equity: 11.6, unrealized_pl: 905, stop_price: 755.0, stop_loss_dollars: 1010, beta: null },
+		{ symbol: 'COIN', side: 'short', industry: 'Financial Services', market_value: -6100, pct_of_equity: 5.6, unrealized_pl: 240, stop_price: 262.0, stop_loss_dollars: 520, beta: 2.31 }
+	],
+	industries: [
+		{ industry: 'Semiconductors', count: 1, long_value: 15560, short_value: 0, net_value: 15560, gross_pct: 14.2 },
+		{ industry: 'Pharmaceuticals', count: 1, long_value: 12740, short_value: 0, net_value: 12740, gross_pct: 11.6 },
+		{ industry: 'Technology', count: 1, long_value: 12900, short_value: 0, net_value: 12900, gross_pct: 11.8 },
+		{ industry: 'Banking', count: 1, long_value: 11300, short_value: 0, net_value: 11300, gross_pct: 10.3 },
+		{ industry: 'Oil & Gas', count: 1, long_value: 9800, short_value: 0, net_value: 9800, gross_pct: 8.9 },
+		{ industry: 'Financial Services', count: 1, long_value: 0, short_value: 6100, net_value: -6100, gross_pct: 5.6 }
+	],
+	stop_loss_dollars: 4340, stop_loss_pct: 4.0, positions_without_stop: 1,
+	beta_exposure_pct: 58.3, beta_coverage_pct: 80.5,
+	stress: [
+		{ label: 'S&P 500 -10%', spy_move_pct: -10, pnl_dollars: -6400, pnl_pct: -5.8 },
+		{ label: 'S&P 500 -5%', spy_move_pct: -5, pnl_dollars: -3200, pnl_pct: -2.9 },
+		{ label: 'S&P 500 +5%', spy_move_pct: 5, pnl_dollars: 3200, pnl_pct: 2.9 },
+		{ label: 'S&P 500 +10%', spy_move_pct: 10, pnl_dollars: 6400, pnl_pct: 5.8 }
+	],
+	drawdown: { current_pct: 0, max_pct: -4.7, peak_equity: 109600, peak_date: '2026-09-12', points: mockDrawdownPoints },
+	warnings: ['NVDA is 14% of the account', '1 position(s) have no stop at the broker', 'Market sensitivity measured for 81% of the book; the rest is assumed to move 1:1 with the S&P 500']
+};
