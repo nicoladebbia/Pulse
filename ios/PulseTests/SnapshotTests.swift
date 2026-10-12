@@ -62,6 +62,27 @@ final class SnapshotTests: XCTestCase {
         XCTAssertEqual(keys(original).subtracting(ignored), keys(reencoded))
     }
 
+    func testPositionsAndClosedTradesCarryTheirPlainLanguageExplanation() throws {
+        let s = try SnapshotReader.decode(fixtureData())
+        let held = try XCTUnwrap(s.positions.first?.explanation)
+        XCTAssertFalse(held.why.isEmpty)
+        XCTAssertNotNil(held.plan, "an open position says when it will sell")
+        let closed = try XCTUnwrap(s.recentTrades.first?.explanation)
+        XCTAssertNil(closed.plan, "a closed trade has no exit plan")
+        XCTAssertNotNil(closed.now)
+    }
+
+    func testAnOlderFileWithoutExplanationsStillReads() throws {
+        var obj = try XCTUnwrap(JSONSerialization.jsonObject(with: fixtureData()) as? [String: Any])
+        var positions = try XCTUnwrap(obj["positions"] as? [[String: Any]])
+        for i in positions.indices {
+            positions[i].removeValue(forKey: "explanation")
+        }
+        obj["positions"] = positions
+        let s = try SnapshotReader.decode(JSONSerialization.data(withJSONObject: obj))
+        XCTAssertTrue(s.positions.allSatisfy { $0.explanation == nil })
+    }
+
     func testANewerFormatAsksForAnUpdate() {
         let data = Data(#"{"version": 2, "future": true}"#.utf8)
         XCTAssertThrowsError(try SnapshotReader.decode(data)) { error in

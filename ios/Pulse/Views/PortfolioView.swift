@@ -115,34 +115,44 @@ struct AccountCard: View {
 
 struct PositionRow: View {
     let position: Snapshot.Position
+    @State private var expanded = Debug.expandExplanations
 
     var body: some View {
         Card(padding: 14) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Text(position.symbol).font(.headline).foregroundStyle(Theme.text)
-                        if position.isShort {
-                            Badge(text: "SHORT", color: Theme.down)
-                        }
-                    }
-                    if let industry = position.industry {
-                        Text(industry).font(.caption).foregroundStyle(Theme.textSecondary).lineLimit(1)
-                    }
-                    stop
+            VStack(alignment: .leading, spacing: 10) {
+                summary
+                if let explanation = position.explanation {
+                    ExplanationToggle(explanation: explanation, expanded: $expanded)
                 }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 4) {
-                    Text(Fmt.money(abs(position.marketValue))).font(.headline.monospacedDigit()).foregroundStyle(Theme.text)
-                    HStack(spacing: 4) {
-                        Text(Fmt.signedMoney(position.unrealizedPl))
-                        if let pct = position.unrealizedPlPct {
-                            Text("(\(Fmt.signedPct(pct)))")
-                        }
+            }
+        }
+    }
+
+    private var summary: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(position.symbol).font(.headline).foregroundStyle(Theme.text)
+                    if position.isShort {
+                        Badge(text: "SHORT", color: Theme.down)
                     }
-                    .font(.footnote.weight(.medium).monospacedDigit())
-                    .foregroundStyle(Theme.gain(position.unrealizedPl))
                 }
+                if let industry = position.industry {
+                    Text(industry).font(.caption).foregroundStyle(Theme.textSecondary).lineLimit(1)
+                }
+                stop
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(Fmt.money(abs(position.marketValue))).font(.headline.monospacedDigit()).foregroundStyle(Theme.text)
+                HStack(spacing: 4) {
+                    Text(Fmt.signedMoney(position.unrealizedPl))
+                    if let pct = position.unrealizedPlPct {
+                        Text("(\(Fmt.signedPct(pct)))")
+                    }
+                }
+                .font(.footnote.weight(.medium).monospacedDigit())
+                .foregroundStyle(Theme.gain(position.unrealizedPl))
             }
         }
     }
@@ -189,8 +199,20 @@ struct SignalRow: View {
 
 struct TradeRow: View {
     let trade: Snapshot.ClosedTrade
+    @State private var expanded = Debug.expandExplanations
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            summary
+            if let explanation = trade.explanation {
+                ExplanationToggle(explanation: explanation, expanded: $expanded)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    private var summary: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -213,7 +235,5 @@ struct TradeRow: View {
                 .foregroundStyle(Theme.gain(pnl))
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
     }
 }

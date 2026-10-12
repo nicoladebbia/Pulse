@@ -8,6 +8,7 @@
 //! change (a removed or retyped field), which the phone shows as "update the
 //! app". `tests/fixtures/snapshot_v1.json` is decoded by both sides' tests.
 
+pub mod explain;
 pub mod live;
 pub mod risk;
 
@@ -75,6 +76,9 @@ pub struct Position {
     pub unrealized_pl_pct: Option<f64>,
     pub stop_price: Option<f64>,
     pub industry: Option<String>,
+    /// Why Pulse bought it, in plain words. Absent for a position Pulse has no trade for.
+    #[serde(default)]
+    pub explanation: Option<explain::Explanation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +119,8 @@ pub struct ClosedTrade {
     pub exit_date: String,
     pub pnl: Option<f64>,
     pub pnl_pct: Option<f64>,
+    #[serde(default)]
+    pub explanation: Option<explain::Explanation>,
 }
 
 /// What Alpaca reports right now, fetched by the caller.
@@ -206,21 +212,21 @@ pub fn load_signals(conn: &Connection, held: &HashSet<String>) -> rusqlite::Resu
 }
 
 pub fn load_recent_trades(conn: &Connection) -> rusqlite::Result<Vec<ClosedTrade>> {
-    let mut stmt = conn.prepare(
-        "SELECT ticker, direction, entry_date, exit_date, pnl, pnl_pct FROM paper_trades
-         WHERE status != 'open' AND exit_date IS NOT NULL ORDER BY exit_date DESC, id DESC LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![MAX_TRADES as i64], |r| {
-        Ok(ClosedTrade {
-            ticker: r.get(0)?,
-            direction: r.get(1)?,
-            entry_date: r.get(2)?,
-            exit_date: r.get(3)?,
-            pnl: r.get::<_, Option<f64>>(4)?.filter(|v| v.is_finite()),
-            pnl_pct: r.get::<_, Option<f64>>(5)?.filter(|v| v.is_finite()),
+    Ok(explain::load_closed(conn, MAX_TRADES)?
+        .into_iter()
+        .filter_map(|f| {
+            let finite = |v: Option<f64>| v.filter(|v| v.is_finite());
+            Some(ClosedTrade {
+                explanation: Some(explain::explain(&f)),
+                pnl: conn.query_row("SELECT pnl FROM paper_trades WHERE id = ?1", [f.id], |r| r.get::<_, Option<f64>>(0)).ok().flatten().filter(|v| v.is_finite()),
+                pnl_pct: finite(f.pnl_pct),
+                ticker: f.ticker,
+                direction: f.direction,
+                entry_date: f.entry_date,
+                exit_date: f.exit_date?,
+            })
         })
-    })?;
-    rows.collect()
+        .collect())
 }
 
 fn fin(v: &mut f64) {
@@ -334,6 +340,11 @@ pub fn build_from(
     let stops = risk::load_stops(conn).map_err(err)?;
     let industries = risk::load_industries(conn).map_err(err)?;
 
+    let mut open_trades = HashMap::new();
+    for t in explain::load_open(conn).map_err(err)? {
+        open_trades.entry(t.ticker.to_uppercase()).or_insert(t);
+    }
+
     let (account, positions, risk_report) = match live {
         None => match previous.and_then(|p| carried_over(p, now)) {
             Some((as_of, account, positions, risk)) => {
@@ -348,6 +359,12 @@ pub fn build_from(
                 .iter()
                 .map(|p| {
                     let short = p.qty < 0.0 || p.market_value < 0.0;
+                    let pct = position_pct(short, p.market_value, p.unrealized_pl);
+                    let explanation = Some(open_trades.get(&p.symbol.to_uppercase()).map_or_else(explain::not_a_pulse_trade, |t| {
+                        let mut t = t.clone();
+                        t.current_pct = pct;
+                        explain::explain(&t)
+                    }));
                     Position {
                         symbol: p.symbol.clone(),
                         side: if short { "short" } else { "long" }.to_string(),
@@ -355,9 +372,10 @@ pub fn build_from(
                         price: p.price,
                         market_value: p.market_value,
                         unrealized_pl: p.unrealized_pl,
-                        unrealized_pl_pct: position_pct(short, p.market_value, p.unrealized_pl),
+                        unrealized_pl_pct: pct,
                         stop_price: stops.get(&p.symbol).copied(),
                         industry: industries.get(&p.symbol).cloned(),
+                        explanation,
                     }
                 })
                 .collect();

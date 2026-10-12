@@ -96,6 +96,13 @@
   "generated_at": "2026-10-11T12:00:00Z",
   "positions": [
     {
+      "explanation": {
+        "headline": "Several signals agreed",
+        "now": "Bought on 2026-10-01 at $100.00. It is up 2.5% since, so the reasons are playing out so far.",
+        "plan": "Pulse sells everything if the price moves 10% against it from the purchase price. It closes half the position once the gain reaches 3× the stock’s normal daily swing. After 5 trading days it can also sell early if the signals behind the buy fade. It never holds longer than 60 trading days. A safety order at the broker is set at $190.00 right now.",
+        "size": "About $1,000 invested. Pulse sizes each trade by how much the stock normally swings, so wilder stocks get less money.",
+        "why": "Several separate kinds of evidence pointed at Apple Inc at the same time: a rise in news coverage and attention (80% strength) and more people searching for it (60% strength). When different signals agree, Pulse treats it as stronger than any one alone."
+      },
       "industry": "Technology",
       "market_value": 2050.0,
       "price": 205.0,
@@ -107,6 +114,13 @@
       "unrealized_pl_pct": 2.5
     },
     {
+      "explanation": {
+        "headline": "Bought by you",
+        "now": "Bought on 2026-10-02 at $100.00. It is up 7.7% since, so the reasons are playing out so far.",
+        "plan": "Pulse sells (buys back) if the price moves 10% against it from the sale price. It closes half the position once the gain reaches 3× the stock’s normal daily swing. After 5 trading days it can also sell early if the signals behind the buy fade. It never holds longer than 60 trading days. A safety order at the broker is set at $270.00 right now.",
+        "size": null,
+        "why": "You placed this short sale yourself. Pulse did not pick it."
+      },
       "industry": "Automobiles",
       "market_value": -1200.0,
       "price": 240.0,
@@ -123,6 +137,13 @@
       "direction": "long",
       "entry_date": "2026-09-05",
       "exit_date": "2026-09-25",
+      "explanation": {
+        "headline": "Several signals agreed",
+        "now": "Bought on 2026-09-05 at $100.00; closed on 2026-09-25. It lost 3.0%. Why it ended: the price fell far enough from its high to trigger the trailing stop.",
+        "plan": null,
+        "size": "About $1,000 invested. Pulse sizes each trade by how much the stock normally swings, so wilder stocks get less money.",
+        "why": "Pulse’s daily scan ranked AMD among the strongest names, but the individual signals were not saved for this older trade."
+      },
       "pnl": -150.0,
       "pnl_pct": -3.0,
       "ticker": "AMD"
@@ -131,6 +152,13 @@
       "direction": "long",
       "entry_date": "2026-09-01",
       "exit_date": "2026-09-20",
+      "explanation": {
+        "headline": "Several signals agreed",
+        "now": "Bought on 2026-09-01 at $100.00; closed on 2026-09-20. It made 8.4%. Why it ended: the signals behind the buy faded.",
+        "plan": null,
+        "size": "About $1,000 invested. Pulse sizes each trade by how much the stock normally swings, so wilder stocks get less money.",
+        "why": "Several separate kinds of evidence pointed at NVDA at the same time: a rise in news coverage and attention (70% strength). When different signals agree, Pulse treats it as stronger than any one alone."
+      },
       "pnl": 420.5,
       "pnl_pct": 8.4,
       "ticker": "NVDA"

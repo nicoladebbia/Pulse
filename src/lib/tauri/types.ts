@@ -725,6 +725,19 @@ export interface TradeDetail {
 	sizing: TradeSizing;
 }
 
+export interface TradeExplanation {
+	/** A few words: what kind of buy this was. */
+	headline: string;
+	/** Why Pulse bought it. */
+	why: string;
+	/** How much, and why that much. */
+	size: string | null;
+	/** When Pulse will sell (open trades only). */
+	plan: string | null;
+	/** How it is doing, or how it ended. */
+	now: string | null;
+}
+
 export interface TradeRationale {
 	text: string;
 	generated_at: string;

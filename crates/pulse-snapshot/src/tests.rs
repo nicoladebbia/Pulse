@@ -16,7 +16,7 @@ fn now() -> DateTime<Utc> {
 fn setup() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        r#"CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
          CREATE TABLE entity_tickers (entity_id INTEGER, ticker TEXT NOT NULL, is_public INTEGER DEFAULT 1);
          CREATE TABLE briefings (id INTEGER PRIMARY KEY, date TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT '2026-10-11 05:00:00',
            status TEXT NOT NULL, briefing_type TEXT NOT NULL DEFAULT 'daily', time_label TEXT, executive_summary TEXT);
@@ -27,7 +27,10 @@ fn setup() -> Connection {
          CREATE TABLE cross_signals (id INTEGER PRIMARY KEY, entity_id INTEGER, ticker TEXT, compound_score REAL NOT NULL,
            convergence_detected INTEGER DEFAULT 0, computed_at TEXT);
          CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, ticker TEXT NOT NULL, direction TEXT NOT NULL DEFAULT 'long', status TEXT NOT NULL,
-           entry_date TEXT, exit_date TEXT, pnl REAL, pnl_pct REAL, stop_order_id TEXT, broker_stop_price REAL);
+           entry_date TEXT, exit_date TEXT, pnl REAL, pnl_pct REAL, stop_order_id TEXT, broker_stop_price REAL,
+           entity_id INTEGER, entry_price REAL NOT NULL DEFAULT 100, exit_price REAL, position_size REAL NOT NULL DEFAULT 1000,
+           exit_reason TEXT, signal_profile TEXT, entry_context TEXT, entry_trigger TEXT NOT NULL DEFAULT 'convergence',
+           scale_in_count INTEGER DEFAULT 0);
          CREATE TABLE portfolio_snapshots (id INTEGER PRIMARY KEY, date TEXT NOT NULL UNIQUE, total_value REAL NOT NULL);
          CREATE TABLE ticker_industry (ticker TEXT PRIMARY KEY, industry TEXT, checked_at TEXT NOT NULL DEFAULT '');
          CREATE TABLE earnings_calendar (
@@ -51,11 +54,13 @@ fn setup() -> Connection {
            (1, NULL, 0.62, 1, '2026-10-11 07:00:00'), (1, NULL, 0.41, 0, '2026-10-11 06:00:00'),
            (3, NULL, 0.35, 0, '2026-10-11 07:00:00'), (2, NULL, 0.9, 1, '2026-10-09 07:00:00');
 
-         INSERT INTO paper_trades (id, ticker, direction, status, entry_date, exit_date, pnl, pnl_pct, stop_order_id, broker_stop_price) VALUES
-           (1, 'AAPL', 'long', 'open', '2026-10-01', NULL, NULL, NULL, 'ord-1', 190.0),
-           (2, 'TSLA', 'short', 'open', '2026-10-02', NULL, NULL, NULL, 'ord-2', 270.0),
-           (3, 'NVDA', 'long', 'closed', '2026-09-01', '2026-09-20', 420.5, 8.4, NULL, NULL),
-           (4, 'AMD', 'long', 'stopped_out', '2026-09-05', '2026-09-25', -150.0, -3.0, NULL, NULL);
+         INSERT INTO paper_trades (id, ticker, direction, status, entry_date, exit_date, pnl, pnl_pct, stop_order_id, broker_stop_price,
+             entity_id, signal_profile, exit_reason) VALUES
+           (1, 'AAPL', 'long', 'open', '2026-10-01', NULL, NULL, NULL, 'ord-1', 190.0, 1, '{"news":0.8,"search":0.6}', NULL),
+           (2, 'TSLA', 'short', 'open', '2026-10-02', NULL, NULL, NULL, 'ord-2', 270.0, 2, '{"source":"manual"}', NULL),
+           (3, 'NVDA', 'long', 'closed', '2026-09-01', '2026-09-20', 420.5, 8.4, NULL, NULL, NULL, '{"news":0.7}', 'signal_decay'),
+           (4, 'AMD', 'long', 'stopped_out', '2026-09-05', '2026-09-25', -150.0, -3.0, NULL, NULL, NULL, NULL, 'trailing_stop'),
+           (5, 'AMD', 'long', 'closed', '2026-09-03', '2026-09-05', NULL, NULL, NULL, NULL, NULL, NULL, 'merged_into_4');
 
          INSERT INTO portfolio_snapshots (date, total_value) VALUES
            ('2026-10-06', 99000.0), ('2026-10-07', 101000.0), ('2026-10-08', 100500.0), ('2026-10-09', 99800.0);
@@ -63,7 +68,7 @@ fn setup() -> Connection {
          INSERT INTO earnings_calendar (ticker, report_date, hour, eps_estimate, revenue_estimate, fetched_at) VALUES
            ('AAPL', '2026-10-22', 'amc', 1.62, 94000000000.0, '2026-10-11 05:00:00'),
            ('MSFT', '2026-10-20', 'amc', 3.1, 65000000000.0, '2026-10-11 05:00:00'),
-           ('TSLA', '2026-12-30', NULL, NULL, NULL, '2026-10-11 05:00:00');",
+           ('TSLA', '2026-12-30', NULL, NULL, NULL, '2026-10-11 05:00:00');"#,
     )
     .unwrap();
     conn
@@ -184,6 +189,24 @@ fn without_alpaca_the_database_parts_still_show() {
     assert!(!snap.signals.is_empty());
     assert!(snap.signals.iter().all(|s| !s.held), "nothing is known to be held without the broker");
     assert!(snap.calendar.has_earnings_data);
+}
+
+#[test]
+fn every_position_explains_itself_even_one_pulse_never_traded() {
+    let mut l = live();
+    l.positions.push(HeldPosition { symbol: "XYZ".into(), qty: 3.0, price: 10.0, market_value: 30.0, unrealized_pl: 1.0 });
+    let snap = build(&setup(), d("2026-10-11"), now(), Some(&l)).unwrap();
+    let by = |s: &str| snap.positions.iter().find(|p| p.symbol == s).unwrap().explanation.clone().unwrap();
+    let aapl = by("AAPL");
+    assert!(aapl.why.contains("Apple Inc") && aapl.plan.is_some(), "{aapl:?}");
+    assert!(aapl.now.unwrap().contains("up 2.5%"), "the live return from the broker is used");
+    assert!(by("TSLA").why.contains("You placed this short sale yourself"));
+    let xyz = by("XYZ");
+    assert_eq!(xyz.headline, "Not opened by Pulse");
+    assert!(xyz.plan.is_none());
+    // recent trades: merged scale-ins are not listed, the rest are explained
+    assert!(snap.recent_trades.iter().all(|t| t.explanation.is_some()));
+    assert_eq!(snap.recent_trades.iter().filter(|t| t.ticker == "AMD").count(), 1);
 }
 
 #[test]
