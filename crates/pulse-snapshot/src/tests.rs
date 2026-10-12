@@ -361,6 +361,65 @@ fn write_atomic_creates_the_folder_replaces_the_file_and_leaves_no_temp() {
 }
 
 #[test]
+fn parallel_writes_never_leave_a_half_file_or_a_temp_file() {
+    let dir = scratch("parallel").join("out");
+    let snap = build(&setup(), d("2026-10-11"), now(), Some(&live())).unwrap();
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| {
+                for _ in 0..10 {
+                    write_atomic(&dir, &snap).unwrap();
+                    assert!(read_previous(&dir).is_some(), "a reader always finds a whole file");
+                }
+            });
+        }
+    });
+    let files: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(files, vec![FILE_NAME.to_string()]);
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn a_broker_outage_keeps_the_last_account_figures_marked_with_when_they_were_read() {
+    let conn = setup();
+    let first = build(&conn, d("2026-10-11"), now(), Some(&live())).unwrap();
+    assert!(first.account_as_of.is_none());
+
+    let later = now() + chrono::Duration::hours(5);
+    let second = build_from(&conn, d("2026-10-11"), later, None, Some(&first)).unwrap();
+    assert_eq!(second.account.as_ref().map(|a| a.equity), first.account.as_ref().map(|a| a.equity));
+    assert_eq!(second.positions.len(), first.positions.len());
+    assert!(second.risk.is_some());
+    assert_eq!(second.account_as_of.as_deref(), Some(first.generated_at.as_str()));
+    assert!(second.signals.iter().any(|s| s.held), "held names stay marked");
+
+    // A second outage keeps the original read time, not the first outage's write time.
+    let third = build_from(&conn, d("2026-10-11"), later + chrono::Duration::hours(1), None, Some(&second)).unwrap();
+    assert_eq!(third.account_as_of, first.account_as_of.or(Some(first.generated_at.clone())));
+
+    // Broker back: current figures, no marker.
+    let back = build_from(&conn, d("2026-10-11"), later, Some(&live()), Some(&third)).unwrap();
+    assert!(back.account_as_of.is_none());
+}
+
+#[test]
+fn account_figures_too_old_or_from_another_schema_are_not_carried() {
+    let conn = setup();
+    let first = build(&conn, d("2026-10-11"), now(), Some(&live())).unwrap();
+    let stale = build_from(&conn, d("2026-10-15"), now() + chrono::Duration::hours(73), None, Some(&first)).unwrap();
+    assert!(stale.account.is_none() && stale.positions.is_empty() && stale.account_as_of.is_none());
+
+    let mut other = first.clone();
+    other.version = SCHEMA_VERSION + 1;
+    let snap = build_from(&conn, d("2026-10-11"), now(), None, Some(&other)).unwrap();
+    assert!(snap.account.is_none());
+
+    let mut empty = first;
+    empty.account = None;
+    assert!(build_from(&conn, d("2026-10-11"), now(), None, Some(&empty)).unwrap().account.is_none());
+}
+
+#[test]
 fn output_dir_follows_the_switch_the_override_then_icloud_drive() {
     let os = |s: &str| Some(std::ffi::OsString::from(s));
     assert_eq!(resolve_dir(Some("off"), os("/x"), os("/home/me")), None);

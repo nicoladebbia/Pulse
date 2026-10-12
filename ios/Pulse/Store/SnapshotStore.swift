@@ -72,17 +72,28 @@ final class SnapshotStore {
         do {
             let data = try await Task.detached(priority: .userInitiated) { try SnapshotReader.readFile(inFolder: folder) }.value
             let fresh = try SnapshotReader.decode(data)
-            snapshot = fresh
             lastRead = .now
             error = nil
             phase = .ready
-            try? data.write(to: cacheURL, options: .atomic)
+            // iCloud can deliver an older copy after a newer one; keep the newer.
+            if Self.isNewer(fresh, than: snapshot) {
+                snapshot = fresh
+                try? data.write(to: cacheURL, options: .atomic)
+            }
         } catch {
             self.error = error.localizedDescription
             if snapshot == nil {
                 phase = .ready
             }
         }
+    }
+
+    /// False only when `current` was generated after `candidate`.
+    nonisolated static func isNewer(_ candidate: Snapshot, than current: Snapshot?) -> Bool {
+        guard let current,
+              let a = Fmt.timestamp(candidate.generatedAt),
+              let b = Fmt.timestamp(current.generatedAt) else { return true }
+        return a >= b
     }
 
     func chooseFolder(_ url: URL) async {

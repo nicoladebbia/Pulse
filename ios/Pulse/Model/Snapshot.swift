@@ -9,6 +9,9 @@ struct Snapshot: Codable, Sendable, Equatable {
     let generatedAt: String
     /// Nil when the Mac could not reach Alpaca for this update.
     let account: Account?
+    /// When `account`, `positions` and `risk` were read from Alpaca, if that was an
+    /// earlier run (the Mac could not reach Alpaca for this one). Nil when current.
+    let accountAsOf: String?
     let positions: [Position]
     let risk: Risk?
     let briefing: Briefing?
@@ -112,6 +115,11 @@ struct Snapshot: Codable, Sendable, Equatable {
         var id: String {
             "\(ticker)-\(date)"
         }
+
+        /// Days from today on this phone, not from when the Mac wrote the file.
+        var daysAway: Int {
+            Fmt.daysFromToday(date) ?? daysUntil
+        }
     }
 
     struct MacroEvent: Codable, Sendable, Equatable, Identifiable {
@@ -124,6 +132,10 @@ struct Snapshot: Codable, Sendable, Equatable {
         let daysUntil: Int
         var id: String {
             "\(date)-\(kind)"
+        }
+
+        var daysAway: Int {
+            Fmt.daysFromToday(date) ?? daysUntil
         }
     }
 

@@ -11,6 +11,12 @@ struct PortfolioView: View {
                         SnapshotHeader()
                         if let snapshot = store.snapshot {
                             if let account = snapshot.account {
+                                if let asOf = snapshot.accountAsOf {
+                                    NoticeCard(
+                                        title: "Account figures are older",
+                                        message: "The Mac could not reach Alpaca for the latest update. Account, positions and risk are from \(Fmt.timestamp(asOf).map { $0.formatted(date: .abbreviated, time: .shortened) } ?? asOf)."
+                                    )
+                                }
                                 AccountCard(account: account, positionCount: snapshot.positions.count)
                             } else {
                                 NoticeCard(
@@ -39,7 +45,7 @@ struct PortfolioView: View {
                                 SectionTitle(text: "Recently closed").id("trades")
                                 Card(padding: 0) {
                                     VStack(spacing: 0) {
-                                        ForEach(Array(snapshot.recentTrades.enumerated()), id: \.element.id) { i, t in
+                                        ForEach(Array(snapshot.recentTrades.enumerated()), id: \.offset) { i, t in
                                             TradeRow(trade: t)
                                             if i < snapshot.recentTrades.count - 1 {
                                                 Divider().overlay(Theme.border)

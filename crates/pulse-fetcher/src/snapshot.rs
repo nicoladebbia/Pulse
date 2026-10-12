@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 /// Build and write the snapshot. `Ok(None)` when it is switched off
 /// (`PULSE_SNAPSHOT=off`). Without broker data (no keys, offline) the snapshot
-/// is still written with the parts the database has.
+/// is still written with the parts the database has, and the account figures
+/// of the copy already on disk (marked with when they were read).
 pub async fn refresh(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
     let Some(dir) = pulse_snapshot::output_dir() else {
         return Ok(None);
@@ -23,7 +24,8 @@ pub async fn refresh(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     let today = chrono::Local::now().date_naive();
-    let snapshot = pulse_snapshot::build(&conn, today, chrono::Utc::now(), live.as_ref()).map_err(anyhow::Error::msg)?;
+    let previous = if live.is_none() { pulse_snapshot::read_previous(&dir) } else { None };
+    let snapshot = pulse_snapshot::build_from(&conn, today, chrono::Utc::now(), live.as_ref(), previous.as_ref()).map_err(anyhow::Error::msg)?;
     drop(conn);
     let path = pulse_snapshot::write_atomic(&dir, &snapshot).map_err(anyhow::Error::msg)?;
     Ok(Some(path))

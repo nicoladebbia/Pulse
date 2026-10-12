@@ -38,6 +38,10 @@ pub struct Snapshot {
     pub generated_at: String,
     /// None when Alpaca could not be reached for this run.
     pub account: Option<Account>,
+    /// When `account`, `positions` and `risk` were read from Alpaca, if that was
+    /// an earlier run (the broker was unreachable for this one). None when they
+    /// are current.
+    pub account_as_of: Option<String>,
     pub positions: Vec<Position>,
     /// Positions are listed separately above, so `risk.positions` is empty.
     pub risk: Option<RiskReport>,
@@ -306,15 +310,38 @@ fn position_pct(side_short: bool, market_value: f64, pl: f64) -> Option<f64> {
     (cost > 0.0 && cost.is_finite()).then(|| pl / cost * 100.0)
 }
 
+/// A previous copy's account figures older than this are not carried forward.
+const CARRY_MAX_HOURS: i64 = 72;
+
 /// Build the snapshot. Without `live` (Alpaca unreachable) the account, positions
 /// and risk are left out and everything from the local database still shows.
 pub fn build(conn: &Connection, today: NaiveDate, now: DateTime<Utc>, live: Option<&LiveAccount>) -> Result<Snapshot, String> {
+    build_from(conn, today, now, live, None)
+}
+
+/// Like `build`, but when `live` is missing the account, positions and risk of
+/// `previous` (the file already on disk) are kept, marked with `account_as_of`,
+/// so one broker hiccup does not blank the phone's portfolio.
+pub fn build_from(
+    conn: &Connection,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+    live: Option<&LiveAccount>,
+    previous: Option<&Snapshot>,
+) -> Result<Snapshot, String> {
     let err = |e: rusqlite::Error| e.to_string();
+    let mut account_as_of = None;
     let stops = risk::load_stops(conn).map_err(err)?;
     let industries = risk::load_industries(conn).map_err(err)?;
 
     let (account, positions, risk_report) = match live {
-        None => (None, Vec::new(), None),
+        None => match previous.and_then(|p| carried_over(p, now)) {
+            Some((as_of, account, positions, risk)) => {
+                account_as_of = Some(as_of);
+                (Some(account), positions, risk)
+            }
+            None => (None, Vec::new(), None),
+        },
         Some(l) => {
             let positions: Vec<Position> = l
                 .positions
@@ -372,6 +399,7 @@ pub fn build(conn: &Connection, today: NaiveDate, now: DateTime<Utc>, live: Opti
         version: SCHEMA_VERSION,
         generated_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         account,
+        account_as_of,
         positions,
         risk: risk_report,
         briefing: load_briefing(conn).map_err(err)?,
@@ -381,6 +409,23 @@ pub fn build(conn: &Connection, today: NaiveDate, now: DateTime<Utc>, live: Opti
     };
     snapshot.sanitize();
     Ok(snapshot)
+}
+
+/// The account figures of an earlier copy, with when they were read. None if
+/// it has none, is from another schema, or is too old to still mean anything.
+fn carried_over(previous: &Snapshot, now: DateTime<Utc>) -> Option<(String, Account, Vec<Position>, Option<RiskReport>)> {
+    if previous.version != SCHEMA_VERSION {
+        return None;
+    }
+    let account = previous.account.clone()?;
+    let as_of = previous.account_as_of.clone().unwrap_or_else(|| previous.generated_at.clone());
+    let read_at = DateTime::parse_from_rfc3339(&as_of).ok()?.with_timezone(&Utc);
+    (now - read_at <= chrono::Duration::hours(CARRY_MAX_HOURS)).then(|| (as_of, account, previous.positions.clone(), previous.risk.clone()))
+}
+
+/// The snapshot already on disk, if there is a readable one.
+pub fn read_previous(dir: &Path) -> Option<Snapshot> {
+    serde_json::from_slice(&std::fs::read(dir.join(FILE_NAME)).ok()?).ok()
 }
 
 /// Where the snapshot goes: `PULSE_SNAPSHOT_DIR`, else a `Pulse` folder in iCloud
@@ -410,9 +455,26 @@ pub fn write_atomic(dir: &Path, snapshot: &Snapshot) -> Result<PathBuf, String> 
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let json = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
     let target = dir.join(FILE_NAME);
-    let tmp = dir.join(format!(".{FILE_NAME}.tmp"));
-    std::fs::write(&tmp, json).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &target).map_err(|e| format!("cannot replace {}: {e}", target.display()))?;
+    // A name of its own per write: two runs can overlap (the hook runs after the
+    // fetcher lock is released), and a shared temp file would let one truncate
+    // what the other is about to rename.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let tmp = dir.join(format!(".{FILE_NAME}.{}.{nanos}.{n}.tmp", std::process::id()));
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(&json)?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot write {}: {e}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot replace {}: {e}", target.display()));
+    }
     Ok(target)
 }
 

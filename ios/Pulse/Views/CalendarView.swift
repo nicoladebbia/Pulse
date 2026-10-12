@@ -16,10 +16,10 @@ struct CalendarView: View {
     private func days(_ c: Snapshot.CalendarData) -> [Day] {
         var byDate: [String: Day] = [:]
         for e in c.macroEvents {
-            byDate[e.date, default: Day(date: e.date, daysUntil: e.daysUntil, macro: [], earnings: [])].macro.append(e)
+            byDate[e.date, default: Day(date: e.date, daysUntil: e.daysAway, macro: [], earnings: [])].macro.append(e)
         }
         for e in c.earnings {
-            byDate[e.date, default: Day(date: e.date, daysUntil: e.daysUntil, macro: [], earnings: [])].earnings.append(e)
+            byDate[e.date, default: Day(date: e.date, daysUntil: e.daysAway, macro: [], earnings: [])].earnings.append(e)
         }
         return byDate.values.sorted { $0.date < $1.date }
     }
@@ -146,7 +146,7 @@ private struct EarningsRow: View {
                 if let name = item.name {
                     Text(name).font(.caption).foregroundStyle(Theme.textSecondary).lineLimit(1)
                 }
-                if item.blackout, item.daysUntil >= 0 {
+                if item.blackout, item.daysAway >= 0 {
                     Text("No new buys").font(.caption2.weight(.semibold)).foregroundStyle(Theme.amber)
                 }
             }

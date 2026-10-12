@@ -134,4 +134,32 @@ final class SnapshotTests: XCTestCase {
         XCTAssertNil(store.snapshot)
         XCTAssertEqual(store.phase, .needsFolder)
     }
+
+    func testDaysAreCountedFromTodayOnThePhoneNotFromWhenTheMacWroteTheFile() throws {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        let noon = try XCTUnwrap(cal.date(from: DateComponents(year: 2026, month: 10, day: 12, hour: 12)))
+        XCTAssertEqual(Fmt.daysFromToday("2026-10-12", now: noon, calendar: cal), 0)
+        XCTAssertEqual(Fmt.daysFromToday("2026-10-13", now: noon, calendar: cal), 1)
+        XCTAssertEqual(Fmt.daysFromToday("2026-10-10", now: noon, calendar: cal), -2)
+        XCTAssertNil(Fmt.daysFromToday("soon", now: noon, calendar: cal))
+    }
+
+    func testAnOlderCopyDeliveredLateDoesNotReplaceANewerOne() throws {
+        let base = try SnapshotReader.decode(fixtureData())
+        let json = try XCTUnwrap(String(data: fixtureData(), encoding: .utf8))
+        let older = try SnapshotReader.decode(Data(json.replacingOccurrences(of: base.generatedAt, with: "2020-01-01T00:00:00Z").utf8))
+        XCTAssertTrue(SnapshotStore.isNewer(base, than: older))
+        XCTAssertFalse(SnapshotStore.isNewer(older, than: base))
+        XCTAssertTrue(SnapshotStore.isNewer(base, than: nil))
+        XCTAssertTrue(SnapshotStore.isNewer(base, than: base), "the same copy again is harmless")
+    }
+
+    func testAccountAsOfIsReadWhenTheMacKeptAnOlderAccount() throws {
+        let json = try XCTUnwrap(String(data: fixtureData(), encoding: .utf8))
+        XCTAssertNil(try SnapshotReader.decode(fixtureData()).accountAsOf)
+        let kept = json.replacingOccurrences(of: "\"account_as_of\": null", with: "\"account_as_of\": \"2026-10-11T12:00:00Z\"")
+        XCTAssertNotEqual(kept, json, "the fixture carries the key")
+        XCTAssertEqual(try SnapshotReader.decode(Data(kept.utf8)).accountAsOf, "2026-10-11T12:00:00Z")
+    }
 }

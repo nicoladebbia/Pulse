@@ -78,6 +78,13 @@ enum Fmt {
         dayParser.date(from: String(s.prefix(10)))
     }
 
+    /// Whole days from today (on this phone) to a `YYYY-MM-DD` date. The snapshot's
+    /// own `daysUntil` is fixed at the moment the Mac wrote it.
+    static func daysFromToday(_ s: String, now: Date = .now, calendar: Calendar = .current) -> Int? {
+        guard let target = day(s) else { return nil }
+        return calendar.dateComponents([.day], from: calendar.startOfDay(for: now), to: calendar.startOfDay(for: target)).day
+    }
+
     static func timestamp(_ s: String) -> Date? {
         try? Date(s, strategy: .iso8601)
     }
