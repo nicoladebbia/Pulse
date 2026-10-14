@@ -173,6 +173,23 @@ pub(crate) fn log_trade_event(
     }
 }
 
+/// The `client_order_id` of an exit sell. Keyed by the hour, not the day: a sell that ended
+/// unfilled can be retried by a later run the same day without Alpaca refusing the id, and a
+/// launchd retry storm inside one hour cannot sell twice. A full and a half close get distinct
+/// ids.
+fn exit_client_id(ticker: &str, is_full: bool) -> String {
+    let hour_key = chrono::Local::now().format("%Y%m%d%H").to_string();
+    format!("pulse-exit-{}-{}-{}", ticker, hour_key, if is_full { "full" } else { "half" })
+}
+
+/// `PULSE_CLOSE_TRADE_ID=<id>` makes a position-management pass handle that one trade only and
+/// close it in full (reason `manual`), through the same stop cancel / position re-read / order /
+/// booking path as every other exit. It is the command-line twin of the app's Close button, and
+/// like any exit it only places an order with `EXIT_DRY_RUN=false`.
+fn parse_close_id(v: &str) -> Option<i64> {
+    v.trim().parse::<i64>().ok().filter(|id| *id > 0)
+}
+
 /// What a one-dollar rise is worth per share: 1 for a long, -1 for a short
 /// (`paper_trades.direction`).
 pub(crate) fn trade_sign(conn: &rusqlite::Connection, trade_id: i64) -> f64 {
@@ -2132,7 +2149,15 @@ async fn manage_pass(db_path: &Path) -> anyhow::Result<(usize, bool)> {
     let mut actions = 0usize;
     let mut entries_settled = false;
 
+    let only_trade = std::env::var("PULSE_CLOSE_TRADE_ID").ok().and_then(|v| parse_close_id(&v));
+    if let Some(id) = only_trade {
+        tracing::warn!("Position mgmt: PULSE_CLOSE_TRADE_ID set — handling trade #{} only and closing it in full", id);
+    }
+
     for t in &open {
+        if only_trade.is_some_and(|id| id != t.id) {
+            continue;
+        }
         let mut t = t.clone();
         let ticker = &t.ticker.clone();
         let entry_price = &t.entry_price.clone();
@@ -2370,6 +2395,8 @@ async fn manage_pass(db_path: &Path) -> anyhow::Result<(usize, bool)> {
         let expired = hold_limit.is_some_and(|max| held_days >= max);
         let (mut close_qty, mut reason): (f64, String) = if stop_fired {
             (held_qty, "broker_stop (remainder after the stop sold)".to_string())
+        } else if only_trade == Some(t.id) {
+            (held_qty, "manual".to_string())
         } else {
             // Signal decay check first — cheapest, and a decayed thesis means
             // exit regardless of price action.
@@ -2449,6 +2476,20 @@ async fn manage_pass(db_path: &Path) -> anyhow::Result<(usize, bool)> {
             continue;
         }
 
+        // This hour's sell id already exists at Alpaca (placed earlier this hour, even if it
+        // ended with no fill): Alpaca would refuse the id again, so selling now could only
+        // cancel the stop and put it back. Leave the stop alone; a run in the next hour sends a
+        // fresh id.
+        match stops::get_order_by_client_id(&client, &creds, &exit_client_id(ticker, is_full)).await {
+            Ok(Some(o)) => {
+                tracing::info!("Position mgmt: {} sell {} already sent this hour ({}) — no second order", ticker, o.id, o.status);
+                continue;
+            }
+            Ok(None) => {}
+            // Unknown: go on. The id still stops a duplicate at the broker.
+            Err(e) => tracing::warn!("Position mgmt: {} earlier sell lookup failed ({}), going on", ticker, e),
+        }
+
         // A sell stop holds its shares: Alpaca refuses any other sell for them
         // until it is cancelled. If it cannot be cancelled, do not sell this
         // run — the stop is still protecting the position.
@@ -2516,10 +2557,7 @@ async fn manage_pass(db_path: &Path) -> anyhow::Result<(usize, bool)> {
         // Deterministic client_order_id keyed on ticker+day+half-vs-full prevents a
         // launchd retry storm from double-selling (same bug class as the buy-side
         // ORCL stacking). A full and a half close on the same day get distinct ids.
-        // Keyed by the hour, not the day: a sell that ended unfilled can be
-        // retried by a later run the same day without Alpaca refusing the id.
-        let hour_key = chrono::Local::now().format("%Y%m%d%H").to_string();
-        let exit_coid = format!("pulse-exit-{}-{}-{}", ticker, hour_key, if is_full {"full"} else {"half"});
+        let exit_coid = exit_client_id(ticker, is_full);
         let order = serde_json::json!({
             "symbol": ticker,
             "qty": format!("{:.9}", close_qty),
@@ -3357,6 +3395,23 @@ mod ledger_tests {
         assert_eq!(whole_shares(999.0, 1_000.0), None);
         assert_eq!(whole_shares(1_000.0, 0.0), None);
         assert_eq!(whole_shares(f64::NAN, 10.0), None);
+    }
+
+    #[test]
+    fn exit_ids_differ_by_ticker_and_by_full_versus_half() {
+        let full = super::exit_client_id("HOOD", true);
+        assert!(full.starts_with("pulse-exit-HOOD-") && full.ends_with("-full"), "{full}");
+        assert_ne!(full, super::exit_client_id("HOOD", false));
+        assert_ne!(full, super::exit_client_id("ARM", true));
+    }
+
+    #[test]
+    fn close_request_takes_only_a_positive_whole_number() {
+        assert_eq!(super::parse_close_id("111"), Some(111));
+        assert_eq!(super::parse_close_id(" 7 "), Some(7));
+        for bad in ["", "0", "-3", "abc", "1.5", "all"] {
+            assert_eq!(super::parse_close_id(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
