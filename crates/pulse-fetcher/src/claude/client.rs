@@ -444,7 +444,7 @@ where
     if !v.is_finite() {
         return Err(serde::de::Error::custom("non-finite relevance"));
     }
-    Ok(v.round().clamp(-1000.0, 1000.0) as i32)
+    Ok(v.round().clamp(0.0, 10.0) as i32)
 }
 
 #[derive(Deserialize)]

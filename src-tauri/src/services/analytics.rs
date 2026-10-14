@@ -121,8 +121,9 @@ pub fn compute_analytics(conn: &Connection) -> Result<PortfolioAnalytics, String
 
     // Core metrics
     let total = closed.len();
-    let wins: Vec<&ClosedTrade> = closed.iter().filter(|t| t.pnl_pct > 0.0).collect();
-    let losses: Vec<&ClosedTrade> = closed.iter().filter(|t| t.pnl_pct <= 0.0).collect();
+    // Win/loss by booked dollars: pnl_pct of a half-closed trade is only its last leg.
+    let wins: Vec<&ClosedTrade> = closed.iter().filter(|t| t.pnl_dollars > 0.0).collect();
+    let losses: Vec<&ClosedTrade> = closed.iter().filter(|t| t.pnl_dollars <= 0.0).collect();
 
     let win_rate = wins.len() as f64 / total as f64 * 100.0;
     let loss_rate = losses.len() as f64 / total as f64 * 100.0;
