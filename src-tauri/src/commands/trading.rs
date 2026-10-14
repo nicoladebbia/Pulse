@@ -103,9 +103,11 @@ pub async fn execute_trade(
     // Gather DB info first, drop lock before async calls
     let (entity_id, signal_profile, current_price, already_open, open_count) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let eid: i64 = conn
+        // Looked up before any order exists: entity_id 0 used to break the foreign key AFTER
+        // the order was live at Alpaca, leaving a position the app never recorded.
+        let eid: Option<i64> = conn
             .query_row("SELECT entity_id FROM entity_tickers WHERE ticker = ?1", [&ticker], |row| row.get(0))
-            .unwrap_or(0);
+            .ok();
         let profile = serde_json::json!({"source": "manual", "confidence": confidence}).to_string();
         let price: f64 = conn
             .query_row("SELECT close FROM entity_prices WHERE ticker = ?1 ORDER BY date DESC LIMIT 1", [&ticker], |row| row.get(0))
@@ -119,6 +121,9 @@ pub async fn execute_trade(
         (eid, profile, price, already, count)
     };
 
+    let Some(entity_id) = entity_id else {
+        return Err(format!("{} is not a tracked company, so Pulse cannot record a trade in it", ticker));
+    };
     if already_open {
         return Err(format!("Already have open position for {}", ticker));
     }
@@ -455,7 +460,9 @@ pub struct AutoBacktestStatus {
     pub message: String,
 }
 
-#[tauri::command]
+// `async` makes Tauri run this off the main thread: a full backtest used to freeze the window
+// on the first launch of each day.
+#[tauri::command(async)]
 pub fn auto_backtest_if_due(db: State<'_, DbState>) -> Result<AutoBacktestStatus, String> {
     const THRESHOLD_DAYS: i64 = 90;
 

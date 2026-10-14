@@ -121,8 +121,9 @@ pub fn compute_analytics(conn: &Connection) -> Result<PortfolioAnalytics, String
 
     // Core metrics
     let total = closed.len();
-    let wins: Vec<&ClosedTrade> = closed.iter().filter(|t| t.pnl_pct > 0.0).collect();
-    let losses: Vec<&ClosedTrade> = closed.iter().filter(|t| t.pnl_pct <= 0.0).collect();
+    // Win/loss by booked dollars: pnl_pct of a half-closed trade is only its last leg.
+    let wins: Vec<&ClosedTrade> = closed.iter().filter(|t| t.pnl_dollars > 0.0).collect();
+    let losses: Vec<&ClosedTrade> = closed.iter().filter(|t| t.pnl_dollars <= 0.0).collect();
 
     let win_rate = wins.len() as f64 / total as f64 * 100.0;
     let loss_rate = losses.len() as f64 / total as f64 * 100.0;
@@ -230,12 +231,13 @@ fn get_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
 
     let mut stmt = conn.prepare(
         "SELECT pt.ticker, pt.entry_date, pt.exit_date, pt.entry_price, pt.exit_price,
-                pt.position_size, pt.pnl_pct, pt.signal_profile, e.sector
+                pt.position_size, pt.pnl_pct, pt.signal_profile, e.sector, COALESCE(pt.realized_pnl, pt.pnl)
          FROM paper_trades pt
          LEFT JOIN entities e ON e.id = pt.entity_id
          WHERE pt.status IN ('closed', 'stopped_out', 'expired')
            AND pt.exit_price IS NOT NULL AND pt.pnl_pct IS NOT NULL
            AND pt.exit_date IS NOT NULL AND pt.exit_date != ''
+           AND COALESCE(pt.exit_reason, '') NOT LIKE 'merged_into%'
          ORDER BY pt.exit_date ASC"
     ).map_err(|e| e.to_string())?;
 
@@ -244,8 +246,10 @@ fn get_closed_trades(conn: &Connection) -> Result<Vec<ClosedTrade>, String> {
         let exit_price: f64 = row.get(4)?;
         let position_size: f64 = row.get(5)?;
         let pnl_pct: f64 = row.get(6)?;
-        // Dollar P&L = position_size * pnl_pct / 100
-        let pnl_dollars = position_size * pnl_pct / 100.0;
+        // The booked dollars are the truth: after a half close position_size is only what
+        // was left and pnl_pct only the last leg, so size * pct understates the trade.
+        let booked: Option<f64> = row.get(9)?;
+        let pnl_dollars = booked.unwrap_or(position_size * pnl_pct / 100.0);
 
         Ok(ClosedTrade {
             ticker: row.get(0)?,
@@ -735,5 +739,25 @@ mod tests {
     fn parse_trade_date_rejects_garbage() {
         assert!(parse_trade_date("not-a-date").is_none());
         assert!(parse_trade_date("").is_none());
+    }
+
+    #[test]
+    fn closed_trades_skip_merged_rows_and_use_booked_dollars() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, sector TEXT);
+             CREATE TABLE paper_trades (
+                id INTEGER PRIMARY KEY, entity_id INTEGER, ticker TEXT, entry_price REAL, entry_date TEXT,
+                exit_price REAL, exit_date TEXT, position_size REAL, pnl REAL, pnl_pct REAL,
+                realized_pnl REAL, signal_profile TEXT, status TEXT, exit_reason TEXT);
+             -- a half-closed trade: 86 dollars left of the position, -360.85 booked, -8.8% on the last leg
+             INSERT INTO paper_trades VALUES (1, NULL, 'BG', 100, '2026-09-01', 91, '2026-09-10', 86, -360.85, -8.8, -360.85, '{}', 'closed', 'trailing_stop');
+             -- the ledger repair left this scale-in fragment behind
+             INSERT INTO paper_trades VALUES (2, NULL, 'INTC', 65, '2026-04-16', 107, '2026-05-01', 0.19, 0.12, 65.1, NULL, '{}', 'expired', 'merged_into_1');",
+        )
+        .unwrap();
+        let trades = get_closed_trades(&conn).unwrap();
+        assert_eq!(trades.len(), 1);
+        assert!((trades[0].pnl_dollars - -360.85).abs() < 1e-9, "{}", trades[0].pnl_dollars);
     }
 }

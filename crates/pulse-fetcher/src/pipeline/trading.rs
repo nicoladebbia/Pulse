@@ -797,6 +797,7 @@ pub(crate) async fn auto_trade_on_convergence(db_path: &Path) -> anyhow::Result<
     }
 
     let conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     // Hourly modes can be the first process to touch the DB after an update.
     // Non-fatal: trading must not stop because a newer table is missing.
     if let Err(e) = crate::db::run_migrations(&conn) {
@@ -2074,6 +2075,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
     let creds = pulse_alpaca::Credentials { key: alpaca_key.clone(), secret: alpaca_secret.clone() };
 
     let conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     // Ensure schema is current (idempotent) — needed when this runs standalone
     // via `--mode manage-positions` without the full pipeline's migration pass.
     crate::db::run_migrations(&conn)?;
@@ -2613,6 +2615,7 @@ pub(crate) async fn snapshot_portfolio(db_path: &Path) -> anyhow::Result<bool> {
     let total_pnl_pct = (total_pnl / INITIAL_EQUITY) * 100.0;
 
     let conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
 
     let open_positions: i64 = conn.query_row(
         "SELECT COUNT(*) FROM paper_trades WHERE status = 'open'",

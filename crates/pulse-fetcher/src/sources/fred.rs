@@ -81,12 +81,12 @@ async fn fetch_series(
     );
 
     super::API_CALLS.fred.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let resp = client.get(&url).send().await?;
+    let resp = client.get(&url).send().await.map_err(|e| e.without_url())?;
     if !resp.status().is_success() {
         anyhow::bail!("FRED API returned {} for {}", resp.status(), series_id);
     }
 
-    let data: FredResponse = resp.json().await?;
+    let data: FredResponse = resp.json().await.map_err(|e| e.without_url())?;
     let obs = data.observations.unwrap_or_default();
 
     if obs.is_empty() {

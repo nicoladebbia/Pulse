@@ -52,7 +52,7 @@ pub async fn generate_prefixes(
 
         let body = serde_json::json!({
             "model": HAIKU_MODEL,
-            "max_tokens": 1500,
+            "max_tokens": 2500,
             "system": format!(
                 r#"You generate contextual prefixes for news stories to improve search retrieval.
 
@@ -64,7 +64,7 @@ For each story below, write a 1-2 sentence prefix that:
 2. Connects the story to related ongoing narratives or trends
 3. Notes temporal context if relevant (what preceded this, what might follow)
 
-Return ONLY valid JSON: {{"prefixes": ["prefix for story 0", "prefix for story 1", ...]}}
+Return ONLY valid JSON, one object per story, echoing the story's number in "id": {{"prefixes": [{{"id": 0, "prefix": "prefix for story 0"}}, {{"id": 1, "prefix": "prefix for story 1"}}, ...]}}
 Keep each prefix under 80 words. Be specific — use names, not descriptions."#,
                 day_context
             ),
@@ -127,7 +127,7 @@ Keep each prefix under 80 words. Be specific — use names, not descriptions."#,
 
         #[derive(Deserialize)]
         struct PrefixResponse {
-            prefixes: Vec<String>,
+            prefixes: Vec<PrefixItem>,
         }
 
         if let Ok(parsed) = serde_json::from_str::<PrefixResponse>(json_str) {
@@ -137,9 +137,9 @@ Keep each prefix under 80 words. Be specific — use names, not descriptions."#,
                     parsed.prefixes.len(), chunk.len(), batch_start
                 );
             }
-            for (i, prefix) in parsed.prefixes.into_iter().enumerate() {
-                if !prefix.is_empty() && batch_start + i < all_prefixes.len() {
-                    all_prefixes[batch_start + i] = Some(prefix);
+            for (i, prefix) in assign_prefixes(parsed.prefixes, chunk.len()).into_iter().enumerate() {
+                if prefix.is_some() && batch_start + i < all_prefixes.len() {
+                    all_prefixes[batch_start + i] = prefix;
                 }
             }
         } else {
@@ -157,9 +157,37 @@ Keep each prefix under 80 words. Be specific — use names, not descriptions."#,
     Ok(all_prefixes)
 }
 
+/// One entry of the model's answer: an object that names its story, or (older prompt, and
+/// models that ignore the format) a bare string that can only be matched by position.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PrefixItem {
+    Keyed { id: usize, prefix: String },
+    Bare(String),
+}
+
+/// Match the model's prefixes to the stories of a batch. A prefix stored on the wrong story
+/// is worse than none (it is indexed for search and embedded with that story's text), so bare
+/// strings are only trusted when there is exactly one per story.
+fn assign_prefixes(items: Vec<PrefixItem>, story_count: usize) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = vec![None; story_count];
+    let positional_ok = items.len() == story_count;
+    for (i, item) in items.into_iter().enumerate() {
+        let (idx, prefix) = match item {
+            PrefixItem::Keyed { id, prefix } => (id, prefix),
+            PrefixItem::Bare(prefix) if positional_ok => (i, prefix),
+            PrefixItem::Bare(_) => continue,
+        };
+        if idx < story_count && !prefix.trim().is_empty() {
+            out[idx] = Some(prefix);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod prefix_text_tests {
-    use super::prefix_text;
+    use super::{assign_prefixes, prefix_text, PrefixItem};
     use serde_json::json;
 
     #[test]
@@ -185,5 +213,36 @@ mod prefix_text_tests {
         let err = prefix_text(&v).unwrap_err();
         assert!(err.chars().count() <= 201, "len {}", err.chars().count());
         assert!(err.ends_with('…'));
+    }
+
+    #[test]
+    fn keyed_prefixes_land_on_their_own_story_even_when_one_is_skipped() {
+        let items = vec![
+            PrefixItem::Keyed { id: 0, prefix: "zero".into() },
+            PrefixItem::Keyed { id: 2, prefix: "two".into() },
+        ];
+        let out = assign_prefixes(items, 3);
+        assert_eq!(out, vec![Some("zero".to_string()), None, Some("two".to_string())]);
+    }
+
+    #[test]
+    fn short_bare_list_is_not_assigned_by_position() {
+        let items = vec![PrefixItem::Bare("a".into()), PrefixItem::Bare("b".into())];
+        assert_eq!(assign_prefixes(items, 3), vec![None, None, None]);
+    }
+
+    #[test]
+    fn full_bare_list_is_assigned_by_position() {
+        let items = vec![PrefixItem::Bare("a".into()), PrefixItem::Bare("b".into())];
+        assert_eq!(assign_prefixes(items, 2), vec![Some("a".to_string()), Some("b".to_string())]);
+    }
+
+    #[test]
+    fn out_of_range_ids_and_empty_prefixes_are_dropped() {
+        let items = vec![
+            PrefixItem::Keyed { id: 9, prefix: "far".into() },
+            PrefixItem::Keyed { id: 0, prefix: "  ".into() },
+        ];
+        assert_eq!(assign_prefixes(items, 2), vec![None, None]);
     }
 }

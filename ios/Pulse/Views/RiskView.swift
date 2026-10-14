@@ -11,6 +11,12 @@ struct RiskView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         SnapshotHeader()
                         if let risk = store.snapshot?.risk {
+                            if let asOf = store.snapshot?.accountAsOf {
+                                NoticeCard(
+                                    title: "Risk figures are older",
+                                    message: "The Mac could not reach Alpaca for the latest update. Exposure, stops and stress tests are from \(Fmt.timestamp(asOf).map { $0.formatted(date: .abbreviated, time: .shortened) } ?? asOf)."
+                                )
+                            }
                             if !risk.warnings.isEmpty {
                                 NoticeCard(title: "Heads up", message: risk.warnings.joined(separator: "\n"))
                             }

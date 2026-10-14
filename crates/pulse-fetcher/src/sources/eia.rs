@@ -69,7 +69,7 @@ async fn fetch_petroleum(client: &reqwest::Client, api_key: &str) -> anyhow::Res
     );
 
     super::API_CALLS.eia.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let resp = client.get(&url).send().await?;
+    let resp = client.get(&url).send().await.map_err(|e| e.without_url())?;
     if !resp.status().is_success() {
         anyhow::bail!("EIA petroleum API returned {}", resp.status());
     }
@@ -78,7 +78,7 @@ async fn fetch_petroleum(client: &reqwest::Client, api_key: &str) -> anyhow::Res
     let data: EiaResponse = match serde_json::from_str(&body) {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("EIA petroleum parse error: {} (body: {})", e, &body[..body.len().min(200)]);
+            tracing::warn!("EIA petroleum parse error: {} (body: {})", e, crate::article_text::clip(&body, 200));
             return Ok(Vec::new());
         }
     };
@@ -161,7 +161,7 @@ async fn fetch_natgas(client: &reqwest::Client, api_key: &str) -> anyhow::Result
     );
 
     super::API_CALLS.eia.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let resp = client.get(&url).send().await?;
+    let resp = client.get(&url).send().await.map_err(|e| e.without_url())?;
     if !resp.status().is_success() {
         anyhow::bail!("EIA natural gas API returned {}", resp.status());
     }
@@ -170,7 +170,7 @@ async fn fetch_natgas(client: &reqwest::Client, api_key: &str) -> anyhow::Result
     let data: EiaResponse = match serde_json::from_str(&body) {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("EIA natgas parse error: {} (body: {})", e, &body[..body.len().min(200)]);
+            tracing::warn!("EIA natgas parse error: {} (body: {})", e, crate::article_text::clip(&body, 200));
             return Ok(Vec::new());
         }
     };

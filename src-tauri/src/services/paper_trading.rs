@@ -359,6 +359,7 @@ fn get_trades_by_status(conn: &Connection, status: &str) -> Result<Vec<PaperTrad
             "SELECT {TRADE_COLUMNS} FROM paper_trades \
              WHERE status != 'open' \
                AND NOT (status = 'expired' AND pnl_pct IS NULL) \
+               AND COALESCE(exit_reason, '') NOT LIKE 'merged_into%' \
              ORDER BY COALESCE(exit_date, entry_date) DESC LIMIT 50"
         )
     } else {

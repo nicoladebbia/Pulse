@@ -436,7 +436,7 @@ pub(crate) async fn classify_ambiguous_8ks(db_path: &Path) -> anyhow::Result<usi
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 150,
             "system": "Classify this SEC 8-K filing into exactly one category. Return only valid JSON.\n\nCategories:\n- earnings_surprise: unexpected financial results\n- acquisition: M&A activity, merger, purchase\n- partnership: strategic alliance, joint venture\n- restructuring: layoffs, cost cuts, exit activities\n- product_launch: new product, service, or technology\n- regulatory: FDA approval, compliance action, government\n- executive_change: C-suite departure or hire\n- bankruptcy_risk: going concern, debt default\n- shareholder_action: buyback, dividend, activist\n- capital_raise: debt offering, equity raise, IPO\n- litigation: lawsuit, settlement, legal action\n- other: none of the above\n\nReturn: {\"category\": \"...\", \"severity\": 0.0-1.0, \"summary\": \"one sentence\"}",
-            "messages": [{"role": "user", "content": format!("Company: {}\n\n8-K content:\n{}", entity, &preview[..preview.len().min(1500)])}]
+            "messages": [{"role": "user", "content": format!("Company: {}\n\n8-K content:\n{}", entity, crate::article_text::clip(preview, 1500))}]
         });
 
         let resp = client

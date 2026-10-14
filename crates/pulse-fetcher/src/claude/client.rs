@@ -418,8 +418,33 @@ struct AnalysisConnection {
 #[derive(Deserialize)]
 struct AnalysisRelevance {
     story_id: usize,
+    #[serde(deserialize_with = "lenient_score")]
     relevance: i32,
+    /// Models sometimes leave the reason out; that must not throw away the whole analysis.
+    #[serde(default)]
     reason: String,
+}
+
+/// A 0-10 score as the model actually writes it: 8, 8.0, 7.5 or "8". One odd value must
+/// not fail the whole briefing analysis.
+fn lenient_score<'de, D>(d: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Num(f64),
+        Text(String),
+    }
+    let v = match Raw::deserialize(d)? {
+        Raw::Num(n) => n,
+        Raw::Text(s) => s.trim().parse::<f64>().map_err(serde::de::Error::custom)?,
+    };
+    if !v.is_finite() {
+        return Err(serde::de::Error::custom("non-finite relevance"));
+    }
+    Ok(v.round().clamp(0.0, 10.0) as i32)
 }
 
 #[derive(Deserialize)]
@@ -1208,7 +1233,7 @@ impl GroqClient {
                 Err(serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, "no array found")))
             })
             .map_err(|_| {
-                tracing::warn!("Pre-curation JSON parse failed (response: {}...)", &text[..text.len().min(200)]);
+                tracing::warn!("Pre-curation JSON parse failed (response: {}...)", crate::article_text::clip(&text, 200));
                 anyhow::anyhow!("Pre-curation response was not a valid JSON array")
             })?;
 
@@ -1888,5 +1913,15 @@ mod reasoning_model_tests {
         let req = ChatRequest { reasoning_effort: Some("low"), ..req };
         let body = serde_json::to_string(&req).unwrap();
         assert!(body.contains("\"reasoning_effort\":\"low\""), "got {body}");
+    }
+
+    #[test]
+    fn analysis_relevance_tolerates_missing_reason_and_float_scores() {
+        let r: Vec<AnalysisRelevance> = serde_json::from_str(
+            r#"[{"story_id":0,"relevance":7.6},{"story_id":1,"relevance":"4","reason":"x"},{"story_id":2,"relevance":9}]"#,
+        )
+        .unwrap();
+        assert_eq!((r[0].relevance, r[1].relevance, r[2].relevance), (8, 4, 9));
+        assert_eq!(r[0].reason, "");
     }
 }

@@ -89,7 +89,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
 
             let amount_str = format_amount(amount);
             let desc_truncated = if description.len() > 80 {
-                format!("{}...", &description[..77])
+                format!("{}...", crate::article_text::clip(description, 77))
             } else {
                 description.to_string()
             };

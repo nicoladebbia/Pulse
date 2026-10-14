@@ -14,7 +14,16 @@
 
 	function handleKeydown(event: KeyboardEvent) {
 		const target = event.target as HTMLElement;
-		if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
+		if (
+			target.tagName === 'INPUT' ||
+			target.tagName === 'TEXTAREA' ||
+			target.tagName === 'SELECT' ||
+			target.isContentEditable
+		) {
+			return;
+		}
+		// Cmd/Ctrl/Alt combos belong to the system and the page (Cmd+F, Cmd+P, Cmd+K ...)
+		if (event.metaKey || event.ctrlKey || event.altKey) {
 			return;
 		}
 

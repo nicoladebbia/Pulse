@@ -8,7 +8,7 @@
 	import StoryExpanded from '$lib/components/stories/StoryExpanded.svelte';
 	import type { Story, StoryDetail, BriefingWithStories, StoryTrendBadge } from '$lib/tauri/types';
 	import { isTauri, mockBriefingData } from '$lib/tauri/mock';
-	import { getStoryTrendBadges, safeInvoke } from '$lib/tauri/commands';
+	import { getStoryTrendBadges, getTodayBriefing, safeInvoke } from '$lib/tauri/commands';
 	import { isFetching, fetchDone } from '$lib/stores/fetch';
 	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
 
@@ -99,7 +99,8 @@
 			}
 
 			const briefing = await Promise.race([
-				safeInvoke<BriefingWithStories | null>('get_today_briefing'),
+				// The throwing wrapper: a DB error must show the error + Retry, not "no briefing today"
+				getTodayBriefing(),
 				new Promise<null>((_, rej) => setTimeout(() => rej(new Error('Timed out loading briefing')), 10000))
 			]);
 
