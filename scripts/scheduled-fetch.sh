@@ -100,11 +100,19 @@ fi
 if [ "$hour" -ge 21 ]; then
   # The morning one already exists by now, so the evening run needs --force
   # (multiple briefings per day are allowed; each gets its own time label).
-  if [ "$(cat "$STATE_DIR/morning" 2>/dev/null)" = "$today" ]; then
+  # "A briefing exists today" is what counts, not our own stamp: one made by the app or by
+  # hand leaves the stamp unset, and the evening run would then never use --force and never
+  # produce a briefing.
+  if [ "$(cat "$STATE_DIR/morning" 2>/dev/null)" = "$today" ] || [ "$(briefings_today)" -gt 0 ]; then
     run_slot evening --force
   else
     run_slot morning
   fi
 elif [ "$hour" -ge 8 ]; then
-  run_slot morning
+  # Made earlier by the app or by hand: record the slot as done instead of retrying hourly.
+  if [ "$(briefings_today)" -gt 0 ]; then
+    echo "$today" > "$STATE_DIR/morning"
+  else
+    run_slot morning
+  fi
 fi

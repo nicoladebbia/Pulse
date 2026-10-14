@@ -430,7 +430,10 @@ async fn main() -> anyhow::Result<()> {
             // the daily run skipped Phase 13.5 at the already-fetched guard.
             tracing::info!("Running auto-trade (buy path) only...");
             match pipeline::run_auto_trade(&db_path).await {
-                Ok(n) => tracing::info!("Auto-trade complete: {} buy(s) (previewed only if AUTO_TRADE_PREVIEW is on)", n),
+                Ok(n) => {
+                    tracing::info!("Auto-trade complete: {} buy(s) (previewed only if AUTO_TRADE_PREVIEW is on)", n);
+                    protect_new_positions(&db_path, n).await;
+                }
                 Err(e) => {
                     tracing::error!("Auto-trade failed: {}", e);
                     return Err(e);
@@ -560,7 +563,10 @@ async fn main() -> anyhow::Result<()> {
                 // Same entry rules as the scheduled runs; it checks the market
                 // clock itself and skips what it already holds or ordered today.
                 match pipeline::auto_trade_on_convergence(&db_path).await {
-                    Ok(n) => tracing::info!("Live signals: auto-trade placed {} order(s)", n),
+                    Ok(n) => {
+                        tracing::info!("Live signals: auto-trade placed {} order(s)", n);
+                        protect_new_positions(&db_path, n).await;
+                    }
                     Err(e) => tracing::warn!("Live signals: auto-trade failed: {}", e),
                 }
             }
@@ -610,6 +616,19 @@ async fn main() -> anyhow::Result<()> {
 
 /// Refresh upcoming earnings dates (at most every few hours). A failure only
 /// costs the Calendar page some freshness, so it is logged, never fatal.
+/// A buy gets its broker-side stop from position management, which otherwise only runs
+/// hourly from scheduled-fetch.sh. Run it right after new buys so nothing sits unprotected
+/// until the next hour (or, for a late-afternoon buy, until the next morning).
+async fn protect_new_positions(db_path: &std::path::Path, new_buys: usize) {
+    if new_buys == 0 {
+        return;
+    }
+    match pipeline::run_position_management(db_path).await {
+        Ok(n) => tracing::info!("Stops placed for {} new buy(s) ({} action(s))", new_buys, n),
+        Err(e) => tracing::warn!("Could not place stops for {} new buy(s): {} — the next hourly run retries", new_buys, e),
+    }
+}
+
 async fn refresh_calendar(db_path: &std::path::Path) {
     if let Err(e) = calendar::refresh_if_stale(db_path).await {
         tracing::warn!("Earnings calendar refresh failed: {e}");

@@ -33,6 +33,19 @@ fn truncate_at_char_boundary(s: &mut String, max_bytes: usize) {
     s.truncate(end);
 }
 
+/// The longest prefix of `s` that is at most `max_bytes` long and ends on a char boundary.
+/// `&s[..n]` panics when byte `n` falls inside a multi-byte char (curly quotes, accents).
+pub(crate) fn clip(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Strip all tags and decode common entities — the fallback when HTML has no
 /// usable <p> structure (e.g. content:encoded that is plain text or <div>-soup).
 pub fn strip_tags(html: &str) -> String {
@@ -198,6 +211,15 @@ pub async fn enrich(mut articles: Vec<RawArticle>) -> Vec<RawArticle> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clip_never_splits_a_multibyte_char() {
+        let s = "ab\u{2019}cd"; // the curly quote is 3 bytes at 2..5
+        assert_eq!(super::clip(s, 3), "ab");
+        assert_eq!(super::clip(s, 5), "ab\u{2019}");
+        assert_eq!(super::clip(s, 99), s);
+        assert_eq!(super::clip("", 4), "");
+    }
+
     use super::*;
 
     #[test]

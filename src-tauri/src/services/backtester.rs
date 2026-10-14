@@ -765,10 +765,17 @@ fn mark_to_market(
     positions.sort_by(|a, b| a.ticker.cmp(&b.ticker));
     let mut total = 0.0;
     for pos in positions {
+        // A day with no bar carries the last known close. Falling back to the entry price
+        // valued a winning position at cost for that day: a fake drawdown and noisy Sharpe.
         let close = prices
             .get(&pos.ticker)
             .and_then(|m| m.get(date))
             .map(|b| b.0)
+            .or_else(|| {
+                latest_bar(prices, &pos.ticker, date)
+                    .map(|(_, c)| c)
+                    .filter(|c| *c > 0.0)
+            })
             .unwrap_or(pos.entry_price);
         let pnl_pct = ((close - pos.entry_price) / pos.entry_price) * 100.0;
         total += pos.position_value * pnl_pct / 100.0;
@@ -782,9 +789,8 @@ fn latest_bar(
     not_after: &str,
 ) -> Option<(String, f64)> {
     let map = prices.get(ticker)?;
-    let mut dates: Vec<&String> = map.keys().filter(|d| d.as_str() <= not_after).collect();
-    dates.sort();
-    dates.last().map(|d| ((*d).clone(), map.get(*d).map(|b| b.0).unwrap_or(0.0)))
+    let date = map.keys().filter(|d| d.as_str() <= not_after).max()?;
+    Some((date.clone(), map.get(date).map(|b| b.0).unwrap_or(0.0)))
 }
 
 fn get_signal_candidates(conn: &Connection, config: &BacktestConfig) -> Result<Vec<SignalCandidate>, String> {
@@ -922,8 +928,8 @@ fn compute_max_drawdown(curve: &[EquityPoint]) -> f64 {
     max_dd
 }
 
-// Derive monthly returns from the equity curve: pct change between first and
-// last equity snapshot within each month. `trade_count` = trades that *exited*
+// Derive monthly returns from the equity curve: pct change from the previous month's last
+// equity snapshot (the first snapshot, for the first month) to this month's last. `trade_count` = trades that *exited*
 // in that month (realized events), which is what the tooltip represents.
 fn compute_monthly_returns(curve: &[EquityPoint], trades: &[BacktestTrade]) -> Vec<MonthlyReturn> {
     if curve.is_empty() { return Vec::new(); }
@@ -942,9 +948,14 @@ fn compute_monthly_returns(curve: &[EquityPoint], trades: &[BacktestTrade]) -> V
         }
     }
     let mut out = Vec::with_capacity(by_month.len());
+    // A month starts from the PREVIOUS month's last value: starting from its own first point
+    // dropped the first day's move of every month, so the bars did not add up to the total.
+    let mut prev_last: Option<f64> = None;
     for (month, (first, last)) in by_month {
-        let pnl_dollars = last - first;
-        let pnl_pct = if first > 0.0 { pnl_dollars / first * 100.0 } else { 0.0 };
+        let base = prev_last.unwrap_or(first);
+        prev_last = Some(last);
+        let pnl_dollars = last - base;
+        let pnl_pct = if base > 0.0 { pnl_dollars / base * 100.0 } else { 0.0 };
         let trade_count = *exits_by_month.get(&month).unwrap_or(&0);
         out.push(MonthlyReturn { month, pnl_dollars, pnl_pct, trade_count });
     }
@@ -1359,5 +1370,48 @@ mod exit_and_sizing_tests {
         let t = &r.trades[0];
         assert_eq!(t.exit_reason, "stop_loss");
         assert!((t.pnl_dollars + 500.0).abs() < 1e-6, "lost {}", t.pnl_dollars);
+    }
+}
+
+#[cfg(test)]
+mod carry_forward_tests {
+    use super::*;
+
+    fn pos(ticker: &str, entry_price: f64, value: f64) -> OpenPosition {
+        OpenPosition {
+            ticker: ticker.into(), entity_name: String::new(), entry_date: "2026-01-02".into(),
+            entry_price, position_value: value, compound_score: 0.0, signal_profile: String::new(),
+            hwm: entry_price, stop_price: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_day_without_a_bar_keeps_the_last_close_not_the_entry_price() {
+        let mut bars = HashMap::new();
+        bars.insert("2026-01-05".to_string(), (120.0, 121.0, 119.0));
+        let mut prices: PriceTable = HashMap::new();
+        prices.insert("AAA".into(), bars);
+        let mut open = HashMap::new();
+        open.insert("AAA".to_string(), pos("AAA", 100.0, 1000.0));
+        // Up 20% on the 5th; no bar on the 6th: still +20%, not 0.
+        assert!((mark_to_market(&open, &prices, "2026-01-06") - 200.0).abs() < 1e-9);
+        // Before any bar exists the position is valued at cost.
+        assert!(mark_to_market(&open, &prices, "2026-01-02").abs() < 1e-9);
+    }
+
+    #[test]
+    fn monthly_returns_chain_from_the_previous_month_end() {
+        let curve = vec![
+            EquityPoint { date: "2026-01-02".into(), value: 100.0 },
+            EquityPoint { date: "2026-01-30".into(), value: 110.0 },
+            EquityPoint { date: "2026-02-02".into(), value: 121.0 },
+            EquityPoint { date: "2026-02-27".into(), value: 121.0 },
+        ];
+        let m = compute_monthly_returns(&curve, &[]);
+        assert_eq!(m.len(), 2);
+        assert!((m[0].pnl_pct - 10.0).abs() < 1e-9);
+        // February starts from January's 110, so the 2 Feb jump to 121 counts: +10%.
+        assert!((m[1].pnl_pct - 10.0).abs() < 1e-9, "{}", m[1].pnl_pct);
+        assert!((m[0].pnl_dollars + m[1].pnl_dollars - 21.0).abs() < 1e-9);
     }
 }

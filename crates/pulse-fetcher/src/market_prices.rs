@@ -261,9 +261,10 @@ pub async fn fetch_prices(db_path: &std::path::Path) -> anyhow::Result<usize> {
             }
         }
 
-        // Rate limit: 100ms between Finnhub requests (stay under 60/min = 1/sec)
+        // Finnhub's free tier allows 60 calls a minute: 1.1s between requests. At 100ms every
+        // call past the 60th got a 429 and its ticker silently went without a price.
         if alpaca_quotes.is_none() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         }
     }
 
@@ -364,7 +365,7 @@ async fn fetch_quote(
         ticker, api_key
     );
 
-    let resp = client.get(&url).send().await?;
+    let resp = client.get(&url).send().await.map_err(|e| e.without_url())?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         tracing::warn!("Finnhub rate limited, pausing 2s");
@@ -458,7 +459,7 @@ async fn backfill_candles_alpaca(
         anyhow::bail!("Alpaca bars API returned {}", resp.status());
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.without_url())?;
     let bars = match data.get("bars").and_then(|v| v.as_array()) {
         Some(b) if !b.is_empty() => b.clone(),
         _ => return Ok(0),
@@ -600,7 +601,7 @@ pub async fn check_ticker_universe_eligibility(
                 tracing::warn!("Universe gate: Finnhub profile2 for {} returned status {}", ticker, resp.status());
             }
             Err(e) => {
-                tracing::warn!("Universe gate: Finnhub profile2 request failed for {}: {}", ticker, e);
+                tracing::warn!("Universe gate: Finnhub profile2 request failed for {}: {}", ticker, e.without_url());
             }
         }
         match client
@@ -619,7 +620,7 @@ pub async fn check_ticker_universe_eligibility(
                 tracing::warn!("Universe gate: Finnhub quote for {} returned status {}", ticker, resp.status());
             }
             Err(e) => {
-                tracing::warn!("Universe gate: Finnhub quote request failed for {}: {}", ticker, e);
+                tracing::warn!("Universe gate: Finnhub quote request failed for {}: {}", ticker, e.without_url());
             }
         }
     } else if let Some(creds) = pulse_alpaca::credentials() {
@@ -769,12 +770,12 @@ async fn backfill_candles_finnhub(
         ticker, from, now, api_key
     );
 
-    let resp = client.get(&url).send().await?;
+    let resp = client.get(&url).send().await.map_err(|e| e.without_url())?;
     if !resp.status().is_success() {
         anyhow::bail!("Finnhub candle API returned {}", resp.status());
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.without_url())?;
     let status = data.get("s").and_then(|s| s.as_str()).unwrap_or("no_data");
     if status != "ok" {
         return Ok(0);
@@ -837,12 +838,12 @@ pub async fn fetch_historical(
         ticker, from, now, api_key
     );
 
-    let resp = client.get(&url).send().await?;
+    let resp = client.get(&url).send().await.map_err(|e| e.without_url())?;
     if !resp.status().is_success() {
         anyhow::bail!("Finnhub candle API returned {}", resp.status());
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.without_url())?;
 
     let status = data.get("s").and_then(|s| s.as_str()).unwrap_or("no_data");
     if status != "ok" {

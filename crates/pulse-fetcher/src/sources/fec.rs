@@ -63,13 +63,14 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         .get(&url)
         .header("User-Agent", "Pulse/1.0")
         .send()
-        .await?;
+        .await
+        .map_err(|e| e.without_url())?;
 
     if !resp.status().is_success() {
         anyhow::bail!("FEC API returned {}", resp.status());
     }
 
-    let data: FecResponse = resp.json().await?;
+    let data: FecResponse = resp.json().await.map_err(|e| e.without_url())?;
     tracing::info!("FEC: {} contributions returned", data.results.len());
 
     let articles: Vec<RawArticle> = data

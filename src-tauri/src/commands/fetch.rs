@@ -31,6 +31,41 @@ pub struct FetchStatus {
     pub last_at: Option<String>,
 }
 
+/// Where a fetcher binary may live, best first: next to this executable (installed app and
+/// `pnpm tauri dev` both put it there), the standard install location, then the cargo
+/// output of the checkout this build came from, then the old ~/Projects checkout.
+fn fetcher_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        out.push(dir.join("pulse-fetcher"));
+    }
+    out.push(std::path::PathBuf::from("/Applications/Pulse.app/Contents/MacOS/pulse-fetcher"));
+    let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    for profile in ["release", "debug"] {
+        out.push(checkout.join("target").join(profile).join("pulse-fetcher"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        for profile in ["release", "debug"] {
+            out.push(home.join("Projects/Pulse/target").join(profile).join("pulse-fetcher"));
+        }
+    }
+    out
+}
+
+fn find_fetcher(candidates: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    candidates.iter().find(|p| p.is_file()).cloned()
+}
+
+/// The fetcher finds its own DB and `.env`; it only needs a directory that exists.
+fn fetcher_workdir(fetcher: &std::path::Path) -> std::path::PathBuf {
+    fetcher
+        .parent()
+        .map(|p| p.to_path_buf())
+        .filter(|p| p.is_dir())
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
 #[tauri::command]
 pub async fn trigger_manual_fetch() -> Result<String, String> {
     // The fetcher resolves its own (live) DB path, so under a dev override a
@@ -52,19 +87,10 @@ pub async fn trigger_manual_fetch() -> Result<String, String> {
             return Err("Fetch already in progress".to_string());
         }
 
-    // Find the fetcher binary (release or debug)
-    let fetcher_path = {
-        let release = dirs::home_dir()
-            .unwrap_or_default()
-            .join("Projects/Pulse/target/release/pulse-fetcher");
-        let debug = dirs::home_dir()
-            .unwrap_or_default()
-            .join("Projects/Pulse/target/debug/pulse-fetcher");
-        if release.exists() {
-            release
-        } else if debug.exists() {
-            debug
-        } else {
+    // Find the fetcher binary: the installed app ships it next to its own executable.
+    let fetcher_path = match find_fetcher(&fetcher_candidates()) {
+        Some(p) => p,
+        None => {
             FETCHING.store(false, Ordering::SeqCst);
             return Err("pulse-fetcher binary not found".to_string());
         }
@@ -86,11 +112,7 @@ pub async fn trigger_manual_fetch() -> Result<String, String> {
             .arg("--mode")
             .arg("daily")
             .arg("--force")
-            .current_dir(
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join("Projects/Pulse"),
-            )
+            .current_dir(fetcher_workdir(&path))
             .output()
             .await;
 
@@ -460,5 +482,25 @@ mod tests {
         assert!(!s.running);
         assert_eq!(s.last_status, "interrupted");
         assert_eq!(s.detail.as_deref(), Some("Fetch stopped unexpectedly"));
+    }
+
+    #[test]
+    fn find_fetcher_takes_first_existing_candidate() {
+        let dir = std::env::temp_dir().join(format!("pulse-fetcher-find-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("nope");
+        let real = dir.join("pulse-fetcher");
+        std::fs::write(&real, b"").unwrap();
+        assert_eq!(find_fetcher(&[missing.clone(), real.clone()]), Some(real.clone()));
+        assert_eq!(find_fetcher(&[missing]), None);
+        assert_eq!(fetcher_workdir(&real), dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn candidates_include_the_installed_app() {
+        assert!(fetcher_candidates()
+            .iter()
+            .any(|p| p.ends_with("Pulse.app/Contents/MacOS/pulse-fetcher")));
     }
 }

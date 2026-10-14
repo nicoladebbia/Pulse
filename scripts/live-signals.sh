@@ -17,7 +17,9 @@ mkdir -p "$STATE_DIR"
 [ -x "$FETCHER" ] || exit 0
 # Fetchers before live-signals ran the full daily pipeline for unknown modes:
 # do nothing until the app has been updated.
-"$FETCHER" --help 2>/dev/null | grep -q -- --live-trade || exit 0
+# Capture first: with pipefail, grep -q closing the pipe early can make the pipeline fail.
+help_text="$("$FETCHER" --help 2>/dev/null)"
+case "$help_text" in *--live-trade*) ;; *) exit 0 ;; esac
 
 et_weekday="$(TZ=America/New_York date +%u)"
 et_hour=$((10#$(TZ=America/New_York date +%H)))

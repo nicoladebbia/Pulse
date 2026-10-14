@@ -75,7 +75,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!("Federal Register JSON parse error: {} (body starts with: {})",
-                e, &body[..body.len().min(200)]);
+                e, crate::article_text::clip(&body, 200));
             anyhow::bail!("Federal Register JSON parse error: {}", e);
         }
     };
@@ -192,6 +192,6 @@ fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        format!("{}...", crate::article_text::clip(s, max_len.saturating_sub(3)))
     }
 }

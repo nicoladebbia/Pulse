@@ -88,7 +88,8 @@ pub fn load_trades(conn: &Connection) -> rusqlite::Result<Vec<TradeRow>> {
         "SELECT id, entry_date, exit_date, position_size, COALESCE(realized_pnl, pnl), pnl_pct, status = 'open',
                 spy_entry_price, spy_exit_price
          FROM paper_trades
-         WHERE status = 'open' OR pnl_pct IS NOT NULL",
+         WHERE (status = 'open' OR pnl_pct IS NOT NULL)
+           AND COALESCE(exit_reason, '') NOT LIKE 'merged_into%'",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(TradeRow {
