@@ -328,6 +328,15 @@ pub fn get_trade_journal(db: State<'_, DbState>, trade_id: i64) -> Result<TradeJ
 
 /// A finished backtest plus what holding the S&P 500 over the same days would
 /// have done with the same starting money.
+/// The go-live checklist: has the paper bot earned real money? Read-only; it never changes
+/// anything, and nothing in Pulse switches to real money by itself.
+#[tauri::command]
+pub fn get_go_live_gate(db: State<'_, DbState>) -> Result<crate::services::go_live::GateReport, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let input = crate::services::go_live::load(&conn).map_err(|e| e.to_string())?;
+    Ok(crate::services::go_live::evaluate(&input))
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BacktestRun {
     pub result: BacktestResult,

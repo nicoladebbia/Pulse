@@ -127,6 +127,7 @@ pub fn run() {
             commands::trading::get_portfolio_analytics,
             commands::trading::get_exit_review,
             commands::trading::get_benchmark,
+            commands::trading::get_go_live_gate,
             commands::trading::get_trade_decisions,
             commands::trading::get_signal_scorecard,
             commands::trading::get_learning_report,
