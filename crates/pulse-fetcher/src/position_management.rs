@@ -205,7 +205,10 @@ pub fn evaluate_position_with(
     // Compute ATR for this ticker
     let atr = compute_atr(conn, ticker, 14);
     if atr <= 0.0 {
-        // No ATR data — fall back to fixed stop-loss (the max hold is the caller's).
+        // No ATR data — fall back to fixed stop-loss (the max hold is the caller's). The
+        // peak is still recorded: without it, the trail that starts once the 8th price bar
+        // arrives would begin from today's price and forget a run-up made before.
+        track_extreme(conn, trade_id, entry_price, current_price, false);
         if pnl_pct <= -rules.fixed_stop_pct {
             return PositionAction::CloseAll {
                 reason: format!("fixed_stop_loss ({:.1}%, no ATR data)", pnl_pct),
@@ -275,6 +278,29 @@ pub fn evaluate_position_with(
     PositionAction::Hold
 }
 
+/// Keep the trade's high-water mark (the low for a short) current. Called when there is no ATR
+/// yet, so the trailing stop that follows starts from the real peak.
+fn track_extreme(conn: &Connection, trade_id: i64, entry_price: f64, current_price: f64, short: bool) {
+    let stored: f64 = conn
+        .query_row(
+            "SELECT COALESCE(high_water_mark, entry_price) FROM paper_trades WHERE id = ?1",
+            [trade_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(entry_price);
+    let better = if short { current_price < stored } else { current_price > stored };
+    if better {
+        persist_state(
+            conn.execute(
+                "UPDATE paper_trades SET high_water_mark = ?1 WHERE id = ?2",
+                rusqlite::params![current_price, trade_id],
+            ),
+            "high_water_mark",
+            trade_id,
+        );
+    }
+}
+
 /// The stop the broker should hold for a position: the same levels
 /// `evaluate_position` checks each run, so the broker sells at the moment this
 /// code would have — not up to an hour (or a gap) later.
@@ -332,6 +358,7 @@ pub fn evaluate_short(
     }
     let atr = compute_atr(conn, ticker, 14);
     if atr <= 0.0 {
+        track_extreme(conn, trade_id, entry_price, current_price, true);
         if pnl_pct <= -10.0 {
             return PositionAction::CloseAll {
                 reason: format!("fixed_stop_loss ({:.1}%, short, no ATR data)", pnl_pct),
@@ -1074,5 +1101,41 @@ mod journal_reason_tests {
         assert!(pulse_snapshot::explain::rules_for("convergence").decay_exit);
         assert!(!pulse_snapshot::explain::rules_for(INSIDER_DIRECTOR).decay_exit);
         assert_eq!(super::DECAY_MIN_HELD_DAYS, 5, "the explanation says signals can fade after 5 trading days");
+    }
+}
+
+#[cfg(test)]
+mod extreme_without_atr_tests {
+    use super::*;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, entry_price REAL, high_water_mark REAL);
+             INSERT INTO paper_trades VALUES (1, 100.0, 100.0);
+             INSERT INTO paper_trades VALUES (2, 100.0, 100.0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn hwm(conn: &Connection, id: i64) -> f64 {
+        conn.query_row("SELECT high_water_mark FROM paper_trades WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_long_keeps_its_peak_while_there_is_no_atr() {
+        let conn = db();
+        track_extreme(&conn, 1, 100.0, 130.0, false);
+        track_extreme(&conn, 1, 100.0, 118.0, false); // pulled back: the peak stays
+        assert_eq!(hwm(&conn, 1), 130.0);
+    }
+
+    #[test]
+    fn a_short_keeps_its_low_while_there_is_no_atr() {
+        let conn = db();
+        track_extreme(&conn, 2, 100.0, 80.0, true);
+        track_extreme(&conn, 2, 100.0, 90.0, true);
+        assert_eq!(hwm(&conn, 2), 80.0);
     }
 }

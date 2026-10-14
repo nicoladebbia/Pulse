@@ -198,8 +198,9 @@ pub(crate) fn record_full_close(
     reason: &str,
 ) -> rusqlite::Result<f64> {
     let sign = trade_sign(conn, trade_id);
-    let pnl_pct = sign * ((exit_price - entry_price) / entry_price) * 100.0;
     let pnl_now = sign * (exit_price - entry_price) * qty_sold;
+    let pnl_pct = whole_trade_pnl_pct(conn, trade_id, entry_price, qty_sold, pnl_now)
+        .unwrap_or(sign * ((exit_price - entry_price) / entry_price) * 100.0);
     conn.execute(
         "UPDATE paper_trades SET status = ?7, exit_price = ?1, exit_date = ?2,
              pnl = COALESCE(realized_pnl, 0) + ?3, realized_pnl = COALESCE(realized_pnl, 0) + ?3,
@@ -209,6 +210,31 @@ pub(crate) fn record_full_close(
     )?;
     log_trade_event(conn, trade_id, exit_at, "close", Some(exit_price), Some(qty_sold), reason, None);
     Ok(pnl_now)
+}
+
+/// The return of the WHOLE trade in percent: all booked dollars over everything the trade
+/// held at cost. The last leg's own percentage (what this used to store) made a trade that
+/// sold half at +25% and the rest at +2% read +2% next to a large dollar profit, which fed the
+/// win rate, the edge used for sizing and the SPY comparison. `None` when the earlier legs are
+/// not in `trade_events` (old rows): the caller then keeps the last-leg figure.
+fn whole_trade_pnl_pct(conn: &rusqlite::Connection, trade_id: i64, entry_price: f64, qty_last: f64, pnl_last: f64) -> Option<f64> {
+    let realized_before: f64 = conn
+        .query_row("SELECT COALESCE(realized_pnl, 0) FROM paper_trades WHERE id = ?1", [trade_id], |r| r.get(0))
+        .ok()?;
+    let sold_before: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(qty), 0) FROM trade_events
+             WHERE trade_id = ?1 AND kind IN ('half_close', 'partial_sale', 'stop_sale')",
+            [trade_id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if sold_before <= 0.0 {
+        // No earlier leg recorded (a single-leg trade, or an old row): keep the last-leg figure.
+        return None;
+    }
+    let cost = entry_price * (qty_last + sold_before);
+    (cost > 0.0 && entry_price > 0.0).then(|| (realized_before + pnl_last) / cost * 100.0)
 }
 
 /// The row status for a close: a stop of any kind is 'stopped_out', anything
@@ -1772,6 +1798,25 @@ struct OpenTrade {
     short: bool,
 }
 
+/// What the final re-read of the broker position allows.
+#[derive(Debug, PartialEq)]
+enum Recheck {
+    /// Nothing (or the wrong side) is held any more: place no order.
+    Gone,
+    /// Sell/cover `qty` of the `held` shares.
+    Sell { qty: f64, held: f64 },
+}
+
+/// `live` is Alpaca's signed quantity (negative for a short). A full close takes whatever is
+/// really held; a partial one never more than planned or than is held.
+fn recheck_close_qty(short: bool, live: f64, planned: f64, is_full: bool) -> Recheck {
+    let held = if short { -live } else { live };
+    if held <= 1e-6 {
+        return Recheck::Gone;
+    }
+    Recheck::Sell { qty: if is_full { held } else { planned.min(held) }, held }
+}
+
 impl OpenTrade {
     fn sign(&self) -> f64 {
         if self.short { -1.0 } else { 1.0 }
@@ -2057,6 +2102,22 @@ pub(crate) async fn stamp_spy_prices(conn: &rusqlite::Connection, client: &reqwe
 /// Returns the number of exit ACTIONS executed (orders placed, or in dry-run,
 /// actions that WOULD have been placed).
 pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
+    let (mut actions, entries_settled) = manage_pass(db_path).await?;
+    if entries_settled {
+        // A buy that filled after its run (overnight, or slow) is settled in the pass above
+        // and `continue`s: it has no stop until the next call, up to an hour away. One more
+        // pass places it now.
+        match manage_pass(db_path).await {
+            Ok((more, _)) => actions += more,
+            Err(e) => tracing::warn!("Position mgmt: second pass for newly filled entries failed: {}", e),
+        }
+    }
+    Ok(actions)
+}
+
+/// One pass over the open positions. The flag says an entry order settled as filled during
+/// this pass, so that position has no broker stop yet.
+async fn manage_pass(db_path: &Path) -> anyhow::Result<(usize, bool)> {
     use pulse_alpaca::stops;
 
     let dry_run = std::env::var("EXIT_DRY_RUN")
@@ -2067,7 +2128,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         Ok(k) if !k.is_empty() => k,
         _ => {
             tracing::info!("Position mgmt: skipping (ALPACA_API_KEY not set)");
-            return Ok(0);
+            return Ok((0, false));
         }
     };
     let alpaca_secret = std::env::var("ALPACA_SECRET_KEY")
@@ -2082,7 +2143,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
 
     let open = load_open_trades(&conn)?;
     if open.is_empty() {
-        return Ok(0);
+        return Ok((0, false));
     }
 
     let client = reqwest::Client::builder()
@@ -2093,6 +2154,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let now_dt = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let mut actions = 0usize;
+    let mut entries_settled = false;
 
     for t in &open {
         let mut t = t.clone();
@@ -2127,9 +2189,10 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                 continue;
             }
             match settlement {
-                EntrySettlement::Filled { price, qty, .. } => tracing::info!(
-                    "Position mgmt: {} entry filled — {:.4} sh @ ${:.2}", ticker, qty, price
-                ),
+                EntrySettlement::Filled { price, qty, .. } => {
+                    entries_settled = true;
+                    tracing::info!("Position mgmt: {} entry filled — {:.4} sh @ ${:.2}", ticker, qty, price)
+                }
                 EntrySettlement::Dead { status } => tracing::warn!(
                     "Position mgmt: {} entry order ended {} with no fill — row expired", ticker, status
                 ),
@@ -2442,6 +2505,36 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             is_full = true;
         }
 
+        // The quantity above was read before the stop was cancelled. The app's Close button
+        // (or an overlapping run) may have sold in between, and a second sell of shares that
+        // are gone opens a short on this account. Read the position once more, last thing
+        // before the order, and sell no more than is really there.
+        match held_shares(&client, &creds, ticker).await {
+            Ok(live) => match recheck_close_qty(t.short, live, close_qty, is_full) {
+                Recheck::Sell { qty, held } => {
+                    if (held - held_qty).abs() > 1e-6 {
+                        tracing::warn!("Position mgmt: {} holds {:.4} now, not {:.4} — selling {:.4}", ticker, held, held_qty, qty);
+                    }
+                    held_qty = held;
+                    close_qty = qty;
+                    is_full = (close_qty - held_qty).abs() < 1e-6;
+                }
+                Recheck::Gone => {
+                    tracing::warn!("Position mgmt: {} is no longer held (sold elsewhere) — no sell, it reconciles next run", ticker);
+                    actions += 1;
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Position mgmt: {} position unreadable before the sell ({}) — no sell this run", ticker, e);
+                if stop_known {
+                    let want = t.stop_level(&conn);
+                    sync_broker_stop(side, &conn, &client, &creds, t.id, ticker, held_qty, want, None, false).await;
+                }
+                continue;
+            }
+        }
+
         // --- Place the SELL order (live) ---
         let mut sent_order: Option<serde_json::Value> = None;
         // Deterministic client_order_id keyed on ticker+day+half-vs-full prevents a
@@ -2467,7 +2560,23 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             .send()
             .await;
         let failure = match sent {
-            Err(e) => Some(e.to_string()),
+            // No reply is not "not placed": a timeout can come after Alpaca accepted (and even
+            // filled) the order. Ask for it by its client id before deciding.
+            Err(e) => match stops::get_order_by_client_id(&client, &creds, &exit_coid).await {
+                Ok(None) => Some(e.to_string()),
+                Ok(Some(o)) => {
+                    sent_order = Some(serde_json::json!({ "id": o.id }));
+                    None
+                }
+                Err(lookup) => {
+                    tracing::warn!(
+                        "Position mgmt: sell for {} sent, no reply ({}) and the order could not be looked up ({}) — reconciles next run",
+                        ticker, e, lookup
+                    );
+                    actions += 1;
+                    continue;
+                }
+            },
             Ok(r) if !r.status().is_success() => {
                 let status = r.status();
                 Some(format!("{} {}", status, r.text().await.unwrap_or_default()))
@@ -2561,7 +2670,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
     }
 
     stamp_spy_prices(&conn, &client, &creds).await;
-    Ok(actions)
+    Ok((actions, entries_settled))
 }
 
 /// Snapshot the live portfolio state into the `portfolio_snapshots` table.
@@ -2857,6 +2966,7 @@ mod ledger_tests {
     use super::{
         apply_entry_settlement, book_partial_sale, book_stop_sale, classify_entry_order, exit_status, record_full_close,
         resync_sold_shares, sells_explain_gap, settle_exit_order, whole_shares, EntrySettlement, ExitSettled,
+        recheck_close_qty, Recheck,
     };
     use pulse_alpaca::stops::StopOrder;
     use rusqlite::Connection;
@@ -2941,7 +3051,9 @@ mod ledger_tests {
         let (pnl, pnl_pct): (f64, f64) =
             conn.query_row("SELECT pnl, pnl_pct FROM paper_trades WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert!((pnl - 75.0).abs() < 1e-9, "{pnl}");
-        assert!((pnl_pct - 5.0).abs() < 1e-9, "last leg: 20 -> 19 short is +5%, got {pnl_pct}");
+        // The whole trade: +$75 on 100 shares shorted at $20 ($2,000) is 3.75%, not the last
+        // leg's 5%.
+        assert!((pnl_pct - 3.75).abs() < 1e-9, "whole trade, got {pnl_pct}");
         // Rebuilt from broker buys: two covers at 18 and 21.
         let realized = resync_sold_shares(&conn, id, 20.0, &[(10.0, 18.0), (10.0, 21.0)], 80.0, "2026-10-04T10:00:00").unwrap();
         assert!((realized - 10.0).abs() < 1e-9, "{realized}");
@@ -3256,5 +3368,52 @@ mod ledger_tests {
         assert_eq!(whole_shares(999.0, 1_000.0), None);
         assert_eq!(whole_shares(1_000.0, 0.0), None);
         assert_eq!(whole_shares(f64::NAN, 10.0), None);
+    }
+
+    #[test]
+    fn recheck_never_sells_shares_that_are_gone_or_into_a_short() {
+        // long, already sold elsewhere
+        assert_eq!(recheck_close_qty(false, 0.0, 10.0, true), Recheck::Gone);
+        // long ledger but the account is now short: do not add to it
+        assert_eq!(recheck_close_qty(false, -3.0, 10.0, true), Recheck::Gone);
+        // short ledger, already covered
+        assert_eq!(recheck_close_qty(true, 0.0, 10.0, true), Recheck::Gone);
+        // short ledger but the account is now long
+        assert_eq!(recheck_close_qty(true, 4.0, 10.0, false), Recheck::Gone);
+    }
+
+    #[test]
+    fn recheck_sells_what_is_really_held() {
+        // someone sold 4 of 10: a full close now sells 6
+        assert_eq!(recheck_close_qty(false, 6.0, 10.0, true), Recheck::Sell { qty: 6.0, held: 6.0 });
+        // a half close of 5 is capped by what is left
+        assert_eq!(recheck_close_qty(false, 3.0, 5.0, false), Recheck::Sell { qty: 3.0, held: 3.0 });
+        // normal half close
+        assert_eq!(recheck_close_qty(false, 10.0, 5.0, false), Recheck::Sell { qty: 5.0, held: 10.0 });
+        // short: Alpaca reports negative quantities
+        assert_eq!(recheck_close_qty(true, -41.0, 41.0, true), Recheck::Sell { qty: 41.0, held: 41.0 });
+    }
+
+    #[test]
+    fn a_half_closed_winner_that_ends_small_still_reads_as_a_win() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        conn.execute("UPDATE paper_trades SET filled_qty = 100 WHERE id = ?1", [id]).unwrap();
+        // 50 sold at +25% ($250), the other 50 stopped at +2% ($20): +$270 on $2,000 = 13.5%.
+        book_partial_sale(&conn, id, 20.0, 25.0, 50.0, 50.0, "2026-10-01T10:00:00", true).unwrap();
+        record_full_close(&conn, id, 20.0, 20.4, 50.0, "2026-10-02T10:00:00", "trailing_stop").unwrap();
+        let (pnl, pnl_pct): (f64, f64) =
+            conn.query_row("SELECT pnl, pnl_pct FROM paper_trades WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert!((pnl - 270.0).abs() < 1e-9, "{pnl}");
+        assert!((pnl_pct - 13.5).abs() < 1e-9, "{pnl_pct}");
+    }
+
+    #[test]
+    fn a_single_leg_trade_keeps_its_own_percentage() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        record_full_close(&conn, id, 20.0, 22.0, 10.0, "2026-10-02T10:00:00", "signal_decay").unwrap();
+        let pnl_pct: f64 = conn.query_row("SELECT pnl_pct FROM paper_trades WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert!((pnl_pct - 10.0).abs() < 1e-9, "{pnl_pct}");
     }
 }

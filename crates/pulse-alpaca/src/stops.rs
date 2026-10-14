@@ -185,6 +185,20 @@ pub async fn get_order(client: &reqwest::Client, creds: &Credentials, id: &str) 
     read_order(resp, "order lookup").await.map(Some)
 }
 
+/// One order by the client_order_id we gave it. `Ok(None)` when Alpaca has no such order, which
+/// is how a sell whose reply never arrived is told apart from one that was never placed.
+pub async fn get_order_by_client_id(client: &reqwest::Client, creds: &Credentials, coid: &str) -> Result<Option<StopOrder>, String> {
+    let resp = creds
+        .auth(client.get(format!("{PAPER_URL}/orders:by_client_order_id")).query(&[("client_order_id", coid)]))
+        .send()
+        .await
+        .map_err(|e| format!("order lookup failed: {e}"))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    read_order(resp, "order lookup").await.map(Some)
+}
+
 /// Pulse's open stop orders for a symbol.
 pub async fn open_stops(client: &reqwest::Client, creds: &Credentials, symbol: &str) -> Result<Vec<StopOrder>, String> {
     open_stops_for(Side::Sell, client, creds, symbol).await
