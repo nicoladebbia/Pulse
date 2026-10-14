@@ -283,11 +283,15 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
     }
 
     let sign = if short { -1.0 } else { 1.0 };
-    let pnl_pct = sign * ((exit_price - entry_price) / entry_price) * 100.0;
     let pnl = sign * (exit_price - entry_price) * held_qty;
 
     // On top of realized_pnl: a half-closed trade has already booked that half.
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // The percentage of the WHOLE trade (all booked legs over what it held at cost), as the
+    // fetcher's exits store it; the last leg's own figure only when the earlier legs are unknown.
+    // Read before the UPDATE below adds this leg to realized_pnl.
+    let pnl_pct = pulse_snapshot::ledger::whole_trade_pnl_pct(&conn, trade_id, entry_price, held_qty, pnl)
+        .unwrap_or(sign * ((exit_price - entry_price) / entry_price) * 100.0);
     conn.execute(
         "UPDATE paper_trades SET status='closed', exit_price=?1, exit_date=?2,
             pnl=COALESCE(realized_pnl, 0) + ?3, realized_pnl=COALESCE(realized_pnl, 0) + ?3,
@@ -295,6 +299,10 @@ pub async fn close_position(db: State<'_, DbState>, trade_id: i64) -> Result<Pap
          WHERE id=?5",
         rusqlite::params![exit_price, now, pnl, pnl_pct, trade_id],
     ).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO trade_events (trade_id, at, kind, price, qty, reason, detail) VALUES (?1, ?2, 'close', ?3, ?4, 'manual', NULL)",
+        rusqlite::params![trade_id, now, exit_price, held_qty],
+    ).ok();
     crate::services::api_usage::log_usage(&conn, "alpaca", "trading", "close_position", 0, 0).ok();
 
     paper_trading::get_trades_from_db(&conn, "closed")

@@ -1,4 +1,5 @@
 use super::*;
+use pulse_snapshot::ledger::whole_trade_pnl_pct;
 
 /// What Alpaca actually filled, as opposed to what we asked for.
 pub(crate) struct Fill {
@@ -210,31 +211,6 @@ pub(crate) fn record_full_close(
     )?;
     log_trade_event(conn, trade_id, exit_at, "close", Some(exit_price), Some(qty_sold), reason, None);
     Ok(pnl_now)
-}
-
-/// The return of the WHOLE trade in percent: all booked dollars over everything the trade
-/// held at cost. The last leg's own percentage (what this used to store) made a trade that
-/// sold half at +25% and the rest at +2% read +2% next to a large dollar profit, which fed the
-/// win rate, the edge used for sizing and the SPY comparison. `None` when the earlier legs are
-/// not in `trade_events` (old rows): the caller then keeps the last-leg figure.
-fn whole_trade_pnl_pct(conn: &rusqlite::Connection, trade_id: i64, entry_price: f64, qty_last: f64, pnl_last: f64) -> Option<f64> {
-    let realized_before: f64 = conn
-        .query_row("SELECT COALESCE(realized_pnl, 0) FROM paper_trades WHERE id = ?1", [trade_id], |r| r.get(0))
-        .ok()?;
-    let sold_before: f64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(qty), 0) FROM trade_events
-             WHERE trade_id = ?1 AND kind IN ('half_close', 'partial_sale', 'stop_sale')",
-            [trade_id],
-            |r| r.get(0),
-        )
-        .ok()?;
-    if sold_before <= 0.0 {
-        // No earlier leg recorded (a single-leg trade, or an old row): keep the last-leg figure.
-        return None;
-    }
-    let cost = entry_price * (qty_last + sold_before);
-    (cost > 0.0 && entry_price > 0.0).then(|| (realized_before + pnl_last) / cost * 100.0)
 }
 
 /// The row status for a close: a stop of any kind is 'stopped_out', anything
@@ -2564,15 +2540,27 @@ async fn manage_pass(db_path: &Path) -> anyhow::Result<(usize, bool)> {
             // filled) the order. Ask for it by its client id before deciding.
             Err(e) => match stops::get_order_by_client_id(&client, &creds, &exit_coid).await {
                 Ok(None) => Some(e.to_string()),
+                // An order with this id from earlier in the hour that ended with no fill is not
+                // this sell: treat it as a failed send so the stop goes back.
+                Ok(Some(o)) if o.is_final() && o.filled_qty <= 0.0 => {
+                    Some(format!("{} (an earlier order with this id ended {})", e, o.status))
+                }
                 Ok(Some(o)) => {
                     sent_order = Some(serde_json::json!({ "id": o.id }));
                     None
                 }
+                // Unknown whether the sell exists. Put the stop back: if the sell is live Alpaca
+                // refuses the stop (the shares are committed), and if it never went out the
+                // position is protected again instead of bare until the next run.
                 Err(lookup) => {
                     tracing::warn!(
                         "Position mgmt: sell for {} sent, no reply ({}) and the order could not be looked up ({}) — reconciles next run",
                         ticker, e, lookup
                     );
+                    if stop_known {
+                        let want = t.stop_level(&conn);
+                        sync_broker_stop(side, &conn, &client, &creds, t.id, ticker, held_qty, want, None, false).await;
+                    }
                     actions += 1;
                     continue;
                 }
@@ -2670,7 +2658,8 @@ async fn manage_pass(db_path: &Path) -> anyhow::Result<(usize, bool)> {
     }
 
     stamp_spy_prices(&conn, &client, &creds).await;
-    Ok((actions, entries_settled))
+    // A dry run places no stops, so a second pass would only count the same actions twice.
+    Ok((actions, entries_settled && !dry_run))
 }
 
 /// Snapshot the live portfolio state into the `portfolio_snapshots` table.

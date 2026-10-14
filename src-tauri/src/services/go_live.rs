@@ -38,7 +38,8 @@ pub struct TradeFact {
 #[derive(Debug, Clone)]
 pub struct GateInput {
     pub trades: Vec<TradeFact>,
-    pub max_drawdown_pct: f64,
+    /// `None` when there is no account history yet: the check cannot pass without it.
+    pub max_drawdown_pct: Option<f64>,
     /// Open, filled positions with no stop order at the broker.
     pub open_without_stop: i64,
 }
@@ -183,8 +184,11 @@ pub fn evaluate(input: &GateInput) -> GateReport {
     criteria.push(Criterion {
         key: "drawdown",
         label: "Drawdown stayed small",
-        passed: input.max_drawdown_pct <= MAX_DRAWDOWN_PCT,
-        current: format!("{:.1}%", input.max_drawdown_pct),
+        passed: input.max_drawdown_pct.is_some_and(|d| d <= MAX_DRAWDOWN_PCT),
+        current: input
+            .max_drawdown_pct
+            .map(|d| format!("{d:.1}%"))
+            .unwrap_or_else(|| "no history yet".into()),
         target: format!("at most {MAX_DRAWDOWN_PCT:.0}%"),
         detail: "The deepest fall from the account's high so far.".into(),
     });
@@ -226,14 +230,17 @@ pub fn evaluate(input: &GateInput) -> GateReport {
     }
 }
 
-/// Read the facts from the database. Merged ledger fragments and trades marked as tests are left out.
+/// Read the facts from the database. Merged ledger fragments, trades marked as tests and closes
+/// with no exit price (reconciled without a fill, so with no booked result) are left out. `pnl` is
+/// the whole trade's dollars: every proper close sets it to the booked legs plus the last one.
 pub fn load(conn: &Connection) -> rusqlite::Result<GateInput> {
     let mut stmt = conn.prepare(
-        "SELECT COALESCE(pt.realized_pnl, pt.pnl), tr.excess_pct, pt.entry_date, COALESCE(pt.exit_date, '')
+        "SELECT COALESCE(pt.pnl, pt.realized_pnl), tr.excess_pct, pt.entry_date, COALESCE(pt.exit_date, '')
          FROM paper_trades pt
          LEFT JOIN trade_reviews tr ON tr.trade_id = pt.id
          WHERE pt.status IN ('closed', 'stopped_out')
-           AND COALESCE(pt.realized_pnl, pt.pnl) IS NOT NULL
+           AND COALESCE(pt.exit_price, 0) > 0
+           AND COALESCE(pt.pnl, pt.realized_pnl) IS NOT NULL
            AND COALESCE(pt.exit_reason, '') NOT LIKE 'merged_into%'
            AND json_extract(CASE WHEN json_valid(pt.entry_context) THEN pt.entry_context ELSE '{}' END, '$.event.test') IS NULL",
     )?;
@@ -247,13 +254,10 @@ pub fn load(conn: &Connection) -> rusqlite::Result<GateInput> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let max_drawdown_pct: f64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(drawdown_pct), 0) FROM portfolio_snapshots",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0.0);
+    // No snapshots (or an unreadable table) is "unknown", never "0%".
+    let max_drawdown_pct: Option<f64> = conn
+        .query_row("SELECT MAX(drawdown_pct) FROM portfolio_snapshots", [], |r| r.get::<_, Option<f64>>(0))
+        .unwrap_or(None);
     let open_without_stop: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM paper_trades
@@ -297,7 +301,7 @@ mod tests {
             .collect();
         GateInput {
             trades,
-            max_drawdown_pct: 8.0,
+            max_drawdown_pct: Some(8.0),
             open_without_stop: 0,
         }
     }
@@ -340,7 +344,7 @@ mod tests {
             .collect();
         let r = evaluate(&GateInput {
             trades,
-            max_drawdown_pct: 5.0,
+            max_drawdown_pct: Some(5.0),
             open_without_stop: 0,
         });
         let edge = r.criteria.iter().find(|c| c.key == "edge").unwrap();
@@ -365,7 +369,7 @@ mod tests {
     #[test]
     fn a_deep_drawdown_or_an_unprotected_position_blocks_it() {
         let mut g = strong();
-        g.max_drawdown_pct = 22.0;
+        g.max_drawdown_pct = Some(22.0);
         assert_ne!(evaluate(&g).status, "ready");
         let mut g = strong();
         g.open_without_stop = 1;
@@ -389,7 +393,7 @@ mod tests {
             .collect();
         let r = evaluate(&GateInput {
             trades,
-            max_drawdown_pct: 8.5,
+            max_drawdown_pct: Some(8.5),
             open_without_stop: 0,
         });
         assert_eq!(r.status, "not_yet");
@@ -408,27 +412,48 @@ mod tests {
     fn load_skips_merged_and_test_trades() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, status TEXT, realized_pnl REAL, pnl REAL, exit_reason TEXT,
+            "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, status TEXT, realized_pnl REAL, pnl REAL, exit_price REAL, exit_reason TEXT,
                 entry_context TEXT, entry_date TEXT, exit_date TEXT, order_status TEXT DEFAULT 'filled', stop_order_id TEXT);
              CREATE TABLE trade_reviews (trade_id INTEGER PRIMARY KEY, excess_pct REAL);
              CREATE TABLE portfolio_snapshots (drawdown_pct REAL);
-             INSERT INTO paper_trades (id,status,pnl,exit_reason,entry_context,entry_date,exit_date) VALUES
-               (1,'closed',100,'trailing_stop','{}','2026-01-01','2026-01-10'),
-               (2,'expired',0.12,'merged_into_1',NULL,'2026-01-01','2026-01-10'),
-               (3,'closed',-5,'manual','{\"event\":{\"test\":true}}','2026-01-01','2026-01-10'),
-               (4,'closed',50,'signal_decay',NULL,'2026-01-02','2026-01-12');
+             INSERT INTO paper_trades (id,status,pnl,exit_price,exit_reason,entry_context,entry_date,exit_date) VALUES
+               (1,'closed',100,10,'trailing_stop','{}','2026-01-01','2026-01-10'),
+               (2,'expired',0.12,10,'merged_into_1',NULL,'2026-01-01','2026-01-10'),
+               (3,'closed',-5,10,'manual','{\"event\":{\"test\":true}}','2026-01-01','2026-01-10'),
+               (4,'closed',50,10,'signal_decay',NULL,'2026-01-02','2026-01-12'),
+               (6,'closed',-300,NULL,'reconcile_no_fill',NULL,'2026-01-02','2026-01-12');
+             INSERT INTO paper_trades (id,status,realized_pnl,pnl,exit_price,exit_reason,entry_date,exit_date) VALUES
+               (7,'closed',20,35,10,'manual_not_held','2026-01-02','2026-01-12');
              INSERT INTO paper_trades (id,status,pnl,entry_date,stop_order_id) VALUES (5,'open',0,'2026-02-01',NULL);
              INSERT INTO trade_reviews VALUES (1, 2.5);
              INSERT INTO portfolio_snapshots VALUES (4.0), (9.5), (2.0);",
         )
         .unwrap();
         let g = load(&conn).unwrap();
-        assert_eq!(g.trades.len(), 2, "only trades 1 and 4 count");
-        assert_eq!(g.max_drawdown_pct, 9.5);
+        assert_eq!(g.trades.len(), 3, "trades 1, 4 and 7 count; merged, test and no-exit-price rows do not");
+        assert!(g.trades.iter().any(|t| t.pnl == 35.0), "the whole trade's pnl, not only the booked half");
+        assert_eq!(g.max_drawdown_pct, Some(9.5));
         assert_eq!(g.open_without_stop, 1);
         assert_eq!(
             g.trades.iter().find(|t| t.pnl == 100.0).unwrap().excess_pct,
             Some(2.5)
         );
+    }
+
+    #[test]
+    fn no_account_history_does_not_pass_the_drawdown_check() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, status TEXT, realized_pnl REAL, pnl REAL, exit_price REAL, exit_reason TEXT,
+                entry_context TEXT, entry_date TEXT, exit_date TEXT, order_status TEXT DEFAULT 'filled', stop_order_id TEXT);
+             CREATE TABLE trade_reviews (trade_id INTEGER PRIMARY KEY, excess_pct REAL);
+             CREATE TABLE portfolio_snapshots (drawdown_pct REAL);",
+        )
+        .unwrap();
+        let g = load(&conn).unwrap();
+        assert_eq!(g.max_drawdown_pct, None);
+        let report = evaluate(&g);
+        let c = report.criteria.iter().find(|c| c.key == "drawdown").unwrap();
+        assert!(!c.passed, "unknown drawdown must not read as 0%");
     }
 }
