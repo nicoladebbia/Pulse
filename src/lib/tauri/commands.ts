@@ -1,6 +1,6 @@
 import { invoke, Channel, type InvokeArgs } from '@tauri-apps/api/core';
 import { trackChatMessage } from '$lib/engagement';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, TrendDossier, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, ExitReview, Benchmark, TradeDecision, SignalScorecard, LearningReport, TradeJournal, TradeDetail, TradeRationale, TradeExplanation, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, BacktestRun, BacktestRange, CalendarData, RiskReport } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, TrendDossier, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, ExitReview, Benchmark, GoLiveGate, TradeDecision, SignalScorecard, LearningReport, TradeJournal, TradeDetail, TradeRationale, TradeExplanation, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, BacktestRun, BacktestRange, CalendarData, RiskReport } from './types';
 
 export function safeInvoke<T>(cmd: string, args?: InvokeArgs): Promise<T | null>;
 export function safeInvoke<T>(cmd: string, args: InvokeArgs | undefined, fallback: T): Promise<T>;
@@ -216,6 +216,10 @@ export async function getExitReview(): Promise<ExitReview> {
 
 export async function getBenchmark(): Promise<Benchmark> {
 	return invoke('get_benchmark');
+}
+
+export async function getGoLiveGate(): Promise<GoLiveGate> {
+	return invoke('get_go_live_gate');
 }
 
 export async function getTradeDecisions(days?: number): Promise<TradeDecision[]> {

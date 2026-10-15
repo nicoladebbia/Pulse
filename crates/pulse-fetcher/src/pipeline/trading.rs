@@ -1,4 +1,5 @@
 use super::*;
+use pulse_snapshot::ledger::whole_trade_pnl_pct;
 
 /// What Alpaca actually filled, as opposed to what we asked for.
 pub(crate) struct Fill {
@@ -172,6 +173,23 @@ pub(crate) fn log_trade_event(
     }
 }
 
+/// The `client_order_id` of an exit sell. Keyed by the hour, not the day: a sell that ended
+/// unfilled can be retried by a later run the same day without Alpaca refusing the id, and a
+/// launchd retry storm inside one hour cannot sell twice. A full and a half close get distinct
+/// ids.
+fn exit_client_id(ticker: &str, is_full: bool) -> String {
+    let hour_key = chrono::Local::now().format("%Y%m%d%H").to_string();
+    format!("pulse-exit-{}-{}-{}", ticker, hour_key, if is_full { "full" } else { "half" })
+}
+
+/// `PULSE_CLOSE_TRADE_ID=<id>` makes a position-management pass handle that one trade only and
+/// close it in full (reason `manual`), through the same stop cancel / position re-read / order /
+/// booking path as every other exit. It is the command-line twin of the app's Close button, and
+/// like any exit it only places an order with `EXIT_DRY_RUN=false`.
+fn parse_close_id(v: &str) -> Option<i64> {
+    v.trim().parse::<i64>().ok().filter(|id| *id > 0)
+}
+
 /// What a one-dollar rise is worth per share: 1 for a long, -1 for a short
 /// (`paper_trades.direction`).
 pub(crate) fn trade_sign(conn: &rusqlite::Connection, trade_id: i64) -> f64 {
@@ -198,8 +216,9 @@ pub(crate) fn record_full_close(
     reason: &str,
 ) -> rusqlite::Result<f64> {
     let sign = trade_sign(conn, trade_id);
-    let pnl_pct = sign * ((exit_price - entry_price) / entry_price) * 100.0;
     let pnl_now = sign * (exit_price - entry_price) * qty_sold;
+    let pnl_pct = whole_trade_pnl_pct(conn, trade_id, entry_price, qty_sold, pnl_now)
+        .unwrap_or(sign * ((exit_price - entry_price) / entry_price) * 100.0);
     conn.execute(
         "UPDATE paper_trades SET status = ?7, exit_price = ?1, exit_date = ?2,
              pnl = COALESCE(realized_pnl, 0) + ?3, realized_pnl = COALESCE(realized_pnl, 0) + ?3,
@@ -1772,6 +1791,25 @@ struct OpenTrade {
     short: bool,
 }
 
+/// What the final re-read of the broker position allows.
+#[derive(Debug, PartialEq)]
+enum Recheck {
+    /// Nothing (or the wrong side) is held any more: place no order.
+    Gone,
+    /// Sell/cover `qty` of the `held` shares.
+    Sell { qty: f64, held: f64 },
+}
+
+/// `live` is Alpaca's signed quantity (negative for a short). A full close takes whatever is
+/// really held; a partial one never more than planned or than is held.
+fn recheck_close_qty(short: bool, live: f64, planned: f64, is_full: bool) -> Recheck {
+    let held = if short { -live } else { live };
+    if held <= 1e-6 {
+        return Recheck::Gone;
+    }
+    Recheck::Sell { qty: if is_full { held } else { planned.min(held) }, held }
+}
+
 impl OpenTrade {
     fn sign(&self) -> f64 {
         if self.short { -1.0 } else { 1.0 }
@@ -2057,6 +2095,22 @@ pub(crate) async fn stamp_spy_prices(conn: &rusqlite::Connection, client: &reqwe
 /// Returns the number of exit ACTIONS executed (orders placed, or in dry-run,
 /// actions that WOULD have been placed).
 pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usize> {
+    let (mut actions, entries_settled) = manage_pass(db_path).await?;
+    if entries_settled {
+        // A buy that filled after its run (overnight, or slow) is settled in the pass above
+        // and `continue`s: it has no stop until the next call, up to an hour away. One more
+        // pass places it now.
+        match manage_pass(db_path).await {
+            Ok((more, _)) => actions += more,
+            Err(e) => tracing::warn!("Position mgmt: second pass for newly filled entries failed: {}", e),
+        }
+    }
+    Ok(actions)
+}
+
+/// One pass over the open positions. The flag says an entry order settled as filled during
+/// this pass, so that position has no broker stop yet.
+async fn manage_pass(db_path: &Path) -> anyhow::Result<(usize, bool)> {
     use pulse_alpaca::stops;
 
     let dry_run = std::env::var("EXIT_DRY_RUN")
@@ -2067,7 +2121,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         Ok(k) if !k.is_empty() => k,
         _ => {
             tracing::info!("Position mgmt: skipping (ALPACA_API_KEY not set)");
-            return Ok(0);
+            return Ok((0, false));
         }
     };
     let alpaca_secret = std::env::var("ALPACA_SECRET_KEY")
@@ -2082,7 +2136,7 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
 
     let open = load_open_trades(&conn)?;
     if open.is_empty() {
-        return Ok(0);
+        return Ok((0, false));
     }
 
     let client = reqwest::Client::builder()
@@ -2093,8 +2147,17 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let now_dt = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let mut actions = 0usize;
+    let mut entries_settled = false;
+
+    let only_trade = std::env::var("PULSE_CLOSE_TRADE_ID").ok().and_then(|v| parse_close_id(&v));
+    if let Some(id) = only_trade {
+        tracing::warn!("Position mgmt: PULSE_CLOSE_TRADE_ID set — handling trade #{} only and closing it in full", id);
+    }
 
     for t in &open {
+        if only_trade.is_some_and(|id| id != t.id) {
+            continue;
+        }
         let mut t = t.clone();
         let ticker = &t.ticker.clone();
         let entry_price = &t.entry_price.clone();
@@ -2127,9 +2190,10 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
                 continue;
             }
             match settlement {
-                EntrySettlement::Filled { price, qty, .. } => tracing::info!(
-                    "Position mgmt: {} entry filled — {:.4} sh @ ${:.2}", ticker, qty, price
-                ),
+                EntrySettlement::Filled { price, qty, .. } => {
+                    entries_settled = true;
+                    tracing::info!("Position mgmt: {} entry filled — {:.4} sh @ ${:.2}", ticker, qty, price)
+                }
                 EntrySettlement::Dead { status } => tracing::warn!(
                     "Position mgmt: {} entry order ended {} with no fill — row expired", ticker, status
                 ),
@@ -2331,6 +2395,8 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
         let expired = hold_limit.is_some_and(|max| held_days >= max);
         let (mut close_qty, mut reason): (f64, String) = if stop_fired {
             (held_qty, "broker_stop (remainder after the stop sold)".to_string())
+        } else if only_trade == Some(t.id) {
+            (held_qty, "manual".to_string())
         } else {
             // Signal decay check first — cheapest, and a decayed thesis means
             // exit regardless of price action.
@@ -2410,6 +2476,20 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             continue;
         }
 
+        // This hour's sell id already exists at Alpaca (placed earlier this hour, even if it
+        // ended with no fill): Alpaca would refuse the id again, so selling now could only
+        // cancel the stop and put it back. Leave the stop alone; a run in the next hour sends a
+        // fresh id.
+        match stops::get_order_by_client_id(&client, &creds, &exit_client_id(ticker, is_full)).await {
+            Ok(Some(o)) => {
+                tracing::info!("Position mgmt: {} sell {} already sent this hour ({}) — no second order", ticker, o.id, o.status);
+                continue;
+            }
+            Ok(None) => {}
+            // Unknown: go on. The id still stops a duplicate at the broker.
+            Err(e) => tracing::warn!("Position mgmt: {} earlier sell lookup failed ({}), going on", ticker, e),
+        }
+
         // A sell stop holds its shares: Alpaca refuses any other sell for them
         // until it is cancelled. If it cannot be cancelled, do not sell this
         // run — the stop is still protecting the position.
@@ -2442,15 +2522,42 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             is_full = true;
         }
 
+        // The quantity above was read before the stop was cancelled. The app's Close button
+        // (or an overlapping run) may have sold in between, and a second sell of shares that
+        // are gone opens a short on this account. Read the position once more, last thing
+        // before the order, and sell no more than is really there.
+        match held_shares(&client, &creds, ticker).await {
+            Ok(live) => match recheck_close_qty(t.short, live, close_qty, is_full) {
+                Recheck::Sell { qty, held } => {
+                    if (held - held_qty).abs() > 1e-6 {
+                        tracing::warn!("Position mgmt: {} holds {:.4} now, not {:.4} — selling {:.4}", ticker, held, held_qty, qty);
+                    }
+                    held_qty = held;
+                    close_qty = qty;
+                    is_full = (close_qty - held_qty).abs() < 1e-6;
+                }
+                Recheck::Gone => {
+                    tracing::warn!("Position mgmt: {} is no longer held (sold elsewhere) — no sell, it reconciles next run", ticker);
+                    actions += 1;
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Position mgmt: {} position unreadable before the sell ({}) — no sell this run", ticker, e);
+                if stop_known {
+                    let want = t.stop_level(&conn);
+                    sync_broker_stop(side, &conn, &client, &creds, t.id, ticker, held_qty, want, None, false).await;
+                }
+                continue;
+            }
+        }
+
         // --- Place the SELL order (live) ---
         let mut sent_order: Option<serde_json::Value> = None;
         // Deterministic client_order_id keyed on ticker+day+half-vs-full prevents a
         // launchd retry storm from double-selling (same bug class as the buy-side
         // ORCL stacking). A full and a half close on the same day get distinct ids.
-        // Keyed by the hour, not the day: a sell that ended unfilled can be
-        // retried by a later run the same day without Alpaca refusing the id.
-        let hour_key = chrono::Local::now().format("%Y%m%d%H").to_string();
-        let exit_coid = format!("pulse-exit-{}-{}-{}", ticker, hour_key, if is_full {"full"} else {"half"});
+        let exit_coid = exit_client_id(ticker, is_full);
         let order = serde_json::json!({
             "symbol": ticker,
             "qty": format!("{:.9}", close_qty),
@@ -2467,7 +2574,35 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
             .send()
             .await;
         let failure = match sent {
-            Err(e) => Some(e.to_string()),
+            // No reply is not "not placed": a timeout can come after Alpaca accepted (and even
+            // filled) the order. Ask for it by its client id before deciding.
+            Err(e) => match stops::get_order_by_client_id(&client, &creds, &exit_coid).await {
+                Ok(None) => Some(e.to_string()),
+                // An order with this id from earlier in the hour that ended with no fill is not
+                // this sell: treat it as a failed send so the stop goes back.
+                Ok(Some(o)) if o.is_final() && o.filled_qty <= 0.0 => {
+                    Some(format!("{} (an earlier order with this id ended {})", e, o.status))
+                }
+                Ok(Some(o)) => {
+                    sent_order = Some(serde_json::json!({ "id": o.id }));
+                    None
+                }
+                // Unknown whether the sell exists. Put the stop back: if the sell is live Alpaca
+                // refuses the stop (the shares are committed), and if it never went out the
+                // position is protected again instead of bare until the next run.
+                Err(lookup) => {
+                    tracing::warn!(
+                        "Position mgmt: sell for {} sent, no reply ({}) and the order could not be looked up ({}) — reconciles next run",
+                        ticker, e, lookup
+                    );
+                    if stop_known {
+                        let want = t.stop_level(&conn);
+                        sync_broker_stop(side, &conn, &client, &creds, t.id, ticker, held_qty, want, None, false).await;
+                    }
+                    actions += 1;
+                    continue;
+                }
+            },
             Ok(r) if !r.status().is_success() => {
                 let status = r.status();
                 Some(format!("{} {}", status, r.text().await.unwrap_or_default()))
@@ -2561,7 +2696,8 @@ pub(crate) async fn manage_open_positions(db_path: &Path) -> anyhow::Result<usiz
     }
 
     stamp_spy_prices(&conn, &client, &creds).await;
-    Ok(actions)
+    // A dry run places no stops, so a second pass would only count the same actions twice.
+    Ok((actions, entries_settled && !dry_run))
 }
 
 /// Snapshot the live portfolio state into the `portfolio_snapshots` table.
@@ -2857,6 +2993,7 @@ mod ledger_tests {
     use super::{
         apply_entry_settlement, book_partial_sale, book_stop_sale, classify_entry_order, exit_status, record_full_close,
         resync_sold_shares, sells_explain_gap, settle_exit_order, whole_shares, EntrySettlement, ExitSettled,
+        recheck_close_qty, Recheck,
     };
     use pulse_alpaca::stops::StopOrder;
     use rusqlite::Connection;
@@ -2941,7 +3078,9 @@ mod ledger_tests {
         let (pnl, pnl_pct): (f64, f64) =
             conn.query_row("SELECT pnl, pnl_pct FROM paper_trades WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert!((pnl - 75.0).abs() < 1e-9, "{pnl}");
-        assert!((pnl_pct - 5.0).abs() < 1e-9, "last leg: 20 -> 19 short is +5%, got {pnl_pct}");
+        // The whole trade: +$75 on 100 shares shorted at $20 ($2,000) is 3.75%, not the last
+        // leg's 5%.
+        assert!((pnl_pct - 3.75).abs() < 1e-9, "whole trade, got {pnl_pct}");
         // Rebuilt from broker buys: two covers at 18 and 21.
         let realized = resync_sold_shares(&conn, id, 20.0, &[(10.0, 18.0), (10.0, 21.0)], 80.0, "2026-10-04T10:00:00").unwrap();
         assert!((realized - 10.0).abs() < 1e-9, "{realized}");
@@ -3256,5 +3395,69 @@ mod ledger_tests {
         assert_eq!(whole_shares(999.0, 1_000.0), None);
         assert_eq!(whole_shares(1_000.0, 0.0), None);
         assert_eq!(whole_shares(f64::NAN, 10.0), None);
+    }
+
+    #[test]
+    fn exit_ids_differ_by_ticker_and_by_full_versus_half() {
+        let full = super::exit_client_id("HOOD", true);
+        assert!(full.starts_with("pulse-exit-HOOD-") && full.ends_with("-full"), "{full}");
+        assert_ne!(full, super::exit_client_id("HOOD", false));
+        assert_ne!(full, super::exit_client_id("ARM", true));
+    }
+
+    #[test]
+    fn close_request_takes_only_a_positive_whole_number() {
+        assert_eq!(super::parse_close_id("111"), Some(111));
+        assert_eq!(super::parse_close_id(" 7 "), Some(7));
+        for bad in ["", "0", "-3", "abc", "1.5", "all"] {
+            assert_eq!(super::parse_close_id(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn recheck_never_sells_shares_that_are_gone_or_into_a_short() {
+        // long, already sold elsewhere
+        assert_eq!(recheck_close_qty(false, 0.0, 10.0, true), Recheck::Gone);
+        // long ledger but the account is now short: do not add to it
+        assert_eq!(recheck_close_qty(false, -3.0, 10.0, true), Recheck::Gone);
+        // short ledger, already covered
+        assert_eq!(recheck_close_qty(true, 0.0, 10.0, true), Recheck::Gone);
+        // short ledger but the account is now long
+        assert_eq!(recheck_close_qty(true, 4.0, 10.0, false), Recheck::Gone);
+    }
+
+    #[test]
+    fn recheck_sells_what_is_really_held() {
+        // someone sold 4 of 10: a full close now sells 6
+        assert_eq!(recheck_close_qty(false, 6.0, 10.0, true), Recheck::Sell { qty: 6.0, held: 6.0 });
+        // a half close of 5 is capped by what is left
+        assert_eq!(recheck_close_qty(false, 3.0, 5.0, false), Recheck::Sell { qty: 3.0, held: 3.0 });
+        // normal half close
+        assert_eq!(recheck_close_qty(false, 10.0, 5.0, false), Recheck::Sell { qty: 5.0, held: 10.0 });
+        // short: Alpaca reports negative quantities
+        assert_eq!(recheck_close_qty(true, -41.0, 41.0, true), Recheck::Sell { qty: 41.0, held: 41.0 });
+    }
+
+    #[test]
+    fn a_half_closed_winner_that_ends_small_still_reads_as_a_win() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        conn.execute("UPDATE paper_trades SET filled_qty = 100 WHERE id = ?1", [id]).unwrap();
+        // 50 sold at +25% ($250), the other 50 stopped at +2% ($20): +$270 on $2,000 = 13.5%.
+        book_partial_sale(&conn, id, 20.0, 25.0, 50.0, 50.0, "2026-10-01T10:00:00", true).unwrap();
+        record_full_close(&conn, id, 20.0, 20.4, 50.0, "2026-10-02T10:00:00", "trailing_stop").unwrap();
+        let (pnl, pnl_pct): (f64, f64) =
+            conn.query_row("SELECT pnl, pnl_pct FROM paper_trades WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert!((pnl - 270.0).abs() < 1e-9, "{pnl}");
+        assert!((pnl_pct - 13.5).abs() < 1e-9, "{pnl_pct}");
+    }
+
+    #[test]
+    fn a_single_leg_trade_keeps_its_own_percentage() {
+        let conn = db();
+        let id = insert(&conn, "filled");
+        record_full_close(&conn, id, 20.0, 22.0, 10.0, "2026-10-02T10:00:00", "signal_decay").unwrap();
+        let pnl_pct: f64 = conn.query_row("SELECT pnl_pct FROM paper_trades WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert!((pnl_pct - 10.0).abs() < 1e-9, "{pnl_pct}");
     }
 }

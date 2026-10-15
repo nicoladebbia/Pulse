@@ -9,6 +9,7 @@
 //! app". `tests/fixtures/snapshot_v1.json` is decoded by both sides' tests.
 
 pub mod explain;
+pub mod ledger;
 pub mod live;
 pub mod risk;
 

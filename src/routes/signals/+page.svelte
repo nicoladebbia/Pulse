@@ -7,16 +7,17 @@
 		getFinancialQuotas, refreshPrices, getPortfolioAnalytics, getExitReview, getTradeJournal,
 		startPriceStream, stopPriceStream, getTradeRationale, getTradeExplanations,
 		getPendingCalibration, applyPendingCalibration, rejectPendingCalibration, getCalibrationGateStatus,
-		getBenchmark, getTradeDecisions, getSignalScorecard, getLearningReport
+		getBenchmark, getGoLiveGate, getTradeDecisions, getSignalScorecard, getLearningReport
 	} from '$lib/tauri/commands';
 	import type {
 		CrossSignal, EntityPrice, Portfolio, FinancialEvent,
 		SignalEvidence, SourceHealth, FinancialApiQuota, PortfolioAnalytics, ExitReview,
 		TradeJournal, PriceUpdate, TradeRationale, TradeExplanation as Explanation,
-		PendingCalibrationRow, CalibrationGateStatus, Benchmark, TradeDecision, SignalScorecard as Scorecard, LearningReport as Learning
+		PendingCalibrationRow, CalibrationGateStatus, Benchmark, GoLiveGate, TradeDecision, SignalScorecard as Scorecard, LearningReport as Learning
 	} from '$lib/tauri/types';
 	import TradeExplanation from '$lib/components/signals/TradeExplanation.svelte';
 	import BenchmarkCard from '$lib/components/signals/BenchmarkCard.svelte';
+	import GoLiveCard from '$lib/components/signals/GoLiveCard.svelte';
 	import TradeDecisions from '$lib/components/signals/TradeDecisions.svelte';
 	import SignalScorecard from '$lib/components/signals/SignalScorecard.svelte';
 	import LearningReport from '$lib/components/signals/LearningReport.svelte';
@@ -65,6 +66,8 @@
 	let portfolioError = $state<string | null>(null);
 	let benchmark = $state<Benchmark | null>(null);
 	let benchmarkError = $state<string | null>(null);
+	let goLive = $state<GoLiveGate | null>(null);
+	let goLiveError = $state<string | null>(null);
 	let decisions = $state<TradeDecision[] | null>(null);
 	let decisionsError = $state<string | null>(null);
 	let scorecard = $state<Scorecard | null>(null);
@@ -251,6 +254,10 @@
 		getBenchmark()
 			.then(b => { benchmark = b; })
 			.catch(e => { benchmarkError = String(e?.message ?? e); });
+		goLiveError = null;
+		getGoLiveGate()
+			.then(g => { goLive = g; })
+			.catch(e => { goLiveError = String(e?.message ?? e); });
 	}
 
 	async function handleTrade(ticker: string, confidence: number) {
@@ -1046,6 +1053,7 @@
 				</div>
 			</div>
 
+			<GoLiveCard gate={goLive} error={goLiveError} />
 			<BenchmarkCard {benchmark} error={benchmarkError} />
 			<TradeDecisions {decisions} error={decisionsError} />
 

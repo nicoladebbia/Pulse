@@ -1248,3 +1248,20 @@ export interface RiskReport {
 	drawdown: DrawdownInfo;
 	warnings: string[];
 }
+
+export interface GoLiveCriterion {
+	key: string;
+	label: string;
+	passed: boolean;
+	current: string;
+	target: string;
+	detail: string;
+}
+
+export interface GoLiveGate {
+	status: 'ready' | 'close' | 'not_yet';
+	headline: string;
+	passed: number;
+	total: number;
+	criteria: GoLiveCriterion[];
+}
