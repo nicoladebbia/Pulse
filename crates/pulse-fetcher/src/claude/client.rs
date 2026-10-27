@@ -466,6 +466,45 @@ struct CurationResult {
     tech: Vec<usize>,
 }
 
+/// Salvage for an analyze body the strict parse rejected. Parses to `Value` (which
+/// collapses duplicate keys, last wins), then reads each array item on its own, so one
+/// malformed item (wrong type, missing id) costs only that item, never the whole
+/// briefing. Dropped relevance scores are re-requested by the caller's retry. Returns
+/// None only when the body is not JSON or holds none of the four sections.
+fn parse_analysis_lenient(json_str: &str) -> Option<AnalysisResponse> {
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let obj = val.as_object()?;
+    fn items<T: serde::de::DeserializeOwned>(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Vec<T> {
+        let Some(arr) = obj.get(key).and_then(|v| v.as_array()) else { return Vec::new() };
+        let out: Vec<T> = arr.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect();
+        if out.len() < arr.len() {
+            tracing::warn!("analyze salvage: dropped {}/{} malformed `{}` items", arr.len() - out.len(), arr.len(), key);
+        }
+        out
+    }
+    fn ids(cur: Option<&serde_json::Value>, key: &str) -> Vec<usize> {
+        cur.and_then(|c| c.get(key)).and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|n| n.as_u64().map(|n| n as usize)).collect())
+            .unwrap_or_default()
+    }
+    let cur = obj.get("curation");
+    let parsed = AnalysisResponse {
+        connections: items(obj, "connections"),
+        relevance_scores: items(obj, "relevance_scores"),
+        trends: items(obj, "trends"),
+        curation: CurationResult {
+            ai: ids(cur, "ai"),
+            miami: ids(cur, "miami"),
+            italy: ids(cur, "italy"),
+            tech: ids(cur, "tech"),
+        },
+    };
+    let empty = parsed.connections.is_empty() && parsed.relevance_scores.is_empty()
+        && parsed.trends.is_empty() && parsed.curation.ai.is_empty() && parsed.curation.miami.is_empty()
+        && parsed.curation.italy.is_empty() && parsed.curation.tech.is_empty();
+    (!empty).then_some(parsed)
+}
+
 impl GroqClient {
     pub fn new(api_key: &str, db_path: Option<PathBuf>) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -1047,10 +1086,7 @@ impl GroqClient {
         // into the struct. Mirrors summarize_story's lenient fallback (this file).
         let parsed: AnalysisResponse = match serde_json::from_str(&json_str) {
             Ok(p) => p,
-            Err(strict_err) => serde_json::from_str::<serde_json::Value>(&json_str)
-                .ok()
-                .and_then(|val| serde_json::from_value(val).ok())
-                .ok_or_else(|| {
+            Err(strict_err) => parse_analysis_lenient(&json_str).ok_or_else(|| {
                     // INSTRUMENTATION (not a fix): both parses failed. Log the RAW model
                     // body — head + tail — so the NEXT free scheduled run reveals what Groq
                     // actually returned (missing `curation`? truncated? which keys present?),
@@ -1496,6 +1532,28 @@ fn extract_json(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lenient_analysis_keeps_good_items_past_a_duplicate_key_and_a_bad_item() {
+        let body = r#"{"connections":[{"story_ids":[0,1],"connection":"c","insight":"i"},{"story_ids":"x"}],
+            "relevance_scores":[{"story_id":0,"relevance":7,"relevance":8,"reason":"r"},
+                                {"story_id":"bad","relevance":5},{"relevance":3},{"story_id":2,"relevance":"6"}],
+            "trends":[{"trend":"t","story_ids":[1],"trajectory":"emerging"}],
+            "curation":{"ai":[0,1,"x"],"miami":[2]}}"#;
+        assert!(serde_json::from_str::<AnalysisResponse>(body).is_err());
+        let p = parse_analysis_lenient(body).expect("salvaged");
+        assert_eq!(p.connections.len(), 1);
+        assert_eq!(p.relevance_scores.len(), 2);
+        assert_eq!(p.relevance_scores[0].relevance, 8);
+        assert_eq!(p.trends.len(), 1);
+        assert_eq!((p.curation.ai.len(), p.curation.miami.len(), p.curation.italy.len()), (2, 1, 0));
+    }
+
+    #[test]
+    fn lenient_analysis_rejects_non_json_and_empty_bodies() {
+        assert!(parse_analysis_lenient("not json").is_none());
+        assert!(parse_analysis_lenient("{}").is_none());
+    }
+
     use super::*;
 
     fn rel(id: usize, score: i32) -> AnalysisRelevance {
