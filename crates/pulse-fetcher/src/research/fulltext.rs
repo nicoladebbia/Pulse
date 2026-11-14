@@ -76,7 +76,7 @@ pub fn html_to_text(html: &str) -> String {
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
-        .user_agent("Pulse/1.0 (personal research reader; mailto:nicolagiovannidebbia@gmail.com)")
+        .user_agent(crate::contact::research_user_agent())
         .build()
         .unwrap_or_default()
 }

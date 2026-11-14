@@ -11,8 +11,6 @@
 use super::RawArticle;
 use serde::Deserialize;
 
-const USER_AGENT: &str = "macos:com.pulse.fetcher:0.1.0 (by /u/nicoladebbia)";
-
 /// (subreddit, listing, sector, filter_tier)
 /// filter_tier: "strict" (research/news subs) or "relaxed" (discussion subs)
 const SUBREDDITS: &[(&str, &str, &str, &str)] = &[
@@ -71,7 +69,7 @@ struct RedditPost {
 
 pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
     let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(crate::contact::reddit_user_agent())
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 

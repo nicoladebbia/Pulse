@@ -52,7 +52,7 @@ pub async fn run(db_path: &Path, opts: RunOptions) -> anyhow::Result<()> {
                 .to_string()
         });
         let client = reqwest::Client::builder()
-            .user_agent("Pulse/1.0 (personal research reader; mailto:nicolagiovannidebbia@gmail.com)")
+            .user_agent(crate::contact::research_user_agent())
             .build()?;
         let papers = ingest::fetch_since(&client, &since, opts.limit).await?;
         let inserted = ingest::upsert(&conn, &papers)?;
