@@ -23,6 +23,9 @@ pub fn run() {
             std::fs::create_dir_all(&app_data).ok();
 
             let db_path = db::connection::dev_db_override().unwrap_or_else(|| app_data.join("pulse.db"));
+            if let Some(why) = db::connection::live_db_refusal(&db_path) {
+                return Err(why.into());
+            }
 
             // Load .env from the project directory for API keys
             // ~/Projects/Pulse is the long-standing checkout; otherwise use the
