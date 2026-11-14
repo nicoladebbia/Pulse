@@ -675,19 +675,27 @@ class Guard(unittest.TestCase):
         ]:
             self.assertIsNone(self.blocked(cmd), cmd)
 
-    def test_a_global_flag_only_counts_on_an_install(self):
+    def test_a_global_flag_is_left_alone_only_where_it_is_the_scripts_own(self):
         for cmd in [
             "pnpm test -g foo",
             "pnpm vitest run -g x",
             "pnpm exec playwright test -g x",
+            "pnpm --filter web test -g foo",
+            "pnpm test -- -g foo",
             "npm ls -g --depth=0",
         ]:
             self.assertIsNone(self.blocked(cmd), cmd)
         for cmd in [
             "pnpm add -g x",
+            "pnpm add test -g",
             "npm i -g x",
             "npm --global install x",
             "pnpm --filter web add -g x",
+            "pnpm env use -g 22",
+            "pnpm -g env use 22",
+            "npm install-test -g x",
+            "pnpm self-update -g",
+            "npm config set -g prefix /tmp/x",
             "yarn global add x",
         ]:
             self.assertIsNotNone(self.blocked(cmd), cmd)
@@ -1038,8 +1046,15 @@ class Runner(unittest.TestCase):
         self.assertEqual(
             env["PULSE_NO_LIVE_DB"], "1"
         )  # the fetcher refuses the live one
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
-        self.assertIn("pushInsteadOf", env["GIT_CONFIG_KEY_0"])
+        settings = {
+            (env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"])
+            for i in range(int(env["GIT_CONFIG_COUNT"]))
+        }
+        for address in ("https://github.com/", "git@github.com:"):
+            self.assertIn(
+                ("url.night-team-no-push://blocked/.pushInsteadOf", address), settings
+            )
+        self.assertIn(("gc.auto", "0"), settings)  # no housekeeping inside the fence
         hooks = self.team.guard_settings(self.team.HOME / "my wt")["hooks"][
             "PreToolUse"
         ]
@@ -1813,6 +1828,12 @@ class Jobs(unittest.TestCase):
         self.assertEqual(wt, left)
         self.assertTrue((wt / "src/a.txt").exists())
         self.assertFalse((wt / "src/old.txt").exists())
+        # A worktree left locked is replaced as well.
+        g("worktree", "lock", str(wt), cwd=self.repo)
+        (wt / "src/old.txt").write_text("left behind\n")
+        wt = self.team.make_worktree("origin/main", None)
+        self.assertTrue((wt / "src/a.txt").exists())
+        self.assertFalse((wt / "src/old.txt").exists())
         g("worktree", "remove", "--force", str(wt), cwd=self.repo)
 
     def test_github_being_unreachable_stops_the_job_before_anything_runs(self):
@@ -1823,24 +1844,38 @@ class Jobs(unittest.TestCase):
 
 
 class Fence(unittest.TestCase):
-    """The system sandbox around sessions and checks, against stand-in folders."""
+    """The system sandbox around sessions and checks, against a real repository
+    with a linked worktree and stand-ins for the other folders."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        root = Path(self.tmp.name).resolve()
+        root = self.root = Path(self.tmp.name).resolve()
         self.home, self.repo = root / "team", root / "repo"
         self.live, self.phone = root / "app-data", root / "phone"
         self.wt = self.repo / ".claude/worktrees/team-job"
+        self.git_global = root / "git-global/config"
+
+        g("init", "-q", "-b", "main", str(self.repo), cwd=root)
+        for key, value in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+        ]:
+            g("config", key, value, cwd=self.repo)
+        (self.repo / ".gitignore").write_text(".env*\n!.env.example\n.claude/\n")
+        commit(self.repo, "src/a.txt", "a\n", "first")
+        g("worktree", "add", "-q", "-b", "job", str(self.wt), cwd=self.repo)
+        commit(self.repo, "src/b.txt", "b\n", "main moves on")
+        (self.repo / "src/a.txt").write_text("edited, not committed\n")
+
         for folder in [
             self.home / "bin",
             self.home / "db",
             self.home / "target",
-            self.repo / ".git/hooks",
-            self.repo / "src",
-            self.wt / "src",
             self.live,
             self.phone,
+            self.git_global.parent,
         ]:
             folder.mkdir(parents=True)
         for path, text in [
@@ -1851,8 +1886,8 @@ class Fence(unittest.TestCase):
             (self.repo / ".env", "KEY=real"),
             (self.repo / ".env.local", "KEY=real"),
             (self.repo / ".env.example", "KEY="),
-            (self.repo / "src/a.txt", "a"),
             (self.wt / ".env", "KEY=placeholder"),
+            (self.git_global, "[core]\n\tautocrlf = false"),
         ]:
             path.write_text(text + "\n")
 
@@ -1867,30 +1902,53 @@ class Fence(unittest.TestCase):
             )
         self.team.LIVE_DB = self.live / "pulse.db"
         self.team.PHONE_DIR = self.phone
+        self.team.GIT_GLOBAL_FILE = self.git_global
+        self.team.GIT_GLOBAL_DIR = root / "git-global/xdg"
 
-    def works(self, script):
-        done = subprocess.run(
+    def fenced(self, script):
+        env = dict(
+            os.environ, **self.team.NO_PUBLISH, GIT_CONFIG_GLOBAL=str(self.git_global)
+        )
+        return subprocess.run(
             self.team.fenced(["bash", "-c", script], self.wt),
             cwd=self.wt,
+            env=env,
             capture_output=True,
             text=True,
             check=False,
         )
-        return done.returncode == 0
+
+    def refused(self, script):
+        """Stopped, and by the fence: not by a typo or a file that is not there."""
+        done = self.fenced(script)
+        self.assertNotEqual(done.returncode, 0, script)
+        self.assertIn("not permitted", (done.stdout + done.stderr).lower(), script)
+
+    def allowed(self, script):
+        done = self.fenced(script)
+        self.assertEqual(done.returncode, 0, f"{script}\n{done.stdout}{done.stderr}")
 
     def test_the_profile_names_what_is_out_of_reach(self):
         profile = self.team.fence_profile(self.wt)
+        store = self.repo / ".git"
         for line in [
             f'(deny file-read-data file-write* (subpath "{self.live}"))',
             f'(deny file-read-data file-write* (subpath "{self.phone}"))',
             f'(deny file-write* (subpath "{self.home}"))',
             f'(deny file-write* (subpath "{self.repo}"))',
-            f'(deny file-write* (subpath "{self.repo}/.git/hooks"))',
+            f'(allow file-write* (subpath "{store}/worktrees/team-job"))',
+            f'(allow file-write* (subpath "{store}/objects"))',
             f'(deny file-read-data (literal "{self.repo}/.env"))',
             f'(deny file-read-data (literal "{self.repo}/.env.local"))',
+            f'(deny file-write* (literal "{self.git_global}"))',
+            f'(deny file-write* (literal "{self.git_global}.lock"))',
         ]:
             self.assertIn(line, profile)
         self.assertNotIn(".env.example", profile)
+        # Git's store is opened part by part, never as a whole, and never its
+        # settings or its hooks.
+        for shut in [f'"{store}")', f'"{store}/config', f'"{store}/hooks']:
+            self.assertNotIn(shut, profile)
         # What is given back comes after what is taken away: the later rule wins.
         self.assertLess(
             profile.index(f'(deny file-write* (subpath "{self.repo}"))'),
@@ -1901,14 +1959,31 @@ class Fence(unittest.TestCase):
             ["/usr/bin/sandbox-exec", "-p", profile, "claude", "-p"],
         )
 
+    def test_a_worktree_cannot_name_another_part_of_the_store_as_its_own(self):
+        entry = self.repo / ".git/worktrees/team-job"
+        self.assertEqual(self.team.worktree_entry(self.wt), entry)
+        for forged in [self.repo / ".git", self.repo / ".git/worktrees", self.root]:
+            (self.wt / ".git").write_text(f"gitdir: {forged}\n")
+            self.assertEqual(self.team.worktree_entry(self.wt), entry)
+        self.assertEqual(self.team.worktree_entry(self.root / "gone/team-job"), entry)
+
+    def test_sessions_and_checks_start_inside_the_fence(self):
+        seen = []
+        self.team.sh = lambda cmd, **kw: seen.append(cmd) or (0, "{}", "")
+        run = {"dir": self.root, "cost": 0.0, "abort": ""}
+        self.team.session("do it", self.wt, {}, 1, "pr-1-build", run)
+        self.team.run_checks(self.wt, run, "pr-1")
+        fence = self.team.fenced([], self.wt)
+        self.assertEqual([cmd[: len(fence)] for cmd in seen], [fence, fence])
+        self.assertEqual([cmd[len(fence)] for cmd in seen], ["claude", "bash"])
+
     @unittest.skipUnless(os.path.exists("/usr/bin/sandbox-exec"), "needs macOS")
     def test_the_system_keeps_the_fence_whatever_the_spelling(self):
         self.assertEqual(self.team.fence_problem(), "")
         live, home, repo, wt = self.live, self.home, self.repo, self.wt
-        for script in [
+        scripts = [
             f"cat '{live}/pulse.db'",
-            f"cat '{live.parent}'/app-d*/pul*.db",  # a glob
-            f"cat '{str(live).upper()}/PULSE.DB'",  # another case, the same file
+            f"cat '{live.parent}'/app-d*/pulse.db",  # a glob
             f"cat '{live}/.env'",
             f"ls '{live}'",
             f"echo x >> '{live}/pulse.db'",
@@ -1920,24 +1995,55 @@ class Fence(unittest.TestCase):
             f"echo x > '{home}/IDEAS.md'",
             f"echo x > '{repo}/src/a.txt'",
             f"rm '{repo}/src/a.txt'",
-            f"echo x > '{repo}/.git/hooks/pre-push'",
             f"cat '{repo}/.env'",
             f"cat '{repo}/.env.local'",
-        ]:
-            self.assertFalse(self.works(script), script)
+        ]
+        if Path(str(live).upper()).exists():  # this disk ignores letter case
+            scripts.append(f"cat '{str(live).upper()}/PULSE.DB'")
+        for script in scripts:
+            self.refused(script)
         for script in [
             f"test -f '{live}/pulse.db'",  # that it is there may be known
             f"cat '{home}/bin/checks.sh'",
             f"echo x > '{home}/target/built' && echo x >> '{home}/db/job.db'",
             f"echo x > '{home}/db/job.db-wal' && echo x > '{home}/db/fetcher.lock'",
             f"cat '{repo}/src/a.txt' '{repo}/.env.example'",
-            f"echo x > '{repo}/.git/night-test'",
             f"echo x > '{wt}/src/new.txt' && cat '{wt}/.env'",
             'echo x > "$(mktemp)"',
         ]:
-            self.assertTrue(self.works(script), script)
+            self.allowed(script)
         self.assertEqual((live / "pulse.db").read_text(), "LIVE\n")
         self.assertEqual((home / "bin/checks.sh").read_text(), "exit 1\n")
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/sandbox-exec"), "needs macOS")
+    def test_git_works_in_the_worktree_and_nowhere_else(self):
+        repo = self.repo
+        for script in [
+            "echo new > src/new.txt && git add -A && git commit -qm 'in the fence'",
+            "git merge -q --no-edit main && test -f src/b.txt",
+            "git branch side && git branch -D side",
+            "git pack-refs --all && git status --short",
+            "git log --oneline -1",
+        ]:
+            self.allowed(script)
+        self.assertEqual(g("log", "-1", "--format=%s", "job", cwd=repo)[:5], "Merge")
+        for script in [
+            # Settings and hooks: both can name a program the runner's git starts.
+            "git config core.hooksPath /tmp/night-hooks",
+            "git config --global core.hooksPath /tmp/night-hooks",
+            f"echo x >> '{repo}/.git/config'",
+            f"echo x > '{repo}/.git/hooks/pre-push'",
+            # The main checkout's own state: what is checked out and staged there.
+            f"git -C '{repo}' commit -qam 'not mine'",
+            f"echo 'ref: refs/heads/job' > '{repo}/.git/HEAD'",
+        ]:
+            self.refused(script)
+        self.assertIn("src/a.txt", g("status", "--porcelain", cwd=repo))
+        self.assertEqual(
+            g("log", "-1", "--format=%s", "main", cwd=repo), "main moves on"
+        )
+        self.assertNotIn("hooksPath", (repo / ".git/config").read_text())
+        self.assertNotIn("hooksPath", self.git_global.read_text())
 
 
 if __name__ == "__main__":

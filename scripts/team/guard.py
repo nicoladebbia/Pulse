@@ -91,12 +91,14 @@ SHELL_SCRIPT_FLAG = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # -c, -lc, -ic
 CARGO_RUN = {"run", "r"}
 NODE_TOOLS = {"npm", "pnpm", "yarn"}
 GLOBAL_FLAGS = {"-g", "--global", "--location=global"}
-# Only these put something onto the Mac with a global flag. Elsewhere `-g` is
-# the script's own (`pnpm test -g name`) or only looks (`npm ls -g`).
-INSTALL_WORDS = {
-    "install", "i", "add", "update", "up", "upgrade", "uninstall", "un", "remove",
-    "rm", "link", "ln", "unlink",
+# With a global flag only these are left alone: they run a script or a program,
+# so the flag is that program's own (`pnpm test -g name`), or they only look
+# (`npm ls -g`). Everything else with the flag changes what is on the Mac.
+RUNS_OR_LOOKS = {
+    "test", "t", "run", "run-script", "exec", "x", "vitest", "playwright",
+    "ls", "list", "ll", "la", "root", "bin", "prefix", "outdated", "why",
 }  # fmt: skip
+NODE_TAKES_VALUE = {"--filter", "-F", "-C", "--dir", "--prefix"}
 CARGO_TAKES_VALUE = {"--color", "--config", "-C", "-Z"}
 ONLY_PRINTS = {"--help", "-h", "--version", "-V"}
 REDIRECT = re.compile(r"^\d*[<>]")
@@ -252,17 +254,25 @@ def runs_on_live_db(cmd: str) -> bool:
 
 
 def installs_globally(cmd: str) -> bool:
-    """npm, pnpm or yarn asked to install onto the Mac instead of into the
+    """npm, pnpm or yarn asked to change what is on the Mac instead of the
     project, wherever the flag stands. What follows `--` belongs to the script
-    being run (`pnpm test -- -g name`), not to the tool."""
+    being run (`pnpm test -- -g name`), not to the tool, and so does a flag
+    after a command that only runs something or only looks."""
     for first, rest, _ in _commands(cmd):
         if first not in NODE_TOOLS:
             continue
         own = rest[: rest.index("--")] if "--" in rest else rest
-        plain = [w for w in own if not w.startswith("-")]
-        if (GLOBAL_FLAGS & set(own) and INSTALL_WORDS & set(plain)) or (
-            first == "yarn" and plain[:1] == ["global"]
-        ):
+        plain, value_next = [], False
+        for word in own:
+            if value_next:
+                value_next = False
+            elif word in NODE_TAKES_VALUE:
+                value_next = True
+            elif not word.startswith("-"):
+                plain.append(word)
+        if first == "yarn" and plain[:1] == ["global"]:
+            return True
+        if GLOBAL_FLAGS & set(own) and not RUNS_OR_LOOKS & set(plain[:1]):
             return True
     return False
 

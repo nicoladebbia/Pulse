@@ -41,6 +41,10 @@ LIVE_DB = Path.home() / "Library/Application Support/com.pulse.app/pulse.db"
 # Where the fetcher writes the phone's snapshot (iCloud Drive).
 PHONE_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Pulse"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+# Git's settings for the whole Mac. Like the repository's own, they can name a
+# program for git to start, and the runner's git runs outside the fence.
+GIT_GLOBAL_FILE = Path.home() / ".gitconfig"
+GIT_GLOBAL_DIR = Path.home() / ".config/git"
 DB_COPY = HOME / "db/pulse-copy.db"  # tonight's copy of the live database
 DB_JOB = HOME / "db/job.db"  # what sessions use; a fresh clone of the copy per job
 IDEAS = HOME / "IDEAS.md"
@@ -88,13 +92,19 @@ PLACEHOLDER_KEYS = [
 # Nothing the team starts can publish, however the command is spelled: gh gets a
 # token GitHub rejects, and git rewrites every push to GitHub to a dead address.
 # (The runner's own git and gh calls run without this.)
+GIT_SETTINGS = [
+    ("url.night-team-no-push://blocked/.pushInsteadOf", "https://github.com/"),
+    ("url.night-team-no-push://blocked/.pushInsteadOf", "git@github.com:"),
+    # No housekeeping from inside the fence: it writes to parts of git's store
+    # the fence keeps shut. The runner's own git and Nicola's still do it.
+    ("gc.auto", "0"),
+    ("maintenance.auto", "false"),
+]
 NO_PUBLISH = {
     "GH_TOKEN": "night-team-placeholder",
-    "GIT_CONFIG_COUNT": "2",
-    "GIT_CONFIG_KEY_0": "url.night-team-no-push://blocked/.pushInsteadOf",
-    "GIT_CONFIG_VALUE_0": "https://github.com/",
-    "GIT_CONFIG_KEY_1": "url.night-team-no-push://blocked/.pushInsteadOf",
-    "GIT_CONFIG_VALUE_1": "git@github.com:",
+    "GIT_CONFIG_COUNT": str(len(GIT_SETTINGS)),
+    **{f"GIT_CONFIG_KEY_{i}": key for i, (key, _) in enumerate(GIT_SETTINGS)},
+    **{f"GIT_CONFIG_VALUE_{i}": value for i, (_, value) in enumerate(GIT_SETTINGS)},
 }
 SAFE_ENV = {
     **NO_PUBLISH,
@@ -314,6 +324,22 @@ def night_env() -> dict:
     return env
 
 
+def worktree_entry(worktree: Path) -> Path:
+    """Git's own folder for a linked worktree (its HEAD and its index), as the
+    worktree's `.git` file names it. A session can rewrite that file, so
+    anything but a folder inside `.git/worktrees` falls back to the usual name."""
+    entries = Path(os.path.realpath(REPO / ".git/worktrees"))
+    try:
+        text = (worktree / ".git").read_text()
+    except OSError:
+        text = ""
+    if text.startswith("gitdir:"):
+        entry = Path(os.path.realpath(text.split(":", 1)[1].strip()))
+        if entry.parent == entries:
+            return entry
+    return entries / worktree.name
+
+
 def fence_profile(worktree: Path) -> str:
     """A macOS sandbox profile for everything that runs what a session wrote:
     the sessions themselves and the checks. guard.py reads the words of a
@@ -326,8 +352,11 @@ def fence_profile(worktree: Path) -> str:
     - the team's own folder (the installed runner, its checks and its guard, the
       state, the idea list) is read-only, except the build folder and the
       database copy the sessions work on;
-    - the main checkout is read-only, except this job's worktree and git's own
-      store (never its hooks), and its `.env` files cannot be read.
+    - the main checkout is read-only, except this job's worktree and the parts
+      of git's store a commit there lands in, and its `.env` files cannot be
+      read. Git's settings and hooks stay shut (both can name a program that
+      the runner's own git would start), and so do the main checkout's own
+      HEAD and index.
 
     Everything else stays as it is. A later rule wins over an earlier one."""
 
@@ -335,23 +364,43 @@ def fence_profile(worktree: Path) -> str:
         text = os.path.realpath(path)
         return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
+    def rule(what: str, kind: str, *paths) -> list[str]:
+        return [f"({what} ({kind} {q(path)}))" for path in paths]
+
+    store = REPO / ".git"
     secrets = sorted(
         {REPO / ".env", *REPO.glob(".env*")} - {REPO / ".env.example"}, key=str
     )
+    # Git writes a settings file through a `.lock` beside it; a link is followed.
+    settings = {GIT_GLOBAL_FILE, Path(os.path.realpath(GIT_GLOBAL_FILE))}
+    settings |= {Path(f"{path}.lock") for path in settings}
     lines = [
         "(version 1)",
         "(allow default)",
-        f"(deny file-read-data file-write* (subpath {q(LIVE_DB.parent)}))",
-        f"(deny file-read-data file-write* (subpath {q(PHONE_DIR)}))",
-        f"(deny file-write* (subpath {q(HOME)}))",
-        f"(allow file-write* (subpath {q(HOME / 'target')}))",
-        # The copy, what SQLite keeps beside it and the fetcher's lock file.
-        f"(allow file-write* (subpath {q(DB_JOB.parent)}))",
-        f"(deny file-write* (subpath {q(REPO)}))",
-        f"(allow file-write* (subpath {q(REPO / '.git')}))",
-        f"(deny file-write* (subpath {q(REPO / '.git/hooks')}))",
-        f"(allow file-write* (subpath {q(worktree)}))",
-        *(f"(deny file-read-data (literal {q(path)}))" for path in secrets),
+        *rule("deny file-read-data file-write*", "subpath", LIVE_DB.parent, PHONE_DIR),
+        *rule("deny file-write*", "subpath", HOME),
+        # The build folder; the copy, what SQLite keeps beside it and the
+        # fetcher's lock file.
+        *rule("allow file-write*", "subpath", HOME / "target", DB_JOB.parent),
+        *rule("deny file-write*", "subpath", REPO),
+        *rule(
+            "allow file-write*",
+            "subpath",
+            worktree,
+            worktree_entry(worktree),
+            *(store / part for part in ("objects", "refs", "logs", "rr-cache")),
+        ),
+        *rule(
+            "allow file-write*",
+            "literal",
+            *(
+                store / name
+                for name in ("packed-refs", "packed-refs.lock", "packed-refs.new")
+            ),
+        ),
+        *rule("deny file-read-data", "literal", *secrets),
+        *rule("deny file-write*", "literal", *sorted(settings, key=str)),
+        *rule("deny file-write*", "subpath", GIT_GLOBAL_DIR),
     ]
     return "\n".join(lines)
 
@@ -458,14 +507,15 @@ def make_worktree(ref: str, branch: str | None) -> Path:
     a binary that points into a worktree that is gone."""
     path = REPO / WORKTREE
     if path.exists():
-        git("worktree", "remove", "--force", str(path))
-    git("worktree", "prune")
+        # Forced twice: also when the worktree was locked.
+        git("worktree", "remove", "--force", "--force", str(path))
     if path.is_symlink() or path.exists():
         # A leftover git no longer lists as a worktree (a removal that stopped
         # halfway): `remove` refuses it and `add` would refuse the folder.
         # Commits live in the repository, not here; like `remove --force`, this
         # drops only what was never committed.
         path.unlink() if path.is_symlink() else shutil.rmtree(path, ignore_errors=True)
+    git("worktree", "prune")  # after the folder is gone, so its entry goes too
     if branch and exists(branch) and not on_github(branch):
         # An earlier attempt that was kept on this Mac under the same name (a
         # second run on one day). `-B` below would start over on top of it.
