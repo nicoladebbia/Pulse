@@ -647,6 +647,51 @@ class Guard(unittest.TestCase):
         ]:
             self.assertIsNotNone(self.blocked(cmd), cmd)
 
+    def test_quoting_case_and_wrappers_do_not_hide_a_command(self):
+        for cmd in [
+            '"gh" pr merge 5',
+            "git 'push' origin main",
+            'la""unchctl list',
+            "Launchctl list",
+            "Osascript -e 'beep'",
+            "cat ~/Library/Application\\ Support/com.pulse.a''pp/pulse.db",
+            "Pulse-Fetcher --mode daily",
+            "Cargo run -p pulse-fetcher",
+            "setsid pulse-fetcher --mode daily",
+            "stdbuf -oL pulse-fetcher --mode daily",
+            "arch -arm64 pulse-fetcher --mode daily",
+            'bash -c -- "pulse-fetcher --mode daily"',
+            "pulse-fetcher --mode daily # --db-path",
+            "pulse-fetcher --mode daily --db-pathx /tmp/a.db",
+        ]:
+            self.assertIsNotNone(self.blocked(cmd), cmd)
+        for cmd in [
+            'pulse-fetcher --db-path "$PULSE_DB_PATH" --mode daily  # on the copy',
+            'pulse-fetcher --db-path="$PULSE_DB_PATH" --mode daily',
+            'bash -c -- "cargo test"',
+            "git commit -m 'explain the push step (#12)'",
+            "git commit -m \"say what 'gh' pr view shows\"",
+            "cargo test  # run the fetcher's tests",
+        ]:
+            self.assertIsNone(self.blocked(cmd), cmd)
+
+    def test_a_global_flag_only_counts_on_an_install(self):
+        for cmd in [
+            "pnpm test -g foo",
+            "pnpm vitest run -g x",
+            "pnpm exec playwright test -g x",
+            "npm ls -g --depth=0",
+        ]:
+            self.assertIsNone(self.blocked(cmd), cmd)
+        for cmd in [
+            "pnpm add -g x",
+            "npm i -g x",
+            "npm --global install x",
+            "pnpm --filter web add -g x",
+            "yarn global add x",
+        ]:
+            self.assertIsNotNone(self.blocked(cmd), cmd)
+
     def test_every_refusal_says_how_to_get_past_a_false_alarm(self):
         for cmd in [
             "git push",
@@ -1759,11 +1804,140 @@ class Jobs(unittest.TestCase):
         subprocess.run(["rm", "-rf", str(stale)], check=True)  # deleted, not pruned
         self.assertEqual(self.team.local_work("feat/thing"), "")
 
+    def test_a_leftover_folder_git_no_longer_lists_does_not_stop_the_night(self):
+        # A removal that stopped halfway: the folder is there, git's entry is not.
+        left = self.repo / self.team.WORKTREE
+        (left / "src").mkdir(parents=True)
+        (left / "src/old.txt").write_text("left behind\n")
+        wt = self.team.make_worktree("origin/main", None)
+        self.assertEqual(wt, left)
+        self.assertTrue((wt / "src/a.txt").exists())
+        self.assertFalse((wt / "src/old.txt").exists())
+        g("worktree", "remove", "--force", str(wt), cwd=self.repo)
+
     def test_github_being_unreachable_stops_the_job_before_anything_runs(self):
         g("remote", "set-url", "origin", str(self.origin) + "-gone", cwd=self.repo)
         res = self.team.run_job(self.IDEA, self.run)
         self.assertEqual((res["result"], self.sessions), ("error", []))
         self.assertIn("could not reach GitHub", res["reasons"][0])
+
+
+class Fence(unittest.TestCase):
+    """The system sandbox around sessions and checks, against stand-in folders."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name).resolve()
+        self.home, self.repo = root / "team", root / "repo"
+        self.live, self.phone = root / "app-data", root / "phone"
+        self.wt = self.repo / ".claude/worktrees/team-job"
+        for folder in [
+            self.home / "bin",
+            self.home / "db",
+            self.home / "target",
+            self.repo / ".git/hooks",
+            self.repo / "src",
+            self.wt / "src",
+            self.live,
+            self.phone,
+        ]:
+            folder.mkdir(parents=True)
+        for path, text in [
+            (self.live / "pulse.db", "LIVE"),
+            (self.live / ".env", "KEY=real"),
+            (self.home / "bin/checks.sh", "exit 1"),
+            (self.home / "db/job.db", "COPY"),
+            (self.repo / ".env", "KEY=real"),
+            (self.repo / ".env.local", "KEY=real"),
+            (self.repo / ".env.example", "KEY="),
+            (self.repo / "src/a.txt", "a"),
+            (self.wt / ".env", "KEY=placeholder"),
+        ]:
+            path.write_text(text + "\n")
+
+        saved = {k: os.environ.get(k) for k in ("PULSE_TEAM_HOME", "PULSE_TEAM_REPO")}
+        os.environ.update(
+            PULSE_TEAM_HOME=str(self.home), PULSE_TEAM_REPO=str(self.repo)
+        )
+        self.team = importlib.reload(importlib.import_module("team"))
+        for key, value in saved.items():
+            os.environ.pop(key, None) if value is None else os.environ.__setitem__(
+                key, value
+            )
+        self.team.LIVE_DB = self.live / "pulse.db"
+        self.team.PHONE_DIR = self.phone
+
+    def works(self, script):
+        done = subprocess.run(
+            self.team.fenced(["bash", "-c", script], self.wt),
+            cwd=self.wt,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return done.returncode == 0
+
+    def test_the_profile_names_what_is_out_of_reach(self):
+        profile = self.team.fence_profile(self.wt)
+        for line in [
+            f'(deny file-read-data file-write* (subpath "{self.live}"))',
+            f'(deny file-read-data file-write* (subpath "{self.phone}"))',
+            f'(deny file-write* (subpath "{self.home}"))',
+            f'(deny file-write* (subpath "{self.repo}"))',
+            f'(deny file-write* (subpath "{self.repo}/.git/hooks"))',
+            f'(deny file-read-data (literal "{self.repo}/.env"))',
+            f'(deny file-read-data (literal "{self.repo}/.env.local"))',
+        ]:
+            self.assertIn(line, profile)
+        self.assertNotIn(".env.example", profile)
+        # What is given back comes after what is taken away: the later rule wins.
+        self.assertLess(
+            profile.index(f'(deny file-write* (subpath "{self.repo}"))'),
+            profile.index(f'(allow file-write* (subpath "{self.wt}"))'),
+        )
+        self.assertEqual(
+            self.team.fenced(["claude", "-p"], self.wt),
+            ["/usr/bin/sandbox-exec", "-p", profile, "claude", "-p"],
+        )
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/sandbox-exec"), "needs macOS")
+    def test_the_system_keeps_the_fence_whatever_the_spelling(self):
+        self.assertEqual(self.team.fence_problem(), "")
+        live, home, repo, wt = self.live, self.home, self.repo, self.wt
+        for script in [
+            f"cat '{live}/pulse.db'",
+            f"cat '{live.parent}'/app-d*/pul*.db",  # a glob
+            f"cat '{str(live).upper()}/PULSE.DB'",  # another case, the same file
+            f"cat '{live}/.env'",
+            f"ls '{live}'",
+            f"echo x >> '{live}/pulse.db'",
+            f"rm '{live}/pulse.db'",
+            f"ln '{live}/pulse.db' '{wt}/hard.db'",
+            f"ln -s '{live}/pulse.db' '{wt}/soft.db' && cat '{wt}/soft.db'",
+            f"echo x > '{self.phone}/pulse-snapshot.json'",
+            f"echo 'exit 0' > '{home}/bin/checks.sh'",
+            f"echo x > '{home}/IDEAS.md'",
+            f"echo x > '{repo}/src/a.txt'",
+            f"rm '{repo}/src/a.txt'",
+            f"echo x > '{repo}/.git/hooks/pre-push'",
+            f"cat '{repo}/.env'",
+            f"cat '{repo}/.env.local'",
+        ]:
+            self.assertFalse(self.works(script), script)
+        for script in [
+            f"test -f '{live}/pulse.db'",  # that it is there may be known
+            f"cat '{home}/bin/checks.sh'",
+            f"echo x > '{home}/target/built' && echo x >> '{home}/db/job.db'",
+            f"echo x > '{home}/db/job.db-wal' && echo x > '{home}/db/fetcher.lock'",
+            f"cat '{repo}/src/a.txt' '{repo}/.env.example'",
+            f"echo x > '{repo}/.git/night-test'",
+            f"echo x > '{wt}/src/new.txt' && cat '{wt}/.env'",
+            'echo x > "$(mktemp)"',
+        ]:
+            self.assertTrue(self.works(script), script)
+        self.assertEqual((live / "pulse.db").read_text(), "LIVE\n")
+        self.assertEqual((home / "bin/checks.sh").read_text(), "exit 1\n")
 
 
 if __name__ == "__main__":

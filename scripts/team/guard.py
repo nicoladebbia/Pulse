@@ -13,7 +13,10 @@ placeholder API keys and a placeholder `.env` in the worktree (see `night_env`
 and `write_placeholder_env` in team.py), a debug build of the fetcher follows
 `PULSE_DB_PATH` to the copy, and `PULSE_NO_LIVE_DB` makes every Pulse binary
 refuse the live database. A shell command can be spelled in ways no
-pattern sees, which is why none of these layers stands alone.
+pattern sees, which is why none of these layers stands alone: the runner also
+starts every session inside a system sandbox (`fence_profile` in team.py) that
+keeps the live data, the team's own files and the main checkout out of reach
+whatever the spelling. The patterns here are the early, readable refusal.
 
     guard.py <main checkout> <session's worktree>
 
@@ -58,6 +61,9 @@ GIT_STASH = re.compile(GIT + r"stash\b(?!\s+(?:list|show)\b)")
 SECRET_FILE = re.compile(r"(?<![\w])\.env(?![\w])(?!\.example)", re.I)
 # The patterns see words, not meaning, so a search or a commit message that only
 # mentions one is blocked too. Every Bash refusal says how to get past that.
+# What a shell drops before it runs a command. The patterns are tried on the
+# command as written and again without these (`"gh" pr merge`, `la""unchctl`).
+QUOTING = re.compile(r"[\"'\\]")
 REWORD = " (if those words are only inside a commit message or a search, reword it or use the Grep tool)"
 
 # These open the live database unless told otherwise. The copy made for the app
@@ -73,15 +79,24 @@ ASSIGNMENT = re.compile(r"^[A-Za-z_]\w*=")
 # a number or a duration (`timeout 30s`, `nice -n 5`).
 BEFORE_COMMAND = {
     "time", "nohup", "exec", "env", "command", "caffeinate", "nice", "timeout",
-    "gtimeout", "xargs", "then", "do", "else", "if", "while", "!", "{",
+    "gtimeout", "xargs", "setsid", "stdbuf", "arch", "builtin", "noglob",
+    "then", "do", "else", "if", "while", "!", "{",
 }  # fmt: skip
-TAKES_VALUE = {"-s", "--signal", "-u", "--unset", "-I", "-J", "-C", "--chdir", "-a"}
+TAKES_VALUE = {
+    "-s", "--signal", "-u", "--unset", "-I", "-J", "-C", "--chdir", "-a", "-arch",
+}  # fmt: skip
 DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 SHELL_SCRIPT_FLAG = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # -c, -lc, -ic
 CARGO_RUN = {"run", "r"}
 NODE_TOOLS = {"npm", "pnpm", "yarn"}
 GLOBAL_FLAGS = {"-g", "--global", "--location=global"}
+# Only these put something onto the Mac with a global flag. Elsewhere `-g` is
+# the script's own (`pnpm test -g name`) or only looks (`npm ls -g`).
+INSTALL_WORDS = {
+    "install", "i", "add", "update", "up", "upgrade", "uninstall", "un", "remove",
+    "rm", "link", "ln", "unlink",
+}  # fmt: skip
 CARGO_TAKES_VALUE = {"--color", "--config", "-C", "-Z"}
 ONLY_PRINTS = {"--help", "-h", "--version", "-V"}
 REDIRECT = re.compile(r"^\d*[<>]")
@@ -92,19 +107,20 @@ NEVER = [
         "the installed app's data and the phone snapshot are off limits; use the copy in $PULSE_DB_PATH",
     ),
     (
-        re.compile(WORD + r"(?:launchctl|sudo|osascript|crontab)\b"),
+        re.compile(WORD + r"(?:launchctl|sudo|osascript|crontab)\b", re.I),
         "launchctl, sudo, osascript and crontab are not for unattended sessions",
     ),
     (
         re.compile(
             WORD
             + r"(?:brew\s+(?:install|uninstall|reinstall|upgrade|tap)|cargo\s+install"
-            r"|rustup\s+(?:default|update|self|toolchain)|security\s+(?:[a-z]+-[a-z-]+|export|import))\b"
+            r"|rustup\s+(?:default|update|self|toolchain)|security\s+(?:[a-z]+-[a-z-]+|export|import))\b",
+            re.I,
         ),
         INSTALLS,
     ),
     (
-        re.compile(r"install-app\.sh|install-launchd\.sh"),
+        re.compile(r"install-app\.sh|install-launchd\.sh", re.I),
         "installing onto this Mac needs Nicola",
     ),
     (
@@ -127,7 +143,26 @@ WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_TOOLS = {"Read", "Grep", "Glob"}
 
 
+def _without_comment(segment: str) -> str:
+    """The segment up to a shell comment: an unquoted `#` that starts a word."""
+    quote, i = "", 0
+    while i < len(segment):
+        ch = segment[i]
+        if ch == "\\" and quote != "'":
+            i += 2  # the next character is taken as it is
+            continue
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or segment[i - 1].isspace()):
+            return segment[:i]
+        i += 1
+    return segment
+
+
 def _words(segment: str) -> list[str]:
+    segment = _without_comment(segment)
     try:
         return shlex.split(segment)
     except ValueError:  # an unbalanced quote: the separator sat inside a string
@@ -148,7 +183,7 @@ def _command(words: list[str]) -> list[str]:
             ASSIGNMENT.match(word)
             or word.startswith("-")
             or DURATION.match(word)
-            or os.path.basename(word) in BEFORE_COMMAND
+            or os.path.basename(word).lower() in BEFORE_COMMAND
         ):
             i += 1
         else:
@@ -181,14 +216,22 @@ def _commands(cmd: str):
         words = _command(_words(segment))
         if not words:
             continue
-        first = os.path.basename(words[0])
+        # Lower case: on this Mac's disk `Pulse-Fetcher` starts the same program.
+        first = os.path.basename(words[0]).lower()
         rest = [w for w in words[1:] if not REDIRECT.match(w)]
         yield first, rest, segment
         if first in SHELLS:
-            for i, word in enumerate(rest[:-1]):
-                if SHELL_SCRIPT_FLAG.match(word):
-                    yield from _commands(rest[i + 1])
-                    break
+            yield from _commands(_script(rest))
+
+
+def _script(args: list[str]) -> str:
+    """What `bash -c "…"` runs: the first word after the flag that is not an
+    option itself (`bash -c -- "…"`)."""
+    for i, word in enumerate(args):
+        if SHELL_SCRIPT_FLAG.match(word):
+            later = [w for w in args[i + 1 :] if not w.startswith(("-", "+"))]
+            return later[0] if later else ""
+    return ""
 
 
 def runs_on_live_db(cmd: str) -> bool:
@@ -196,8 +239,9 @@ def runs_on_live_db(cmd: str) -> bool:
     run`) without --db-path. Without the flag they open the live database, and
     the fetcher's default mode is a full daily run. Building, testing, copying
     or searching for a binary is fine, and so is asking one for its help text."""
-    for first, rest, segment in _commands(cmd):
-        if "--db-path" in segment:
+    for first, rest, _ in _commands(cmd):
+        # The flag itself, not the same letters in a comment or a longer word.
+        if any(w == "--db-path" or w.startswith("--db-path=") for w in rest):
             continue
         if PULSE_BINARY.match(first):
             if not (rest and all(w in ONLY_PRINTS for w in rest)):
@@ -216,7 +260,9 @@ def installs_globally(cmd: str) -> bool:
             continue
         own = rest[: rest.index("--")] if "--" in rest else rest
         plain = [w for w in own if not w.startswith("-")]
-        if GLOBAL_FLAGS & set(own) or (first == "yarn" and plain[:1] == ["global"]):
+        if (GLOBAL_FLAGS & set(own) and INSTALL_WORDS & set(plain)) or (
+            first == "yarn" and plain[:1] == ["global"]
+        ):
             return True
     return False
 
@@ -227,6 +273,17 @@ def bash_block_reason(cmd: str, repo: str) -> str | None:
 
 
 def _bash_block_reason(cmd: str, repo: str) -> str | None:
+    reason = _reason(cmd, repo)
+    if reason:
+        return reason
+    bare = QUOTING.sub("", cmd)
+    return _reason(bare, repo, parsed=False) if bare != cmd else None
+
+
+def _reason(cmd: str, repo: str, parsed: bool = True) -> str | None:
+    """`parsed` off leaves out the checks that read the command word by word:
+    they have already seen it, and without its quoting it no longer splits the
+    way a shell would split it."""
     if GIT_PUSH.search(cmd):
         return "commit only; the runner pushes after its checks"
     if GIT_STASH.search(cmd):
@@ -235,15 +292,19 @@ def _bash_block_reason(cmd: str, repo: str) -> str | None:
         if (m.group(1), m.group(2) or "") not in GH_ALLOWED:
             call = f"gh {m.group(1)} {m.group(2) or ''}".strip()
             return f"`{call}` is not allowed here; gh is read-only for sessions"
-    if runs_on_live_db(cmd):
+    if parsed and runs_on_live_db(cmd):
         return (
             'run Pulse binaries (and `cargo run`) only with --db-path "$PULSE_DB_PATH", never on the '
             "live database; the dev app (`pnpm tauri dev`) takes it from the environment"
         )
     if SECRET_FILE.search(cmd):
         return ".env files hold real keys and are off limits"
-    if installs_globally(cmd):
+    if parsed and installs_globally(cmd):
         return INSTALLS
+    return _never(cmd, repo)
+
+
+def _never(cmd: str, repo: str) -> str | None:
     for pattern, reason in NEVER:
         if pattern.search(cmd):
             return reason

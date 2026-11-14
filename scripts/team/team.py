@@ -38,10 +38,14 @@ import rules  # noqa: E402
 HOME = Path(os.environ.get("PULSE_TEAM_HOME") or Path.home() / ".pulse-team")
 REPO = Path(os.environ.get("PULSE_TEAM_REPO") or Path.home() / "dev/Pulse")
 LIVE_DB = Path.home() / "Library/Application Support/com.pulse.app/pulse.db"
+# Where the fetcher writes the phone's snapshot (iCloud Drive).
+PHONE_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Pulse"
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 DB_COPY = HOME / "db/pulse-copy.db"  # tonight's copy of the live database
 DB_JOB = HOME / "db/job.db"  # what sessions use; a fresh clone of the copy per job
 IDEAS = HOME / "IDEAS.md"
 PAGE_URL = HOME / "page-url.txt"  # the artifact the nightly page is published to
+WORKTREE = ".claude/worktrees/team-job"  # every job's worktree, one at a time
 BASE = "main"
 LABEL = "needs-you"
 PLIST_LABEL = "com.pulse.team"
@@ -310,6 +314,58 @@ def night_env() -> dict:
     return env
 
 
+def fence_profile(worktree: Path) -> str:
+    """A macOS sandbox profile for everything that runs what a session wrote:
+    the sessions themselves and the checks. guard.py reads the words of a
+    command, and a command can be spelled in ways no pattern sees (a glob, a
+    split quote, a wrapper). This fence is kept by the system on the files
+    themselves, whatever the spelling, also through links:
+
+    - the installed app's folder (live database, real keys) and the phone's
+      snapshot folder can be neither read nor written;
+    - the team's own folder (the installed runner, its checks and its guard, the
+      state, the idea list) is read-only, except the build folder and the
+      database copy the sessions work on;
+    - the main checkout is read-only, except this job's worktree and git's own
+      store (never its hooks), and its `.env` files cannot be read.
+
+    Everything else stays as it is. A later rule wins over an earlier one."""
+
+    def q(path) -> str:
+        text = os.path.realpath(path)
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    secrets = sorted(
+        {REPO / ".env", *REPO.glob(".env*")} - {REPO / ".env.example"}, key=str
+    )
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        f"(deny file-read-data file-write* (subpath {q(LIVE_DB.parent)}))",
+        f"(deny file-read-data file-write* (subpath {q(PHONE_DIR)}))",
+        f"(deny file-write* (subpath {q(HOME)}))",
+        f"(allow file-write* (subpath {q(HOME / 'target')}))",
+        # The copy, what SQLite keeps beside it and the fetcher's lock file.
+        f"(allow file-write* (subpath {q(DB_JOB.parent)}))",
+        f"(deny file-write* (subpath {q(REPO)}))",
+        f"(allow file-write* (subpath {q(REPO / '.git')}))",
+        f"(deny file-write* (subpath {q(REPO / '.git/hooks')}))",
+        f"(allow file-write* (subpath {q(worktree)}))",
+        *(f"(deny file-read-data (literal {q(path)}))" for path in secrets),
+    ]
+    return "\n".join(lines)
+
+
+def fenced(cmd: list[str], worktree: Path) -> list[str]:
+    return [SANDBOX_EXEC, "-p", fence_profile(worktree), *cmd]
+
+
+def fence_problem() -> str:
+    """Empty when the fence can be put up on this Mac, else what went wrong."""
+    code, out, err = sh(fenced(["/usr/bin/true"], REPO / WORKTREE), timeout=30)
+    return "" if code == 0 else (err or out or f"exit code {code}").strip()[-200:]
+
+
 def brief() -> str:
     text = (HERE / "TEAM.md").read_text()
     return text.split("# Brief for sessions", 1)[1].strip()
@@ -351,7 +407,9 @@ def session(
     ]
     if MODEL:
         cmd += ["--model", MODEL]
-    code, out, err = sh(cmd, cwd=cwd, timeout=minutes * 60, env=night_env(), reap=True)
+    code, out, err = sh(
+        fenced(cmd, cwd), cwd=cwd, timeout=minutes * 60, env=night_env(), reap=True
+    )
     (run["dir"] / f"{name}.json").write_text(out or err)
     try:
         res = json.loads(out)
@@ -398,10 +456,16 @@ def make_worktree(ref: str, branch: str | None) -> Path:
     fetcher looks for `.env`, where tests find their fixtures). The build folder
     is shared between jobs, so a path that changed from job to job could leave
     a binary that points into a worktree that is gone."""
-    path = REPO / ".claude/worktrees/team-job"
+    path = REPO / WORKTREE
     if path.exists():
         git("worktree", "remove", "--force", str(path))
     git("worktree", "prune")
+    if path.is_symlink() or path.exists():
+        # A leftover git no longer lists as a worktree (a removal that stopped
+        # halfway): `remove` refuses it and `add` would refuse the folder.
+        # Commits live in the repository, not here; like `remove --force`, this
+        # drops only what was never committed.
+        path.unlink() if path.is_symlink() else shutil.rmtree(path, ignore_errors=True)
     if branch and exists(branch) and not on_github(branch):
         # An earlier attempt that was kept on this Mac under the same name (a
         # second run on one day). `-B` below would start over on top of it.
@@ -442,7 +506,7 @@ def run_checks(wt: Path, run: dict, name: str) -> tuple[bool, str, str]:
         **NO_PUBLISH,
     )
     code, out, err = sh(
-        ["bash", str(HERE / "checks.sh")],
+        fenced(["bash", str(HERE / "checks.sh")], wt),
         cwd=wt,
         timeout=CHECKS_MIN * 60,
         env=env,
@@ -1132,6 +1196,13 @@ def cmd_run(args) -> int:
 
 
 def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> None:
+    problem = fence_problem()
+    if problem:
+        # Without it a session's command could reach the live database.
+        report["notes"].append(
+            f"the file fence for sessions could not be put up ({problem}); nothing was done"
+        )
+        return
     log("fetching")
     if git("fetch", "origin", "--prune")[0] != 0:
         report["notes"].append("could not reach GitHub; nothing was done")
