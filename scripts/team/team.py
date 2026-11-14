@@ -70,7 +70,12 @@ JOB_MIN = _int("PULSE_TEAM_JOB_MIN", 180)  # one job starts no new pass after th
 MAX_FIX_ROUNDS = _int("PULSE_TEAM_FIX_ROUNDS", 2)
 MAX_MAIN_MOVES = 2  # times a job starts over because main changed under it
 MODEL = os.environ.get("PULSE_TEAM_MODEL", "")  # empty = the default from settings
-RUN_AT = (_int("PULSE_TEAM_HOUR", 2), _int("PULSE_TEAM_MINUTE", 30))  # used by install
+# The night shift opens at RUN_AT. launchd only wakes the team, every hour at
+# RUN_AT's minute, and `rules.night_due` decides: measured on this Mac, an agent
+# whose StartCalendarInterval names an Hour never fires, a Minute-only one does
+# (the note in launchd/com.pulse.embedding-backfill.plist).
+RUN_AT = (_int("PULSE_TEAM_HOUR", 2), _int("PULSE_TEAM_MINUTE", 30))
+CATCH_UP_MIN = _int("PULSE_TEAM_CATCH_UP_MIN", 210)  # a late wake-up still starts it
 
 # Sessions get placeholders for every key Pulse knows, so nothing they build or
 # run can trade or spend. (dotenvy never overrides a variable that is already
@@ -1214,13 +1219,30 @@ def local_work(branch: str) -> str:
 
 def cmd_run(args) -> int:
     HOME.mkdir(parents=True, exist_ok=True)
-    lock = open(HOME / "lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        log("another run is in progress")
-        return 0
     started = dt.datetime.now()
+    scheduled = getattr(args, "scheduled", False)
+    if scheduled:  # proof that launchd still wakes the team
+        (HOME / "wake.txt").write_text(started.isoformat(timespec="seconds") + "\n")
+    with open(HOME / "lock", "w") as lock:  # held until the run is over
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log("another run is in progress")
+            return 0
+        return locked_run(args, started, scheduled)
+
+
+def locked_run(args, started: dt.datetime, scheduled: bool) -> int:
+    if scheduled:
+        state = load_json(HOME / "state.json", {})
+        night = rules.night_due(
+            started, RUN_AT, CATCH_UP_MIN, state.get("last_night", "")
+        )
+        if not night:
+            return 0
+        # Written before any work: a night that crashes is not started again.
+        state["last_night"] = night
+        save_json(HOME / "state.json", state)
     run = {
         "dir": HOME / "runs" / started.strftime("%Y-%m-%d_%H%M"),
         "cost": 0.0,
@@ -1404,6 +1426,23 @@ def publish_page(html: Path, url: str) -> bool:
 # ---------------------------------------------------------------- commands --
 
 
+def launchd_job(python: str, bin_dir: Path, dirs: list[str]) -> dict:
+    """The launchd agent: an hourly wake-up, never an Hour (see RUN_AT)."""
+    return {
+        "Label": PLIST_LABEL,
+        "ProgramArguments": [python, str(bin_dir / "team.py"), "run", "--scheduled"],
+        "StartCalendarInterval": {"Minute": RUN_AT[1]},
+        "StandardOutPath": str(HOME / "launchd.log"),
+        "StandardErrorPath": str(HOME / "launchd.log"),
+        "EnvironmentVariables": {
+            "PATH": ":".join(dirs),
+            "HOME": str(Path.home()),
+            "PULSE_TEAM_HOME": str(HOME),
+            "PULSE_TEAM_REPO": str(REPO),
+        },
+    }
+
+
 def cmd_install(_args) -> int:
     bin_dir = HOME / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -1437,19 +1476,7 @@ def cmd_install(_args) -> int:
             + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
         )
     )
-    plist = {
-        "Label": PLIST_LABEL,
-        "ProgramArguments": [shutil.which("python3"), str(bin_dir / "team.py"), "run"],
-        "StartCalendarInterval": {"Hour": RUN_AT[0], "Minute": RUN_AT[1]},
-        "StandardOutPath": str(HOME / "launchd.log"),
-        "StandardErrorPath": str(HOME / "launchd.log"),
-        "EnvironmentVariables": {
-            "PATH": ":".join(dirs),
-            "HOME": str(Path.home()),
-            "PULSE_TEAM_HOME": str(HOME),
-            "PULSE_TEAM_REPO": str(REPO),
-        },
-    }
+    plist = launchd_job(shutil.which("python3"), bin_dir, dirs)
     PLIST.parent.mkdir(parents=True, exist_ok=True)
     PLIST.write_bytes(plistlib.dumps(plist))
     domain = f"gui/{os.getuid()}"
@@ -1459,7 +1486,8 @@ def cmd_install(_args) -> int:
         print(f"launchctl failed: {(out + err).strip()}")
         return 1
     print(
-        f"Installed. Runs every night at {RUN_AT[0]:02d}:{RUN_AT[1]:02d} from {bin_dir}. Ideas: {IDEAS}"
+        f"Installed. Wakes every hour at :{RUN_AT[1]:02d} and starts the night shift at "
+        f"{RUN_AT[0]:02d}:{RUN_AT[1]:02d}, from {bin_dir}. Ideas: {IDEAS}"
     )
     return 0
 
@@ -1502,6 +1530,11 @@ def main() -> int:
     r.add_argument("--max-jobs", type=int, default=MAX_JOBS)
     r.add_argument(
         "--no-merge", action="store_true", help="do everything except the final merge"
+    )
+    r.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="an hourly wake-up from launchd: start only when the night shift is due",
     )
     r.set_defaults(fn=cmd_run)
     for name, fn in (

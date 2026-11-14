@@ -5,6 +5,7 @@ team.py does the running (git, gh, claude); this file decides what is allowed.
 
 from __future__ import annotations
 
+import datetime as dt
 import fnmatch
 import hashlib
 import json
@@ -224,6 +225,22 @@ def retry_now(state: dict, key: str) -> None:
     last = attempts.pop(key, None) or {}
     if last.get("parked"):
         attempts[key] = {"sha": "", "result": "", "tries": 0, "parked": True}
+
+
+def night_due(
+    now: dt.datetime, start: tuple[int, int], catch_up_min: int, last_night: str
+) -> str:
+    """The night an hourly wake-up should start, as its date, or "" when it is
+    not time. The shift opens at `start` (hour, minute); a wake-up up to
+    `catch_up_min` minutes late still starts it (the Mac was busy or asleep);
+    each night starts once."""
+    opened = now.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
+    if opened > now:
+        opened -= dt.timedelta(days=1)
+    if now - opened >= dt.timedelta(minutes=catch_up_min):
+        return ""
+    night = opened.date().isoformat()
+    return "" if night == last_night else night
 
 
 # Reasons that carry raw error output. A PR comment names them and leaves the

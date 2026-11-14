@@ -1121,6 +1121,103 @@ def commit(cwd, path, text, message="change"):
     return g("rev-parse", "HEAD", cwd=cwd)
 
 
+class Schedule(unittest.TestCase):
+    """launchd only wakes the team every hour; these decide when the night starts."""
+
+    START, LATE = (2, 30), 210
+
+    def due(self, when, last=""):
+        return rules.night_due(
+            dt.datetime.fromisoformat(when), self.START, self.LATE, last
+        )
+
+    def test_the_night_starts_at_its_minute_and_not_before(self):
+        self.assertEqual(self.due("2026-11-15T02:29:59"), "")
+        self.assertEqual(self.due("2026-11-15T02:30:04"), "2026-11-15")
+
+    def test_a_late_wake_up_still_starts_it_until_the_morning(self):
+        self.assertEqual(self.due("2026-11-15T05:30:02"), "2026-11-15")
+        self.assertEqual(self.due("2026-11-15T06:00:00"), "")
+        self.assertEqual(self.due("2026-11-15T14:30:00"), "")
+
+    def test_a_night_starts_once(self):
+        self.assertEqual(self.due("2026-11-15T03:30:01", last="2026-11-15"), "")
+        self.assertEqual(
+            self.due("2026-11-16T02:30:01", last="2026-11-15"), "2026-11-16"
+        )
+
+    def test_a_shift_that_opens_before_midnight_keeps_its_own_date(self):
+        late_evening = dict(start=(23, 30), catch_up_min=210)
+        after_midnight = dt.datetime.fromisoformat("2026-11-16T00:30:00")
+        self.assertEqual(
+            rules.night_due(after_midnight, last_night="", **late_evening), "2026-11-15"
+        )
+        self.assertEqual(
+            rules.night_due(after_midnight, last_night="2026-11-15", **late_evening), ""
+        )
+
+
+class Wake(unittest.TestCase):
+    """An hourly wake-up from launchd, against a temporary home folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        old_home = os.environ.get("PULSE_TEAM_HOME")
+        os.environ["PULSE_TEAM_HOME"] = self.tmp.name
+        self.team = importlib.reload(importlib.import_module("team"))
+
+        def restore():
+            if old_home is None:
+                os.environ.pop("PULSE_TEAM_HOME", None)
+            else:
+                os.environ["PULSE_TEAM_HOME"] = old_home
+            importlib.reload(self.team)
+
+        self.addCleanup(restore)
+        self.home = Path(self.tmp.name)
+        self.worked = []
+        self.team.work = lambda args, run, state, report, started: self.worked.append(
+            dict(state)
+        )
+        self.team.finish = lambda report, run, state, started: 0
+        self.team.log = lambda msg: None
+        self.args = lambda scheduled: type(
+            "Args", (), {"scheduled": scheduled, "no_merge": True, "only": ""}
+        )()
+
+    def night(self, answer):
+        self.addCleanup(setattr, rules, "night_due", rules.night_due)
+        rules.night_due = lambda now, start, late, last: answer
+
+    def test_the_agent_names_no_hour(self):
+        # An agent that names an Hour never fires on this Mac (team.RUN_AT).
+        job = self.team.launchd_job("/usr/bin/python3", self.home / "bin", ["/usr/bin"])
+        self.assertEqual(job["StartCalendarInterval"], {"Minute": self.team.RUN_AT[1]})
+        self.assertEqual(job["ProgramArguments"][-2:], ["run", "--scheduled"])
+
+    def test_a_wake_up_outside_the_shift_does_nothing_but_leave_its_mark(self):
+        self.night("")
+        self.assertEqual(self.team.cmd_run(self.args(scheduled=True)), 0)
+        self.assertEqual(self.worked, [])
+        self.assertFalse((self.home / "runs").exists())
+        self.assertTrue((self.home / "wake.txt").read_text().strip())
+
+    def test_the_night_is_marked_before_any_work(self):
+        self.night("2026-11-15")
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual([s.get("last_night") for s in self.worked], ["2026-11-15"])
+        saved = json.loads((self.home / "state.json").read_text())
+        self.assertEqual(saved["last_night"], "2026-11-15")
+
+    def test_a_run_started_by_hand_ignores_the_clock(self):
+        self.night("")
+        self.team.cmd_run(self.args(scheduled=False))
+        self.assertEqual(len(self.worked), 1)
+        self.assertFalse((self.home / "wake.txt").exists())
+        self.assertNotIn("last_night", self.worked[0])
+
+
 class Jobs(unittest.TestCase):
     """Whole jobs against a real repository and its 'GitHub' (a bare repository
     next to it). The sessions, the checks and the gh calls are played by the test;
