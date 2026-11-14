@@ -10,8 +10,9 @@ connectors, or touch what runs on this Mac.
 It is one of several layers, not the only one: the runner also starts sessions
 with an environment in which `git push` and `gh` cannot reach GitHub, with
 placeholder API keys and a placeholder `.env` in the worktree (see `night_env`
-and `write_placeholder_env` in team.py), and a debug build of the fetcher
-follows `PULSE_DB_PATH` to the copy. A shell command can be spelled in ways no
+and `write_placeholder_env` in team.py), a debug build of the fetcher follows
+`PULSE_DB_PATH` to the copy, and `PULSE_NO_LIVE_DB` makes any fetcher refuse
+the live database. A shell command can be spelled in ways no
 pattern sees, which is why none of these layers stands alone.
 
     guard.py <main checkout> <session's worktree>
@@ -43,6 +44,8 @@ GH_ALLOWED = {
     ("run", "watch"),
     ("issue", "view"),
     ("issue", "list"),
+    ("--version", ""),
+    ("--help", ""),
 }
 GH_CALL = re.compile(WORD + r"gh\s+([a-z-]+)(?:\s+([a-z-]+))?")
 # `git`, then any global options (`-C dir`, `--no-pager`), then the subcommand.
@@ -55,15 +58,27 @@ SECRET_FILE = re.compile(r"(?<![\w])\.env(?![\w])(?!\.example)")
 # mentions one is blocked too. Every Bash refusal says how to get past that.
 REWORD = " (if those words are only inside a commit message or a search, reword it or use the Grep tool)"
 
-# These open the live database unless told otherwise.
-PULSE_BINARIES = {"pulse-fetcher", "pulse-eval", "pulse-backtest"}
+# These open the live database unless told otherwise. The copy made for the app
+# bundle carries a target suffix (pulse-fetcher-aarch64-apple-darwin).
+PULSE_BINARY = re.compile(r"^pulse-(?:fetcher|eval|backtest)(?:-[\w.-]+)?$")
 SEGMENT = re.compile(r"\|\||&&|[;|&\n()`]|\$\(")
 ASSIGNMENT = re.compile(r"^[A-Za-z_]\w*=")
-# Words that can stand before the command a shell actually runs.
+# Words that can stand before the command a shell actually runs (also with a
+# path in front: /usr/bin/env), and what can follow them before that command:
+# options, an option's value (`timeout -s KILL`, `env -u NAME`, `xargs -I {}`),
+# a number or a duration (`timeout 30s`, `nice -n 5`).
 BEFORE_COMMAND = {
     "time", "nohup", "exec", "env", "command", "caffeinate", "nice", "timeout",
     "gtimeout", "xargs", "then", "do", "else", "if", "while", "!", "{",
 }  # fmt: skip
+TAKES_VALUE = {"-s", "--signal", "-u", "--unset", "-I", "-J", "-C", "--chdir", "-a"}
+DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+SHELL_SCRIPT_FLAG = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # -c, -lc, -ic
+CARGO_RUN = {"run", "r"}
+CARGO_TAKES_VALUE = {"--color", "--config", "-C", "-Z"}
+ONLY_PRINTS = {"--help", "-h", "--version", "-V"}
+REDIRECT = re.compile(r"^\d*[<>]")
 NEVER = [
     (
         re.compile(r"com\.pulse\.app|Mobile\\? Documents"),
@@ -78,7 +93,8 @@ NEVER = [
             WORD
             + r"(?:brew\s+(?:install|uninstall|reinstall|upgrade|tap)|cargo\s+install"
             r"|rustup\s+(?:default|update|self|toolchain)|security\s+(?:[a-z]+-[a-z-]+|export|import)"
-            r"|(?:npm|pnpm|yarn)\s+(?:\S+\s+)*(?:-g|--global))\b"
+            r"|(?:npm|pnpm|yarn)\s+(?:(?:-g|--global|global)"
+            r"|(?:add|install|i|link|remove|rm|uninstall|un|update|up|upgrade)\b[^;&|\n]*\s(?:-g|--global)))\b"
         ),
         "installing onto this Mac, changing its toolchain and the keychain are not for unattended sessions",
     ),
@@ -112,30 +128,69 @@ def _words(segment: str) -> list[str]:
         return [w.strip("'\"") for w in segment.split()]
 
 
+def _command(words: list[str]) -> list[str]:
+    """The words from the command a shell would start: variable assignments,
+    the words in BEFORE_COMMAND and what belongs to them are dropped."""
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word in TAKES_VALUE:
+            i += 2
+        elif (
+            ASSIGNMENT.match(word)
+            or word.startswith("-")
+            or DURATION.match(word)
+            or os.path.basename(word) in BEFORE_COMMAND
+        ):
+            i += 1
+        else:
+            break
+    return words[i:]
+
+
+def _cargo_runs(args: list[str]) -> bool:
+    """`cargo run` / `cargo r`, wherever cargo's own options stand. A `run`
+    after another subcommand (`cargo nextest run`) or after `--` (the name of a
+    test) is not one."""
+    i = 0
+    while i < len(args):
+        word = args[i]
+        if word == "--":
+            return False
+        if word in CARGO_TAKES_VALUE:
+            i += 2
+        elif word.startswith(("-", "+")):
+            i += 1
+        else:
+            return word in CARGO_RUN
+    return False
+
+
 def runs_on_live_db(cmd: str) -> bool:
     """True when the command starts a Pulse binary (itself, or through `cargo
     run`) without --db-path. Without the flag they open the live database, and
     the fetcher's default mode is a full daily run. Building, testing, copying
-    or searching for a binary is fine."""
+    or searching for a binary is fine, and so is asking one for its help text."""
     for segment in SEGMENT.split(cmd):
         if "--db-path" in segment:
             continue
-        words = _words(segment)
-        while words and (
-            ASSIGNMENT.match(words[0])
-            or words[0] in BEFORE_COMMAND
-            or words[0].startswith("-")
-            or words[0].isdigit()
-        ):
-            words.pop(0)
+        words = _command(_words(segment))
         if not words:
             continue
         first = os.path.basename(words[0])
-        if first in PULSE_BINARIES or (first == "cargo" and "run" in words[1:]):
+        rest = [w for w in words[1:] if not REDIRECT.match(w)]
+        if PULSE_BINARY.match(first):
+            if rest and all(w in ONLY_PRINTS for w in rest):
+                continue
             return True
-        if first in {"bash", "sh", "zsh"} and "-c" in words[1:-1]:
-            if runs_on_live_db(words[words.index("-c") + 1]):
-                return True
+        if first == "cargo" and _cargo_runs(rest):
+            return True
+        if first in SHELLS:
+            for i, word in enumerate(rest[:-1]):
+                if SHELL_SCRIPT_FLAG.match(word):
+                    if runs_on_live_db(rest[i + 1]):
+                        return True
+                    break
     return False
 
 

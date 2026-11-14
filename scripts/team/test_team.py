@@ -225,6 +225,55 @@ class PullRequests(unittest.TestCase):
             rules.pr_skip_reason(moved, OWNER, "main", "needs-you", {})
         )
 
+    def test_asking_for_a_pr_by_name_lifts_the_teams_own_label_only(self):
+        labelled = pr(1, labels=self.LABELLED, headRefOid="sha1")
+        state = {}
+        rules.record_attempt(state, "pr-1", "sha1", "blocked", parked=True)
+        rules.retry_now(state, "pr-1")
+        jobs, skipped = rules.select_jobs(
+            True, [labelled], [], state, OWNER, "main", "needs-you"
+        )
+        self.assertEqual(([j["key"] for j in jobs], skipped), (["pr-1"], []))
+        self.assertTrue(jobs[0]["labelled"])  # the job takes the label off
+        # A label Nicola added by hand still keeps the team off.
+        state = {}
+        rules.record_attempt(state, "pr-1", "sha1", "error")
+        rules.retry_now(state, "pr-1")
+        self.assertEqual(state["attempts"], {})
+        self.assertIsNotNone(
+            rules.pr_skip_reason(labelled, OWNER, "main", "needs-you", state)
+        )
+        # The count starts again after it.
+        rules.retry_now(state, "pr-9")  # nothing remembered: nothing to do
+        state = {}
+        rules.record_attempt(state, "pr-1", "sha1", "blocked", parked=True)
+        rules.retry_now(state, "pr-1")
+        rules.record_attempt(state, "pr-1", "sha2", "error", prev_sha="sha1")
+        self.assertEqual(state["attempts"]["pr-1"]["tries"], 1)
+
+    def test_a_pr_comment_leaves_out_error_output_and_this_macs_paths(self):
+        home = "/Users/someone"
+        said = rules.public_reasons(
+            [
+                "Blue or green?",
+                f"runner error: [Errno 2] No such file: '{home}/dev/Pulse/x'",
+                "push failed: remote: denied to someone",
+                "the team's unfinished attempt is kept on this Mac as branch night-kept/pr-5-1114-020000",
+                f'the check "clippy" fails in {home}/dev/Pulse',
+            ],
+            home,
+        )
+        self.assertEqual(
+            said,
+            [
+                "Blue or green?",
+                "runner error (the details are on the night team's page)",
+                "push failed (the details are on the night team's page)",
+                "the team's unfinished attempt is kept on this Mac",
+                'the check "clippy" fails in ~/dev/Pulse',
+            ],
+        )
+
 
 class Attempts(unittest.TestCase):
     def test_stuck_only_on_the_same_commit(self):
@@ -508,8 +557,42 @@ class Guard(unittest.TestCase):
             "cargo build && ./target/debug/pulse-fetcher --force",
             "cargo run --bin pulse-eval",
             "./target/debug/pulse-backtest",
+            # what stands before the command, and other names for the same thing
+            "timeout 30s ./target/release/pulse-fetcher --mode daily",
+            "gtimeout 5m cargo run -p pulse-fetcher -- --mode daily",
+            "timeout 5m cargo run --bin pulse-eval",
+            "timeout -s KILL 30 ./target/debug/pulse-fetcher",
+            "env -u FOO ./target/debug/pulse-fetcher --mode learn",
+            "/usr/bin/env pulse-fetcher",
+            "nohup timeout 10m env A=1 pulse-eval",
+            'bash -lc "./target/debug/pulse-fetcher"',
+            "zsh -ic 'cd x && cargo run'",
+            "cargo r -p pulse-fetcher",
+            "cargo +nightly run -p pulse-fetcher",
+            "cargo --color always run",
+            "cargo run --release -p pulse-fetcher",
+            "src-tauri/binaries/pulse-fetcher-aarch64-apple-darwin --mode daily",
+            "pulse-fetcher --mode daily --help",
         ]:
             self.assertIsNotNone(self.blocked(cmd), cmd)
+
+    def test_looking_at_a_binary_or_running_tests_named_run_is_fine(self):
+        for cmd in [
+            "pulse-fetcher --help",
+            "./target/debug/pulse-fetcher --version",
+            "pulse-fetcher --help 2>&1 | head",
+            "cargo nextest run",
+            "cargo test -p pulse-fetcher -- run",
+            "cargo test run_backfill",
+            "timeout 60 cargo build -p pulse-fetcher",
+            "timeout 10m cargo test --workspace",
+            'timeout 5m ./target/debug/pulse-fetcher --mode learn --db-path "$PULSE_DB_PATH"',
+            "pnpm test -- -g foo",
+            "npm run test -- --grep foo",
+            "pnpm install --frozen-lockfile",
+            "gh --version",
+        ]:
+            self.assertIsNone(self.blocked(cmd), cmd)
 
     def test_the_shared_stash_installs_and_the_keychain_are_blocked(self):
         for cmd in [
@@ -520,6 +603,9 @@ class Guard(unittest.TestCase):
             "cargo install cargo-edit",
             "npm i -g foo",
             "pnpm add --global foo",
+            "pnpm -g add foo",
+            "yarn global add foo",
+            "gh auth status",
             "rustup default nightly",
             "security find-generic-password -s x",
             "ls ${HOME}/dev/Pulse/src",
@@ -869,6 +955,9 @@ class Runner(unittest.TestCase):
         self.assertEqual(
             env["PULSE_DB_PATH"], str(self.team.DB_JOB)
         )  # set even when no copy exists
+        self.assertEqual(
+            env["PULSE_NO_LIVE_DB"], "1"
+        )  # the fetcher refuses the live one
         self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
         self.assertIn("pushInsteadOf", env["GIT_CONFIG_KEY_0"])
         hooks = self.team.guard_settings(self.team.HOME / "my wt")["hooks"][
@@ -905,6 +994,13 @@ class Runner(unittest.TestCase):
         self.assertEqual(code, 124)
         self.assertIn("timed out", err)
         self.assertLess(time.time() - began, 5)
+
+    def test_a_command_that_cannot_start_fails_instead_of_raising(self):
+        code, out, err = self.team.sh(["/nonexistent/night-team-tool"])
+        self.assertEqual((code, out), (127, ""))
+        self.assertIn("could not start", err)
+        gone = Path(self.tmp.name) / "no-such-folder"
+        self.assertEqual(self.team.git("status", cwd=gone)[0], 127)
 
     def test_output_that_is_not_utf8_does_not_crash_the_runner(self):
         code, out, _ = self.team.sh(["bash", "-c", "printf 'ok \\xff\\n'"])
@@ -977,6 +1073,8 @@ class Jobs(unittest.TestCase):
 
         self.sessions, self.calls, self.checks, self.script = [], [], [], {}
         self.pr_branch = ""
+        # What 'GitHub' answers differently: always, and at the last look before a merge.
+        self.github, self.at_merge, self.before_merge = {}, {}, None
         self.team.session = self.session
         self.team.run_checks = lambda wt, run, name: (
             self.checks.pop(0) if self.checks else (True, "", "")
@@ -1011,11 +1109,21 @@ class Jobs(unittest.TestCase):
         if args[:2] == ("pr", "create"):
             self.pr_branch = args[args.index("--head") + 1]
             return 0, "https://github.com/nicola/Pulse/pull/77"
+        if args[:2] == ("pr", "merge"):  # main now holds the merged commit
+            sha = args[args.index("--match-head-commit") + 1]
+            g("update-ref", "refs/heads/main", sha, cwd=self.origin)
         return 0, ""
 
     def gh_json(self, *args):
         # `gh pr view`: GitHub's answer for the branch as it is on 'GitHub' now
-        return {
+        view = {
+            "number": 5,
+            "title": "Thing",
+            "body": "",
+            "author": {"login": "nicola"},
+            "isCrossRepository": False,
+            "headRefName": self.pr_branch,
+            "createdAt": "2026-11-01",
             "state": "OPEN",
             "mergeable": "MERGEABLE",
             "baseRefName": "main",
@@ -1026,6 +1134,13 @@ class Jobs(unittest.TestCase):
             ),
             "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
         }
+        view.update(self.github)
+        if "mergeable" in args[-1] and "title" not in args[-1]:  # merge_ready's look
+            if self.before_merge:
+                self.before_merge()
+                self.before_merge = None
+            view.update(self.at_merge)
+        return view
 
     # -- helpers --
 
@@ -1082,6 +1197,16 @@ class Jobs(unittest.TestCase):
     def merged_sha(self):
         (call,) = self.called("pr", "merge")
         return call[call.index("--match-head-commit") + 1]
+
+    def kept(self, pattern):
+        """Local branches matching `pattern`, as {name: commit}."""
+        out = g(
+            "for-each-ref",
+            "--format=%(refname:short) %(objectname)",
+            f"refs/heads/{pattern}",
+            cwd=self.repo,
+        )
+        return dict(line.split() for line in out.splitlines())
 
     def builds(self, path, text, data=None):
         def play(cwd):
@@ -1191,7 +1316,7 @@ class Jobs(unittest.TestCase):
         )
         self.assertIn("your call", res["reasons"][-1])
         self.assertEqual(self.on_github("feat/thing"), job["sha"])
-        self.assertEqual(self.local("night-kept/pr-5"), "")
+        self.assertEqual(self.kept("night-kept/*"), {})
         self.assertTrue(self.called("pr", "edit", "5", "--add-label", "needs-you"))
         self.assertEqual(self.called("pr", "merge"), [])
 
@@ -1262,9 +1387,25 @@ class Jobs(unittest.TestCase):
             res["reasons"][0],
         )
         self.assertEqual(self.on_github("feat/thing"), job["sha"])
-        self.assertEqual(self.local("night-kept/pr-5"), self.built)
-        self.assertIn("night-kept/pr-5", res["reasons"][-1])
+        ((name, sha),) = self.kept("night-kept/pr-5-*").items()
+        self.assertEqual(sha, self.built)
+        self.assertIn(name, res["reasons"][-1])
         self.assertTrue(self.called("pr", "edit", "5", "--add-label", "needs-you"))
+        # The comment on the pull request is public: it does not name the branch.
+        (comment,) = self.called("pr", "comment")
+        self.assertIn("kept on this Mac", comment[-1])
+        self.assertNotIn("night-kept", comment[-1])
+        # A second night keeps its attempt next to the first one.
+        self.checks = [(False, "clippy", "boom")] * 3
+        self.script["fix"] = [
+            self.builds("src/fix3.txt", "3\n"),
+            self.builds("src/fix4.txt", "4\n"),
+        ]
+        time.sleep(1.1)  # the names carry the time to the second
+        self.team.run_job(job, self.run)
+        self.assertEqual(
+            sorted(self.kept("night-kept/pr-5-*").values()), sorted([sha, self.built])
+        )
 
     def test_a_reviewers_objection_is_fixed_then_merged(self):
         job = self.open_pr({"src/b.txt": "b\n"})
@@ -1320,6 +1461,234 @@ class Jobs(unittest.TestCase):
             (res["result"], self.sessions), ("merged", ["fix1", "review2"])
         )
         self.assertEqual(self.merged_sha(), self.built)
+
+    def test_work_made_after_a_push_is_never_deleted_with_the_branch(self):
+        # Pushed once; then main moves, a fix round touches CI, and the newer
+        # commits may not leave this Mac. The branch that holds them must stay.
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        self.script["fix"] = self.builds(".github/workflows/ci.yml", "on: push\n")
+        self.checks = [(True, "", ""), (False, "clippy", "boom")]
+        self.before_merge = self.main_moves
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "needs_user")
+        self.assertEqual(self.sessions, ["build", "review1", "fix1", "review4"])
+        ((branch, sha),) = self.kept("feat/night-*").items()
+        self.assertEqual(sha, self.built)  # the fix that was not pushed
+        self.assertIn(f"kept on this Mac as branch {branch}", res["reasons"][-1])
+        self.assertNotEqual(self.on_github(branch), self.built)
+        g("merge-base", "--is-ancestor", self.on_github(branch), sha, cwd=self.repo)
+        self.assertEqual(self.called("pr", "merge"), [])
+
+    def test_a_push_that_fails_keeps_the_work_here(self):
+        def build(cwd):
+            done = self.builds("src/x.txt", "x\n")(cwd)
+            g("remote", "set-url", "--push", "origin", "/nonexistent/x", cwd=self.repo)
+            return done
+
+        self.script["build"] = build
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual((res["result"], res["pr"]), ("error", None))
+        self.assertIn("push failed", res["reasons"][0])
+        ((branch, sha),) = self.kept("feat/night-*").items()
+        self.assertEqual(sha, self.built)
+        self.assertEqual(
+            res["reasons"][-1], f"the work is kept on this Mac as branch {branch}"
+        )
+
+    def test_a_failed_push_onto_a_pr_keeps_the_teams_fix_here(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        self.checks = [(False, "clippy", "boom")]
+
+        def fix(cwd):
+            done = self.builds("src/b.txt", "b fixed\n")(cwd)
+            g("remote", "set-url", "--push", "origin", "/nonexistent/x", cwd=self.repo)
+            return done
+
+        self.script["fix"] = fix
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "error")
+        self.assertEqual(list(self.kept("night-kept/pr-5-*").values()), [self.built])
+
+    def test_an_earlier_attempt_under_the_same_name_is_set_aside_not_reset(self):
+        branch = f"feat/night-add-x-abc123-{dt.date.today():%m%d}"
+        g("checkout", "-q", "-b", branch, cwd=self.repo)
+        earlier = commit(self.repo, "src/earlier.txt", "kept\n", "kept attempt")
+        g("checkout", "-q", "main", cwd=self.repo)
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "merged")
+        self.assertEqual(list(self.kept(f"night-kept/{branch}-*").values()), [earlier])
+
+    def test_failing_ci_stops_the_merge_and_parks_the_pr(self):
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        self.github = {
+            "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]
+        }
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual((res["result"], res["pr"]), ("blocked", 77))
+        self.assertIn("GitHub's checks failed", res["reasons"][0])
+        self.assertEqual(self.called("pr", "merge"), [])
+        self.assertTrue(self.called("pr", "edit", "77", "--add-label", "needs-you"))
+        self.assertEqual(self.kept("feat/night-*"), {})  # GitHub has all of it
+
+    def test_ci_that_never_answers_is_an_error_to_retry(self):
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        self.team.CI_MIN = 0
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "error")
+        self.assertIn("did not finish", res["reasons"][0])
+        self.assertEqual(self.called("pr", "merge"), [])
+
+    def test_a_label_or_a_push_during_the_job_stops_the_merge(self):
+        for change, why in [
+            ({"labels": [{"name": "needs-you"}]}, "label was added"),
+            ({"headRefOid": "0" * 40}, "someone pushed to it"),
+            ({"isDraft": True}, "marked as a draft"),
+            ({"state": "CLOSED"}, "no longer open"),
+        ]:
+            self.setUp()
+            job = self.open_pr({"src/b.txt": "b\n"})
+            self.at_merge = change
+            res = self.team.run_job(job, self.run)
+            self.assertEqual(res["result"], "error", why)
+            self.assertIn(why, res["reasons"][0])
+            self.assertEqual(self.called("pr", "merge"), [], why)
+
+    def test_main_moving_while_ci_runs_means_starting_over_too(self):
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        moved = []
+        self.before_merge = lambda: moved.append(self.main_moves())
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual((res["result"], res["reasons"]), ("merged", []))
+        self.assertEqual(self.sessions, ["build", "review1", "review3"])
+        sha = self.merged_sha()
+        g("merge-base", "--is-ancestor", moved[0], sha, cwd=self.origin)
+        g("merge-base", "--is-ancestor", self.built, sha, cwd=self.origin)
+
+    def test_main_that_keeps_moving_leaves_built_work_as_a_pull_request(self):
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+
+        def review(cwd):
+            self.main_moves()
+            return self.PASS
+
+        self.script["review"] = review
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual((res["result"], res["pr"]), ("error", 77))
+        g(
+            "merge-base",
+            "--is-ancestor",
+            self.built,
+            self.on_github(self.pr_branch),
+            cwd=self.origin,
+        )
+        self.assertEqual(self.called("pr", "merge"), [])
+
+    def test_a_fix_that_adds_a_protected_file_stays_off_the_owners_pr(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        self.checks = [(False, "clippy", "boom")]
+        self.script["fix"] = self.builds(".github/workflows/ci.yml", "on: push\n")
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(
+            (res["result"], self.sessions), ("needs_user", ["fix1", "review2"])
+        )
+        self.assertEqual(
+            res["reasons"][0], "changes a protected file: .github/workflows/ci.yml"
+        )
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])
+        self.assertEqual(list(self.kept("night-kept/pr-5-*").values()), [self.built])
+        self.assertEqual(self.called("pr", "merge"), [])
+
+    def test_a_pr_with_the_live_address_or_new_scripts_is_the_owners_call(self):
+        for files, why in [
+            (
+                {  # the attribute would hide the line from a plain `git diff`
+                    ".gitattributes": "*.rs -diff\n",
+                    "src/trade.rs": 'const URL: &str = "https://api.alpaca.markets/v2";\n',
+                },
+                "adds the live (real money) Alpaca trading address",
+            ),
+            (
+                {"package.json": '{"scripts": {"test": "true"}}\n'},
+                "changes the commands the checks run (the scripts in package.json)",
+            ),
+        ]:
+            self.setUp()
+            job = self.open_pr(files)
+            res = self.team.run_job(job, self.run)
+            self.assertEqual(
+                (res["result"], self.sessions), ("needs_user", ["review1"])
+            )
+            self.assertEqual(res["reasons"][0], why)
+            self.assertEqual(self.on_github("feat/thing"), job["sha"])
+            self.assertEqual(self.called("pr", "merge"), [])
+
+    def test_what_a_check_does_to_the_checkout_is_not_merged(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+
+        def checks(wt, run, name):
+            (wt / "stray.txt").write_text("left by a test\n")
+            commit(wt, "src/generated.txt", "x\n", "made by a check")
+            return True, "", ""
+
+        self.team.run_checks = checks
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "merged")
+        self.assertEqual(self.merged_sha(), job["sha"])
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])
+
+    def test_a_job_that_runs_too_long_stops_and_keeps_its_work(self):
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        self.team.JOB_MIN = 0
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual((res["result"], res["pr"]), ("error", 77))
+        self.assertIn("the limit for one job", res["reasons"][0])
+        self.assertEqual(self.sessions, ["build"])
+        self.assertEqual(self.on_github(self.pr_branch), self.built)
+
+    def test_a_pr_is_looked_at_again_right_before_its_job(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        self.assertIsNone(self.team.pr_now(job, "nicola", {}))
+        # The owner pushed meanwhile: the job goes on from the new commit.
+        g("fetch", "-q", "origin", "feat/thing:feat/thing", cwd=self.repo)
+        g("checkout", "-q", "feat/thing", cwd=self.repo)
+        newer = commit(self.repo, "src/c.txt", "c\n", "owner again")
+        g("push", "-q", "origin", "feat/thing", cwd=self.repo)
+        g("checkout", "-q", "main", cwd=self.repo)
+        g("branch", "-q", "-D", "feat/thing", cwd=self.repo)
+        self.assertIsNone(self.team.pr_now(job, "nicola", {}))
+        self.assertEqual(job["sha"], newer)
+        for change, why in [
+            ({"isDraft": True}, "marked as draft"),
+            ({"labels": [{"name": "needs-you"}]}, "waiting for you (label needs-you)"),
+            ({"state": "MERGED"}, "no longer open (merged)"),
+        ]:
+            self.github = change
+            self.assertEqual(self.team.pr_now(job, "nicola", {}), why)
+        self.team.gh_json = lambda *args: (_ for _ in ()).throw(RuntimeError("down"))
+        self.assertEqual(
+            self.team.pr_now(job, "nicola", {}), "GitHub could not be asked about it"
+        )
+
+    def test_a_checkout_whose_folder_is_gone_does_not_stop_the_night(self):
+        self.open_pr({"src/b.txt": "b\n"})
+        stale = Path(self.tmp.name) / "stale"
+        g("fetch", "-q", "origin", cwd=self.repo)
+        g(
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/thing",
+            str(stale),
+            "origin/feat/thing",
+            cwd=self.repo,
+        )
+        self.assertEqual(self.team.local_work("feat/thing"), "")
+        (stale / "src/b.txt").write_text("edited\n")
+        self.assertIn("uncommitted changes", self.team.local_work("feat/thing"))
+        subprocess.run(["rm", "-rf", str(stale)], check=True)  # deleted, not pruned
+        self.assertEqual(self.team.local_work("feat/thing"), "")
 
     def test_github_being_unreachable_stops_the_job_before_anything_runs(self):
         g("remote", "set-url", "origin", str(self.origin) + "-gone", cwd=self.repo)

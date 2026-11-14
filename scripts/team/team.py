@@ -58,6 +58,7 @@ BUILDER_MIN = _int("PULSE_TEAM_BUILDER_MIN", 75)
 REVIEWER_MIN = _int("PULSE_TEAM_REVIEWER_MIN", 40)
 CHECKS_MIN = _int("PULSE_TEAM_CHECKS_MIN", 60)
 CI_MIN = _int("PULSE_TEAM_CI_MIN", 45)
+JOB_MIN = _int("PULSE_TEAM_JOB_MIN", 180)  # one job starts no new pass after this
 MAX_FIX_ROUNDS = _int("PULSE_TEAM_FIX_ROUNDS", 2)
 MAX_MAIN_MOVES = 2  # times a job starts over because main changed under it
 MODEL = os.environ.get("PULSE_TEAM_MODEL", "")  # empty = the default from settings
@@ -100,6 +101,9 @@ SAFE_ENV = {
     "PULSE_LLM": "local",
     "PULSE_CLOUD_TASKS": "",
     "PULSE_SNAPSHOT": "off",
+    # The fetcher refuses the installed app's database when this is set,
+    # whatever build it is and however it was started.
+    "PULSE_NO_LIVE_DB": "1",
     "TYPESAFE_API_KEY": "",  # an opt-in service: set but empty means off
     # scheduled-fetch.sh / live-signals.sh run the INSTALLED fetcher on the live
     # database; with this they find no fetcher and exit.
@@ -217,21 +221,25 @@ def sh(
     """Run a command. Its output goes to files, not pipes, so something it left
     running in the background (a dev server) cannot hold the call open after the
     command itself has ended. On timeout the whole process group is killed
-    (code 124); with `reap` the group is also cleared when the command ends."""
+    (code 124); with `reap` the group is also cleared when the command ends.
+    A command that cannot be started at all gives code 127, like in a shell."""
     kw = {"encoding": "utf-8", "errors": "replace"}
     with (
         tempfile.TemporaryFile("w+", **kw) as out,
         tempfile.TemporaryFile("w+", **kw) as err,
     ):
-        p = subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=out,
-            stderr=err,
-            start_new_session=True,
-        )
+        try:
+            p = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                start_new_session=True,
+            )
+        except OSError as e:  # the program or the folder is not there
+            return 127, "", f"could not start {cmd[0]}: {e}"
         note = ""
         try:
             code = p.wait(timeout=timeout)
@@ -365,6 +373,25 @@ def head(wt: Path) -> str:
     return git("rev-parse", "HEAD", cwd=wt)[1]
 
 
+def exists(branch: str) -> bool:
+    return git("rev-parse", "-q", "--verify", f"refs/heads/{branch}")[0] == 0
+
+
+def on_github(branch: str) -> bool:
+    """True when every commit on this local branch is on GitHub as well: in
+    main, or on the pushed branch of the same name. (Goes by what the last
+    fetch or push saw.)"""
+    for upstream in (f"origin/{BASE}", f"origin/{branch}"):
+        code, out = git("rev-list", "--count", f"{upstream}..refs/heads/{branch}")
+        if code == 0 and out == "0":
+            return True
+    return False
+
+
+def stamp() -> str:
+    return dt.datetime.now().strftime("%m%d-%H%M%S")
+
+
 def make_worktree(ref: str, branch: str | None) -> Path:
     """A fresh worktree for the job at hand, always at the same path. One job
     runs at a time, and Rust compiles paths into what it builds (where the
@@ -375,6 +402,10 @@ def make_worktree(ref: str, branch: str | None) -> Path:
     if path.exists():
         git("worktree", "remove", "--force", str(path))
     git("worktree", "prune")
+    if branch and exists(branch) and not on_github(branch):
+        # An earlier attempt that was kept on this Mac under the same name (a
+        # second run on one day). `-B` below would start over on top of it.
+        git("branch", "-M", branch, f"night-kept/{branch}-{stamp()}")
     args = (
         ["worktree", "add", "-B", branch, str(path), ref]
         if branch
@@ -404,7 +435,12 @@ def write_placeholder_env(wt: Path) -> None:
 def run_checks(wt: Path, run: dict, name: str) -> tuple[bool, str, str]:
     """checks.sh from the installed copy. Returns (ok, failed step, end of output)."""
     # The checks run the code under review, so they cannot publish either.
-    env = dict(os.environ, CARGO_TARGET_DIR=str(HOME / "target"), **NO_PUBLISH)
+    env = dict(
+        os.environ,
+        CARGO_TARGET_DIR=str(HOME / "target"),
+        PULSE_NO_LIVE_DB="1",
+        **NO_PUBLISH,
+    )
     code, out, err = sh(
         ["bash", str(HERE / "checks.sh")],
         cwd=wt,
@@ -539,7 +575,8 @@ def park(res: dict) -> None:
     )
     if gh("pr", "edit", str(res["pr"]), "--add-label", LABEL)[0] == 0:
         res["parked"] = True
-    lines = "\n".join(f"- {r[:600]}" for r in res["reasons"][:12])
+    reasons = rules.public_reasons(res["reasons"], str(Path.home()))
+    lines = "\n".join(f"- {r[:600]}" for r in reasons[:12])
     gh(
         "pr",
         "comment",
@@ -597,7 +634,11 @@ def gate_violations(wt: Path, base: str, tip: str = "HEAD") -> list[str]:
     changes = rules.parse_name_status(must("diff", "--name-status", "-z", fork, tip))
     return (
         rules.protected_violations(changes)
-        + rules.forbidden_content(must("diff", fork, tip))
+        # --text and the two --no- options: a .gitattributes entry or a diff
+        # driver in the change must not be able to hide a line from this scan.
+        + rules.forbidden_content(
+            must("diff", "--text", "--no-ext-diff", "--no-textconv", fork, tip)
+        )
         + rules.script_violations(package(fork), package(tip))
     )
 
@@ -609,6 +650,19 @@ def merge_main(wt: Path, base: str, branch: str) -> bool:
         return True
     git("merge", "--abort", cwd=wt)
     return False
+
+
+def keep_attempt(job: dict, res: dict, wt: Path, branch: str) -> None:
+    """An unfinished attempt on someone's pull request is never pushed onto
+    their branch. It stays on this Mac under a name of its own, so an earlier
+    night's attempt is never overwritten."""
+    if head(wt) == git("rev-parse", f"origin/{branch}", cwd=wt)[1]:
+        return
+    kept = f"night-kept/pr-{job['pr']}-{stamp()}"
+    if git("branch", kept, "HEAD", cwd=wt)[0] == 0:
+        res["reasons"].append(
+            f"the team's unfinished attempt is kept on this Mac as branch {kept}"
+        )
 
 
 def keep_work(
@@ -624,20 +678,15 @@ def keep_work(
 ) -> None:
     """A job that stops keeps the commits its sessions made, so the work and the
     reason are in one place. The team's own branch gets a pull request, unless
-    it holds something that may not leave this Mac. An unfinished attempt on
-    someone's pull request is never pushed onto their branch: it stays here."""
+    it holds something that may not leave this Mac (then the branch stays here;
+    run_job's cleanup never deletes one that is not on GitHub). For someone's
+    pull request see keep_attempt."""
     try:
         ahead = git("rev-list", "--count", f"{base}..HEAD", cwd=wt)[1]
         if not built or ahead in ("", "0"):
             return
         if job["kind"] == "pr":
-            if head(wt) == git("rev-parse", f"origin/{branch}", cwd=wt)[1]:
-                return
-            kept = f"night-kept/pr-{job['pr']}"
-            if git("branch", "-f", kept, "HEAD", cwd=wt)[0] == 0:
-                res["reasons"].append(
-                    f"the team's unfinished attempt is kept on this Mac as branch {kept}"
-                )
+            keep_attempt(job, res, wt, branch)
             return
         listed = violations is not None  # the caller has already given the reasons
         if violations is None:
@@ -703,6 +752,8 @@ def land(
     if err:
         res["result"] = "error"
         res["reasons"].append(err)
+        if job["kind"] == "pr" and built:
+            keep_attempt(job, res, wt, branch)
         return ""
     ci = wait_ci(res["pr"], sha)
     if ci != "pass":
@@ -747,6 +798,7 @@ def land(
 
 def do_job(job: dict, res: dict, run: dict) -> None:
     kind, name = job["kind"], job["key"]
+    began = time.time()
     base = fetch_base()
     reset_job_db()
     title, body = job["title"], ""
@@ -786,6 +838,13 @@ def do_job(job: dict, res: dict, run: dict) -> None:
     rounds = moved = passes = 0
     while True:
         passes += 1
+        if time.time() - began > JOB_MIN * 60:
+            res["result"] = "error"
+            res["reasons"].append(
+                f"took more than {JOB_MIN} min, the limit for one job; it will be tried again"
+            )
+            keep_work(job, res, wt, branch, base, title, body, built)
+            return
         # `problems` goes to the next fix session, `short` on the page.
         if git("status", "--porcelain", cwd=wt)[1]:
             problems = "You left uncommitted changes. Commit what belongs to the change and remove the rest."
@@ -797,12 +856,17 @@ def do_job(job: dict, res: dict, run: dict) -> None:
                 continue
             problems, short = MERGE_MAIN, f"it conflicts with the latest {BASE}"
         else:
+            sha = head(wt)
             ok, step, tail = run_checks(wt, run, f"{name}-{passes}")
+            # The checks run the change's own code. Whatever that did to the
+            # checkout is dropped: what is reviewed and merged is the commit
+            # that was checked.
+            git("reset", "--hard", sha, cwd=wt)
+            git("clean", "-fd", cwd=wt)
             if not ok:
                 problems = f'The check "{step}" fails. The end of its output:\n\n```\n{tail}\n```'
                 short = f'the check "{step}" fails'
             else:
-                sha = head(wt)
                 r = session(
                     REVIEW.format(request=request, base=BASE),
                     wt,
@@ -850,6 +914,7 @@ def do_job(job: dict, res: dict, run: dict) -> None:
                         res["reasons"].append(
                             f"{BASE} kept changing while this job ran; it will be tried again"
                         )
+                        keep_work(job, res, wt, branch, base, title, body, built)
                         return
                     base = (
                         new_base  # merge the new main in, then check and review again
@@ -914,14 +979,19 @@ def run_job(job: dict, run: dict) -> dict:
         if wt:  # never leave a finished worktree behind
             git("worktree", "remove", "--force", wt)
         branch = res.pop("branch", None)
-        # The team's own local branch goes too, unless it holds commits that
-        # never reached GitHub.
-        if branch and (
-            res.get("pushed")
-            or git("rev-list", "--count", f"origin/{BASE}..refs/heads/{branch}")[1]
-            in ("", "0")
-        ):
-            git("branch", "-D", branch)
+        if branch and exists(branch):
+            # The team's own local branch goes too, but only when GitHub has
+            # every commit on it. An earlier push says nothing about commits
+            # made after it.
+            git("fetch", "origin", "--prune")  # a push or a merge just changed GitHub
+            if on_github(branch):
+                git("branch", "-D", branch)
+            elif res["result"] != "merged" and not any(
+                branch in r for r in res["reasons"]
+            ):
+                res["reasons"].append(
+                    f"the work is kept on this Mac as branch {branch}"
+                )
     except Exception as e:  # noqa: BLE001
         res["reasons"].append(f"cleanup error: {e}")
     res["minutes"] = round((time.time() - started) / 60)
@@ -974,6 +1044,29 @@ def after_job(job: dict, res: dict, state: dict) -> None:
 # --------------------------------------------------------------------- run --
 
 
+PR_FIELDS = (
+    "number,title,body,author,isCrossRepository,isDraft,baseRefName,headRefName,"
+    "headRefOid,labels,createdAt,state"
+)
+
+
+def pr_now(job: dict, owner: str, state: dict) -> str | None:
+    """A last look at a pull request right before its job: the night's list can
+    be hours old by then. Returns why the team leaves it alone now, or None
+    after bringing the job up to date with what GitHub has."""
+    try:
+        pr = gh_json("pr", "view", str(job["pr"]), "--json", PR_FIELDS)
+    except (RuntimeError, ValueError):
+        return "GitHub could not be asked about it"
+    if pr.get("state") != "OPEN":
+        return f"no longer open ({str(pr.get('state') or 'unknown').lower()})"
+    pr["busy"] = local_work(pr.get("headRefName") or "")
+    why = rules.pr_skip_reason(pr, owner, BASE, LABEL, state)
+    if not why:
+        job.update(rules.pr_job(pr, LABEL))
+    return why
+
+
 def local_work(branch: str) -> str:
     """Why a PR's branch looks unfinished on this Mac ('' when it does not):
     commits never pushed, or edits not yet committed in a checkout of it."""
@@ -986,7 +1079,8 @@ def local_work(branch: str) -> str:
     for line in git("worktree", "list", "--porcelain")[1].splitlines():
         if line.startswith("worktree "):
             path = line[len("worktree ") :]
-        elif line == f"branch refs/heads/{branch}" and path:
+        elif line == f"branch refs/heads/{branch}" and Path(path).is_dir():
+            # (a worktree whose folder was deleted is still listed until pruned)
             dirty = git("status", "--porcelain", "--untracked-files=no", cwd=Path(path))
             if dirty[0] == 0 and dirty[1]:
                 return "it has uncommitted changes in a checkout on this Mac"
@@ -1033,16 +1127,7 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
         return
     repo_info = gh_json("repo", "view", "--json", "owner,nameWithOwner")
     owner, report["repo"] = repo_info["owner"]["login"], repo_info["nameWithOwner"]
-    prs = gh_json(
-        "pr",
-        "list",
-        "--state",
-        "open",
-        "--limit",
-        "50",
-        "--json",
-        "number,title,body,author,isCrossRepository,isDraft,baseRefName,headRefName,headRefOid,labels,createdAt",
-    )
+    prs = gh_json("pr", "list", "--state", "open", "--limit", "50", "--json", PR_FIELDS)
     for pr in prs:
         pr["busy"] = local_work(pr.get("headRefName") or "")
     ideas = rules.parse_ideas(IDEAS.read_text()) if IDEAS.exists() else []
@@ -1065,7 +1150,7 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
     }
 
     if re.fullmatch(r"pr-\d+", args.only or ""):
-        rules.clear_attempt(state, args.only)  # asked for by name: forget its last stop
+        rules.retry_now(state, args.only)  # asked for by name: forget its last stop
     jobs, report["skipped"] = rules.select_jobs(
         main_ok, prs, ideas, state, owner, BASE, LABEL, main_sha
     )
@@ -1090,6 +1175,14 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
             )
             break
         log(f"job {i + 1}/{len(jobs)}: {job['key']} — {job['title'][:80]}")
+        if job["kind"] == "pr":
+            why = pr_now(job, owner, state)
+            if why:
+                log(f"   -> skipped: {why}")
+                report["skipped"].append(
+                    {"kind": "pr", "pr": job["pr"], "title": job["title"], "why": why}
+                )
+                continue
         res = run_job(job, run)
         report["jobs"].append(res)
         try:

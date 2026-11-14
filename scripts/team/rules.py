@@ -216,6 +216,42 @@ def clear_attempt(state: dict, key: str) -> None:
     (state.get("attempts") or {}).pop(key, None)
 
 
+def retry_now(state: dict, key: str) -> None:
+    """A job asked for by name: forget its last stop. If the team itself put the
+    `needs-you` label on the PR, keep only that fact, so the team's own label
+    does not hold it back (one Nicola added by hand still does)."""
+    attempts = state.get("attempts") or {}
+    last = attempts.pop(key, None) or {}
+    if last.get("parked"):
+        attempts[key] = {"sha": "", "result": "", "tries": 0, "parked": True}
+
+
+# Reasons that carry raw error output. A PR comment names them and leaves the
+# output to the night's page.
+PRIVATE_REASONS = (
+    "runner error",
+    "cleanup error",
+    "the builder session failed",
+    "the review session failed",
+    "could not keep the work",
+    "push failed",
+    "could not open the PR",
+)
+
+
+def public_reasons(reasons: list[str], home: str = "") -> list[str]:
+    """The reasons as they go into a pull request comment, which anyone can
+    read: no raw error output, no folders or branches of this Mac."""
+    out = []
+    for reason in reasons:
+        kind = reason.split(":", 1)[0]
+        if kind in PRIVATE_REASONS:
+            reason = f"{kind} (the details are on the night team's page)"
+        reason = re.sub(r"(kept on this Mac) as branch \S+", r"\1", reason)
+        out.append(reason.replace(home, "~") if home else reason)
+    return out
+
+
 def parse_ideas(text: str) -> list[dict]:
     """IDEAS.md -> [{text, state}] in file order. `- idea` and `- [ ] idea` are
     open, `- [x]` built (merged, or now a pull request), `- [?]` waiting for an answer."""
@@ -276,7 +312,7 @@ def ci_state(rollup: list[dict] | None) -> str:
     return "pending" if pending else "pass"
 
 
-def _pr_job(pr: dict, label: str) -> dict:
+def pr_job(pr: dict, label: str) -> dict:
     return {
         "kind": "pr",
         "key": f"pr-{pr['number']}",
@@ -334,7 +370,7 @@ def select_jobs(
                 pr.get("author") or {}
             ).get("login") == owner:
                 why = pr_why(pr)
-                return ([], [skip_pr(pr, why)]) if why else ([_pr_job(pr, label)], [])
+                return ([], [skip_pr(pr, why)]) if why else ([pr_job(pr, label)], [])
         why = stuck(state, "main", main_sha) or error_cap(state, "main", main_sha)
         if why:
             return [], [{"kind": "main", "title": title, "why": why}]
@@ -345,7 +381,7 @@ def select_jobs(
         if why:
             skipped.append(skip_pr(pr, why))
         else:
-            jobs.append(_pr_job(pr, label))
+            jobs.append(pr_job(pr, label))
     for idea in ideas:
         if idea["state"] != "open":
             continue

@@ -68,9 +68,20 @@ fn acquire_single_instance_lock(db_path: &std::path::Path) -> Option<SingleInsta
 /// the copy it was pointed at instead of the live database. A release build ignores
 /// the variable, so the scheduled fetcher cannot pick it up from a stray environment.
 fn resolve_db_path(flag: Option<PathBuf>, env: Option<std::ffi::OsString>, debug_build: bool) -> PathBuf {
-    flag.or_else(|| env.filter(|v| debug_build && !v.is_empty()).map(PathBuf::from)).unwrap_or_else(|| {
-        dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("com.pulse.app").join("pulse.db")
-    })
+    flag.or_else(|| env.filter(|v| debug_build && !v.is_empty()).map(PathBuf::from)).unwrap_or_else(live_db_path)
+}
+
+/// The installed app's database.
+fn live_db_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("com.pulse.app").join("pulse.db")
+}
+
+/// `PULSE_NO_LIVE_DB` (set to anything) puts the installed app's database off limits
+/// for this run, in every build and however the fetcher was started. The night team
+/// sets it for its unattended sessions and checks, so a test run that forgets
+/// `--db-path` stops here instead of working on the real data.
+fn live_db_forbidden(db_path: &std::path::Path, no_live_db: Option<std::ffi::OsString>) -> bool {
+    no_live_db.is_some_and(|v| !v.is_empty()) && db_path == live_db_path()
 }
 
 #[derive(Parser, Debug)]
@@ -174,6 +185,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let db_path = resolve_db_path(args.db_path, std::env::var_os("PULSE_DB_PATH"), cfg!(debug_assertions));
+    if live_db_forbidden(&db_path, std::env::var_os("PULSE_NO_LIVE_DB")) {
+        anyhow::bail!(
+            "PULSE_NO_LIVE_DB is set, so this run may not use the live database at {}. Pass --db-path with a copy.",
+            db_path.display()
+        );
+    }
 
     tracing::info!("Pulse fetcher starting in {} mode", args.mode);
     tracing::info!("Database: {}", db_path.display());
@@ -1294,6 +1311,19 @@ mod db_path_tests {
 
     fn live() -> PathBuf {
         dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("com.pulse.app").join("pulse.db")
+    }
+
+    #[test]
+    fn the_live_database_can_be_put_off_limits() {
+        assert!(live_db_forbidden(&live(), Some("1".into())));
+        // Not set, or set to nothing: the scheduled fetcher works as always.
+        assert!(!live_db_forbidden(&live(), None));
+        assert!(!live_db_forbidden(&live(), Some("".into())));
+        // A copy is always fine.
+        assert!(!live_db_forbidden(std::path::Path::new("/tmp/copy.db"), Some("1".into())));
+        // Whatever picked the live path (no flag, a release build), it is refused.
+        let picked = resolve_db_path(None, Some("/tmp/env.db".into()), false);
+        assert!(live_db_forbidden(&picked, Some("1".into())));
     }
 
     #[test]
