@@ -39,6 +39,7 @@ LIVE_DB = Path.home() / "Library/Application Support/com.pulse.app/pulse.db"
 DB_COPY = HOME / "db/pulse-copy.db"  # tonight's copy of the live database
 DB_JOB = HOME / "db/job.db"  # what sessions use; a fresh clone of the copy per job
 IDEAS = HOME / "IDEAS.md"
+PAGE_URL = HOME / "page-url.txt"  # the artifact the nightly page is published to
 BASE = "main"
 LABEL = "needs-you"
 PLIST_LABEL = "com.pulse.team"
@@ -580,16 +581,20 @@ def do_job(job: dict, res: dict, run: dict) -> None:
 
     rounds = 0
     while True:
+        # `problems` goes to the next fix session, `short` on the page.
         if git("status", "--porcelain", cwd=wt)[1]:
             problems = "You left uncommitted changes. Commit what belongs to the change and remove the rest."
+            short = "the builder left uncommitted changes"
         elif (
             git("merge-base", "--is-ancestor", f"origin/{BASE}", "HEAD", cwd=wt)[0] != 0
         ):
             problems = MERGE_MAIN  # checked here, not taken on a session's word
+            short = f"the latest {BASE} is still not merged in"
         else:
             ok, step, tail = run_checks(wt, run, f"{name}-r{rounds}")
             if not ok:
                 problems = f'The check "{step}" fails. The end of its output:\n\n```\n{tail}\n```'
+                short = f'the check "{step}" still fails'
             else:
                 sha = head(wt)
                 r = session(
@@ -627,12 +632,12 @@ def do_job(job: dict, res: dict, run: dict) -> None:
                 problems = "An independent reviewer found:\n\n" + "\n".join(
                     f"- {x}" for x in res["findings"]
                 )
+                short = f"the reviewer still objects: {res['findings'][0]}"
         if rounds >= MAX_FIX_ROUNDS:
             res["result"] = "blocked"
-            res["reasons"].append(
-                f"still not right after {rounds} fix rounds: {problems.splitlines()[0]}"
-            )
-            res["reasons"] += res.get("findings", [])
+            res["reasons"].append(f"still not right after {rounds} fix rounds: {short}")
+            if short.startswith("the reviewer"):
+                res["reasons"] += res["findings"][1:]
             keep_work()
             return
         rounds += 1
@@ -924,10 +929,11 @@ def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
     html.parent.mkdir(parents=True, exist_ok=True)
     html.write_text(page.render(history))
     log(page.as_text(report))
-    if state.get("page_url"):
+    url = PAGE_URL.read_text().strip() if PAGE_URL.exists() else ""
+    if url:
         log(
             "page published"
-            if publish_page(html, state["page_url"])
+            if publish_page(html, url)
             else "page publish FAILED (local copy is current)"
         )
     return 0
@@ -1064,9 +1070,7 @@ def cmd_idea(args) -> int:
 def cmd_page(args) -> int:
     """Remember the artifact the nightly page is published to."""
     HOME.mkdir(parents=True, exist_ok=True)
-    state = load_json(HOME / "state.json", {})
-    state["page_url"] = args.url
-    save_json(HOME / "state.json", state)
+    PAGE_URL.write_text(args.url.strip() + "\n")
     print(f"The nightly page will be published to {args.url}")
     return 0
 
