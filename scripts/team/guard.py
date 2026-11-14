@@ -138,7 +138,15 @@ NEVER = [
     ),
 ]
 TMP_ROOTS = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/")
-SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".tauri", ".config/gh", "Library/Keychains")
+SECRET_DIRS = (
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".tauri",
+    ".config/gh",
+    "Library/Keychains",
+    ".pulse-team/secrets",  # the Telegram token
+)
 # Tools that schedule or start work outside this session.
 BLOCKED_TOOLS = {"CronCreate", "CronDelete", "RemoteTrigger"}
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}

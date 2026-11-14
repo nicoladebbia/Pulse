@@ -31,12 +31,14 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import chat  # noqa: E402
 import page  # noqa: E402
 
 import rules  # noqa: E402
 
 HOME = Path(os.environ.get("PULSE_TEAM_HOME") or Path.home() / ".pulse-team")
 REPO = Path(os.environ.get("PULSE_TEAM_REPO") or Path.home() / "dev/Pulse")
+chat.set_home(HOME)  # one folder for the runner and its Telegram line
 LIVE_DB = Path.home() / "Library/Application Support/com.pulse.app/pulse.db"
 # Where the fetcher writes the phone's snapshot (iCloud Drive).
 PHONE_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Pulse"
@@ -54,6 +56,8 @@ BASE = "main"
 LABEL = "needs-you"
 PLIST_LABEL = "com.pulse.team"
 PLIST = Path.home() / "Library/LaunchAgents" / f"{PLIST_LABEL}.plist"
+CHAT_LABEL = f"{PLIST_LABEL}.chat"  # the Telegram listener, always on
+CHAT_PLIST = PLIST.with_name(f"{CHAT_LABEL}.plist")
 
 
 def _int(name: str, default: int) -> int:
@@ -392,6 +396,8 @@ def fence_profile(worktree: Path) -> str:
         "(allow default)",
         *rule("deny file-read-data file-write*", "subpath", LIVE_DB.parent, PHONE_DIR),
         *rule("deny file-write*", "subpath", HOME),
+        # The Telegram token: whoever holds it can text Nicola as the team.
+        *rule("deny file-read-data", "subpath", chat.SECRETS.parent),
         # The build folder; the copy, what SQLite keeps beside it and the
         # fetcher's lock file.
         *rule("allow file-write*", "subpath", HOME / "target", DB_JOB.parent),
@@ -903,8 +909,10 @@ def land(
     now = fetch_base()  # CI can take a while: is this still the main that was tested?
     if now != base:
         return now
-    if run["no_merge"]:
+    if run["no_merge"] or paused():
         res["result"] = "ready"
+        if not run["no_merge"]:
+            res["reasons"].append("paused from Telegram, so it was not merged")
         return ""
     code, out = gh("pr", "merge", str(res["pr"]), "--merge", "--match-head-commit", sha)
     if code != 0:
@@ -933,9 +941,11 @@ def do_job(job: dict, res: dict, run: dict) -> None:
     reset_job_db()
     title, body = job["title"], ""
     hands_off = built = False
+    note = (run.get("notes") or {}).get(name, "")
+    said = f"\n\nNicola's note on this job: {note}" if note else ""
     if kind == "pr":
         branch = job["head"]
-        request = f'PR #{job["pr"]} "{job["title"]}"\n\n{job["body"][:3000]}'
+        request = f'PR #{job["pr"]} "{job["title"]}"\n\n{job["body"][:3000]}{said}'
         if job.get("labelled"):  # a new commit lifted the stop
             gh("pr", "edit", str(job["pr"]), "--remove-label", LABEL)
         wt = make_worktree(f"origin/{branch}", None)
@@ -952,8 +962,8 @@ def do_job(job: dict, res: dict, run: dict) -> None:
             prompt = FIX_MAIN.format(step=run["main_step"], tail=run["main_tail"])
         else:
             branch = f"feat/night-{name.removeprefix('idea-')}-{stamp}"
-            request = job["title"]
-            prompt = BUILD_IDEA.format(title=job["title"])
+            request = job["title"] + said
+            prompt = BUILD_IDEA.format(title=job["title"]) + said
         wt = make_worktree(base, branch)
         res["wt"], res["branch"] = str(wt), branch
         b = session(prompt, wt, BUILDER_SCHEMA, BUILDER_MIN, f"{name}-build", run)
@@ -1091,6 +1101,7 @@ def run_job(job: dict, run: dict) -> dict:
     started = time.time()
     res = {
         "kind": job["kind"],
+        "key": job["key"],
         "title": job["title"],
         "pr": job.get("pr"),
         "result": "error",
@@ -1143,6 +1154,8 @@ def after_job(job: dict, res: dict, state: dict) -> None:
     """Remember the outcome so tomorrow does not repeat it, and tick the idea list."""
     result = res["result"]
     stopped = result in ("needs_user", "blocked", "error")
+    if result == "merged":
+        (state.get("notes") or {}).pop(job["key"], None)
     if res.get("pr"):  # from here on the pull request is the unit of work
         key = f"pr-{res['pr']}"
         if stopped:
@@ -1242,6 +1255,8 @@ def cmd_run(args) -> int:
 
 def locked_run(args, started: dt.datetime, scheduled: bool) -> int:
     state = load_state()
+    if scheduled and paused():
+        return 0  # the night is not spent: a resume before morning still starts it
     if scheduled:
         night = rules.night_due(
             started, RUN_AT, CATCH_UP_MIN, state.get("last_night", "")
@@ -1256,6 +1271,7 @@ def locked_run(args, started: dt.datetime, scheduled: bool) -> int:
         "cost": 0.0,
         "abort": "",
         "no_merge": args.no_merge,
+        "scheduled": scheduled,
         "main_step": "",
         "main_tail": "",
     }
@@ -1291,6 +1307,8 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
         report["notes"].append("could not reach GitHub; nothing was done")
         run["nothing_done"] = True
         return
+    from_chat(state, report)
+    run["notes"] = state.get("notes") or {}
     repo_info = gh_json("repo", "view", "--json", "owner,nameWithOwner")
     owner, report["repo"] = repo_info["owner"]["login"], repo_info["nameWithOwner"]
     prs = gh_json("pr", "list", "--state", "open", "--limit", "50", "--json", PR_FIELDS)
@@ -1335,6 +1353,11 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
         if run["abort"]:
             report["notes"].append(f"stopped early: {run['abort']}")
             break
+        if paused():
+            report["notes"].append(
+                f"paused from Telegram after {i} of {len(jobs)} jobs; the rest wait"
+            )
+            break
         if (time.time() - started.timestamp()) / 60 > BUDGET_MIN:
             report["notes"].append(
                 f"ran out of time after {i} of {len(jobs)} jobs; the rest wait for tomorrow"
@@ -1358,6 +1381,83 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
         save_json(HOME / "state.json", state)
 
 
+def paused() -> bool:
+    """Nicola sent `pause`: nothing new starts and nothing merges until `resume`."""
+    return chat.PAUSED.exists()
+
+
+def from_chat(state: dict, report: dict) -> None:
+    """Bring in what Nicola sent through Telegram: ideas he texted, proposals
+    he said yes to, questions he answered with "try again". The runner is the
+    only writer of the idea list and of state.json, so the listener only leaves
+    these for it."""
+    ideas = []
+    inbox = sorted(chat.INBOX.glob("*.json")) if chat.INBOX.is_dir() else []
+    for path in inbox:
+        item = load_json(path, {})
+        if isinstance(item, dict) and item.get("kind") == "idea" and item.get("text"):
+            ideas.append(str(item["text"]))
+    notes = state.setdefault("notes", {})
+    reopen = []
+    with chat.proposals() as items:
+        for p in items:
+            if p.get("state") != "approved" or p.get("kind") not in (
+                "idea",
+                "question",
+            ):
+                continue  # a trading yes is taken up by the job that asked
+            job = p.get("job") or ""
+            if p["kind"] == "idea":
+                ideas.append(p.get("title", ""))
+                job = rules.idea_key(" ".join(p.get("title", "").split()))
+            elif job.startswith("pr-"):
+                rules.retry_now(state, job)
+            elif job.startswith("idea-"):
+                reopen.append(p.get("title", ""))
+            if p.get("note") and job:
+                notes[job] = p["note"]
+            p["state"] = "consumed"
+    text = IDEAS.read_text() if IDEAS.exists() else "# Pulse ideas\n\n"
+    for title in reopen:
+        text = rules.reopen_idea(text, title)
+    text, added = rules.add_ideas(text, ideas)
+    if added or reopen:
+        IDEAS.write_text(text)
+    for path in inbox:  # only once the list holds them
+        path.unlink(missing_ok=True)
+    if added:
+        report["notes"].append(
+            f"{added} idea{'s' if added != 1 else ''} from Telegram joined the list"
+        )
+    save_json(HOME / "state.json", state)
+
+
+def tell(report: dict, run: dict) -> None:
+    """The night's text for Telegram, and a question for each job that stopped
+    for Nicola. Only for the scheduled night; a chat that is down never fails it."""
+    if not run.get("scheduled") or not chat.paired():
+        return
+    try:
+        for j in report.get("jobs", []):
+            if j.get("result") in ("needs_user", "blocked") and j.get("key"):
+                where = f"PR #{j['pr']}: " if j.get("pr") else ""
+                why = rules.public_reasons(
+                    j.get("reasons") or ["stopped"], str(Path.home())
+                )
+                chat.propose(
+                    "question",
+                    f"{where}{j.get('title', '')}",
+                    "\n".join(why)[:800],
+                    key=f"{j['key']}@{j.get('pushed') or ''}",
+                    job=j["key"],
+                )
+        url = PAGE_URL.read_text().strip() if PAGE_URL.exists() else ""
+        save_json(chat.DIGEST, {"date": dt.date.today().isoformat()})
+        chat.send(page.chat_digest(report, url))
+    except Exception as e:  # noqa: BLE001
+        log(f"could not text the night's report: {type(e).__name__}")
+
+
 def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
     git("fetch", "origin", "--prune", "--tags")
     tag = git("describe", "--tags", "--abbrev=0", f"origin/{BASE}")[1]
@@ -1375,6 +1475,11 @@ def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
     history = ([report] + load_json(HOME / "history.json", []))[:30]
     save_json(HOME / "history.json", history)
     save_json(HOME / "state.json", state)
+    report["asked"] = [
+        {"kind": p.get("kind"), "title": p.get("title"), "state": p.get("state")}
+        for p in load_json(chat.PROPOSALS, [])
+        if isinstance(p, dict) and p.get("state") in (*rules.OPEN_STATES, "queued")
+    ]
     (HOME / "latest.txt").write_text(page.as_text(report))
     html = HOME / "page/index.html"
     html.parent.mkdir(parents=True, exist_ok=True)
@@ -1387,6 +1492,7 @@ def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
             if publish_page(html, url)
             else "page publish FAILED (local copy is current)"
         )
+    tell(report, run)
     return 0
 
 
@@ -1462,7 +1568,15 @@ def launchd_job(python: str, bin_dir: Path, dirs: list[str]) -> dict:
 def cmd_install(_args) -> int:
     bin_dir = HOME / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    for f in ("team.py", "rules.py", "page.py", "guard.py", "checks.sh", "TEAM.md"):
+    for f in (
+        "team.py",
+        "rules.py",
+        "page.py",
+        "guard.py",
+        "chat.py",
+        "checks.sh",
+        "TEAM.md",
+    ):
         if (HERE / f).resolve() != (bin_dir / f).resolve():
             shutil.copy2(HERE / f, bin_dir / f)
     if not IDEAS.exists():
@@ -1501,6 +1615,7 @@ def cmd_install(_args) -> int:
     if code != 0:
         print(f"launchctl failed: {(out + err).strip()}")
         return 1
+    start_listener()
     print(
         f"Installed. Wakes every hour at :{RUN_AT[1]:02d} and starts the night shift at "
         f"{RUN_AT[0]:02d}:{RUN_AT[1]:02d}, from {bin_dir}. Ideas: {IDEAS}"
@@ -1508,9 +1623,89 @@ def cmd_install(_args) -> int:
     return 0
 
 
+def chat_job(python: str, bin_dir: Path) -> dict:
+    """The launchd agent that keeps the Telegram listener running."""
+    return {
+        "Label": CHAT_LABEL,
+        "ProgramArguments": [python, str(bin_dir / "team.py"), "chat", "run"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 60,
+        "StandardOutPath": str(HOME / "chat.log"),
+        "StandardErrorPath": str(HOME / "chat.log"),
+        "EnvironmentVariables": {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": str(Path.home()),
+            "PULSE_TEAM_HOME": str(HOME),
+        },
+    }
+
+
+def stop_listener() -> None:
+    sh(["launchctl", "bootout", f"gui/{os.getuid()}/{CHAT_LABEL}"])
+    CHAT_PLIST.unlink(missing_ok=True)
+
+
+def start_listener() -> bool:
+    """(Re)start the Telegram listener from the installed copy, if a bot is
+    paired. It is not started from a checkout: what listens is what was merged."""
+    stop_listener()
+    if not chat.paired() or not (HOME / "bin/team.py").exists():
+        return False
+    CHAT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    CHAT_PLIST.write_bytes(
+        plistlib.dumps(
+            chat_job(shutil.which("python3") or sys.executable, HOME / "bin")
+        )
+    )
+    code, out, err = sh(
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(CHAT_PLIST)]
+    )
+    if code != 0:
+        print(f"launchctl failed for the Telegram listener: {(out + err).strip()}")
+    return code == 0
+
+
+def cmd_chat(args) -> int:
+    if args.action == "run":
+        return chat.run()
+    if args.action == "pair":
+        stop_listener()  # two listeners on one bot shut each other out
+        code = chat.pair()
+        if code == 0 and not start_listener():
+            print("Paired. The listener starts with the next `team.py install`.")
+        return code
+    if args.action == "unpair":
+        stop_listener()
+        chat.SECRETS.unlink(missing_ok=True)
+        print(
+            "The bot is forgotten on this Mac. Delete it in BotFather to close it for good."
+        )
+        return 0
+    if args.action == "say":
+        print(chat.send(" ".join(args.text), serious=True))
+        return 0
+    if args.action == "propose":
+        title = " ".join(args.text).strip()
+        made = chat.propose("idea", title, args.why, key=rules.idea_key(title))
+        print("queued for Telegram" if made else "already asked")
+        return 0
+    state = load_json(chat.CHAT_STATE, {})
+    asked = [p for p in load_json(chat.PROPOSALS, []) if isinstance(p, dict)]
+    print(f"paired: {'yes' if chat.paired() else 'no'}")
+    print(f"listener last alive: {(state or {}).get('heartbeat', 'never')}")
+    print(f"paused: {'yes' if paused() else 'no'}")
+    for name in ("queued", *rules.OPEN_STATES, "approved"):
+        print(f"{name}: {sum(1 for p in asked if p.get('state') == name)}")
+    waiting = len(list(chat.OUTBOX.glob("*.json"))) if chat.OUTBOX.is_dir() else 0
+    print(f"texts waiting to go out: {waiting}")
+    return 0
+
+
 def cmd_uninstall(_args) -> int:
     sh(["launchctl", "bootout", f"gui/{os.getuid()}/{PLIST_LABEL}"])
     PLIST.unlink(missing_ok=True)
+    stop_listener()
     print(f"Removed the nightly job. {HOME} (ideas, reports) is left in place.")
     return 0
 
@@ -1562,6 +1757,13 @@ def main() -> int:
     i = sub.add_parser("idea")
     i.add_argument("text", nargs="+")
     i.set_defaults(fn=cmd_idea)
+    c = sub.add_parser("chat", help="the Telegram line to Nicola")
+    c.add_argument(
+        "action", choices=("pair", "run", "status", "unpair", "say", "propose")
+    )
+    c.add_argument("text", nargs="*")
+    c.add_argument("--why", default="", help="for propose: the reason, in a sentence")
+    c.set_defaults(fn=cmd_chat)
     g = sub.add_parser("page")
     g.add_argument("url")
     g.set_defaults(fn=cmd_page)

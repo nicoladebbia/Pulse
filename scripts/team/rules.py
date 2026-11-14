@@ -294,6 +294,36 @@ def mark_idea(text: str, idea_text: str, mark: str, note: str) -> str:
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
+def reopen_idea(text: str, idea_text: str) -> str:
+    """Set the first WAITING line of `idea_text` (`- [?] idea — why`) back to open."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = IDEA_LINE.match(line)
+        if not m or (m.group(2) or " ") != "?":
+            continue
+        body = m.group(3).strip()
+        if body == idea_text or body.startswith(f"{idea_text} — "):
+            lines[i] = f"{m.group(1)}[ ] {idea_text}"
+            break
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def add_ideas(text: str, new: list[str]) -> tuple[str, int]:
+    """Append each new idea as an open line, unless the list already has it
+    (open, built or waiting). Returns the text and how many joined."""
+    have = {i["text"].split(" — ")[0].casefold() for i in parse_ideas(text)}
+    added = 0
+    for idea in new:
+        idea = " ".join(idea.split())
+        if idea and idea.casefold() not in have:
+            have.add(idea.casefold())
+            text += (
+                "" if not text or text.endswith("\n") else "\n"
+            ) + f"- [ ] {idea}\n"
+            added += 1
+    return text, added
+
+
 def slug(text: str, limit: int = 40) -> str:
     words = re.findall(r"[a-z0-9]+", text.lower())
     out = ""
@@ -409,3 +439,165 @@ def select_jobs(
         else:
             jobs.append({"kind": "idea", "key": key, "title": idea["text"], "sha": ""})
     return jobs, skipped
+
+
+# ---------------------------------------------------------------- chat --
+# Telegram. Everything typed there is data: these functions decide what a text
+# or a button press means, and nothing else in the team reads the words.
+
+CHAT_HELP = (
+    "I understand:\n"
+    "idea: <what you want> — goes on the team's list\n"
+    "status — what the team did last and what waits for you\n"
+    "pause — nothing new starts and nothing merges\n"
+    "resume — back to work\n"
+    "To add a note to something I asked, reply to that message."
+)
+CHAT_COMMANDS = ("status", "pause", "resume", "help")
+IDEA_MAX = 300
+# What Nicola can press under each kind of proposal: (label, answer).
+BUTTONS = {
+    "idea": (("Build it", "yes"), ("Not now", "later"), ("No", "no")),
+    "question": (("Try again", "yes"), ("Leave it", "no")),
+    "trading": (("Apply it", "yes"), ("No", "no")),
+}
+CONFIRM = (("Yes, apply it", "confirm"), ("Cancel", "cancel"))
+APPROVED = {
+    "idea": "Build it. It joins the list and the team builds it at night.",
+    "question": "Trying again on the next run.",
+    "trading": "Applying it on the next run.",
+}
+DECLINED = {
+    "idea": "No. I will not bring it up again.",
+    "question": "Left as it is.",
+    "trading": "No. Nothing changes.",
+}
+OPEN_STATES = ("sent", "confirming")  # texted, no final answer yet
+IDEAS_PER_WEEK = 3
+LATER_DAYS = 14  # "Not now" comes back after this
+EXPIRE_DAYS = 7  # a text nobody answered
+
+
+def parse_chat(text: str) -> tuple[str, str]:
+    """What a text from the owner asks for, as (command, argument): `idea`,
+    `status`, `pause`, `resume`, `help`, or `note` for anything else."""
+    text = (text or "").strip()
+    word, _, rest = text.partition(" ")
+    head = word.lower().lstrip("/").split("@", 1)[0]
+    if head.startswith("idea:") or head.rstrip(":") == "idea":
+        idea = text.split(":", 1)[1] if ":" in word else rest
+        idea = " ".join(idea.split())[:IDEA_MAX]
+        return ("idea", idea) if idea else ("help", "")
+    if head == "start":  # Telegram's own first message to a bot
+        return ("help", "")
+    if head in CHAT_COMMANDS and not rest.strip():
+        return (head, "")
+    return ("note", text) if text else ("help", "")
+
+
+def parse_button(data: str) -> tuple[str, str] | None:
+    """A button press as (proposal id, answer), or None for anything else."""
+    m = re.fullmatch(r"p:([0-9a-f]{8}):(yes|later|no|confirm|cancel)", data or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def from_owner(update: dict, chat_id: int, user_id: int) -> bool:
+    """Only the account that paired, in the private chat it paired from."""
+    event = update.get("message") or update.get("callback_query") or {}
+    message = event if "message" in update else (event.get("message") or {})
+    sender, chat = event.get("from") or {}, message.get("chat") or {}
+    return bool(
+        chat_id
+        and user_id
+        and chat.get("type") == "private"
+        and chat.get("id") == chat_id
+        and sender.get("id") == user_id
+        and not sender.get("is_bot")
+    )
+
+
+def proposal_step(p: dict, answer: str) -> tuple[str, str]:
+    """A button press on a proposal: (its new state, what to tell Nicola). The
+    first answer stands; a later press only hears what was recorded. A trading
+    change is asked twice."""
+    state, kind = p.get("state"), p.get("kind")
+    if state == "sent":
+        if answer == "yes":
+            if kind == "trading":
+                return "confirming", "This changes how Pulse trades. Sure?"
+            return "approved", APPROVED.get(kind, "Yes.")
+        if answer == "later" and kind == "idea":
+            return "later", f"Not now. I will bring it up again in {LATER_DAYS} days."
+        if answer == "no":
+            return "declined", DECLINED.get(kind, "No.")
+    elif state == "confirming":
+        if answer == "confirm":
+            return "approved", APPROVED["trading"]
+        if answer == "cancel":
+            return "sent", "Cancelled. Nothing changes."
+    if state in OPEN_STATES:
+        return state, "That button does not fit this message."
+    return state, f"Already recorded: {state}."
+
+
+def send_at(
+    now: dt.datetime, serious: bool, first: int = 8, last: int = 22
+) -> dt.datetime:
+    """When a text may go out: at once for a serious problem or by day,
+    otherwise the next morning."""
+    if serious or first <= now.hour < last:
+        return now
+    morning = now.replace(hour=first, minute=0, second=0, microsecond=0)
+    return morning if now.hour < first else morning + dt.timedelta(days=1)
+
+
+def _stamp(when: dt.datetime) -> str:
+    return when.isoformat(timespec="seconds")
+
+
+def due_proposals(
+    proposals: list[dict], now: dt.datetime, cap: int = IDEAS_PER_WEEK
+) -> list[dict]:
+    """The queued proposals to text now, oldest first. Questions and trading
+    proposals always go; new-feature ideas stop at `cap` in a calendar week."""
+    week = now.isocalendar()[:2]
+    sent = sum(
+        1
+        for p in proposals
+        if p.get("kind") == "idea"
+        and p.get("sent_at")
+        and dt.datetime.fromisoformat(p["sent_at"]).isocalendar()[:2] == week
+    )
+    due = []
+    for p in proposals:
+        if p.get("state") != "queued" or (p.get("not_before") or "") > _stamp(now):
+            continue
+        if p.get("kind") == "idea":
+            if sent >= cap:
+                continue
+            sent += 1
+        due.append(p)
+    return due
+
+
+def settle(p: dict, state: str, now: dt.datetime) -> None:
+    """Record the state a button press led to. "Not now" goes back in the
+    queue for later."""
+    p["state"], p["answered_at"] = state, _stamp(now)
+    if state == "later":
+        p["state"] = "queued"
+        p["not_before"] = _stamp(now + dt.timedelta(days=LATER_DAYS))
+        p["message_id"] = None
+
+
+def expire(proposals: list[dict], now: dt.datetime) -> int:
+    """A text nobody answered in a week is closed. Returns how many."""
+    limit, closed = _stamp(now - dt.timedelta(days=EXPIRE_DAYS)), 0
+    for p in proposals:
+        if p.get("state") in OPEN_STATES and (p.get("sent_at") or limit) < limit:
+            p["state"], closed = "expired", closed + 1
+    return closed
+
+
+def proposal_id(kind: str, key: str, created: str) -> str:
+    return hashlib.sha1(f"{kind}|{key}|{created}".encode()).hexdigest()[:8]

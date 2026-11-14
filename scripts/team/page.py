@@ -121,6 +121,12 @@ def needs_you(report: dict) -> list[str]:
     for i in report.get("ideas", []):
         if i.get("state") == "waiting":
             out.append(f"Idea: {i['text']}")
+    asked = [a for a in report.get("asked") or [] if a.get("state") != "queued"]
+    if asked:
+        out.append(
+            f"{len(asked)} question{'s' if len(asked) != 1 else ''} wait for your answer in Telegram: "
+            + "; ".join(str(a.get("title", ""))[:80] for a in asked[:5])
+        )
     merges = (report.get("unreleased") or {}).get("merges", 0)
     if merges:
         tag = (report.get("unreleased") or {}).get("tag") or "the last release"
@@ -147,6 +153,48 @@ def as_text(report: dict) -> str:
     if waiting:
         lines.append("Needs you:")
         lines += [f"  - {w}" for w in waiting]
+    return "\n".join(lines)
+
+
+def chat_digest(report: dict, url: str = "") -> str:
+    """The night in a few lines, for Telegram. Each job that stopped for Nicola
+    gets its own message with buttons, so here it is only counted."""
+    jobs = report.get("jobs", [])
+    lines = [f"Pulse team — {_when(report.get('started', ''))}"]
+    for result, word in (("merged", "Merged"), ("ready", "Ready to merge")):
+        done = [j for j in jobs if j.get("result") == result]
+        if done:
+            lines.append(f"{word}: {len(done)}")
+            lines += [
+                f"• {j.get('title', '')}" + (f" (PR #{j['pr']})" if j.get("pr") else "")
+                for j in done[:8]
+            ]
+    stopped = [j for j in jobs if j.get("result") in ("needs_user", "blocked")]
+    if stopped:
+        lines.append(f"Stopped for you: {len(stopped)}. I ask about each one below.")
+    retry = sum(1 for j in jobs if j.get("result") == "error")
+    if retry:
+        lines.append(f"Failed and will be tried again: {retry}")
+    if not jobs:
+        lines.append("Nothing to work on.")
+    lines += [f"Note: {n}" for n in (report.get("notes") or [])[:4]]
+    main = report.get("main") or {}
+    if (
+        main
+        and not main.get("ok")
+        and not any(j.get("result") == "merged" for j in jobs)
+    ):
+        lines.append(
+            f"main is failing its checks ({main.get('failed_step') or 'unknown step'}) and the team could not fix it."
+        )
+    merges = (report.get("unreleased") or {}).get("merges", 0)
+    if merges:
+        lines.append(
+            f"Not in your app yet: {merges} merged change{'s' if merges != 1 else ''}. "
+            'Tell Claude "release Pulse" when you want them.'
+        )
+    if url:
+        lines.append(f"Page: {url}")
     return "\n".join(lines)
 
 
