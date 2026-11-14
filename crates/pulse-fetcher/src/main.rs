@@ -62,6 +62,40 @@ fn acquire_single_instance_lock(db_path: &std::path::Path) -> Option<SingleInsta
     }
 }
 
+/// Which database this run uses. `--db-path` always wins. A debug build (one made
+/// from a checkout, never the installed app's fetcher) then honours `PULSE_DB_PATH`,
+/// the variable the dev app reads, so a test run that leaves the flag out lands on
+/// the copy it was pointed at instead of the live database. A release build ignores
+/// the variable, so the scheduled fetcher cannot pick it up from a stray environment.
+fn resolve_db_path(flag: Option<PathBuf>, env: Option<std::ffi::OsString>, debug_build: bool) -> PathBuf {
+    flag.or_else(|| env.filter(|v| debug_build && !v.is_empty()).map(PathBuf::from)).unwrap_or_else(live_db_path)
+}
+
+/// The installed app's database.
+fn live_db_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("com.pulse.app").join("pulse.db")
+}
+
+/// `PULSE_NO_LIVE_DB` (set to anything) puts the installed app's database off limits
+/// for this run, in every build and however the fetcher was started. The night team
+/// sets it for its unattended sessions and checks, so a test run that forgets
+/// `--db-path` stops here instead of working on the real data.
+fn live_db_forbidden(db_path: &std::path::Path, no_live_db: Option<std::ffi::OsString>) -> bool {
+    no_live_db.is_some_and(|v| !v.is_empty()) && same_file(db_path, &live_db_path())
+}
+
+/// True when both paths name one file on disk. Another spelling of it (upper case on a
+/// case-insensitive disk, a symlink, `..`, a hard link) is still the same file. Paths
+/// that do not exist yet are compared as written. (`pulse_lib::db::connection` has the
+/// same check for the app and its tools.)
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => a == b,
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "pulse-fetcher", about = "Daily news fetch pipeline for Pulse")]
 struct Args {
@@ -162,12 +196,13 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Loaded API keys from {}", env_path.display());
     }
 
-    let db_path = args.db_path.unwrap_or_else(|| {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("com.pulse.app")
-            .join("pulse.db")
-    });
+    let db_path = resolve_db_path(args.db_path, std::env::var_os("PULSE_DB_PATH"), cfg!(debug_assertions));
+    if live_db_forbidden(&db_path, std::env::var_os("PULSE_NO_LIVE_DB")) {
+        anyhow::bail!(
+            "PULSE_NO_LIVE_DB is set, so this run may not use the live database at {}. Pass --db-path with a copy.",
+            db_path.display()
+        );
+    }
 
     tracing::info!("Pulse fetcher starting in {} mode", args.mode);
     tracing::info!("Database: {}", db_path.display());
@@ -1280,6 +1315,73 @@ fn recompute_signals(conn: &rusqlite::Connection, today: &str) -> anyhow::Result
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod db_path_tests {
+    use super::*;
+
+    fn live() -> PathBuf {
+        dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("com.pulse.app").join("pulse.db")
+    }
+
+    #[test]
+    fn the_live_database_can_be_put_off_limits() {
+        assert!(live_db_forbidden(&live(), Some("1".into())));
+        // Not set, or set to nothing: the scheduled fetcher works as always.
+        assert!(!live_db_forbidden(&live(), None));
+        assert!(!live_db_forbidden(&live(), Some("".into())));
+        // A copy is always fine.
+        assert!(!live_db_forbidden(std::path::Path::new("/tmp/copy.db"), Some("1".into())));
+        // Whatever picked the live path (no flag, a release build), it is refused.
+        let picked = resolve_db_path(None, Some("/tmp/env.db".into()), false);
+        assert!(live_db_forbidden(&picked, Some("1".into())));
+    }
+
+    #[test]
+    fn another_spelling_of_a_path_is_still_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pulse.db");
+        std::fs::write(&db, b"x").unwrap();
+        let other = dir.path().join("other.db");
+        std::fs::write(&other, b"x").unwrap();
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        let hard = dir.path().join("hard.db");
+        std::fs::hard_link(&db, &hard).unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        assert!(same_file(&db, &db));
+        assert!(same_file(&db, &link));
+        assert!(same_file(&db, &hard));
+        assert!(same_file(&db, &sub.join("..").join("pulse.db")));
+        assert!(!same_file(&db, &other));
+        // Not there yet: compared as written.
+        let missing = dir.path().join("missing.db");
+        assert!(same_file(&missing, &missing));
+        assert!(!same_file(&missing, &db));
+    }
+
+    #[test]
+    fn the_flag_always_wins() {
+        let flag = Some(PathBuf::from("/tmp/flag.db"));
+        assert_eq!(resolve_db_path(flag.clone(), Some("/tmp/env.db".into()), true), PathBuf::from("/tmp/flag.db"));
+        assert_eq!(resolve_db_path(flag, Some("/tmp/env.db".into()), false), PathBuf::from("/tmp/flag.db"));
+    }
+
+    #[test]
+    fn a_debug_build_uses_the_variable_instead_of_the_live_database() {
+        assert_eq!(resolve_db_path(None, Some("/tmp/env.db".into()), true), PathBuf::from("/tmp/env.db"));
+        // Unset or empty means "not given", not "the current folder".
+        assert_eq!(resolve_db_path(None, None, true), live());
+        assert_eq!(resolve_db_path(None, Some("".into()), true), live());
+    }
+
+    #[test]
+    fn a_release_build_ignores_the_variable() {
+        assert_eq!(resolve_db_path(None, Some("/tmp/env.db".into()), false), live());
+    }
 }
 
 #[cfg(test)]

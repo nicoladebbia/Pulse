@@ -120,3 +120,13 @@ jobs:
       # from source rather than needing a system library.
       - name: Test
         run: cargo test --workspace --locked
+
+  # The night team (scripts/team) merges by these rules, so they are tested on
+  # every PR. Standard library only: no install step.
+  night-team:
+    name: Night team rules (unittest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s scripts/team
