@@ -85,6 +85,7 @@ GLOBAL_FLAGS = {"-g", "--global", "--location=global"}
 CARGO_TAKES_VALUE = {"--color", "--config", "-C", "-Z"}
 ONLY_PRINTS = {"--help", "-h", "--version", "-V"}
 REDIRECT = re.compile(r"^\d*[<>]")
+INSTALLS = "installing onto this Mac, changing its toolchain and the keychain are not for unattended sessions"
 NEVER = [
     (
         re.compile(r"com\.pulse\.app|Mobile\\? Documents", re.I),
@@ -100,7 +101,7 @@ NEVER = [
             + r"(?:brew\s+(?:install|uninstall|reinstall|upgrade|tap)|cargo\s+install"
             r"|rustup\s+(?:default|update|self|toolchain)|security\s+(?:[a-z]+-[a-z-]+|export|import))\b"
         ),
-        "installing onto this Mac, changing its toolchain and the keychain are not for unattended sessions",
+        INSTALLS,
     ),
     (
         re.compile(r"install-app\.sh|install-launchd\.sh"),
@@ -242,7 +243,7 @@ def _bash_block_reason(cmd: str, repo: str) -> str | None:
     if SECRET_FILE.search(cmd):
         return ".env files hold real keys and are off limits"
     if installs_globally(cmd):
-        return NEVER[2][1]
+        return INSTALLS
     for pattern, reason in NEVER:
         if pattern.search(cmd):
             return reason
