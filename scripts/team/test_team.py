@@ -573,6 +573,7 @@ class Guard(unittest.TestCase):
             "cargo run --release -p pulse-fetcher",
             "src-tauri/binaries/pulse-fetcher-aarch64-apple-darwin --mode daily",
             "pulse-fetcher --mode daily --help",
+            "command pulse-fetcher",
         ]:
             self.assertIsNotNone(self.blocked(cmd), cmd)
 
@@ -590,9 +591,38 @@ class Guard(unittest.TestCase):
             "pnpm test -- -g foo",
             "npm run test -- --grep foo",
             "pnpm install --frozen-lockfile",
+            "npm install --global-style",
+            "command -v pulse-fetcher",
+            "cat pulse-backtest-report.html",
             "gh --version",
         ]:
             self.assertIsNone(self.blocked(cmd), cmd)
+
+    def test_another_spelling_of_a_path_is_the_same_path(self):
+        # This Mac's disk does not tell upper case from lower case.
+        home = os.path.expanduser("~")
+        for cmd in [
+            "sqlite3 ~/Library/Application\\ Support/Com.Pulse.App/pulse.db",
+            'pulse-fetcher --db-path "$HOME/Library/Application Support/COM.PULSE.APP/pulse.db"',
+            "cat .ENV",
+            "cat ~/.SSH/id_ed25519",
+            "cat .Claude/settings.json",
+        ]:
+            self.assertIsNotNone(self.blocked(cmd), cmd)
+        for path in [
+            f"{home}/Library/Application Support/Com.Pulse.App/pulse.db",
+            f"{home}/.SSH/id_ed25519",
+            f"{self.WT}/.ENV",
+            f"{home}/dev/pulse/src/app.html",  # the main checkout, lower case
+        ]:
+            self.assertIsNotNone(
+                guard.read_block_reason(path, self.WT, self.REPO), path
+            )
+        self.assertIsNotNone(
+            guard.write_block_reason(
+                f"{self.WT}/.CLAUDE/settings.json", self.WT, self.WT
+            )
+        )
 
     def test_the_shared_stash_installs_and_the_keychain_are_blocked(self):
         for cmd in [
@@ -605,6 +635,11 @@ class Guard(unittest.TestCase):
             "pnpm add --global foo",
             "pnpm -g add foo",
             "yarn global add foo",
+            "npm --no-fund install -g x",
+            "pnpm --filter x add -g y",
+            "npm --prefix p install -g x",
+            "npm install --location=global x",
+            'bash -c "npm i -g x"',
             "gh auth status",
             "rustup default nightly",
             "security find-generic-password -s x",
@@ -1509,6 +1544,26 @@ class Jobs(unittest.TestCase):
         self.assertEqual(res["result"], "error")
         self.assertEqual(list(self.kept("night-kept/pr-5-*").values()), [self.built])
 
+    def test_a_runner_error_after_a_fix_on_a_pr_keeps_the_fix_here(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        self.checks = [(False, "clippy", "boom")]
+
+        def fix(cwd):
+            done = self.builds("src/b.txt", "b fixed\n")(cwd)
+            # GitHub goes away: the next fetch raises inside the job
+            g("remote", "set-url", "origin", str(self.origin) + "-gone", cwd=self.repo)
+            return done
+
+        self.script["fix"] = fix
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "error")
+        self.assertIn("runner error: could not reach GitHub", res["reasons"][0])
+        ((name, sha),) = self.kept("night-kept/pr-5-*").items()
+        self.assertEqual(sha, self.built)
+        self.assertIn(name, res["reasons"][-1])
+        self.assertNotIn("built", res)
+        self.assertFalse((self.repo / ".claude/worktrees/team-job").exists())
+
     def test_an_earlier_attempt_under_the_same_name_is_set_aside_not_reset(self):
         branch = f"feat/night-add-x-abc123-{dt.date.today():%m%d}"
         g("checkout", "-q", "-b", branch, cwd=self.repo)
@@ -1665,6 +1720,20 @@ class Jobs(unittest.TestCase):
         ]:
             self.github = change
             self.assertEqual(self.team.pr_now(job, "nicola", {}), why)
+        # The team's own label after a new commit: the job is told to take it off.
+        self.github = {"labels": [{"name": "needs-you"}]}
+        parked = {
+            "attempts": {"pr-5": {"sha": "old", "result": "blocked", "parked": True}}
+        }
+        self.assertIsNone(self.team.pr_now(job, "nicola", parked))
+        self.assertTrue(job["labelled"])
+        # Commits on this Mac that are not pushed yet: someone is still working on it.
+        self.github = {}
+        g("branch", "-q", "feat/thing", "origin/feat/thing", cwd=self.repo)
+        g("checkout", "-q", "feat/thing", cwd=self.repo)
+        commit(self.repo, "src/d.txt", "d\n", "not pushed")
+        g("checkout", "-q", "main", cwd=self.repo)
+        self.assertIn("not pushed yet", self.team.pr_now(job, "nicola", {}))
         self.team.gh_json = lambda *args: (_ for _ in ()).throw(RuntimeError("down"))
         self.assertEqual(
             self.team.pr_now(job, "nicola", {}), "GitHub could not be asked about it"

@@ -101,8 +101,8 @@ SAFE_ENV = {
     "PULSE_LLM": "local",
     "PULSE_CLOUD_TASKS": "",
     "PULSE_SNAPSHOT": "off",
-    # The fetcher refuses the installed app's database when this is set,
-    # whatever build it is and however it was started.
+    # The fetcher, the app and its tools refuse the installed app's database
+    # when this is set, whatever the build and however they were started.
     "PULSE_NO_LIVE_DB": "1",
     "TYPESAFE_API_KEY": "",  # an opt-in service: set but empty means off
     # scheduled-fetch.sh / live-signals.sh run the INSTALLED fetcher on the live
@@ -656,8 +656,11 @@ def keep_attempt(job: dict, res: dict, wt: Path, branch: str) -> None:
     """An unfinished attempt on someone's pull request is never pushed onto
     their branch. It stays on this Mac under a name of its own, so an earlier
     night's attempt is never overwritten."""
-    if head(wt) == git("rev-parse", f"origin/{branch}", cwd=wt)[1]:
-        return
+    tip = head(wt)
+    if not tip or git("merge-base", "--is-ancestor", tip, f"origin/{branch}")[0] == 0:
+        return  # nothing here that GitHub does not have
+    if git("branch", "--points-at", tip, "--list", f"night-kept/pr-{job['pr']}-*")[1]:
+        return  # kept already
     kept = f"night-kept/pr-{job['pr']}-{stamp()}"
     if git("branch", kept, "HEAD", cwd=wt)[0] == 0:
         res["reasons"].append(
@@ -827,7 +830,7 @@ def do_job(job: dict, res: dict, run: dict) -> None:
         wt = make_worktree(base, branch)
         res["wt"], res["branch"] = str(wt), branch
         b = session(prompt, wt, BUILDER_SCHEMA, BUILDER_MIN, f"{name}-build", run)
-        built = True
+        built = res["built"] = True
         title = b["data"].get("pr_title") or title
         body = b["data"].get("pr_body") or ""
         res["summary"] = b["data"].get("summary", "")
@@ -944,7 +947,7 @@ def do_job(job: dict, res: dict, run: dict) -> None:
             keep_work(job, res, wt, branch, base, title, body, built)
             return
         rounds += 1
-        built = True
+        built = res["built"] = True
         fix = FIX_CHANGE.format(request=request, problems=problems)
         if not finished(
             session(fix, wt, BUILDER_SCHEMA, BUILDER_MIN, f"{name}-fix{rounds}", run),
@@ -952,6 +955,9 @@ def do_job(job: dict, res: dict, run: dict) -> None:
         ):
             keep_work(job, res, wt, branch, base, title, body, built)
             return
+
+
+DONE = ("merged", "ready")  # results after which GitHub has everything
 
 
 def run_job(job: dict, run: dict) -> dict:
@@ -973,9 +979,14 @@ def run_job(job: dict, run: dict) -> dict:
         res["result"] = "error"
         res["reasons"].append(f"runner error: {e}")
     try:
+        wt, built = res.pop("wt", None), res.pop("built", False)
+        if wt and built and job["kind"] == "pr" and res["result"] not in DONE:
+            # Fix commits for someone's PR sit on no branch at all. Whatever
+            # way the job ended (a runner error included), they are kept
+            # before the worktree goes.
+            keep_attempt(job, res, Path(wt), job["head"])
         if res.get("pr") and res["result"] in ("needs_user", "blocked"):
             park(res)
-        wt = res.pop("wt", None)
         if wt:  # never leave a finished worktree behind
             git("worktree", "remove", "--force", wt)
         branch = res.pop("branch", None)

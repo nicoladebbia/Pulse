@@ -12,6 +12,40 @@ pub fn dev_db_override() -> Option<std::path::PathBuf> {
     std::env::var_os("PULSE_DB_PATH").filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
 }
 
+/// The installed app's database.
+pub fn live_db_path() -> std::path::PathBuf {
+    dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("com.pulse.app").join("pulse.db")
+}
+
+/// `PULSE_NO_LIVE_DB` (set to anything) puts the installed app's database off limits for
+/// this process, in every build. The night team sets it for its unattended sessions and
+/// checks, so nothing built or started there can work on the real data. Returns why
+/// `db_path` is refused, or None when it may be opened. Nothing else sets the variable,
+/// so the installed app is not affected. (The fetcher has the same check.)
+pub fn live_db_refusal(db_path: &Path) -> Option<String> {
+    refusal(db_path, &live_db_path(), std::env::var_os("PULSE_NO_LIVE_DB"))
+}
+
+fn refusal(db_path: &Path, live: &Path, no_live_db: Option<std::ffi::OsString>) -> Option<String> {
+    (no_live_db.is_some_and(|v| !v.is_empty()) && same_file(db_path, live)).then(|| {
+        format!(
+            "PULSE_NO_LIVE_DB is set, so this run may not use the live database at {}. Use a copy.",
+            db_path.display()
+        )
+    })
+}
+
+/// True when both paths name one file on disk. Another spelling of it (upper case on a
+/// case-insensitive disk, a symlink, `..`, a hard link) is still the same file. Paths
+/// that do not exist yet are compared as written.
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => a == b,
+    }
+}
+
 pub const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_schema.sql");
 pub const MIGRATION_002: &str = include_str!("../../../migrations/002_fts_indexes.sql");
 pub const MIGRATION_003: &str = include_str!("../../../migrations/003_intelligence.sql");
@@ -827,6 +861,27 @@ pub fn initialize_in_memory() -> Result<Connection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PULSE_NO_LIVE_DB refuses the live database under any spelling, and nothing else.
+    #[test]
+    fn the_live_database_can_be_put_off_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("pulse.db");
+        std::fs::write(&live, b"x").unwrap();
+        let copy = dir.path().join("copy.db");
+        std::fs::write(&copy, b"x").unwrap();
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&live, &link).unwrap();
+        let on = || Some(std::ffi::OsString::from("1"));
+
+        assert!(refusal(&live, &live, on()).is_some());
+        assert!(refusal(&link, &live, on()).is_some());
+        assert!(refusal(&dir.path().join(".").join("pulse.db"), &live, on()).is_some());
+        assert!(refusal(&copy, &live, on()).is_none());
+        // Not set, or set to nothing: the installed app opens its database as always.
+        assert!(refusal(&live, &live, None).is_none());
+        assert!(refusal(&live, &live, Some(std::ffi::OsString::new())).is_none());
+    }
 
     /// Migration 024 must result in stories_fts using porter unicode61.
     #[test]

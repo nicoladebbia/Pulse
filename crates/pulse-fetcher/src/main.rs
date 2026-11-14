@@ -81,7 +81,19 @@ fn live_db_path() -> PathBuf {
 /// sets it for its unattended sessions and checks, so a test run that forgets
 /// `--db-path` stops here instead of working on the real data.
 fn live_db_forbidden(db_path: &std::path::Path, no_live_db: Option<std::ffi::OsString>) -> bool {
-    no_live_db.is_some_and(|v| !v.is_empty()) && db_path == live_db_path()
+    no_live_db.is_some_and(|v| !v.is_empty()) && same_file(db_path, &live_db_path())
+}
+
+/// True when both paths name one file on disk. Another spelling of it (upper case on a
+/// case-insensitive disk, a symlink, `..`, a hard link) is still the same file. Paths
+/// that do not exist yet are compared as written. (`pulse_lib::db::connection` has the
+/// same check for the app and its tools.)
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => a == b,
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -1324,6 +1336,31 @@ mod db_path_tests {
         // Whatever picked the live path (no flag, a release build), it is refused.
         let picked = resolve_db_path(None, Some("/tmp/env.db".into()), false);
         assert!(live_db_forbidden(&picked, Some("1".into())));
+    }
+
+    #[test]
+    fn another_spelling_of_a_path_is_still_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pulse.db");
+        std::fs::write(&db, b"x").unwrap();
+        let other = dir.path().join("other.db");
+        std::fs::write(&other, b"x").unwrap();
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        let hard = dir.path().join("hard.db");
+        std::fs::hard_link(&db, &hard).unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        assert!(same_file(&db, &db));
+        assert!(same_file(&db, &link));
+        assert!(same_file(&db, &hard));
+        assert!(same_file(&db, &sub.join("..").join("pulse.db")));
+        assert!(!same_file(&db, &other));
+        // Not there yet: compared as written.
+        let missing = dir.path().join("missing.db");
+        assert!(same_file(&missing, &missing));
+        assert!(!same_file(&missing, &db));
     }
 
     #[test]

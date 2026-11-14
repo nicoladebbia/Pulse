@@ -11,8 +11,8 @@ It is one of several layers, not the only one: the runner also starts sessions
 with an environment in which `git push` and `gh` cannot reach GitHub, with
 placeholder API keys and a placeholder `.env` in the worktree (see `night_env`
 and `write_placeholder_env` in team.py), a debug build of the fetcher follows
-`PULSE_DB_PATH` to the copy, and `PULSE_NO_LIVE_DB` makes any fetcher refuse
-the live database. A shell command can be spelled in ways no
+`PULSE_DB_PATH` to the copy, and `PULSE_NO_LIVE_DB` makes every Pulse binary
+refuse the live database. A shell command can be spelled in ways no
 pattern sees, which is why none of these layers stands alone.
 
     guard.py <main checkout> <session's worktree>
@@ -53,14 +53,18 @@ GIT = WORD + r"git(?:\s+-[cC]\s+\S+|\s+-{1,2}[\w-]+(?:=\S+)?)*\s+"
 GIT_PUSH = re.compile(GIT + r"push\b")
 # Every worktree shares one stash with Nicola's checkout; looking is fine.
 GIT_STASH = re.compile(GIT + r"stash\b(?!\s+(?:list|show)\b)")
-SECRET_FILE = re.compile(r"(?<![\w])\.env(?![\w])(?!\.example)")
+# Paths are matched without regard to case: on this Mac's disk `Com.Pulse.App`
+# and `.ENV` are the same folder and file as their lower-case spellings.
+SECRET_FILE = re.compile(r"(?<![\w])\.env(?![\w])(?!\.example)", re.I)
 # The patterns see words, not meaning, so a search or a commit message that only
 # mentions one is blocked too. Every Bash refusal says how to get past that.
 REWORD = " (if those words are only inside a commit message or a search, reword it or use the Grep tool)"
 
 # These open the live database unless told otherwise. The copy made for the app
 # bundle carries a target suffix (pulse-fetcher-aarch64-apple-darwin).
-PULSE_BINARY = re.compile(r"^pulse-(?:fetcher|eval|backtest)(?:-[\w.-]+)?$")
+PULSE_BINARY = re.compile(
+    r"^pulse-(?:fetcher|eval|backtest)(?:-(?:aarch64|x86_64|universal)[\w.-]*)?$"
+)
 SEGMENT = re.compile(r"\|\||&&|[;|&\n()`]|\$\(")
 ASSIGNMENT = re.compile(r"^[A-Za-z_]\w*=")
 # Words that can stand before the command a shell actually runs (also with a
@@ -76,12 +80,14 @@ DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 SHELL_SCRIPT_FLAG = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # -c, -lc, -ic
 CARGO_RUN = {"run", "r"}
+NODE_TOOLS = {"npm", "pnpm", "yarn"}
+GLOBAL_FLAGS = {"-g", "--global", "--location=global"}
 CARGO_TAKES_VALUE = {"--color", "--config", "-C", "-Z"}
 ONLY_PRINTS = {"--help", "-h", "--version", "-V"}
 REDIRECT = re.compile(r"^\d*[<>]")
 NEVER = [
     (
-        re.compile(r"com\.pulse\.app|Mobile\\? Documents"),
+        re.compile(r"com\.pulse\.app|Mobile\\? Documents", re.I),
         "the installed app's data and the phone snapshot are off limits; use the copy in $PULSE_DB_PATH",
     ),
     (
@@ -92,9 +98,7 @@ NEVER = [
         re.compile(
             WORD
             + r"(?:brew\s+(?:install|uninstall|reinstall|upgrade|tap)|cargo\s+install"
-            r"|rustup\s+(?:default|update|self|toolchain)|security\s+(?:[a-z]+-[a-z-]+|export|import)"
-            r"|(?:npm|pnpm|yarn)\s+(?:(?:-g|--global|global)"
-            r"|(?:add|install|i|link|remove|rm|uninstall|un|update|up|upgrade)\b[^;&|\n]*\s(?:-g|--global)))\b"
+            r"|rustup\s+(?:default|update|self|toolchain)|security\s+(?:[a-z]+-[a-z-]+|export|import))\b"
         ),
         "installing onto this Mac, changing its toolchain and the keychain are not for unattended sessions",
     ),
@@ -104,12 +108,13 @@ NEVER = [
     ),
     (
         re.compile(
-            r"\.ssh/|\.aws/|\.gnupg/|\.tauri/|pulse-updater|\.config/gh|Keychains"
+            r"\.ssh/|\.aws/|\.gnupg/|\.tauri/|pulse-updater|\.config/gh|Keychains",
+            re.I,
         ),
         "keys and credentials are off limits",
     ),
     (
-        re.compile(r"\.claude/settings"),
+        re.compile(r"\.claude/settings", re.I),
         "Claude's settings are off limits for unattended sessions",
     ),
 ]
@@ -134,6 +139,8 @@ def _command(words: list[str]) -> list[str]:
     i = 0
     while i < len(words):
         word = words[i]
+        if word == "command" and words[i + 1 : i + 2] in (["-v"], ["-V"]):
+            return []  # only looks a name up
         if word in TAKES_VALUE:
             i += 2
         elif (
@@ -166,31 +173,50 @@ def _cargo_runs(args: list[str]) -> bool:
     return False
 
 
-def runs_on_live_db(cmd: str) -> bool:
-    """True when the command starts a Pulse binary (itself, or through `cargo
-    run`) without --db-path. Without the flag they open the live database, and
-    the fetcher's default mode is a full daily run. Building, testing, copying
-    or searching for a binary is fine, and so is asking one for its help text."""
+def _commands(cmd: str):
+    """Every command in a shell line as (name, its arguments, the text it came
+    from). The script handed to `bash -c "…"` is read as commands too."""
     for segment in SEGMENT.split(cmd):
-        if "--db-path" in segment:
-            continue
         words = _command(_words(segment))
         if not words:
             continue
         first = os.path.basename(words[0])
         rest = [w for w in words[1:] if not REDIRECT.match(w)]
-        if PULSE_BINARY.match(first):
-            if rest and all(w in ONLY_PRINTS for w in rest):
-                continue
-            return True
-        if first == "cargo" and _cargo_runs(rest):
-            return True
+        yield first, rest, segment
         if first in SHELLS:
             for i, word in enumerate(rest[:-1]):
                 if SHELL_SCRIPT_FLAG.match(word):
-                    if runs_on_live_db(rest[i + 1]):
-                        return True
+                    yield from _commands(rest[i + 1])
                     break
+
+
+def runs_on_live_db(cmd: str) -> bool:
+    """True when the command starts a Pulse binary (itself, or through `cargo
+    run`) without --db-path. Without the flag they open the live database, and
+    the fetcher's default mode is a full daily run. Building, testing, copying
+    or searching for a binary is fine, and so is asking one for its help text."""
+    for first, rest, segment in _commands(cmd):
+        if "--db-path" in segment:
+            continue
+        if PULSE_BINARY.match(first):
+            if not (rest and all(w in ONLY_PRINTS for w in rest)):
+                return True
+        elif first == "cargo" and _cargo_runs(rest):
+            return True
+    return False
+
+
+def installs_globally(cmd: str) -> bool:
+    """npm, pnpm or yarn asked to install onto the Mac instead of into the
+    project, wherever the flag stands. What follows `--` belongs to the script
+    being run (`pnpm test -- -g name`), not to the tool."""
+    for first, rest, _ in _commands(cmd):
+        if first not in NODE_TOOLS:
+            continue
+        own = rest[: rest.index("--")] if "--" in rest else rest
+        plain = [w for w in own if not w.startswith("-")]
+        if GLOBAL_FLAGS & set(own) or (first == "yarn" and plain[:1] == ["global"]):
+            return True
     return False
 
 
@@ -215,6 +241,8 @@ def _bash_block_reason(cmd: str, repo: str) -> str | None:
         )
     if SECRET_FILE.search(cmd):
         return ".env files hold real keys and are off limits"
+    if installs_globally(cmd):
+        return NEVER[2][1]
     for pattern, reason in NEVER:
         if pattern.search(cmd):
             return reason
@@ -237,11 +265,12 @@ def _full(path: str, cwd: str) -> str:
 
 
 def _is_env_file(full: str) -> bool:
-    name = os.path.basename(full)
+    name = os.path.basename(full).lower()
     return name == ".env" or (name.startswith(".env.") and name != ".env.example")
 
 
 def _inside(full: str, root: str) -> bool:
+    full, root = full.lower(), root.lower()
     return full == root or full.startswith(root + os.sep)
 
 
@@ -252,7 +281,7 @@ def read_block_reason(path: str, cwd: str, repo: str) -> str | None:
     full = _full(path, cwd)
     if _is_env_file(full):
         return ".env files hold real keys and are off limits"
-    if "/com.pulse.app" in full or "/Mobile Documents" in full:
+    if "/com.pulse.app" in full.lower() or "/mobile documents" in full.lower():
         return "the installed app's data and the phone snapshot are off limits; use the copy in $PULSE_DB_PATH"
     home = os.path.realpath(os.path.expanduser("~"))
     if any(_inside(full, os.path.join(home, d)) for d in SECRET_DIRS):
