@@ -1190,11 +1190,84 @@ class Wake(unittest.TestCase):
         self.addCleanup(setattr, rules, "night_due", rules.night_due)
         rules.night_due = lambda now, start, late, last: answer
 
-    def test_the_agent_names_no_hour(self):
-        # An agent that names an Hour never fires on this Mac (team.RUN_AT).
+    def test_the_agent_names_no_hour_and_hands_the_runner_its_hour(self):
         job = self.team.launchd_job("/usr/bin/python3", self.home / "bin", ["/usr/bin"])
         self.assertEqual(job["StartCalendarInterval"], {"Minute": self.team.RUN_AT[1]})
         self.assertEqual(job["ProgramArguments"][-2:], ["run", "--scheduled"])
+        env = job["EnvironmentVariables"]
+        self.assertEqual(
+            (int(env["PULSE_TEAM_HOUR"]), int(env["PULSE_TEAM_MINUTE"])),
+            self.team.RUN_AT,
+        )
+        self.assertEqual(int(env["PULSE_TEAM_CATCH_UP_MIN"]), self.team.CATCH_UP_MIN)
+
+    def test_a_night_already_started_is_left_alone(self):
+        # The real rule, with the clock inside tonight's shift.
+        now = dt.datetime.now()
+        self.team.RUN_AT, self.team.CATCH_UP_MIN = (now.hour, 0), 120
+        (self.home / "state.json").write_text(
+            json.dumps({"last_night": now.date().isoformat()})
+        )
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(self.worked, [])
+        (self.home / "state.json").write_text("{}")
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(len(self.worked), 1)
+
+    def test_a_wake_up_during_another_run_waits_for_the_next_hour(self):
+        self.night("2026-11-15")
+        import fcntl
+
+        with open(self.home / "lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertEqual(self.team.cmd_run(self.args(scheduled=True)), 0)
+        self.assertEqual(self.worked, [])
+        self.assertFalse((self.home / "state.json").exists())  # the night is not spent
+
+    def test_the_lock_is_free_again_after_a_run_that_blew_up(self):
+        self.night("2026-11-15")
+
+        def boom(report, run, state, started):
+            raise RuntimeError("the report could not be written")
+
+        self.team.finish = boom
+        with self.assertRaises(RuntimeError):
+            self.team.cmd_run(self.args(scheduled=True))
+        self.team.finish = lambda report, run, state, started: 0
+        self.night("2026-11-16")
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(len(self.worked), 2)
+
+    def test_a_night_that_could_do_nothing_is_tried_again_next_hour(self):
+        self.night("2026-11-15")
+        saved = []
+
+        def no_network(args, run, state, report, started):
+            run["nothing_done"] = True
+
+        self.team.work = no_network
+        self.team.finish = lambda report, run, state, started: saved.append(dict(state))
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertNotIn("last_night", saved[0])
+
+    def test_a_night_that_crashed_is_not_started_again(self):
+        self.night("2026-11-15")
+        saved = []
+
+        def crash(args, run, state, report, started):
+            run["nothing_done"] = True
+            raise RuntimeError("boom")
+
+        self.team.work = crash
+        self.team.finish = lambda report, run, state, started: saved.append(dict(state))
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(saved[0]["last_night"], "2026-11-15")
+
+    def test_a_state_file_that_is_not_a_table_does_not_stop_the_wake_up(self):
+        self.night("2026-11-15")
+        (self.home / "state.json").write_text("[1, 2]")
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(len(self.worked), 1)
 
     def test_a_wake_up_outside_the_shift_does_nothing_but_leave_its_mark(self):
         self.night("")

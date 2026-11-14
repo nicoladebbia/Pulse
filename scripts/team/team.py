@@ -71,9 +71,12 @@ MAX_FIX_ROUNDS = _int("PULSE_TEAM_FIX_ROUNDS", 2)
 MAX_MAIN_MOVES = 2  # times a job starts over because main changed under it
 MODEL = os.environ.get("PULSE_TEAM_MODEL", "")  # empty = the default from settings
 # The night shift opens at RUN_AT. launchd only wakes the team, every hour at
-# RUN_AT's minute, and `rules.night_due` decides: measured on this Mac, an agent
-# whose StartCalendarInterval names an Hour never fires, a Minute-only one does
-# (the note in launchd/com.pulse.embedding-backfill.plist).
+# RUN_AT's minute, and `rules.night_due` decides. Two reasons: a wake-up that
+# finds GitHub unreachable or the Mac busy gets another try an hour later, and
+# launchd/com.pulse.embedding-backfill.plist records that agents naming an Hour
+# did not fire on this Mac in August 2026, while Minute-only ones always have (a
+# probe on 2026-11-14 saw both fire, so that may be gone; the hourly shape is
+# the one every other Pulse job runs on).
 RUN_AT = (_int("PULSE_TEAM_HOUR", 2), _int("PULSE_TEAM_MINUTE", 30))
 CATCH_UP_MIN = _int("PULSE_TEAM_CATCH_UP_MIN", 210)  # a late wake-up still starts it
 
@@ -301,6 +304,11 @@ def load_json(path: Path, default):
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return default
+
+
+def load_state() -> dict:
+    state = load_json(HOME / "state.json", {})
+    return state if isinstance(state, dict) else {}
 
 
 def save_json(path: Path, data) -> None:
@@ -1233,8 +1241,8 @@ def cmd_run(args) -> int:
 
 
 def locked_run(args, started: dt.datetime, scheduled: bool) -> int:
+    state = load_state()
     if scheduled:
-        state = load_json(HOME / "state.json", {})
         night = rules.night_due(
             started, RUN_AT, CATCH_UP_MIN, state.get("last_night", "")
         )
@@ -1252,7 +1260,6 @@ def locked_run(args, started: dt.datetime, scheduled: bool) -> int:
         "main_tail": "",
     }
     run["dir"].mkdir(parents=True, exist_ok=True)
-    state = load_json(HOME / "state.json", {})
     report = {
         "started": started.isoformat(timespec="minutes"),
         "jobs": [],
@@ -1264,6 +1271,9 @@ def locked_run(args, started: dt.datetime, scheduled: bool) -> int:
         work(args, run, state, report, started)
     except Exception as e:  # noqa: BLE001 - whatever happens, leave a report behind
         report["notes"].append(f"the run stopped on an error: {str(e)[-300:]}")
+    else:
+        if scheduled and run.get("nothing_done"):
+            state.pop("last_night", None)  # the next hourly wake-up tries again
     return finish(report, run, state, started)
 
 
@@ -1274,10 +1284,12 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
         report["notes"].append(
             f"the file fence for sessions could not be put up ({problem}); nothing was done"
         )
+        run["nothing_done"] = True
         return
     log("fetching")
     if git("fetch", "origin", "--prune")[0] != 0:
         report["notes"].append("could not reach GitHub; nothing was done")
+        run["nothing_done"] = True
         return
     repo_info = gh_json("repo", "view", "--json", "owner,nameWithOwner")
     owner, report["repo"] = repo_info["owner"]["login"], repo_info["nameWithOwner"]
@@ -1439,6 +1451,10 @@ def launchd_job(python: str, bin_dir: Path, dirs: list[str]) -> dict:
             "HOME": str(Path.home()),
             "PULSE_TEAM_HOME": str(HOME),
             "PULSE_TEAM_REPO": str(REPO),
+            # The runner picks the hour, so it needs the ones chosen at install.
+            "PULSE_TEAM_HOUR": str(RUN_AT[0]),
+            "PULSE_TEAM_MINUTE": str(RUN_AT[1]),
+            "PULSE_TEAM_CATCH_UP_MIN": str(CATCH_UP_MIN),
         },
     }
 
