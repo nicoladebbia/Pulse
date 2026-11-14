@@ -62,6 +62,17 @@ fn acquire_single_instance_lock(db_path: &std::path::Path) -> Option<SingleInsta
     }
 }
 
+/// Which database this run uses. `--db-path` always wins. A debug build (one made
+/// from a checkout, never the installed app's fetcher) then honours `PULSE_DB_PATH`,
+/// the variable the dev app reads, so a test run that leaves the flag out lands on
+/// the copy it was pointed at instead of the live database. A release build ignores
+/// the variable, so the scheduled fetcher cannot pick it up from a stray environment.
+fn resolve_db_path(flag: Option<PathBuf>, env: Option<std::ffi::OsString>, debug_build: bool) -> PathBuf {
+    flag.or_else(|| env.filter(|v| debug_build && !v.is_empty()).map(PathBuf::from)).unwrap_or_else(|| {
+        dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("com.pulse.app").join("pulse.db")
+    })
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "pulse-fetcher", about = "Daily news fetch pipeline for Pulse")]
 struct Args {
@@ -162,12 +173,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Loaded API keys from {}", env_path.display());
     }
 
-    let db_path = args.db_path.unwrap_or_else(|| {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("com.pulse.app")
-            .join("pulse.db")
-    });
+    let db_path = resolve_db_path(args.db_path, std::env::var_os("PULSE_DB_PATH"), cfg!(debug_assertions));
 
     tracing::info!("Pulse fetcher starting in {} mode", args.mode);
     tracing::info!("Database: {}", db_path.display());
@@ -1280,6 +1286,35 @@ fn recompute_signals(conn: &rusqlite::Connection, today: &str) -> anyhow::Result
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod db_path_tests {
+    use super::*;
+
+    fn live() -> PathBuf {
+        dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("com.pulse.app").join("pulse.db")
+    }
+
+    #[test]
+    fn the_flag_always_wins() {
+        let flag = Some(PathBuf::from("/tmp/flag.db"));
+        assert_eq!(resolve_db_path(flag.clone(), Some("/tmp/env.db".into()), true), PathBuf::from("/tmp/flag.db"));
+        assert_eq!(resolve_db_path(flag, Some("/tmp/env.db".into()), false), PathBuf::from("/tmp/flag.db"));
+    }
+
+    #[test]
+    fn a_debug_build_uses_the_variable_instead_of_the_live_database() {
+        assert_eq!(resolve_db_path(None, Some("/tmp/env.db".into()), true), PathBuf::from("/tmp/env.db"));
+        // Unset or empty means "not given", not "the current folder".
+        assert_eq!(resolve_db_path(None, None, true), live());
+        assert_eq!(resolve_db_path(None, Some("".into()), true), live());
+    }
+
+    #[test]
+    fn a_release_build_ignores_the_variable() {
+        assert_eq!(resolve_db_path(None, Some("/tmp/env.db".into()), false), live());
+    }
 }
 
 #[cfg(test)]

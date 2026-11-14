@@ -175,10 +175,7 @@ def render(history: list[dict]) -> str:
             '<section id="needs-you"><h2>Needs you</h2><p>Nothing. Everything from last night is handled.</p></section>'
         )
 
-    body = (
-        "".join(_job(j, repo) for j in jobs)
-        or "<p>Nothing to work on.</p>"
-    )
+    body = "".join(_job(j, repo) for j in jobs) or "<p>Nothing to work on.</p>"
     notes = "".join(f'<p class="sub">{e(n)}</p>' for n in report.get("notes", []))
     sections.append(
         f'<section id="last-night"><h2>Last night</h2>{body}{notes}</section>'

@@ -7,18 +7,24 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import re
 
 # Files the night team may not change without Nicola. A PR that touches one is
-# finished and reviewed as usual but left open with the `needs-you` label.
+# still checked and reviewed, but the team changes nothing in it, pushes nothing
+# and leaves it open with the `needs-you` label. Work of the team's own that
+# touches one never leaves this Mac.
 #   - CI and the team's own scripts are the gate itself.
 #   - launchd/, install and schedule scripts decide what runs on the Mac.
 #   - tauri.conf.json / capabilities hold the updater key and app permissions.
 #   - go_live.rs holds thresholds that must not be tuned to a result.
-#   - .claude/ holds settings, hooks and skills that Claude sessions load and run.
+#   - .claude/ and .mcp.json hold settings, hooks, skills and connectors that
+#     Claude sessions load and run; .cargo/ can change how everything is built.
 PROTECTED_GLOBS = [
     ".github/*",
     ".claude/*",
+    ".mcp.json",
+    ".cargo/*",
     "scripts/team/*",
     "launchd/*",
     "scripts/install-app.sh",
@@ -98,6 +104,48 @@ def forbidden_content(diff: str) -> list[str]:
     return []
 
 
+def script_violations(old_pkg: str, new_pkg: str) -> list[str]:
+    """package.json before and after. The checks are `pnpm check` and `pnpm test`,
+    and installing runs the lifecycle scripts, so a change to `scripts` can
+    switch a check off without touching a protected file."""
+
+    def scripts(text: str):
+        if not text.strip():
+            return {}
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        found = data.get("scripts") if isinstance(data, dict) else None
+        return found if isinstance(found, dict) else {}
+
+    old, new = scripts(old_pkg), scripts(new_pkg)
+    if old is None or new is None or old != new:
+        return ["changes the commands the checks run (the scripts in package.json)"]
+    return []
+
+
+def merge_blockers(view: dict, sha: str, base: str, label: str) -> str:
+    """The last look at a pull request before merging it: '' when it is still
+    the one that was checked (same commit, same target, nobody stepped in) and
+    GitHub can merge it, else why not."""
+    if view.get("state") != "OPEN":
+        return f"the pull request is no longer open ({view.get('state') or 'unknown'})"
+    if view.get("headRefOid") != sha:
+        return "someone pushed to it while the job ran"
+    if view.get("baseRefName") != base:
+        return f"it no longer targets {base}"
+    if view.get("isDraft"):
+        return "it was marked as a draft while the job ran"
+    if any(l.get("name") == label for l in view.get("labels") or []):
+        return f"the {label} label was added while the job ran"
+    if view.get("mergeable") != "MERGEABLE":
+        return (
+            f"GitHub will not merge it right now ({view.get('mergeable') or 'unknown'})"
+        )
+    return ""
+
+
 def pr_skip_reason(
     pr: dict, owner: str, base: str, label: str, state: dict | None = None
 ) -> str | None:
@@ -145,12 +193,22 @@ def error_cap(state: dict, key: str, sha: str, max_errors: int = 3) -> str | Non
 
 
 def record_attempt(
-    state: dict, key: str, sha: str, result: str, parked: bool = False
+    state: dict,
+    key: str,
+    sha: str,
+    result: str,
+    parked: bool = False,
+    prev_sha: str = "",
 ) -> None:
-    """`parked` = the team itself put the `needs-you` label on this PR."""
+    """`parked` = the team itself put the `needs-you` label on this PR.
+    `prev_sha` = the commit the job started from. The team's own push (main
+    merged in, a fix) moves a PR from `prev_sha` to `sha`; that is the same run
+    of attempts, so the count carries on. Only a commit from someone else
+    starts it again."""
     attempts = state.setdefault("attempts", {})
     last = attempts.get(key) or {}
-    tries = last.get("tries", 0) + 1 if last.get("sha") == sha else 1
+    same_run = bool(last) and last.get("sha") in {sha, prev_sha}
+    tries = last.get("tries", 0) + 1 if same_run else 1
     attempts[key] = {"sha": sha, "result": result, "tries": tries, "parked": parked}
 
 
@@ -245,9 +303,18 @@ def select_jobs(
     (oldest first), then ideas from the top of the list. Returns (jobs, skipped)."""
 
     def pr_why(pr: dict) -> str | None:
-        return pr_skip_reason(pr, owner, base, label, state) or error_cap(
-            state, f"pr-{pr['number']}", pr.get("headRefOid") or ""
+        key, sha = f"pr-{pr['number']}", pr.get("headRefOid") or ""
+        why = pr_skip_reason(pr, owner, base, label, state) or error_cap(
+            state, key, sha
         )
+        if why:
+            return why
+        # A stop the team could not label (the label call failed) would otherwise
+        # be repeated every night. A stop it did label is lifted by removing the
+        # label, so that one is tried again.
+        if not _last(state, key, sha).get("parked"):
+            return stuck(state, key, sha)
+        return None
 
     def skip_pr(pr: dict, why: str) -> dict:
         return {

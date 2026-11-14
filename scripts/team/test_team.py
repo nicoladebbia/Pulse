@@ -2,10 +2,14 @@
 
 import datetime as dt
 import importlib
+import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guard  # noqa: E402
@@ -16,22 +20,46 @@ OWNER = "nicola"
 
 
 def pr(n, **over):
-    base = {"number": n, "title": f"PR {n}", "author": {"login": OWNER}, "isCrossRepository": False,
-            "isDraft": False, "baseRefName": "main", "headRefName": f"feat/{n}", "headRefOid": f"sha{n}",
-            "labels": [], "createdAt": f"2026-10-{n:02d}", "body": ""}
+    base = {
+        "number": n,
+        "title": f"PR {n}",
+        "author": {"login": OWNER},
+        "isCrossRepository": False,
+        "isDraft": False,
+        "baseRefName": "main",
+        "headRefName": f"feat/{n}",
+        "headRefOid": f"sha{n}",
+        "labels": [],
+        "createdAt": f"2026-10-{n:02d}",
+        "body": "",
+    }
     base.update(over)
     return base
 
 
 class ProtectedFiles(unittest.TestCase):
     def test_normal_code_is_fine(self):
-        changes = [("M", "crates/pulse-fetcher/src/main.rs"), ("A", "migrations/060_new.sql"), ("M", "CLAUDE.md")]
+        changes = [
+            ("M", "crates/pulse-fetcher/src/main.rs"),
+            ("A", "migrations/060_new.sql"),
+            ("M", "CLAUDE.md"),
+        ]
         self.assertEqual(rules.protected_violations(changes), [])
 
     def test_gate_and_install_files_are_protected(self):
-        for path in [".github/workflows/ci.yml", "scripts/team/rules.py", "launchd/com.pulse.live-signals.plist",
-                     "scripts/scheduled-fetch.sh", "src-tauri/tauri.conf.json", "src-tauri/src/services/go_live.rs",
-                     ".env", "ios/.env.local", "rust-toolchain.toml"]:
+        for path in [
+            ".github/workflows/ci.yml",
+            "scripts/team/rules.py",
+            "launchd/com.pulse.live-signals.plist",
+            "scripts/scheduled-fetch.sh",
+            "src-tauri/tauri.conf.json",
+            "src-tauri/src/services/go_live.rs",
+            ".env",
+            "ios/.env.local",
+            "rust-toolchain.toml",
+            ".mcp.json",
+            ".cargo/config.toml",
+        ]:
             self.assertTrue(rules.protected_violations([("M", path)]), path)
 
     def test_existing_migration_may_not_change(self):
@@ -39,18 +67,33 @@ class ProtectedFiles(unittest.TestCase):
         self.assertTrue(rules.protected_violations([("D", "migrations/042_x.sql")]))
 
     def test_rename_counts_as_delete_plus_add(self):
-        changes = rules.parse_name_status("R100\0migrations/042_x.sql\0migrations/061_x.sql\0M\0src/a.ts\0")
-        self.assertEqual(changes, [("D", "migrations/042_x.sql"), ("A", "migrations/061_x.sql"), ("M", "src/a.ts")])
+        changes = rules.parse_name_status(
+            "R100\0migrations/042_x.sql\0migrations/061_x.sql\0M\0src/a.ts\0"
+        )
+        self.assertEqual(
+            changes,
+            [
+                ("D", "migrations/042_x.sql"),
+                ("A", "migrations/061_x.sql"),
+                ("M", "src/a.ts"),
+            ],
+        )
         self.assertEqual(len(rules.protected_violations(changes)), 1)
 
     def test_rename_out_of_a_protected_path_is_caught(self):
-        changes = rules.parse_name_status("R090\0.github/workflows/ci.yml\0docs/ci.yml\0")
+        changes = rules.parse_name_status(
+            "R090\0.github/workflows/ci.yml\0docs/ci.yml\0"
+        )
         self.assertTrue(rules.protected_violations(changes))
 
     def test_unusual_file_names_are_still_matched(self):
         # Without -z git prints this as "scripts/team/\303\251 x.py" (quoted), which matched nothing.
-        changes = rules.parse_name_status("A\0scripts/team/\u00e9 x.py\0M\0src/tab\there.ts\0")
-        self.assertEqual(changes, [("A", "scripts/team/\u00e9 x.py"), ("M", "src/tab\there.ts")])
+        changes = rules.parse_name_status(
+            "A\0scripts/team/\u00e9 x.py\0M\0src/tab\there.ts\0"
+        )
+        self.assertEqual(
+            changes, [("A", "scripts/team/\u00e9 x.py"), ("M", "src/tab\there.ts")]
+        )
         self.assertEqual(len(rules.protected_violations(changes)), 1)
 
     def test_claude_folder_is_protected(self):
@@ -60,11 +103,82 @@ class ProtectedFiles(unittest.TestCase):
 
 class LiveEndpoint(unittest.TestCase):
     def test_only_added_live_host_is_flagged(self):
-        self.assertTrue(rules.forbidden_content('+const URL: &str = "https://api.alpaca.markets/v2";'))
-        self.assertEqual(rules.forbidden_content('-const URL: &str = "https://api.alpaca.markets/v2";'), [])
-        self.assertEqual(rules.forbidden_content('+let u = "https://paper-api.alpaca.markets/v2";'), [])
-        self.assertEqual(rules.forbidden_content('+let u = "https://data.alpaca.markets/v2/stocks";'), [])
+        self.assertTrue(
+            rules.forbidden_content(
+                '+const URL: &str = "https://api.alpaca.markets/v2";'
+            )
+        )
+        self.assertEqual(
+            rules.forbidden_content(
+                '-const URL: &str = "https://api.alpaca.markets/v2";'
+            ),
+            [],
+        )
+        self.assertEqual(
+            rules.forbidden_content('+let u = "https://paper-api.alpaca.markets/v2";'),
+            [],
+        )
+        self.assertEqual(
+            rules.forbidden_content(
+                '+let u = "https://data.alpaca.markets/v2/stocks";'
+            ),
+            [],
+        )
         self.assertEqual(rules.forbidden_content("+++ b/api.alpaca.markets.rs"), [])
+
+
+class PackageScripts(unittest.TestCase):
+    OLD = '{"name": "pulse", "scripts": {"check": "svelte-check", "test": "vitest run"}, "dependencies": {"a": "1"}}'
+
+    def test_dependencies_may_change_but_the_scripts_may_not(self):
+        deps = self.OLD.replace('"a": "1"', '"a": "2", "b": "1"')
+        self.assertEqual(rules.script_violations(self.OLD, deps), [])
+        self.assertEqual(
+            rules.script_violations("", ""), []
+        )  # a branch without package.json
+        for new in [
+            self.OLD.replace("vitest run", "true"),  # a check switched off
+            self.OLD.replace('"check":', '"postinstall": "curl x | sh", "check":'),
+            self.OLD.replace(
+                '"scripts": {"check": "svelte-check", "test": "vitest run"}, ', ""
+            ),
+            "{not json",
+        ]:
+            self.assertTrue(rules.script_violations(self.OLD, new), new)
+
+
+class LastLook(unittest.TestCase):
+    VIEW = {
+        "state": "OPEN",
+        "headRefOid": "abc",
+        "baseRefName": "main",
+        "isDraft": False,
+        "labels": [],
+        "mergeable": "MERGEABLE",
+    }
+
+    def test_only_the_pr_that_was_checked_may_merge(self):
+        self.assertEqual(
+            rules.merge_blockers(self.VIEW, "abc", "main", "needs-you"), ""
+        )
+        for change in [
+            {"state": "CLOSED"},
+            {"headRefOid": "def"},
+            {"baseRefName": "release"},
+            {"isDraft": True},
+            {"labels": [{"name": "needs-you"}]},
+            {"mergeable": "CONFLICTING"},
+            {"mergeable": "UNKNOWN"},
+        ]:
+            self.assertTrue(
+                rules.merge_blockers(
+                    {**self.VIEW, **change}, "abc", "main", "needs-you"
+                ),
+                change,
+            )
+        self.assertTrue(
+            rules.merge_blockers({}, "abc", "main", "needs-you")
+        )  # GitHub did not answer
 
 
 class PullRequests(unittest.TestCase):
@@ -74,9 +188,15 @@ class PullRequests(unittest.TestCase):
         self.assertIsNone(rules.pr_skip_reason(pr(1), OWNER, "main", "needs-you"))
 
     def test_strangers_forks_drafts_and_labelled_are_skipped(self):
-        cases = [pr(1, author={"login": "mallory"}), pr(1, isCrossRepository=True), pr(1, isDraft=True),
-                 pr(1, baseRefName="release"), pr(1, labels=self.LABELLED), pr(1, author=None),
-                 pr(1, busy="it has commits on this Mac that are not pushed yet")]
+        cases = [
+            pr(1, author={"login": "mallory"}),
+            pr(1, isCrossRepository=True),
+            pr(1, isDraft=True),
+            pr(1, baseRefName="release"),
+            pr(1, labels=self.LABELLED),
+            pr(1, author=None),
+            pr(1, busy="it has commits on this Mac that are not pushed yet"),
+        ]
         for case in cases:
             self.assertIsNotNone(rules.pr_skip_reason(case, OWNER, "main", "needs-you"))
 
@@ -84,16 +204,26 @@ class PullRequests(unittest.TestCase):
         state = {}
         rules.record_attempt(state, "pr-1", "sha1", "blocked", parked=True)
         same = pr(1, labels=self.LABELLED)
-        self.assertIsNotNone(rules.pr_skip_reason(same, OWNER, "main", "needs-you", state))
+        self.assertIsNotNone(
+            rules.pr_skip_reason(same, OWNER, "main", "needs-you", state)
+        )
         moved = pr(1, labels=self.LABELLED, headRefOid="newsha")
-        self.assertIsNone(rules.pr_skip_reason(moved, OWNER, "main", "needs-you", state))
+        self.assertIsNone(
+            rules.pr_skip_reason(moved, OWNER, "main", "needs-you", state)
+        )
 
     def test_a_label_added_by_hand_holds_until_removed(self):
         state = {}
-        rules.record_attempt(state, "pr-1", "oldsha", "error")  # an old record, not a park
+        rules.record_attempt(
+            state, "pr-1", "oldsha", "error"
+        )  # an old record, not a park
         moved = pr(1, labels=self.LABELLED, headRefOid="newsha")
-        self.assertIsNotNone(rules.pr_skip_reason(moved, OWNER, "main", "needs-you", state))
-        self.assertIsNotNone(rules.pr_skip_reason(moved, OWNER, "main", "needs-you", {}))
+        self.assertIsNotNone(
+            rules.pr_skip_reason(moved, OWNER, "main", "needs-you", state)
+        )
+        self.assertIsNotNone(
+            rules.pr_skip_reason(moved, OWNER, "main", "needs-you", {})
+        )
 
 
 class Attempts(unittest.TestCase):
@@ -115,17 +245,39 @@ class Attempts(unittest.TestCase):
         rules.clear_attempt(state, "pr-1")
         self.assertIsNone(rules.error_cap(state, "pr-1", "abc"))
 
+    def test_the_teams_own_pushes_do_not_reset_the_count(self):
+        # Each night main has moved, so the team pushes a new merge commit onto
+        # the PR and then fails on something technical. That is still one run.
+        state = {}
+        rules.record_attempt(state, "pr-1", "m1", "error", prev_sha="owner")
+        rules.record_attempt(state, "pr-1", "m2", "error", prev_sha="m1")
+        self.assertIsNone(rules.error_cap(state, "pr-1", "m2"))
+        rules.record_attempt(state, "pr-1", "m3", "error", prev_sha="m2")
+        self.assertIsNotNone(rules.error_cap(state, "pr-1", "m3"))
+        # A commit from someone else starts the count again.
+        rules.record_attempt(state, "pr-1", "m4", "error", prev_sha="theirs")
+        self.assertEqual(state["attempts"]["pr-1"]["tries"], 1)
+
 
 class Ideas(unittest.TestCase):
     TEXT = "# Pulse ideas\n\n- [x] done thing — merged\n- [ ] dark mode toggle\n- plain line idea\n- [?] unclear — which one?\n"
 
     def test_parse(self):
         got = [(i["state"], i["text"]) for i in rules.parse_ideas(self.TEXT)]
-        self.assertEqual(got, [("done", "done thing — merged"), ("open", "dark mode toggle"),
-                               ("open", "plain line idea"), ("waiting", "unclear — which one?")])
+        self.assertEqual(
+            got,
+            [
+                ("done", "done thing — merged"),
+                ("open", "dark mode toggle"),
+                ("open", "plain line idea"),
+                ("waiting", "unclear — which one?"),
+            ],
+        )
 
     def test_mark_only_touches_the_matching_open_line(self):
-        out = rules.mark_idea(self.TEXT, "dark mode toggle", "x", "merged 2026-11-14 (PR #60)")
+        out = rules.mark_idea(
+            self.TEXT, "dark mode toggle", "x", "merged 2026-11-14 (PR #60)"
+        )
         self.assertIn("- [x] dark mode toggle — merged 2026-11-14 (PR #60)\n", out)
         self.assertIn("- plain line idea\n", out)
         self.assertTrue(out.endswith("\n"))
@@ -133,7 +285,9 @@ class Ideas(unittest.TestCase):
         self.assertIn("- [?] plain line idea — needs a decision", out)
 
     def test_slug_and_key(self):
-        self.assertEqual(rules.slug("Add a Dark-Mode toggle!!"), "add-a-dark-mode-toggle")
+        self.assertEqual(
+            rules.slug("Add a Dark-Mode toggle!!"), "add-a-dark-mode-toggle"
+        )
         self.assertLessEqual(len(rules.slug("word " * 40)), 40)
         self.assertEqual(rules.slug("???"), "idea")
         long_a, long_b = "word " * 20 + "one", "word " * 20 + "two"  # same first words
@@ -144,10 +298,21 @@ class Ideas(unittest.TestCase):
 
 class Queue(unittest.TestCase):
     def select(self, main_ok=True, prs=(), ideas=(), state=None, main_sha="m1"):
-        return rules.select_jobs(main_ok, list(prs), list(ideas), state or {}, OWNER, "main", "needs-you", main_sha)
+        return rules.select_jobs(
+            main_ok,
+            list(prs),
+            list(ideas),
+            state or {},
+            OWNER,
+            "main",
+            "needs-you",
+            main_sha,
+        )
 
     def test_red_main_goes_first_and_alone(self):
-        jobs, _ = self.select(main_ok=False, prs=[pr(1)], ideas=[{"text": "x", "state": "open"}])
+        jobs, _ = self.select(
+            main_ok=False, prs=[pr(1)], ideas=[{"text": "x", "state": "open"}]
+        )
         self.assertEqual([(j["kind"], j["sha"]) for j in jobs], [("main", "m1")])
 
     def test_red_main_is_not_retried_on_the_same_commit(self):
@@ -156,14 +321,18 @@ class Queue(unittest.TestCase):
         jobs, skipped = self.select(main_ok=False, prs=[pr(1)], state=state)
         self.assertEqual(jobs, [])
         self.assertEqual(skipped[0]["kind"], "main")
-        jobs, _ = self.select(main_ok=False, state=state, main_sha="m2")  # main moved: try again
+        jobs, _ = self.select(
+            main_ok=False, state=state, main_sha="m2"
+        )  # main moved: try again
         self.assertEqual(len(jobs), 1)
 
     def test_red_main_continues_an_open_fix_instead_of_a_second_one(self):
         fix = pr(7, headRefName="fix/night-main-1113")
         jobs, _ = self.select(main_ok=False, prs=[pr(1), fix])
         self.assertEqual([j["key"] for j in jobs], ["pr-7"])
-        parked = pr(7, headRefName="fix/night-main-1113", labels=[{"name": "needs-you"}])
+        parked = pr(
+            7, headRefName="fix/night-main-1113", labels=[{"name": "needs-you"}]
+        )
         jobs, skipped = self.select(main_ok=False, prs=[pr(1), parked])
         self.assertEqual(jobs, [])
         self.assertEqual(skipped[0]["pr"], 7)
@@ -172,9 +341,16 @@ class Queue(unittest.TestCase):
         self.assertEqual([j["kind"] for j in jobs], ["main"])
 
     def test_open_prs_oldest_first_then_ideas(self):
-        ideas = [{"text": "done", "state": "done"}, {"text": "next idea", "state": "open"}]
-        jobs, skipped = self.select(prs=[pr(9), pr(3), pr(5, isDraft=True)], ideas=ideas)
-        self.assertEqual([j["key"] for j in jobs], ["pr-3", "pr-9", rules.idea_key("next idea")])
+        ideas = [
+            {"text": "done", "state": "done"},
+            {"text": "next idea", "state": "open"},
+        ]
+        jobs, skipped = self.select(
+            prs=[pr(9), pr(3), pr(5, isDraft=True)], ideas=ideas
+        )
+        self.assertEqual(
+            [j["key"] for j in jobs], ["pr-3", "pr-9", rules.idea_key("next idea")]
+        )
         self.assertEqual([s["pr"] for s in skipped], [5])
         self.assertEqual(jobs[0]["sha"], "sha3")
         self.assertFalse(jobs[0]["labelled"])
@@ -183,12 +359,30 @@ class Queue(unittest.TestCase):
         state = {}
         for _ in range(3):
             rules.record_attempt(state, "pr-1", "sha1", "error")
-        rules.record_attempt(state, "pr-2", "sha2", "blocked", parked=True)  # label since removed: try again
+        rules.record_attempt(
+            state, "pr-2", "sha2", "blocked", parked=True
+        )  # label since removed: try again
         for _ in range(3):
             rules.record_attempt(state, rules.idea_key("flaky"), "", "error")
-        jobs, skipped = self.select(prs=[pr(1), pr(2)], ideas=[{"text": "flaky", "state": "open"}], state=state)
+        jobs, skipped = self.select(
+            prs=[pr(1), pr(2)], ideas=[{"text": "flaky", "state": "open"}], state=state
+        )
         self.assertEqual([j["key"] for j in jobs], ["pr-2"])
         self.assertEqual([s["why"] for s in skipped], ["failed 3 nights in a row"] * 2)
+
+    def test_a_stop_the_team_could_not_label_is_not_repeated_every_night(self):
+        state = {}
+        rules.record_attempt(
+            state, "pr-1", "sha1", "blocked"
+        )  # the label call failed: not parked
+        jobs, skipped = self.select(prs=[pr(1)], state=state)
+        self.assertEqual(
+            (jobs, skipped[0]["why"]), ([], "no change since the last attempt")
+        )
+        jobs, _ = self.select(
+            prs=[pr(1, headRefOid="new")], state=state
+        )  # a new commit lifts it
+        self.assertEqual(len(jobs), 1)
 
 
 class Ci(unittest.TestCase):
@@ -196,10 +390,20 @@ class Ci(unittest.TestCase):
         ok = {"status": "COMPLETED", "conclusion": "SUCCESS"}
         self.assertEqual(rules.ci_state([]), "none")
         self.assertEqual(rules.ci_state(None), "none")
-        self.assertEqual(rules.ci_state([ok, {"status": "COMPLETED", "conclusion": "SKIPPED"}]), "pass")
-        self.assertEqual(rules.ci_state([ok, {"status": "IN_PROGRESS", "conclusion": ""}]), "pending")
-        self.assertEqual(rules.ci_state([ok, {"status": "COMPLETED", "conclusion": "FAILURE"}]), "fail")
-        self.assertEqual(rules.ci_state([{"status": "COMPLETED", "conclusion": "CANCELLED"}]), "fail")
+        self.assertEqual(
+            rules.ci_state([ok, {"status": "COMPLETED", "conclusion": "SKIPPED"}]),
+            "pass",
+        )
+        self.assertEqual(
+            rules.ci_state([ok, {"status": "IN_PROGRESS", "conclusion": ""}]), "pending"
+        )
+        self.assertEqual(
+            rules.ci_state([ok, {"status": "COMPLETED", "conclusion": "FAILURE"}]),
+            "fail",
+        )
+        self.assertEqual(
+            rules.ci_state([{"status": "COMPLETED", "conclusion": "CANCELLED"}]), "fail"
+        )
         self.assertEqual(rules.ci_state([{"state": "PENDING"}]), "pending")
         self.assertEqual(rules.ci_state([{"state": "ERROR"}]), "fail")
 
@@ -212,32 +416,158 @@ class Guard(unittest.TestCase):
         return guard.bash_block_reason(cmd, self.REPO)
 
     def test_everyday_commands_pass(self):
-        for cmd in ["cargo test --workspace --locked", "git status && git commit -am 'fix'", "git stash push -u -m x",
-                    "pnpm check", "gh pr view 53 --json title", "gh pr diff 53", "gh run view 1 --log-failed",
-                    f"cd {self.WT} && cargo build -p pulse-fetcher",
-                    './target/debug/pulse-fetcher --mode learn --db-path "$PULSE_DB_PATH"',
-                    "cat .env.example", "grep -rn 'process.env' src", "source .venv/bin/activate",
-                    "node .claude/skills/run-pulse/cdp.mjs shot /tmp/a.png", "git merge origin/main",
-                    "cargo build --manifest-path src-tauri/Cargo.toml", "git log --oneline origin/main..HEAD"]:
+        for cmd in [
+            "cargo test --workspace --locked",
+            "git status && git commit -am 'fix'",
+            "git stash list",
+            "pnpm check",
+            "gh pr view 53 --json title",
+            "gh pr diff 53",
+            "gh run view 1 --log-failed",
+            f"cd {self.WT} && cargo build -p pulse-fetcher",
+            "cargo test -p pulse-fetcher",
+            "cargo clippy -p pulse-fetcher -- -D warnings",
+            "ls -la target/debug/pulse-fetcher",
+            'cp "${CARGO_TARGET_DIR:-target}/debug/pulse-fetcher" src-tauri/binaries/pulse-fetcher-aarch64-apple-darwin',
+            "grep -rn pulse-fetcher scripts",
+            "pnpm tauri dev",
+            "pnpm add -D vitest",
+            "rustup show",
+            "git commit -m 'security fix for the fetcher'",
+            './target/debug/pulse-fetcher --mode learn --db-path "$PULSE_DB_PATH"',
+            'cargo run -p pulse-fetcher -- --mode learn --db-path "$PULSE_DB_PATH"',
+            "cat .env.example",
+            "grep -rn 'process.env' src",
+            "source .venv/bin/activate",
+            "node .claude/skills/run-pulse/cdp.mjs shot /tmp/a.png",
+            "git merge origin/main",
+            "cargo build --manifest-path src-tauri/Cargo.toml",
+            "git log --oneline origin/main..HEAD",
+        ]:
             self.assertIsNone(self.blocked(cmd), cmd)
 
     def test_publishing_is_blocked(self):
-        for cmd in ["git push", "git push origin HEAD:main", "git -C /x push --force", "cd x && git push -u origin b",
-                    "gh pr merge 53 --merge", "gh pr create --fill", "gh release create v1", "gh api repos/x/y/merges",
-                    "gh pr edit 1 --add-label x", "gh workflow run ci.yml", "gh secret set X",
-                    'bash -c "git push origin HEAD"', "sh -c 'git push'", "/usr/bin/git push", "git --no-pager push",
-                    "git -p push origin", 'bash -c "gh pr merge 5"', "/opt/homebrew/bin/gh pr merge 5"]:
+        for cmd in [
+            "git push",
+            "git push origin HEAD:main",
+            "git -C /x push --force",
+            "cd x && git push -u origin b",
+            "gh pr merge 53 --merge",
+            "gh pr create --fill",
+            "gh release create v1",
+            "gh api repos/x/y/merges",
+            "gh pr edit 1 --add-label x",
+            "gh workflow run ci.yml",
+            "gh secret set X",
+            'bash -c "git push origin HEAD"',
+            "sh -c 'git push'",
+            "/usr/bin/git push",
+            "git --no-pager push",
+            "git -p push origin",
+            'bash -c "gh pr merge 5"',
+            "/opt/homebrew/bin/gh pr merge 5",
+        ]:
             self.assertIsNotNone(self.blocked(cmd), cmd)
 
     def test_live_data_secrets_and_the_mac_are_blocked(self):
-        for cmd in ["./target/debug/pulse-fetcher --mode daily", "cargo run -p pulse-fetcher -- --mode auto-trade",
-                    "cat .env", f"cat {self.REPO}/.env", "cp .env.local /tmp/x", "node --env-file=.env x.js",
-                    "sqlite3 ~/Library/Application\\ Support/com.pulse.app/pulse.db .tables",
-                    "ls ~/Library/Mobile\\ Documents/", "launchctl list", "sudo rm x", "osascript -e 'x'",
-                    "bash scripts/install-app.sh", f"cd {self.REPO} && git checkout main",
-                    "git -C ~/dev/Pulse checkout main", "ls $HOME/dev/Pulse/src", "crontab -l",
-                    "cat ~/.ssh/id_ed25519", "cat ~/.tauri/pulse-updater.key", "echo '{}' > .claude/settings.json"]:
+        for cmd in [
+            "./target/debug/pulse-fetcher --mode daily",
+            "cargo run -p pulse-fetcher -- --mode auto-trade",
+            "cat .env",
+            f"cat {self.REPO}/.env",
+            "cp .env.local /tmp/x",
+            "node --env-file=.env x.js",
+            "sqlite3 ~/Library/Application\\ Support/com.pulse.app/pulse.db .tables",
+            "ls ~/Library/Mobile\\ Documents/",
+            "launchctl list",
+            "sudo rm x",
+            "osascript -e 'x'",
+            "bash scripts/install-app.sh",
+            f"cd {self.REPO} && git checkout main",
+            "git -C ~/dev/Pulse checkout main",
+            "ls $HOME/dev/Pulse/src",
+            "crontab -l",
+            "cat ~/.ssh/id_ed25519",
+            "cat ~/.tauri/pulse-updater.key",
+            "echo '{}' > .claude/settings.json",
+        ]:
             self.assertIsNotNone(self.blocked(cmd), cmd)
+
+    def test_pulse_binaries_never_run_without_a_database_path(self):
+        # Without --db-path they open the live database; the fetcher's default mode is a full daily run.
+        for cmd in [
+            "cargo run -p pulse-fetcher",
+            "cargo run -p pulse-fetcher -- --force",
+            "./target/debug/pulse-fetcher",
+            '"$CARGO_TARGET_DIR/debug/pulse-fetcher"',
+            "cd crates/pulse-fetcher && cargo run",
+            "AUTO_TRADE_ENABLED=false EXIT_DRY_RUN=true ./target/debug/pulse-fetcher --mode learn",
+            'bash -c "./target/debug/pulse-fetcher --force"',
+            "echo $(./target/debug/pulse-fetcher --mode snapshot)",
+            "timeout 60 ./target/debug/pulse-fetcher",
+            "cargo build && ./target/debug/pulse-fetcher --force",
+            "cargo run --bin pulse-eval",
+            "./target/debug/pulse-backtest",
+        ]:
+            self.assertIsNotNone(self.blocked(cmd), cmd)
+
+    def test_the_shared_stash_installs_and_the_keychain_are_blocked(self):
+        for cmd in [
+            "git stash",
+            "git stash pop",
+            "git -C . stash push -u -m x",
+            "brew install jq",
+            "cargo install cargo-edit",
+            "npm i -g foo",
+            "pnpm add --global foo",
+            "rustup default nightly",
+            "security find-generic-password -s x",
+            "ls ${HOME}/dev/Pulse/src",
+        ]:
+            self.assertIsNotNone(self.blocked(cmd), cmd)
+
+    def test_every_refusal_says_how_to_get_past_a_false_alarm(self):
+        for cmd in [
+            "git push",
+            "grep -rn com.pulse.app src",
+            "git log -S install-app.sh",
+        ]:
+            self.assertIn("reword it or use the Grep tool", self.blocked(cmd), cmd)
+
+    def test_the_hook_takes_its_paths_from_the_command_line(self):
+        def hook(event):
+            text = event if isinstance(event, str) else json.dumps(event)
+            done = subprocess.run(
+                [sys.executable, guard.__file__, self.REPO, self.WT],
+                input=text,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return done.returncode, done.stderr
+
+        code, err = hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": self.REPO + "/src/a.ts"},
+                "cwd": self.WT,
+            }
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("night-team guard", err)
+        inside = {
+            "tool_name": "Write",
+            "tool_input": {"file_path": self.WT + "/src/a.ts"},
+            "cwd": self.WT,
+        }
+        self.assertEqual(hook(inside)[0], 0)
+        main = {
+            "tool_name": "Bash",
+            "tool_input": {"command": f"cd {self.REPO} && git checkout main"},
+            "cwd": self.WT,
+        }
+        self.assertEqual(hook(main)[0], 2)
+        self.assertEqual(hook("not json")[0], 2)  # unreadable input blocks
 
     def test_writes_stay_in_the_worktree(self):
         self.assertIsNone(guard.write_block_reason("src/a.ts", self.WT))
@@ -247,29 +577,57 @@ class Guard(unittest.TestCase):
         self.assertIsNotNone(guard.write_block_reason(".env", self.WT))
         self.assertIsNone(guard.write_block_reason(".env.example", self.WT))
         self.assertIsNotNone(guard.write_block_reason(".claude/settings.json", self.WT))
-        self.assertIsNotNone(guard.write_block_reason(".claude/skills/run-pulse/SKILL.md", self.WT))
+        self.assertIsNotNone(
+            guard.write_block_reason(".claude/skills/run-pulse/SKILL.md", self.WT)
+        )
 
     def test_writes_from_a_subfolder_use_the_worktree_root(self):
         sub = self.WT + "/src-tauri"
         self.assertIsNone(guard.write_block_reason("../README.md", sub, self.WT))
-        self.assertIsNotNone(guard.write_block_reason("../.claude/settings.json", sub, self.WT))
-        self.assertIsNotNone(guard.write_block_reason("../../team-pr-2/a.ts", sub, self.WT))
+        self.assertIsNotNone(
+            guard.write_block_reason("../.claude/settings.json", sub, self.WT)
+        )
+        self.assertIsNotNone(
+            guard.write_block_reason("../../team-pr-2/a.ts", sub, self.WT)
+        )
 
     def test_reads_of_secrets_live_data_and_the_main_checkout_are_blocked(self):
         home = os.path.expanduser("~")
-        for path in [".env", "ios/.env.local", self.REPO + "/.env", self.REPO + "/src/a.ts", self.REPO,
-                     home + "/Library/Application Support/com.pulse.app/pulse.db",
-                     home + "/Library/Application Support/com.pulse.app/.env",
-                     home + "/Library/Mobile Documents/com~apple~CloudDocs/Pulse/pulse-snapshot.json",
-                     "~/.ssh/id_ed25519", home + "/.tauri/pulse-updater.key", home + "/.config/gh/hosts.yml"]:
-            self.assertIsNotNone(guard.read_block_reason(path, self.WT, self.REPO), path)
-        for path in ["src/a.ts", ".env.example", self.WT + "/CLAUDE.md", "/etc/hosts", "",
-                     home + "/.cargo/registry/src/x/lib.rs", self.REPO + "/.claude/worktrees/team-pr-2/a.ts"]:
+        for path in [
+            ".env",
+            "ios/.env.local",
+            self.REPO + "/.env",
+            self.REPO + "/src/a.ts",
+            self.REPO,
+            home + "/Library/Application Support/com.pulse.app/pulse.db",
+            home + "/Library/Application Support/com.pulse.app/.env",
+            home
+            + "/Library/Mobile Documents/com~apple~CloudDocs/Pulse/pulse-snapshot.json",
+            "~/.ssh/id_ed25519",
+            home + "/.tauri/pulse-updater.key",
+            home + "/.config/gh/hosts.yml",
+        ]:
+            self.assertIsNotNone(
+                guard.read_block_reason(path, self.WT, self.REPO), path
+            )
+        for path in [
+            "src/a.ts",
+            ".env.example",
+            self.WT + "/CLAUDE.md",
+            "/etc/hosts",
+            "",
+            home + "/.cargo/registry/src/x/lib.rs",
+            self.REPO + "/.claude/worktrees/team-pr-2/a.ts",
+        ]:
             self.assertIsNone(guard.read_block_reason(path, self.WT, self.REPO), path)
 
     def test_decide_routes_by_tool(self):
         def decide(tool, **args):
-            return guard.decide({"tool_name": tool, "tool_input": args, "cwd": self.WT}, self.REPO, self.WT)
+            return guard.decide(
+                {"tool_name": tool, "tool_input": args, "cwd": self.WT},
+                self.REPO,
+                self.WT,
+            )
 
         self.assertIsNotNone(decide("Bash", command="git push"))
         self.assertIsNone(decide("Bash", command="cargo test"))
@@ -288,18 +646,47 @@ class Guard(unittest.TestCase):
 
 class Page(unittest.TestCase):
     REPORT = {
-        "started": "2026-11-14T04:15", "minutes": 62, "cost": 3.5, "repo": "nicola/Pulse",
+        "started": "2026-11-14T04:15",
+        "minutes": 62,
+        "cost": 3.5,
+        "repo": "nicola/Pulse",
         "main": {"sha": "abc1234", "ok": True, "failed_step": ""},
         "jobs": [
-            {"kind": "pr", "title": "Scan <all> tickers", "pr": 54, "result": "merged", "summary": "It now scans & more.",
-             "try_it": ["Open Signals"], "not_verified": ["live run"], "reasons": [], "minutes": 30},
-            {"kind": "idea", "title": "Dark mode", "pr": 60, "result": "needs_user", "summary": "",
-             "reasons": ["changes a protected file: .github/workflows/ci.yml"], "minutes": 20},
+            {
+                "kind": "pr",
+                "title": "Scan <all> tickers",
+                "pr": 54,
+                "result": "merged",
+                "summary": "It now scans & more.",
+                "try_it": ["Open Signals"],
+                "not_verified": ["live run"],
+                "reasons": [],
+                "minutes": 30,
+            },
+            {
+                "kind": "idea",
+                "title": "Dark mode",
+                "pr": 60,
+                "result": "needs_user",
+                "summary": "",
+                "reasons": ["changes a protected file: .github/workflows/ci.yml"],
+                "minutes": 20,
+            },
         ],
-        "skipped": [{"kind": "pr", "pr": 7, "title": "Old", "why": "marked as draft"},
-                    {"kind": "main", "title": "Fix failing checks on main", "why": "no change since the last attempt"}],
-        "ideas": [{"text": "Next thing", "state": "open"}, {"text": "Unclear — which?", "state": "waiting"}],
-        "unreleased": {"tag": "v0.8.7", "merges": 2}, "notes": [],
+        "skipped": [
+            {"kind": "pr", "pr": 7, "title": "Old", "why": "marked as draft"},
+            {
+                "kind": "main",
+                "title": "Fix failing checks on main",
+                "why": "no change since the last attempt",
+            },
+        ],
+        "ideas": [
+            {"text": "Next thing", "state": "open"},
+            {"text": "Unclear — which?", "state": "waiting"},
+        ],
+        "unreleased": {"tag": "v0.8.7", "merges": 2},
+        "notes": [],
     }
 
     def test_render_escapes_and_shows_everything(self):
@@ -308,7 +695,14 @@ class Page(unittest.TestCase):
         self.assertIn("Scan &lt;all&gt; tickers", html)
         self.assertNotIn("<all>", html)
         self.assertIn("https://github.com/nicola/Pulse/pull/54", html)
-        for text in ["Needs you", "changes a protected file", "Next thing", "Earlier nights", "release Pulse", "marked as draft"]:
+        for text in [
+            "Needs you",
+            "changes a protected file",
+            "Next thing",
+            "Earlier nights",
+            "release Pulse",
+            "marked as draft",
+        ]:
             self.assertIn(text, html)
 
     def test_empty_history_still_renders(self):
@@ -319,10 +713,14 @@ class Page(unittest.TestCase):
         waiting = page.needs_you(self.REPORT)
         # the stopped job, the stuck main fix, the waiting idea, the unreleased merges
         self.assertEqual(len(waiting), 4)
-        self.assertTrue(any(w.startswith("Fix failing checks on main") for w in waiting), waiting)
+        self.assertTrue(
+            any(w.startswith("Fix failing checks on main") for w in waiting), waiting
+        )
         red = dict(self.REPORT, main={"ok": False, "failed_step": "clippy"}, jobs=[])
         self.assertIn("main is failing", page.needs_you(red)[0])
-        fixed = dict(red, jobs=[{"kind": "pr", "pr": 9, "title": "fix", "result": "merged"}])
+        fixed = dict(
+            red, jobs=[{"kind": "pr", "pr": 9, "title": "fix", "result": "merged"}]
+        )
         self.assertFalse(any("main is failing" in w for w in page.needs_you(fixed)))
 
 
@@ -335,7 +733,9 @@ class Runner(unittest.TestCase):
         cls.old_home = os.environ.get("PULSE_TEAM_HOME")
         os.environ["PULSE_TEAM_HOME"] = cls.tmp.name
         cls.team = importlib.import_module("team")
-        importlib.reload(cls.team)  # pick up the temporary home even if already imported
+        importlib.reload(
+            cls.team
+        )  # pick up the temporary home even if already imported
 
     @classmethod
     def tearDownClass(cls):
@@ -346,8 +746,15 @@ class Runner(unittest.TestCase):
         cls.tmp.cleanup()
 
     def setUp(self):
-        self.team.IDEAS.write_text("# Pulse ideas\n\n- [ ] dark mode\n- [ ] second idea\n")
-        self.job = {"kind": "idea", "key": rules.idea_key("dark mode"), "title": "dark mode", "sha": ""}
+        self.team.IDEAS.write_text(
+            "# Pulse ideas\n\n- [ ] dark mode\n- [ ] second idea\n"
+        )
+        self.job = {
+            "kind": "idea",
+            "key": rules.idea_key("dark mode"),
+            "title": "dark mode",
+            "sha": "",
+        }
         self.today = dt.date.today().isoformat()
 
     def res(self, result, **over):
@@ -365,56 +772,560 @@ class Runner(unittest.TestCase):
 
     def test_idea_that_became_a_pr_is_not_built_twice(self):
         state = {}
-        stopped = self.res("blocked", pr=60, pushed="abc", parked=True, reasons=["still not right"])
+        stopped = self.res(
+            "blocked", pr=60, pushed="abc", parked=True, reasons=["still not right"]
+        )
         self.team.after_job(self.job, stopped, state)
         self.assertIn(f"- [x] dark mode — now PR #60 ({self.today})\n", self.ideas())
-        self.assertEqual(state["attempts"]["pr-60"], {"sha": "abc", "result": "blocked", "tries": 1, "parked": True})
-        self.assertEqual([i["text"] for i in rules.parse_ideas(self.ideas()) if i["state"] == "open"], ["second idea"])
+        self.assertEqual(
+            state["attempts"]["pr-60"],
+            {"sha": "abc", "result": "blocked", "tries": 1, "parked": True},
+        )
+        self.assertEqual(
+            [
+                i["text"]
+                for i in rules.parse_ideas(self.ideas())
+                if i["state"] == "open"
+            ],
+            ["second idea"],
+        )
 
     def test_idea_with_a_question_waits_with_the_question(self):
-        self.team.after_job(self.job, self.res("needs_user", reasons=["Which colours?\nsecond line"]), {})
+        self.team.after_job(
+            self.job,
+            self.res("needs_user", reasons=["Which colours?\nsecond line"]),
+            {},
+        )
         self.assertIn("- [?] dark mode — Which colours? second line\n", self.ideas())
 
     def test_idea_errors_retry_three_nights_then_wait(self):
         state = {}
         for _ in range(2):
-            self.team.after_job(self.job, self.res("error", reasons=["timed out after 75 min"]), state)
+            self.team.after_job(
+                self.job, self.res("error", reasons=["timed out after 75 min"]), state
+            )
             self.assertIn("- [ ] dark mode\n", self.ideas())
-        self.team.after_job(self.job, self.res("error", reasons=["timed out after 75 min"]), state)
-        self.assertIn("- [?] dark mode — failed 3 nights in a row: timed out after 75 min\n", self.ideas())
-        self.assertEqual(state["attempts"], {})  # setting the line back to [ ] starts over
+        self.team.after_job(
+            self.job, self.res("error", reasons=["timed out after 75 min"]), state
+        )
+        self.assertIn(
+            "- [?] dark mode — failed 3 nights in a row: timed out after 75 min\n",
+            self.ideas(),
+        )
+        self.assertEqual(
+            state["attempts"], {}
+        )  # setting the line back to [ ] starts over
 
     def test_pr_and_main_outcomes_are_remembered_by_commit(self):
         state = {}
         job = {"kind": "pr", "key": "pr-5", "title": "t", "pr": 5, "sha": "origin-head"}
         self.team.after_job(job, self.res("blocked", pr=5), state)
         self.assertEqual(state["attempts"]["pr-5"]["sha"], "origin-head")
-        self.team.after_job(job, self.res("needs_user", pr=5, pushed="new-head", parked=True), state)
-        self.assertEqual(state["attempts"]["pr-5"], {"sha": "new-head", "result": "needs_user", "tries": 1, "parked": True})
+        self.team.after_job(
+            job, self.res("needs_user", pr=5, pushed="new-head", parked=True), state
+        )
+        # the team's own push moved the PR: the same run of attempts, so the count carries on
+        self.assertEqual(
+            state["attempts"]["pr-5"],
+            {"sha": "new-head", "result": "needs_user", "tries": 2, "parked": True},
+        )
         main = {"kind": "main", "key": "main", "title": "Fix main", "sha": "main-sha"}
         self.team.after_job(main, self.res("blocked"), state)
         self.assertIsNotNone(rules.stuck(state, "main", "main-sha"))
         self.team.after_job(job, self.res("ready", pr=5), state)
         self.assertNotIn("pr-5", state["attempts"])
-        self.assertEqual(self.ideas().count("[ ]"), 2)  # non-idea jobs never touch the list
+        self.assertEqual(
+            self.ideas().count("[ ]"), 2
+        )  # non-idea jobs never touch the list
 
     def test_session_environment_cannot_trade_spend_or_publish(self):
         os.environ["ANTHROPIC_API_KEY"] = "real"
         os.environ["ALPACA_API_KEY"] = "real"
+        os.environ["PULSE_TEAM_REPO"] = "/somewhere/Pulse"
         try:
-            env = self.team.night_env(self.team.HOME / "wt")
+            env = self.team.night_env()
         finally:
-            del os.environ["ANTHROPIC_API_KEY"], os.environ["ALPACA_API_KEY"]
-        self.assertNotIn("ANTHROPIC_API_KEY", env)  # or `claude` itself would log in with it
+            del (
+                os.environ["ANTHROPIC_API_KEY"],
+                os.environ["ALPACA_API_KEY"],
+                os.environ["PULSE_TEAM_REPO"],
+            )
+        self.assertNotIn(
+            "ANTHROPIC_API_KEY", env
+        )  # or `claude` itself would log in with it
+        self.assertEqual(
+            env["TYPESAFE_API_KEY"], ""
+        )  # set but empty: the opt-in service stays off
+        # nothing in a session's shell points at the main checkout or the team's folder
+        self.assertFalse(
+            {"PULSE_TEAM_REPO", "PULSE_TEAM_HOME", "PULSE_TEAM_WORKTREE"} & set(env)
+        )
         for key in ["ALPACA_API_KEY", "ALPACA_SECRET_KEY", "GROQ_API_KEY", "GH_TOKEN"]:
             self.assertEqual(env[key], "night-team-placeholder", key)
-        self.assertEqual((env["AUTO_TRADE_ENABLED"], env["EXIT_DRY_RUN"], env["PULSE_LLM"]), ("false", "true", "local"))
-        self.assertEqual(env["PULSE_DB_PATH"], str(self.team.DB_JOB))  # set even when no copy exists
+        self.assertEqual(
+            (env["AUTO_TRADE_ENABLED"], env["EXIT_DRY_RUN"], env["PULSE_LLM"]),
+            ("false", "true", "local"),
+        )
+        self.assertEqual(
+            env["PULSE_DB_PATH"], str(self.team.DB_JOB)
+        )  # set even when no copy exists
         self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
         self.assertIn("pushInsteadOf", env["GIT_CONFIG_KEY_0"])
-        self.assertEqual(env["PULSE_TEAM_WORKTREE"], str(self.team.HOME / "wt"))
-        hooks = self.team.guard_settings()["hooks"]["PreToolUse"]
+        hooks = self.team.guard_settings(self.team.HOME / "my wt")["hooks"][
+            "PreToolUse"
+        ]
         self.assertEqual(hooks[0]["matcher"], "*")  # every tool call, not only Bash
+        command = hooks[0]["hooks"][0]["command"]
+        self.assertTrue(
+            command.endswith(f"'{self.team.HOME / 'my wt'}'"), command
+        )  # quoted, as the last argument
+
+    def test_a_child_left_running_does_not_hold_the_call_open(self):
+        began = time.time()
+        code, out, _ = self.team.sh(["bash", "-c", "sleep 20 & echo $!"], timeout=15)
+        self.assertEqual(code, 0)
+        self.assertLess(time.time() - began, 5)
+        os.kill(int(out), 9)  # it was left alone; tidy up
+
+    def test_reap_clears_what_a_command_left_behind(self):
+        _, out, _ = self.team.sh(["bash", "-c", "sleep 20 & echo $!"], reap=True)
+        gone = False
+        for _ in range(40):
+            try:
+                os.kill(int(out), 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            time.sleep(0.05)
+        self.assertTrue(gone)
+
+    def test_a_timeout_kills_the_command_and_says_so(self):
+        began = time.time()
+        code, _, err = self.team.sh(["bash", "-c", "sleep 20; echo late"], timeout=1)
+        self.assertEqual(code, 124)
+        self.assertIn("timed out", err)
+        self.assertLess(time.time() - began, 5)
+
+    def test_output_that_is_not_utf8_does_not_crash_the_runner(self):
+        code, out, _ = self.team.sh(["bash", "-c", "printf 'ok \\xff\\n'"])
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("ok"))
+
+
+def g(*args, cwd):
+    done = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
+    )
+    if done.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)}: {done.stderr}")
+    return done.stdout.strip()
+
+
+def commit(cwd, path, text, message="change"):
+    target = Path(cwd) / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text)
+    g("add", "-A", cwd=cwd)
+    g("commit", "-q", "-m", message, cwd=cwd)
+    return g("rev-parse", "HEAD", cwd=cwd)
+
+
+class Jobs(unittest.TestCase):
+    """Whole jobs against a real repository and its 'GitHub' (a bare repository
+    next to it). The sessions, the checks and the gh calls are played by the test;
+    every git command, the gate and the order things happen in are the real ones."""
+
+    IDEA = {"kind": "idea", "key": "idea-add-x-abc123", "title": "Add x", "sha": ""}
+    PASS = {"verdict": "pass", "summary": "It does the thing.", "findings": []}
+    DONE = {
+        "status": "done",
+        "pr_title": "Add x",
+        "pr_body": "What and why.",
+        "summary": "Adds x.",
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name).resolve()
+        self.origin, self.repo = root / "origin.git", root / "repo"
+        g("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=root)
+        g("init", "-q", "-b", "main", str(self.repo), cwd=root)
+        for key, value in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+        ]:
+            g("config", key, value, cwd=self.repo)
+        g("remote", "add", "origin", str(self.origin), cwd=self.repo)
+        (self.repo / ".gitignore").write_text(".env\n")
+        (self.repo / "package.json").write_text('{"scripts": {"test": "vitest run"}}\n')
+        (self.repo / ".github/workflows").mkdir(parents=True)
+        (self.repo / ".github/workflows/ci.yml").write_text("on: pull_request\n")
+        commit(self.repo, "src/a.txt", "a\n", "first")
+        g("push", "-q", "-u", "origin", "main", cwd=self.repo)
+
+        saved = {k: os.environ.get(k) for k in ("PULSE_TEAM_HOME", "PULSE_TEAM_REPO")}
+        os.environ.update(
+            PULSE_TEAM_HOME=str(root / "home"), PULSE_TEAM_REPO=str(self.repo)
+        )
+        self.team = importlib.reload(importlib.import_module("team"))
+        for key, value in saved.items():
+            os.environ.pop(key, None) if value is None else os.environ.__setitem__(
+                key, value
+            )
+
+        self.sessions, self.calls, self.checks, self.script = [], [], [], {}
+        self.pr_branch = ""
+        self.team.session = self.session
+        self.team.run_checks = lambda wt, run, name: (
+            self.checks.pop(0) if self.checks else (True, "", "")
+        )
+        self.team.gh, self.team.gh_json = self.gh, self.gh_json
+        self.team.log = lambda msg: None
+        self.run = {
+            "dir": root,
+            "cost": 0.0,
+            "abort": "",
+            "no_merge": False,
+            "main_step": "",
+            "main_tail": "",
+        }
+
+    # -- what the test plays --
+
+    def session(self, prompt, cwd, schema, minutes, name, run):
+        self.sessions.append(name.split("-")[-1])
+        kind = name.split("-")[-1].rstrip("0123456789")
+        play = self.script.get(kind)
+        if isinstance(play, list):
+            play = play.pop(0)
+        data = play(cwd) if callable(play) else play
+        return {
+            "ok": True,
+            "data": data or (self.PASS if kind == "review" else self.DONE),
+        }
+
+    def gh(self, *args, timeout=120):
+        self.calls.append(args)
+        if args[:2] == ("pr", "create"):
+            self.pr_branch = args[args.index("--head") + 1]
+            return 0, "https://github.com/nicola/Pulse/pull/77"
+        return 0, ""
+
+    def gh_json(self, *args):
+        # `gh pr view`: GitHub's answer for the branch as it is on 'GitHub' now
+        return {
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "baseRefName": "main",
+            "isDraft": False,
+            "labels": [],
+            "headRefOid": g(
+                "rev-parse", f"refs/heads/{self.pr_branch}", cwd=self.origin
+            ),
+            "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        }
+
+    # -- helpers --
+
+    def open_pr(self, files):
+        """A pull request (#5) from feat/thing, as its owner pushed it."""
+        g("checkout", "-q", "-b", "feat/thing", cwd=self.repo)
+        for path, text in files.items():
+            sha = commit(self.repo, path, text, f"owner: {path}")
+        g("push", "-q", "origin", "feat/thing", cwd=self.repo)
+        g("checkout", "-q", "main", cwd=self.repo)
+        g("branch", "-q", "-D", "feat/thing", cwd=self.repo)
+        self.pr_branch = "feat/thing"
+        return {
+            "kind": "pr",
+            "key": "pr-5",
+            "pr": 5,
+            "title": "Thing",
+            "head": "feat/thing",
+            "body": "",
+            "sha": sha,
+            "labelled": False,
+        }
+
+    def main_moves(self):
+        sha = commit(
+            self.repo, f"src/main-{time.time_ns()}.txt", "moved\n", "main moves"
+        )
+        g("push", "-q", "origin", "main", cwd=self.repo)
+        return sha
+
+    def on_github(self, branch):
+        done = subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", f"refs/heads/{branch}"],
+            cwd=self.origin,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return done.stdout.strip()
+
+    def local(self, branch):
+        done = subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", f"refs/heads/{branch}"],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return done.stdout.strip()
+
+    def called(self, *start):
+        return [c for c in self.calls if c[: len(start)] == start]
+
+    def merged_sha(self):
+        (call,) = self.called("pr", "merge")
+        return call[call.index("--match-head-commit") + 1]
+
+    def builds(self, path, text, data=None):
+        def play(cwd):
+            self.built = commit(cwd, path, text, "builder")
+            return data or self.DONE
+
+        return play
+
+    # -- the jobs --
+
+    def test_an_idea_that_passes_is_pushed_reviewed_and_merged(self):
+        def build(cwd):
+            # the worktree's .env holds placeholders only, and git does not see it
+            self.assertIn(
+                "ANTHROPIC_API_KEY=night-team-placeholder", (cwd / ".env").read_text()
+            )
+            return self.builds("src/x.txt", "x\n")(cwd)
+
+        self.script["build"] = build
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual((res["result"], res["pr"], res["reasons"]), ("merged", 77, []))
+        self.assertEqual(self.sessions, ["build", "review1"])
+        self.assertEqual(
+            self.merged_sha(), self.built
+        )  # exactly the commit that was checked and reviewed
+        self.assertEqual(res["pushed"], self.built)
+        self.assertFalse((self.repo / ".claude/worktrees/team-job").exists())
+        self.assertEqual(g("branch", "--list", "feat/night-*", cwd=self.repo), "")
+
+    def test_no_merge_stops_one_step_short(self):
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        self.run["no_merge"] = True
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "ready")
+        self.assertEqual(self.called("pr", "merge"), [])
+        self.assertEqual(self.on_github(self.pr_branch), self.built)
+
+    def test_work_that_touches_ci_never_leaves_this_mac(self):
+        self.script["build"] = self.builds(".github/workflows/ci.yml", "on: push\n")
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "needs_user")
+        self.assertEqual(
+            res["reasons"][0], "changes a protected file: .github/workflows/ci.yml"
+        )
+        self.assertIn("kept on this Mac as branch feat/night-", res["reasons"][-1])
+        self.assertEqual(
+            g("for-each-ref", "--format=%(refname)", cwd=self.origin), "refs/heads/main"
+        )
+        self.assertEqual(self.called("pr", "create"), [])
+        (branch,) = g(
+            "branch",
+            "--list",
+            "--format=%(refname:short)",
+            "feat/night-*",
+            cwd=self.repo,
+        ).split()
+        self.assertEqual(self.local(branch), self.built)  # the work is still there
+
+    def test_stopped_work_that_touches_ci_is_not_pushed_either(self):
+        stop = {"status": "blocked", "summary": "Could not finish."}
+        self.script["build"] = self.builds(
+            ".github/workflows/ci.yml", "on: push\n", stop
+        )
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "blocked")
+        self.assertIn(
+            "not pushed, because it changes a protected file", res["reasons"][-1]
+        )
+        self.assertEqual(
+            g("for-each-ref", "--format=%(refname)", cwd=self.origin), "refs/heads/main"
+        )
+
+    def test_stopped_work_that_is_harmless_gets_a_pull_request(self):
+        stop = {
+            "status": "needs_user",
+            "summary": "Half done.",
+            "question": "Blue or green?",
+        }
+        self.script["build"] = self.builds("src/x.txt", "x\n", stop)
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(
+            (res["result"], res["pr"], res["reasons"]),
+            ("needs_user", 77, ["Blue or green?"]),
+        )
+        self.assertEqual(self.on_github(self.pr_branch), self.built)
+        self.assertTrue(self.called("pr", "edit", "77", "--add-label", "needs-you"))
+
+    def test_changed_package_scripts_need_the_owner(self):
+        self.script["build"] = self.builds(
+            "package.json", '{"scripts": {"test": "true"}}\n'
+        )
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "needs_user")
+        self.assertIn("package.json", res["reasons"][0])
+        self.assertEqual(self.called("pr", "create"), [])
+
+    def test_a_pr_touching_a_protected_file_is_reviewed_but_nothing_is_pushed(self):
+        job = self.open_pr({"scripts/team/rules.py": "x = 1\n", "src/b.txt": "b\n"})
+        self.main_moves()  # so main has to be merged in, which the runner does on its own copy only
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "needs_user")
+        self.assertEqual(
+            self.sessions, ["review2"]
+        )  # pass 1 was the runner's own merge; no builder session
+        self.assertEqual(
+            res["reasons"][0], "changes a protected file: scripts/team/rules.py"
+        )
+        self.assertIn("your call", res["reasons"][-1])
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])
+        self.assertEqual(self.local("night-kept/pr-5"), "")
+        self.assertTrue(self.called("pr", "edit", "5", "--add-label", "needs-you"))
+        self.assertEqual(self.called("pr", "merge"), [])
+
+    def test_a_protected_pr_the_reviewer_rejects_says_so_and_is_left_alone(self):
+        job = self.open_pr({"scripts/team/rules.py": "x = 1\n"})
+        self.script["review"] = {
+            "verdict": "fail",
+            "summary": "Broken.",
+            "findings": [
+                {"severity": "major", "where": "rules.py:1", "problem": "wrong"}
+            ],
+        }
+        res = self.team.run_job(job, self.run)
+        self.assertEqual((res["result"], self.sessions), ("needs_user", ["review1"]))
+        self.assertIn("the reviewer objects: rules.py:1 wrong", res["reasons"])
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])
+
+    def test_main_moving_during_the_job_means_starting_over(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        moved = []
+
+        def review(cwd):
+            if not moved:
+                moved.append(
+                    self.main_moves()
+                )  # someone merges into main while the reviewer reads
+            return self.PASS
+
+        self.script["review"] = review
+        res = self.team.run_job(job, self.run)
+        self.assertEqual((res["result"], res["reasons"]), ("merged", []))
+        self.assertEqual(
+            self.sessions, ["review1", "review3"]
+        )  # reviewed again on the new main
+        sha = self.merged_sha()
+        self.assertEqual(sha, self.on_github("feat/thing"))
+        g(
+            "merge-base", "--is-ancestor", moved[0], sha, cwd=self.origin
+        )  # the new main is in what merges
+
+    def test_main_that_keeps_moving_is_given_up_for_tonight(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+
+        def review(cwd):
+            self.main_moves()
+            return self.PASS
+
+        self.script["review"] = review
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "error")
+        self.assertIn("kept changing", res["reasons"][0])
+        self.assertEqual(self.called("pr", "merge"), [])
+        self.assertEqual(
+            self.on_github("feat/thing"), job["sha"]
+        )  # never pushed: main moved before each push
+
+    def test_failed_fixes_stay_off_the_owners_branch(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        self.checks = [(False, "clippy", "boom")] * 3
+        self.script["fix"] = [
+            self.builds("src/fix1.txt", "1\n"),
+            self.builds("src/fix2.txt", "2\n"),
+        ]
+        res = self.team.run_job(job, self.run)
+        self.assertEqual((res["result"], self.sessions), ("blocked", ["fix1", "fix2"]))
+        self.assertIn(
+            'still not right after 2 fix rounds: the check "clippy" fails',
+            res["reasons"][0],
+        )
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])
+        self.assertEqual(self.local("night-kept/pr-5"), self.built)
+        self.assertIn("night-kept/pr-5", res["reasons"][-1])
+        self.assertTrue(self.called("pr", "edit", "5", "--add-label", "needs-you"))
+
+    def test_a_reviewers_objection_is_fixed_then_merged(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        fail = {
+            "verdict": "fail",
+            "summary": "No.",
+            "findings": [{"severity": "major", "problem": "off by one"}],
+        }
+        self.script["review"] = [fail, self.PASS]
+        self.script["fix"] = self.builds("src/b.txt", "b fixed\n")
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(
+            (res["result"], self.sessions), ("merged", ["review1", "fix1", "review2"])
+        )
+        self.assertEqual(self.merged_sha(), self.built)
+        self.assertEqual(self.on_github("feat/thing"), self.built)
+
+    def test_a_reviewer_that_edits_the_code_changes_nothing(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+
+        def review(cwd):
+            (cwd / "src/b.txt").write_text("the reviewer was here\n")
+            (cwd / "stray.txt").write_text("x\n")
+            commit(cwd, "src/sneak.txt", "x\n", "reviewer commit")
+            return self.PASS
+
+        self.script["review"] = review
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "merged")
+        self.assertEqual(
+            self.merged_sha(), job["sha"]
+        )  # what was checked, not what the reviewer left
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])
+
+    def test_a_pr_that_conflicts_with_main_goes_to_a_builder(self):
+        job = self.open_pr({"src/a.txt": "the pr's a\n"})
+        commit(self.repo, "src/a.txt", "main's a\n", "main edits the same file")
+        g("push", "-q", "origin", "main", cwd=self.repo)
+
+        def merge(cwd):
+            subprocess.run(
+                ["git", "merge", "origin/main"],
+                cwd=cwd,
+                capture_output=True,
+                check=False,
+            )
+            self.built = commit(cwd, "src/a.txt", "both\n", "merge main")
+            return self.DONE
+
+        self.script["fix"] = merge
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(
+            (res["result"], self.sessions), ("merged", ["fix1", "review2"])
+        )
+        self.assertEqual(self.merged_sha(), self.built)
+
+    def test_github_being_unreachable_stops_the_job_before_anything_runs(self):
+        g("remote", "set-url", "origin", str(self.origin) + "-gone", cwd=self.repo)
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual((res["result"], self.sessions), ("error", []))
+        self.assertIn("could not reach GitHub", res["reasons"][0])
 
 
 if __name__ == "__main__":

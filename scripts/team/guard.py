@@ -8,8 +8,13 @@ fetcher on the live database, read secrets, use the mail/calendar/drive
 connectors, or touch what runs on this Mac.
 
 It is one of several layers, not the only one: the runner also starts sessions
-with an environment in which `git push` and `gh` cannot reach GitHub, and with
-placeholder API keys (see `night_env` in team.py).
+with an environment in which `git push` and `gh` cannot reach GitHub, with
+placeholder API keys and a placeholder `.env` in the worktree (see `night_env`
+and `write_placeholder_env` in team.py), and a debug build of the fetcher
+follows `PULSE_DB_PATH` to the copy. A shell command can be spelled in ways no
+pattern sees, which is why none of these layers stands alone.
+
+    guard.py <main checkout> <session's worktree>
 
 Exit 2 blocks the tool call and shows the reason to the session.
 """
@@ -19,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 
 # A command word can follow the start, white space, a shell separator, a quote
@@ -39,12 +45,25 @@ GH_ALLOWED = {
     ("issue", "list"),
 }
 GH_CALL = re.compile(WORD + r"gh\s+([a-z-]+)(?:\s+([a-z-]+))?")
-# `git push` with any global options before it; `git stash push` is local and fine.
-GIT_PUSH = re.compile(
-    WORD + r"git(?:\s+-[cC]\s+\S+|\s+-{1,2}[\w-]+(?:=\S+)?)*\s+push\b"
-)
+# `git`, then any global options (`-C dir`, `--no-pager`), then the subcommand.
+GIT = WORD + r"git(?:\s+-[cC]\s+\S+|\s+-{1,2}[\w-]+(?:=\S+)?)*\s+"
+GIT_PUSH = re.compile(GIT + r"push\b")
+# Every worktree shares one stash with Nicola's checkout; looking is fine.
+GIT_STASH = re.compile(GIT + r"stash\b(?!\s+(?:list|show)\b)")
 SECRET_FILE = re.compile(r"(?<![\w])\.env(?![\w])(?!\.example)")
-IN_A_MESSAGE = " (if those words are only inside a commit message, reword it)"
+# The patterns see words, not meaning, so a search or a commit message that only
+# mentions one is blocked too. Every Bash refusal says how to get past that.
+REWORD = " (if those words are only inside a commit message or a search, reword it or use the Grep tool)"
+
+# These open the live database unless told otherwise.
+PULSE_BINARIES = {"pulse-fetcher", "pulse-eval", "pulse-backtest"}
+SEGMENT = re.compile(r"\|\||&&|[;|&\n()`]|\$\(")
+ASSIGNMENT = re.compile(r"^[A-Za-z_]\w*=")
+# Words that can stand before the command a shell actually runs.
+BEFORE_COMMAND = {
+    "time", "nohup", "exec", "env", "command", "caffeinate", "nice", "timeout",
+    "gtimeout", "xargs", "then", "do", "else", "if", "while", "!", "{",
+}  # fmt: skip
 NEVER = [
     (
         re.compile(r"com\.pulse\.app|Mobile\\? Documents"),
@@ -53,6 +72,15 @@ NEVER = [
     (
         re.compile(WORD + r"(?:launchctl|sudo|osascript|crontab)\b"),
         "launchctl, sudo, osascript and crontab are not for unattended sessions",
+    ),
+    (
+        re.compile(
+            WORD
+            + r"(?:brew\s+(?:install|uninstall|reinstall|upgrade|tap)|cargo\s+install"
+            r"|rustup\s+(?:default|update|self|toolchain)|security\s+(?:[a-z]+-[a-z-]+|export|import)"
+            r"|(?:npm|pnpm|yarn)\s+(?:\S+\s+)*(?:-g|--global))\b"
+        ),
+        "installing onto this Mac, changing its toolchain and the keychain are not for unattended sessions",
     ),
     (
         re.compile(r"install-app\.sh|install-launchd\.sh"),
@@ -77,18 +105,59 @@ WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_TOOLS = {"Read", "Grep", "Glob"}
 
 
+def _words(segment: str) -> list[str]:
+    try:
+        return shlex.split(segment)
+    except ValueError:  # an unbalanced quote: the separator sat inside a string
+        return [w.strip("'\"") for w in segment.split()]
+
+
+def runs_on_live_db(cmd: str) -> bool:
+    """True when the command starts a Pulse binary (itself, or through `cargo
+    run`) without --db-path. Without the flag they open the live database, and
+    the fetcher's default mode is a full daily run. Building, testing, copying
+    or searching for a binary is fine."""
+    for segment in SEGMENT.split(cmd):
+        if "--db-path" in segment:
+            continue
+        words = _words(segment)
+        while words and (
+            ASSIGNMENT.match(words[0])
+            or words[0] in BEFORE_COMMAND
+            or words[0].startswith("-")
+            or words[0].isdigit()
+        ):
+            words.pop(0)
+        if not words:
+            continue
+        first = os.path.basename(words[0])
+        if first in PULSE_BINARIES or (first == "cargo" and "run" in words[1:]):
+            return True
+        if first in {"bash", "sh", "zsh"} and "-c" in words[1:-1]:
+            if runs_on_live_db(words[words.index("-c") + 1]):
+                return True
+    return False
+
+
 def bash_block_reason(cmd: str, repo: str) -> str | None:
+    reason = _bash_block_reason(cmd, repo)
+    return reason + REWORD if reason else None
+
+
+def _bash_block_reason(cmd: str, repo: str) -> str | None:
     if GIT_PUSH.search(cmd):
-        return "commit only; the runner pushes after its checks" + IN_A_MESSAGE
+        return "commit only; the runner pushes after its checks"
+    if GIT_STASH.search(cmd):
+        return "the stash is shared with Nicola's checkout; set work aside with a commit instead"
     for m in GH_CALL.finditer(cmd):
         if (m.group(1), m.group(2) or "") not in GH_ALLOWED:
             call = f"gh {m.group(1)} {m.group(2) or ''}".strip()
-            return (
-                f"`{call}` is not allowed here; gh is read-only for sessions"
-                + IN_A_MESSAGE
-            )
-    if "pulse-fetcher" in cmd and "--mode" in cmd and "--db-path" not in cmd:
-        return 'run the fetcher only with --db-path "$PULSE_DB_PATH" (never the live database)'
+            return f"`{call}` is not allowed here; gh is read-only for sessions"
+    if runs_on_live_db(cmd):
+        return (
+            'run Pulse binaries (and `cargo run`) only with --db-path "$PULSE_DB_PATH", never on the '
+            "live database; the dev app (`pnpm tauri dev`) takes it from the environment"
+        )
     if SECRET_FILE.search(cmd):
         return ".env files hold real keys and are off limits"
     for pattern, reason in NEVER:
@@ -99,7 +168,8 @@ def bash_block_reason(cmd: str, repo: str) -> str | None:
         home = os.path.expanduser("~")
         forms = {repo}
         if repo.startswith(home):
-            forms |= {"~" + repo[len(home) :], "$HOME" + repo[len(home) :]}
+            rest = repo[len(home) :]
+            forms |= {"~" + rest, "$HOME" + rest, "${HOME}" + rest}
         for form in forms:
             if re.search(re.escape(form) + r"(?!/\.claude/worktrees/)(?![\w.-])", cmd):
                 return "work only inside your worktree, not the main checkout"
@@ -182,11 +252,10 @@ def main() -> int:
     except ValueError:
         print("night-team guard: unreadable hook input", file=sys.stderr)
         return 2  # fail closed
-    reason = decide(
-        event,
-        os.environ.get("PULSE_TEAM_REPO", ""),
-        os.environ.get("PULSE_TEAM_WORKTREE", ""),
-    )
+    # The runner passes both paths on the command line, so a session's shell
+    # never has a variable that points at the main checkout.
+    args = sys.argv[1:] + ["", ""]
+    reason = decide(event, args[0], args[1])
     if reason:
         print(f"Blocked by the night-team guard: {reason}.", file=sys.stderr)
         return 2

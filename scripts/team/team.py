@@ -20,10 +20,12 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -57,13 +59,15 @@ REVIEWER_MIN = _int("PULSE_TEAM_REVIEWER_MIN", 40)
 CHECKS_MIN = _int("PULSE_TEAM_CHECKS_MIN", 60)
 CI_MIN = _int("PULSE_TEAM_CI_MIN", 45)
 MAX_FIX_ROUNDS = _int("PULSE_TEAM_FIX_ROUNDS", 2)
+MAX_MAIN_MOVES = 2  # times a job starts over because main changed under it
 MODEL = os.environ.get("PULSE_TEAM_MODEL", "")  # empty = the default from settings
 RUN_AT = (_int("PULSE_TEAM_HOUR", 2), _int("PULSE_TEAM_MINUTE", 30))  # used by install
 
 # Sessions get placeholders for every key Pulse knows, so nothing they build or
 # run can trade or spend. (dotenvy never overrides a variable that is already
 # set, so the real .env files lose.) ANTHROPIC_API_KEY is left out on purpose:
-# `claude` itself would try to log in with it. PULSE_LLM=local covers that one.
+# `claude` itself would try to log in with it. PULSE_LLM=local and the
+# placeholder .env in every worktree (write_placeholder_env) cover that one.
 PLACEHOLDER_KEYS = [
     "ALPACA_API_KEY",
     "ALPACA_SECRET_KEY",
@@ -96,6 +100,7 @@ SAFE_ENV = {
     "PULSE_LLM": "local",
     "PULSE_CLOUD_TASKS": "",
     "PULSE_SNAPSHOT": "off",
+    "TYPESAFE_API_KEY": "",  # an opt-in service: set but empty means off
     # scheduled-fetch.sh / live-signals.sh run the INSTALLED fetcher on the live
     # database; with this they find no fetcher and exit.
     "PULSE_FETCHER": "/nonexistent/night-team-no-fetcher",
@@ -190,9 +195,10 @@ See it with `git diff origin/{base}...HEAD` and `git log origin/{base}..HEAD`. T
 
 1. Does it do what it is meant to, completely? Does anything it claims not actually work?
 2. Look for bugs, crashes (the crash-prevention rules in CLAUDE.md), data loss, anything that could place or change an order wrongly, anything that weakens a safety check.
-3. New behaviour without tests, and tests that cannot fail.
-4. Run the tests that matter and, where it is safe, see the change working for real (the run-pulse skill explains how). List what you actually ran in `verified` and what you could not check in `not_verified`.
-5. List new dependencies in `new_dependencies`.
+3. New behaviour without tests, and tests that cannot fail. A change that makes the checks themselves weaker (tests deleted, skipped or ignored, lint or test settings loosened) is a `blocker` unless the job cannot be done any other way.
+4. If it edits CLAUDE.md or other instructions for Claude sessions: it may only describe the code. Anything that changes how sessions behave or loosens a rule is a `blocker`.
+5. Run the tests that matter and, where it is safe, see the change working for real (the run-pulse skill explains how). List what you actually ran in `verified` and what you could not check in `not_verified`.
+6. List new dependencies in `new_dependencies`.
 
 Do not edit or commit anything. Verdict `fail` if there is any `blocker` or `major` finding; `minor` findings alone pass. Be concrete: file, line, what goes wrong and with which input.
 `summary`: two or three plain sentences, for a non-developer, on what this change does. `try_it`: steps Nicola can follow to see it."""
@@ -202,32 +208,44 @@ Do not edit or commit anything. Verdict `fail` if there is any `blocker` or `maj
 
 
 def sh(
-    cmd: list[str], cwd: Path | None = None, timeout: int = 600, env: dict | None = None
+    cmd: list[str],
+    cwd: Path | None = None,
+    timeout: int = 600,
+    env: dict | None = None,
+    reap: bool = False,
 ) -> tuple[int, str, str]:
-    """Run a command. On timeout the whole process group is killed (code 124)."""
-    p = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        out, err = p.communicate(timeout=timeout)
-        return p.returncode, out or "", err or ""
-    except subprocess.TimeoutExpired:
+    """Run a command. Its output goes to files, not pipes, so something it left
+    running in the background (a dev server) cannot hold the call open after the
+    command itself has ended. On timeout the whole process group is killed
+    (code 124); with `reap` the group is also cleared when the command ends."""
+    kw = {"encoding": "utf-8", "errors": "replace"}
+    with (
+        tempfile.TemporaryFile("w+", **kw) as out,
+        tempfile.TemporaryFile("w+", **kw) as err,
+    ):
+        p = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=err,
+            start_new_session=True,
+        )
+        note = ""
         try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            out, err = p.communicate(timeout=30)
-        except subprocess.TimeoutExpired:  # something escaped the group and holds the pipe
-            out, err = "", ""
-        return 124, out or "", (err or "") + f"\n[timed out after {timeout // 60} min]"
+            code = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            code, note = 124, f"\n[timed out after {timeout // 60} min]"
+        if note or reap:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            p.wait()
+        out.seek(0)
+        err.seek(0)
+        return code, out.read(), err.read() + note
 
 
 def git(*args: str, cwd: Path | None = None, timeout: int = 300) -> tuple[int, str]:
@@ -265,23 +283,22 @@ def save_json(path: Path, data) -> None:
     tmp.replace(path)
 
 
-def night_env(worktree: Path | None = None) -> dict:
+def night_env() -> dict:
     """The environment of every unattended session: no trading, no real keys,
     no way to publish, a database copy instead of the live one."""
     env = dict(os.environ)
     env.update(SAFE_ENV)
     for key in PLACEHOLDER_KEYS:
         env[key] = "night-team-placeholder"
-    env.pop("ANTHROPIC_API_KEY", None)
-    env["PULSE_TEAM_HOME"] = str(HOME)
-    env["PULSE_TEAM_REPO"] = str(REPO)
+    # The runner's own settings stay with the runner: a session's shell gets no
+    # variable that points at the main checkout or the team's folder.
+    for key in ("ANTHROPIC_API_KEY", "PULSE_TEAM_HOME", "PULSE_TEAM_REPO"):
+        env.pop(key, None)
     env["CARGO_TARGET_DIR"] = str(HOME / "target")
     env["PULSE_TEAM_CHECKS"] = str(HERE / "checks.sh")
-    # Always set, even when there is no copy: the dev app then opens an empty
-    # database there, never the live one.
+    # Always set, even when there is no copy: the dev app and a debug build of
+    # the fetcher then open an empty database there, never the live one.
     env["PULSE_DB_PATH"] = str(DB_JOB)
-    if worktree:
-        env["PULSE_TEAM_WORKTREE"] = str(worktree)
     return env
 
 
@@ -290,11 +307,13 @@ def brief() -> str:
     return text.split("# Brief for sessions", 1)[1].strip()
 
 
-def guard_settings() -> dict:
-    """guard.py as a PreToolUse hook on every tool call of a session."""
+def guard_settings(worktree: Path) -> dict:
+    """guard.py as a PreToolUse hook on every tool call of a session that may
+    write only inside `worktree`."""
+    parts = ["python3", str(HERE / "guard.py"), str(REPO), str(worktree)]
     hook = {
         "type": "command",
-        "command": f"python3 '{HERE / 'guard.py'}'",
+        "command": " ".join(shlex.quote(part) for part in parts),
         "timeout": 10,
     }
     return {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [hook]}]}}
@@ -317,14 +336,14 @@ def session(
         "--permission-prompts",
         "none",
         "--settings",
-        json.dumps(guard_settings()),
+        json.dumps(guard_settings(cwd)),
         "--strict-mcp-config",  # no connectors: a coding session needs no mail or drive
         "-n",
         name,
     ]
     if MODEL:
         cmd += ["--model", MODEL]
-    code, out, err = sh(cmd, cwd=cwd, timeout=minutes * 60, env=night_env(cwd))
+    code, out, err = sh(cmd, cwd=cwd, timeout=minutes * 60, env=night_env(), reap=True)
     (run["dir"] / f"{name}.json").write_text(out or err)
     try:
         res = json.loads(out)
@@ -346,10 +365,13 @@ def head(wt: Path) -> str:
     return git("rev-parse", "HEAD", cwd=wt)[1]
 
 
-def make_worktree(name: str, ref: str, branch: str | None) -> Path:
-    """A fresh worktree under .claude/worktrees/team-<name>. Only ever replaces
-    the team's own leftovers (the team- prefix)."""
-    path = REPO / ".claude/worktrees" / f"team-{name}"
+def make_worktree(ref: str, branch: str | None) -> Path:
+    """A fresh worktree for the job at hand, always at the same path. One job
+    runs at a time, and Rust compiles paths into what it builds (where the
+    fetcher looks for `.env`, where tests find their fixtures). The build folder
+    is shared between jobs, so a path that changed from job to job could leave
+    a binary that points into a worktree that is gone."""
+    path = REPO / ".claude/worktrees/team-job"
     if path.exists():
         git("worktree", "remove", "--force", str(path))
     git("worktree", "prune")
@@ -361,7 +383,22 @@ def make_worktree(name: str, ref: str, branch: str | None) -> Path:
     code, out = git(*args)
     if code != 0:
         raise RuntimeError(f"could not create worktree: {out[-300:]}")
+    write_placeholder_env(path)
     return path
+
+
+def write_placeholder_env(wt: Path) -> None:
+    """A fetcher or dev app built in a checkout loads the first `.env` it finds,
+    and its own checkout's comes before the installed app's (which holds the
+    real keys). Give every team worktree one with placeholders only."""
+    keys = [*PLACEHOLDER_KEYS, "ANTHROPIC_API_KEY"]
+    env = wt / ".env"
+    env.write_text(
+        "# Written by the night team: placeholders only.\n"
+        + "".join(f"{key}=night-team-placeholder\n" for key in keys)
+    )
+    if git("check-ignore", "-q", ".env", cwd=wt)[0] != 0:
+        env.unlink()  # not ignored on this branch: it would count as an uncommitted change
 
 
 def run_checks(wt: Path, run: dict, name: str) -> tuple[bool, str, str]:
@@ -369,7 +406,11 @@ def run_checks(wt: Path, run: dict, name: str) -> tuple[bool, str, str]:
     # The checks run the code under review, so they cannot publish either.
     env = dict(os.environ, CARGO_TARGET_DIR=str(HOME / "target"), **NO_PUBLISH)
     code, out, err = sh(
-        ["bash", str(HERE / "checks.sh")], cwd=wt, timeout=CHECKS_MIN * 60, env=env
+        ["bash", str(HERE / "checks.sh")],
+        cwd=wt,
+        timeout=CHECKS_MIN * 60,
+        env=env,
+        reap=True,
     )
     text = out + err
     (run["dir"] / f"{name}-checks.log").write_text(text)
@@ -510,166 +551,159 @@ def park(res: dict) -> None:
 
 
 def merge_ready(pr: int, sha: str) -> str:
-    """'' when GitHub will merge exactly this commit now, else why not."""
+    """'' when the PR is still the one that was checked and GitHub will merge
+    exactly this commit now, else why not."""
+    fields = "mergeable,headRefOid,state,baseRefName,isDraft,labels"
     view = {}
     for _ in range(6):  # GitHub works `mergeable` out lazily: UNKNOWN at first
         try:
-            view = gh_json(
-                "pr", "view", str(pr), "--json", "mergeable,headRefOid,state"
-            )
+            view = gh_json("pr", "view", str(pr), "--json", fields)
         except (RuntimeError, ValueError):
             view = {}
         if view.get("mergeable") in ("MERGEABLE", "CONFLICTING"):
             break
         time.sleep(10)
-    if (
-        view.get("state") == "OPEN"
-        and view.get("headRefOid") == sha
-        and view.get("mergeable") == "MERGEABLE"
-    ):
-        return ""
-    return f"GitHub will not merge it right now ({view.get('mergeable')}, {view.get('state')})"
+    return rules.merge_blockers(view, sha, BASE, LABEL)
 
 
-def do_job(job: dict, res: dict, run: dict) -> None:
-    kind, name = job["kind"], job["key"]
-    git("fetch", "origin", "--prune")
-    reset_job_db()
-    title = body = ""
-    if kind == "pr":
-        branch = job["head"]
-        request = f'PR #{job["pr"]} "{job["title"]}"\n\n{job["body"][:3000]}'
-        if job.get("labelled"):  # a new commit lifted the stop
-            gh("pr", "edit", str(job["pr"]), "--remove-label", LABEL)
-        wt = make_worktree(name, f"origin/{branch}", None)
-        res["wt"] = str(wt)
-        if git("merge", "--no-edit", f"origin/{BASE}", cwd=wt)[0] != 0:
-            git("merge", "--abort", cwd=wt)
-            prompt = FIX_CHANGE.format(request=request, problems=MERGE_MAIN)
-            if not finished(
-                session(prompt, wt, BUILDER_SCHEMA, BUILDER_MIN, f"{name}-merge", run),
-                res,
-            ):
-                return
-    else:
-        stamp = dt.date.today().strftime("%m%d")
-        if kind == "main":
-            branch = f"{rules.MAIN_FIX_PREFIX}{stamp}"
-            request = f"Make {BASE} pass its checks again"
-            prompt = FIX_MAIN.format(step=run["main_step"], tail=run["main_tail"])
-        else:
-            branch = f"feat/night-{name.removeprefix('idea-')}-{stamp}"
-            request = job["title"]
-            prompt = BUILD_IDEA.format(title=job["title"])
-        wt = make_worktree(name, f"origin/{BASE}", branch)
-        res["wt"], res["branch"] = str(wt), branch
-        b = session(prompt, wt, BUILDER_SCHEMA, BUILDER_MIN, f"{name}-build", run)
-        if not finished(b, res):
-            return
-        title = b["data"].get("pr_title") or job["title"]
-        body = b["data"].get("pr_body") or ""
-        res["summary"] = b["data"].get("summary", "")
+def fetch_base() -> str:
+    """Fetch, then name main by its commit. A job compares against this commit,
+    not the branch name, so it always knows which main it tested against and
+    can tell when main has moved on."""
+    if git("fetch", "origin", "--prune")[0] != 0:
+        raise RuntimeError("could not reach GitHub")
+    code, sha = git("rev-parse", "--verify", f"origin/{BASE}^{{commit}}")
+    if code != 0:
+        raise RuntimeError(f"origin/{BASE} was not found")
+    return sha
 
-    def keep_work() -> None:
-        """A job that stops with commits still gets its PR, so the work and the
-        reason are in one place and nothing is lost."""
-        ahead = git("rev-list", "--count", f"origin/{BASE}..HEAD", cwd=wt)[1]
-        if ahead not in ("", "0"):
-            err = publish(wt, branch, res, title or job["title"], body)
-            if err:
-                res["reasons"].append(err)
 
-    rounds = 0
-    while True:
-        # `problems` goes to the next fix session, `short` on the page.
-        if git("status", "--porcelain", cwd=wt)[1]:
-            problems = "You left uncommitted changes. Commit what belongs to the change and remove the rest."
-            short = "the builder left uncommitted changes"
-        elif (
-            git("merge-base", "--is-ancestor", f"origin/{BASE}", "HEAD", cwd=wt)[0] != 0
-        ):
-            problems = MERGE_MAIN  # checked here, not taken on a session's word
-            short = f"the latest {BASE} is still not merged in"
-        else:
-            ok, step, tail = run_checks(wt, run, f"{name}-r{rounds}")
-            if not ok:
-                problems = f'The check "{step}" fails. The end of its output:\n\n```\n{tail}\n```'
-                short = f'the check "{step}" still fails'
-            else:
-                sha = head(wt)
-                r = session(
-                    REVIEW.format(request=request, base=BASE),
-                    wt,
-                    REVIEW_SCHEMA,
-                    REVIEWER_MIN,
-                    f"{name}-review{rounds}",
-                    run,
-                )
-                # A reviewer must not change what it reviewed.
-                git("reset", "--hard", sha, cwd=wt)
-                git("clean", "-fd", cwd=wt)
-                if not r["ok"]:
-                    res["result"] = "error"
-                    res["reasons"].append(f"the review session failed: {r['error']}")
-                    return
-                review = r["data"]
-                for field in ("summary", "try_it", "not_verified", "new_dependencies"):
-                    if review.get(field):
-                        res[field] = review[field]
-                bad = [
-                    f
-                    for f in review.get("findings") or []
-                    if f.get("severity") in ("blocker", "major")
-                ]
-                if review.get("verdict") == "pass" and not bad:
-                    break
-                found = bad or [
-                    {"problem": review.get("summary", "the reviewer did not pass it")}
-                ]
-                res["findings"] = [
-                    f"{f.get('where', '')} {f['problem']}".strip() for f in found
-                ]
-                problems = "An independent reviewer found:\n\n" + "\n".join(
-                    f"- {x}" for x in res["findings"]
-                )
-                short = f"the reviewer still objects: {res['findings'][0]}"
-        if rounds >= MAX_FIX_ROUNDS:
-            res["result"] = "blocked"
-            res["reasons"].append(f"still not right after {rounds} fix rounds: {short}")
-            if short.startswith("the reviewer"):
-                res["reasons"] += res["findings"][1:]
-            keep_work()
-            return
-        rounds += 1
-        fix = FIX_CHANGE.format(request=request, problems=problems)
-        if not finished(
-            session(fix, wt, BUILDER_SCHEMA, BUILDER_MIN, f"{name}-fix{rounds}", run),
-            res,
-        ):
-            keep_work()
-            return
+def gate_violations(wt: Path, base: str, tip: str = "HEAD") -> list[str]:
+    """What in the change between `base` and `tip` needs Nicola (rules.py
+    decides). Raises when git cannot answer, so a failure never reads as
+    'nothing found'."""
 
-    # Checks and review passed on `sha`, with main merged in.
-    changes = rules.parse_name_status(
-        git("diff", "--name-status", "-z", f"origin/{BASE}...HEAD", cwd=wt)[1]
+    def must(*args: str) -> str:
+        code, out = git(*args, cwd=wt)
+        if code != 0:
+            raise RuntimeError(f"git {args[0]} failed: {out[-200:]}")
+        return out
+
+    def package(rev: str) -> str:
+        code, out = git("show", f"{rev}:package.json", cwd=wt)
+        return out if code == 0 else ""
+
+    fork = must("merge-base", base, tip)
+    changes = rules.parse_name_status(must("diff", "--name-status", "-z", fork, tip))
+    return (
+        rules.protected_violations(changes)
+        + rules.forbidden_content(must("diff", fork, tip))
+        + rules.script_violations(package(fork), package(tip))
     )
-    if not changes:
+
+
+def merge_main(wt: Path, base: str, branch: str) -> bool:
+    """Merge main into the job's branch without a session. False = it conflicts."""
+    message = f"Merge {BASE} into {branch}"
+    if git("merge", "--no-edit", "-m", message, base, cwd=wt)[0] == 0:
+        return True
+    git("merge", "--abort", cwd=wt)
+    return False
+
+
+def keep_work(
+    job: dict,
+    res: dict,
+    wt: Path,
+    branch: str,
+    base: str,
+    title: str,
+    body: str,
+    built: bool,
+    violations: list[str] | None = None,
+) -> None:
+    """A job that stops keeps the commits its sessions made, so the work and the
+    reason are in one place. The team's own branch gets a pull request, unless
+    it holds something that may not leave this Mac. An unfinished attempt on
+    someone's pull request is never pushed onto their branch: it stays here."""
+    try:
+        ahead = git("rev-list", "--count", f"{base}..HEAD", cwd=wt)[1]
+        if not built or ahead in ("", "0"):
+            return
+        if job["kind"] == "pr":
+            if head(wt) == git("rev-parse", f"origin/{branch}", cwd=wt)[1]:
+                return
+            kept = f"night-kept/pr-{job['pr']}"
+            if git("branch", "-f", kept, "HEAD", cwd=wt)[0] == 0:
+                res["reasons"].append(
+                    f"the team's unfinished attempt is kept on this Mac as branch {kept}"
+                )
+            return
+        listed = violations is not None  # the caller has already given the reasons
+        if violations is None:
+            violations = gate_violations(wt, base)
+        if violations:
+            why = (
+                "it was not pushed"
+                if listed
+                else f"not pushed, because it {violations[0]}"
+            )
+            res["reasons"].append(
+                f"{why}; the work is kept on this Mac as branch {branch}"
+            )
+            return
+        err = publish(wt, branch, res, title, body)
+        if err:
+            res["reasons"].append(err)
+    except RuntimeError as e:
+        res["reasons"].append(f"could not keep the work: {e}")
+
+
+def land(
+    job: dict,
+    res: dict,
+    run: dict,
+    wt: Path,
+    branch: str,
+    base: str,
+    sha: str,
+    title: str,
+    body: str,
+    hands_off: bool,
+    built: bool,
+) -> str:
+    """The checks and the review passed on `sha`, which has `base` merged in.
+    Apply the rest of the gate, publish, wait for CI and merge. Returns '' when
+    the job is over (`res` says how), or main's new commit when main moved
+    meanwhile and the job has to go round again."""
+    if git("diff", "--quiet", base, sha, cwd=wt)[0] == 0:
         res["result"] = "blocked"
         res["reasons"].append(
             f"nothing to merge: the branch has no changes compared with {BASE}"
         )
-        return
-    diff = git("diff", f"origin/{BASE}...HEAD", cwd=wt)[1]
-    violations = rules.protected_violations(changes) + rules.forbidden_content(diff)
-    err = publish(wt, branch, res, title or job["title"], body)
-    if err:
-        res["result"] = "error"
-        res["reasons"].append(err)
-        return
+        return ""
+    # Looked at before anything is pushed: a pushed CI file runs on GitHub with
+    # the repository's secrets whether or not it is ever merged.
+    violations = gate_violations(wt, base, sha)
+    if hands_off:
+        res["result"] = "needs_user"
+        res["reasons"].append(
+            "the checks pass and the reviewer has no objection, so merging it is your call"
+        )
+        return ""
     if violations:
         res["result"] = "needs_user"
         res["reasons"] += violations
-        return
+        keep_work(job, res, wt, branch, base, title, body, built, violations)
+        return ""
+    now = fetch_base()
+    if now != base:
+        return now
+    err = publish(wt, branch, res, title, body)
+    if err:
+        res["result"] = "error"
+        res["reasons"].append(err)
+        return ""
     ci = wait_ci(res["pr"], sha)
     if ci != "pass":
         why = {
@@ -679,20 +713,23 @@ def do_job(job: dict, res: dict, run: dict) -> None:
         }[ci]
         res["result"] = "blocked" if ci == "fail" else "error"
         res["reasons"].append(why)
-        return
+        return ""
     why = merge_ready(res["pr"], sha)
     if why:
         res["result"] = "error"
         res["reasons"].append(why)
-        return
+        return ""
+    now = fetch_base()  # CI can take a while: is this still the main that was tested?
+    if now != base:
+        return now
     if run["no_merge"]:
         res["result"] = "ready"
-        return
+        return ""
     code, out = gh("pr", "merge", str(res["pr"]), "--merge", "--match-head-commit", sha)
     if code != 0:
         res["result"] = "error"
         res["reasons"].append(f"merge failed: {out[-200:]}")
-        return
+        return ""
     res["result"] = "merged"
     extra = "".join(f"\n- Not checked: {x}" for x in res.get("not_verified") or [])
     gh(
@@ -705,6 +742,151 @@ def do_job(job: dict, res: dict, run: dict) -> None:
     )
     if branch.startswith(rules.TEAM_PREFIXES):  # the team's own branch: tidy up
         git("push", "origin", "--delete", branch)
+    return ""
+
+
+def do_job(job: dict, res: dict, run: dict) -> None:
+    kind, name = job["kind"], job["key"]
+    base = fetch_base()
+    reset_job_db()
+    title, body = job["title"], ""
+    hands_off = built = False
+    if kind == "pr":
+        branch = job["head"]
+        request = f'PR #{job["pr"]} "{job["title"]}"\n\n{job["body"][:3000]}'
+        if job.get("labelled"):  # a new commit lifted the stop
+            gh("pr", "edit", str(job["pr"]), "--remove-label", LABEL)
+        wt = make_worktree(f"origin/{branch}", None)
+        res["wt"] = str(wt)
+        # A PR that already touches protected files is its owner's to merge. It
+        # is still checked and reviewed, but the team changes and pushes nothing.
+        res["reasons"] += gate_violations(wt, base)
+        hands_off = bool(res["reasons"])
+    else:
+        stamp = dt.date.today().strftime("%m%d")
+        if kind == "main":
+            branch = f"{rules.MAIN_FIX_PREFIX}{stamp}"
+            request = f"Make {BASE} pass its checks again"
+            prompt = FIX_MAIN.format(step=run["main_step"], tail=run["main_tail"])
+        else:
+            branch = f"feat/night-{name.removeprefix('idea-')}-{stamp}"
+            request = job["title"]
+            prompt = BUILD_IDEA.format(title=job["title"])
+        wt = make_worktree(base, branch)
+        res["wt"], res["branch"] = str(wt), branch
+        b = session(prompt, wt, BUILDER_SCHEMA, BUILDER_MIN, f"{name}-build", run)
+        built = True
+        title = b["data"].get("pr_title") or title
+        body = b["data"].get("pr_body") or ""
+        res["summary"] = b["data"].get("summary", "")
+        if not finished(b, res):
+            keep_work(job, res, wt, branch, base, title, body, built)
+            return
+
+    rounds = moved = passes = 0
+    while True:
+        passes += 1
+        # `problems` goes to the next fix session, `short` on the page.
+        if git("status", "--porcelain", cwd=wt)[1]:
+            problems = "You left uncommitted changes. Commit what belongs to the change and remove the rest."
+            short = "the builder left uncommitted changes"
+        elif git("merge-base", "--is-ancestor", base, "HEAD", cwd=wt)[0] != 0:
+            # Checked here, not taken on a session's word. The runner merges
+            # main in by itself; a session is only needed for conflicts.
+            if merge_main(wt, base, branch):
+                continue
+            problems, short = MERGE_MAIN, f"it conflicts with the latest {BASE}"
+        else:
+            ok, step, tail = run_checks(wt, run, f"{name}-{passes}")
+            if not ok:
+                problems = f'The check "{step}" fails. The end of its output:\n\n```\n{tail}\n```'
+                short = f'the check "{step}" fails'
+            else:
+                sha = head(wt)
+                r = session(
+                    REVIEW.format(request=request, base=BASE),
+                    wt,
+                    REVIEW_SCHEMA,
+                    REVIEWER_MIN,
+                    f"{name}-review{passes}",
+                    run,
+                )
+                # A reviewer must not change what it reviewed.
+                git("reset", "--hard", sha, cwd=wt)
+                git("clean", "-fd", cwd=wt)
+                if not r["ok"]:
+                    res["result"] = "error"
+                    res["reasons"].append(f"the review session failed: {r['error']}")
+                    keep_work(job, res, wt, branch, base, title, body, built)
+                    return
+                review = r["data"]
+                for field in ("summary", "try_it", "not_verified", "new_dependencies"):
+                    if review.get(field):
+                        res[field] = review[field]
+                bad = [
+                    f
+                    for f in review.get("findings") or []
+                    if f.get("severity") in ("blocker", "major")
+                ]
+                if review.get("verdict") == "pass" and not bad:
+                    new_base = land(
+                        job,
+                        res,
+                        run,
+                        wt,
+                        branch,
+                        base,
+                        sha,
+                        title,
+                        body,
+                        hands_off,
+                        built,
+                    )
+                    if not new_base:
+                        return
+                    moved += 1
+                    if moved > MAX_MAIN_MOVES:
+                        res["result"] = "error"
+                        res["reasons"].append(
+                            f"{BASE} kept changing while this job ran; it will be tried again"
+                        )
+                        return
+                    base = (
+                        new_base  # merge the new main in, then check and review again
+                    )
+                    continue
+                found = bad or [
+                    {"problem": review.get("summary", "the reviewer did not pass it")}
+                ]
+                res["findings"] = [
+                    f"{f.get('where', '')} {f['problem']}".strip() for f in found
+                ]
+                problems = "An independent reviewer found:\n\n" + "\n".join(
+                    f"- {x}" for x in res["findings"]
+                )
+                short = f"the reviewer objects: {res['findings'][0]}"
+        more = res["findings"][1:] if short.startswith("the reviewer") else []
+        if hands_off:
+            res["result"] = "needs_user"
+            res["reasons"] += [short, *more]
+            return
+        if rounds >= MAX_FIX_ROUNDS:
+            res["result"] = "blocked"
+            res["reasons"] += [
+                f"still not right after {rounds} fix rounds: {short}",
+                *more,
+            ]
+            keep_work(job, res, wt, branch, base, title, body, built)
+            return
+        rounds += 1
+        built = True
+        fix = FIX_CHANGE.format(request=request, problems=problems)
+        if not finished(
+            session(fix, wt, BUILDER_SCHEMA, BUILDER_MIN, f"{name}-fix{rounds}", run),
+            res,
+        ):
+            keep_work(job, res, wt, branch, base, title, body, built)
+            return
 
 
 def run_job(job: dict, run: dict) -> dict:
@@ -758,7 +940,12 @@ def after_job(job: dict, res: dict, state: dict) -> None:
         if stopped:
             sha = res.get("pushed") or job.get("sha") or ""
             rules.record_attempt(
-                state, key, sha, result, parked=bool(res.get("parked"))
+                state,
+                key,
+                sha,
+                result,
+                parked=bool(res.get("parked")),
+                prev_sha=job.get("sha") or "",
             )
         else:
             rules.clear_attempt(state, key)
@@ -864,7 +1051,7 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
     main_ok = state.get("main_ok_sha") == main_sha
     if not main_ok:
         log(f"checking {BASE} ({main_sha[:7]})")
-        wt = make_worktree("main-check", f"origin/{BASE}", None)
+        wt = make_worktree(f"origin/{BASE}", None)
         try:
             main_ok, run["main_step"], run["main_tail"] = run_checks(wt, run, "main")
         finally:
@@ -877,6 +1064,8 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
         "failed_step": run["main_step"],
     }
 
+    if re.fullmatch(r"pr-\d+", args.only or ""):
+        rules.clear_attempt(state, args.only)  # asked for by name: forget its last stop
     jobs, report["skipped"] = rules.select_jobs(
         main_ok, prs, ideas, state, owner, BASE, LABEL, main_sha
     )
@@ -902,8 +1091,11 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
             break
         log(f"job {i + 1}/{len(jobs)}: {job['key']} — {job['title'][:80]}")
         res = run_job(job, run)
-        after_job(job, res, state)
         report["jobs"].append(res)
+        try:
+            after_job(job, res, state)
+        except Exception as e:  # noqa: BLE001 - the job is done; its result stays in the report
+            report["notes"].append(f"could not record the outcome of {job['key']}: {e}")
         save_json(HOME / "state.json", state)
 
 
@@ -959,14 +1151,16 @@ def publish_page(html: Path, url: str) -> bool:
             "--permission-mode",
             "auto",
             "--settings",
-            json.dumps(guard_settings()),
+            json.dumps(
+                guard_settings(html.parent)
+            ),  # it may write only in the page folder
             "-n",
             "pulse-team-page",
             prompt,
         ],
         cwd=Path.home(),
         timeout=120,
-        env=night_env(html.parent),  # the guard keeps its writes inside the page folder
+        env=night_env(),
     )
     parts = [p.strip() for p in out.split("·")]
     if code != 0 or len(parts) < 2:
