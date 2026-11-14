@@ -294,18 +294,22 @@ def mark_idea(text: str, idea_text: str, mark: str, note: str) -> str:
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
-def reopen_idea(text: str, idea_text: str) -> str:
-    """Set the first WAITING line of `idea_text` (`- [?] idea — why`) back to open."""
+def reopen_idea(text: str, key: str) -> str:
+    """Set the WAITING line (`- [?] idea — why`) of the idea named `key`
+    (`idea_key`) back to open. The idea's own words may hold a dash too, so
+    every place the reason could start is tried, longest idea first."""
     lines = text.splitlines()
     for i, line in enumerate(lines):
         m = IDEA_LINE.match(line)
         if not m or (m.group(2) or " ") != "?":
             continue
-        body = m.group(3).strip()
-        if body == idea_text or body.startswith(f"{idea_text} — "):
-            lines[i] = f"{m.group(1)}[ ] {idea_text}"
-            break
-    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+        parts = m.group(3).strip().split(" — ")
+        for n in range(len(parts), 0, -1):
+            idea = " — ".join(parts[:n])
+            if idea_key(idea) == key:
+                lines[i] = f"{m.group(1)}[ ] {idea}"
+                return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    return text
 
 
 def add_ideas(text: str, new: list[str]) -> tuple[str, int]:
@@ -591,10 +595,13 @@ def settle(p: dict, state: str, now: dt.datetime) -> None:
 
 
 def expire(proposals: list[dict], now: dt.datetime) -> int:
-    """A text nobody answered in a week is closed. Returns how many."""
+    """A text nobody answered in a week is closed. Returns how many. The week
+    counts from the last thing that happened to it, so a first press on a
+    trading change gives the second one its own week."""
     limit, closed = _stamp(now - dt.timedelta(days=EXPIRE_DAYS)), 0
     for p in proposals:
-        if p.get("state") in OPEN_STATES and (p.get("sent_at") or limit) < limit:
+        last = max(p.get("sent_at") or "", p.get("answered_at") or "")
+        if p.get("state") in OPEN_STATES and last and last < limit:
             p["state"], closed = "expired", closed + 1
     return closed
 

@@ -63,6 +63,7 @@ class FakeTelegram:
     def __init__(self):
         self.calls, self.paths, self.updates = [], [], []
         self.down = 0  # an HTTP status to answer with instead
+        self.texts_left = None  # a number: sendMessage fails once it is used up
         self.message_id = 100
         fake = self
 
@@ -93,6 +94,10 @@ class FakeTelegram:
         if method == "getMe":
             return 200, {"ok": True, "result": {"username": "pulse_test_bot"}}
         if method == "sendMessage":
+            if self.texts_left is not None:
+                if self.texts_left <= 0:
+                    return 500, {"ok": False, "description": "not now"}
+                self.texts_left -= 1
             self.message_id += 1
             return 200, {"ok": True, "result": {"message_id": self.message_id}}
         if method == "getUpdates":
@@ -282,6 +287,19 @@ class ChatRules(unittest.TestCase):
             ["expired", "confirming", "approved"],
         )
 
+    def test_a_first_press_gives_the_second_its_own_week(self):
+        p = {
+            "kind": "trading",
+            "state": "sent",
+            "sent_at": (DAY - dt.timedelta(days=6, hours=23)).isoformat(
+                timespec="seconds"
+            ),
+        }
+        rules.settle(p, rules.proposal_step(p, "yes")[0], DAY)
+        self.assertEqual(p["state"], "confirming")
+        self.assertEqual(rules.expire([p], DAY + dt.timedelta(days=1)), 0)
+        self.assertEqual(rules.expire([p], DAY + dt.timedelta(days=8)), 1)
+
     def test_ideas_join_the_list_once_and_a_waiting_one_reopens(self):
         listed = "# Pulse ideas\n\n- [x] dark mode — merged 2026-11-01 (PR #3)\n- [?] Fix x — it asked\n"
         out, added = rules.add_ideas(
@@ -289,10 +307,25 @@ class ChatRules(unittest.TestCase):
         )
         self.assertEqual(added, 1)
         self.assertTrue(out.endswith("- [ ] a new one\n"))
-        self.assertIn("- [ ] Fix x\n", rules.reopen_idea(listed, "Fix x"))
+        self.assertIn(
+            "- [ ] Fix x\n", rules.reopen_idea(listed, rules.idea_key("Fix x"))
+        )
         self.assertEqual(
-            rules.reopen_idea(listed, "dark mode"), listed
+            rules.reopen_idea(listed, rules.idea_key("dark mode")), listed
         )  # built: left alone
+
+    def test_a_long_idea_or_one_with_a_dash_reopens_by_its_name(self):
+        long = "Show " + "every stop " * 25 + "on one page"  # past a title's 200
+        dashed = "Signals page — add a filter"
+        listed = (
+            f"# Pulse ideas\n\n- [?] {long} — it asked\n"
+            f"- [?] {dashed} — it asked — twice\n"
+        )
+        out = rules.reopen_idea(listed, rules.idea_key(long))
+        self.assertIn(f"- [ ] {long}\n", out)
+        out = rules.reopen_idea(out, rules.idea_key(dashed))
+        self.assertTrue(out.endswith(f"- [ ] {dashed}\n"))
+        self.assertEqual(rules.reopen_idea(listed, "idea-unknown-000000"), listed)
 
 
 class Sending(ChatCase):
@@ -330,6 +363,25 @@ class Sending(ChatCase):
         self.assertEqual(chat.flush(self.line, DAY), 2)
         self.assertEqual(self.fake.said(), ["first", "second, serious"])
         self.assertEqual(self.outbox(), [])
+
+    def test_a_text_held_up_by_telegram_still_keeps_to_the_day(self):
+        self.fake.down = 500
+        chat.send("an ordinary one", now=DAY)
+        chat.send("a serious one", serious=True, now=DAY)
+        self.fake.down = 0
+        self.fake.calls.clear()
+        late = DAY.replace(hour=23, minute=30)
+        self.assertEqual(chat.flush(self.line, late), 1)
+        self.assertEqual(self.fake.said(), ["a serious one"])
+        self.assertEqual(chat.flush(self.line, late + dt.timedelta(hours=9)), 1)
+        self.assertEqual(self.fake.said()[-1], "an ordinary one")
+
+    def test_a_broken_address_is_an_error_without_the_token(self):
+        line = chat.Bot("12345:bad token\n", OWNER, OWNER, self.fake.base)
+        with self.assertRaises(chat.ChatError) as caught:
+            line.call("getMe")
+        self.assertNotIn("bad token", str(caught.exception))
+        self.assertEqual(self.fake.calls, [])
 
     def test_without_a_paired_bot_nothing_is_sent_or_kept(self):
         chat.SECRETS.unlink()
@@ -465,6 +517,12 @@ class Incoming(ChatCase):
         chat.handle(self.line, text(3, "a note about nothing", reply_to=999), DAY)
         self.assertEqual(self.fake.said()[-1], rules.CHAT_HELP)
 
+    def test_a_text_telegram_hands_over_twice_is_one_note(self):
+        pid, message = self.ask()
+        for _ in range(2):  # the listener died before confirming the update
+            chat.handle(self.line, text(1, "keep it small", reply_to=message), DAY)
+        self.assertEqual(self.asked()[0]["note"], "keep it small")
+
     def test_a_made_up_button_is_refused(self):
         pid, message = self.ask()
         for data in [f"p:{pid}:merge", "p:ffffffff:yes", "release"]:
@@ -542,6 +600,37 @@ class Listener(ChatCase):
         self.fake.down = 0
         self.assertEqual(chat.deliver(self.line, DAY), 1)
 
+    def test_each_proposal_is_recorded_as_it_goes(self):
+        for n in range(2):
+            chat.propose(
+                "question", f"PR #{n}: T", "why", key=f"pr-{n}@a", job=f"pr-{n}"
+            )
+        self.fake.texts_left = 1
+        self.assertEqual(chat.deliver(self.line, DAY), 1)
+        self.assertEqual([p["state"] for p in self.asked()], ["sent", "queued"])
+        self.fake.texts_left = None
+        self.assertEqual(chat.deliver(self.line, DAY), 1)
+        self.assertEqual(len(self.fake.said()), 3)  # the first was not sent again
+        self.assertEqual(len({p["message_id"] for p in self.asked()}), 2)
+
+    def test_a_morning_says_why_there_is_no_report(self):
+        today = DAY.date().isoformat()
+        chat.DIGEST.write_text(
+            json.dumps(
+                {"date": "", "tried": today, "problem": "could not reach GitHub"}
+            )
+        )
+        chat.morning(self.line, DAY.replace(hour=9), {})
+        chat.PAUSED.write_text("now\n")
+        chat.morning(self.line, DAY.replace(hour=9), {})
+        self.assertEqual(
+            self.fake.said(),
+            [
+                "No night report today: could not reach GitHub.",
+                "No night report today: the team is paused. Send resume to go on.",
+            ],
+        )
+
     def test_a_morning_without_a_report_says_so_once(self):
         state = {}
         chat.morning(self.line, DAY.replace(hour=7), state)
@@ -605,6 +694,7 @@ class Pairing(ChatCase):
 
     def test_the_chat_that_sends_the_code_becomes_the_line(self):
         self.fake.updates = [
+            text(0, "ciao è 🙂", user=999, chat_id=999),  # not ASCII: no crash
             text(1, "00099999", user=999, chat_id=999),  # a stranger guessing
             text(2, self.CODE, kind="group"),  # the code, but in a group
             text(3, f"/start {self.CODE}", user=777, chat_id=777),
@@ -629,6 +719,14 @@ class Pairing(ChatCase):
         self.assertEqual(code, 1)
         self.assertFalse(chat.SECRETS.exists())
         self.assertEqual(self.fake.said(), [])
+
+    def test_something_that_is_not_a_token_is_not_tried(self):
+        for typed in ["", "hello there", "12345:abc def", "12345:abc\x7f"]:
+            chat.getpass.getpass = lambda prompt="", typed=typed: typed
+            code, shown = self.pair()
+            self.assertEqual(code, 1, typed)
+        self.assertEqual(self.fake.calls, [])
+        self.assertFalse(chat.SECRETS.exists())
 
     def test_a_token_telegram_rejects_is_not_saved(self):
         self.fake.down = 401
@@ -662,6 +760,14 @@ class Runner(ChatCase):
         again, m3 = self.ask(
             kind="question", title="Fix x", key=f"{fix_key}@", job=fix_key
         )
+        long = "Show " + "every stop " * 25 + "on one page"
+        long_key = rules.idea_key(long)
+        more, m6 = self.ask(
+            kind="question", title=long, key=f"{long_key}@", job=long_key
+        )
+        red, m7 = self.ask(
+            kind="question", title="Fix failing checks on main", key="main@", job="main"
+        )
         no, m4 = self.ask(title="Confetti", key="k2")
         trade, m5 = self.ask(kind="trading", title="Raise the floor", key="t1")
         chat.handle(self.line, text(2, "keep it small", reply_to=m1), DAY)
@@ -671,6 +777,8 @@ class Runner(ChatCase):
                 (idea, m1, "yes"),
                 (retry, m2, "yes"),
                 (again, m3, "yes"),
+                (more, m6, "yes"),
+                (red, m7, "yes"),
                 (no, m4, "no"),
                 (trade, m5, "yes"),
                 (trade, m5, "confirm"),
@@ -679,15 +787,24 @@ class Runner(ChatCase):
             chat.handle(self.line, press(10 + n, f"p:{pid}:{answer}", message), DAY)
         self.team.IDEAS.write_text(
             "# Pulse ideas\n\n- [?] Fix x — it asked a question\n"
+            f"- [?] {long} — it asked too\n"
         )
         parked = {"sha": "abc", "result": "needs_user", "tries": 1, "parked": True}
-        state, report = {"attempts": {"pr-5": dict(parked)}}, {"notes": []}
+        stuck = {"sha": "def", "result": "needs_user", "tries": 1}
+        state = {"attempts": {"pr-5": dict(parked), "main": dict(stuck)}}
+        report = {"notes": []}
 
         self.team.from_chat(state, report)
 
         listed = self.team.IDEAS.read_text()
-        for line in ["- [ ] Fix x\n", "- [ ] dark mode\n", "- [ ] A risk chart\n"]:
+        for line in [
+            "- [ ] Fix x\n",
+            f"- [ ] {long}\n",  # longer than the title a text keeps
+            "- [ ] dark mode\n",
+            "- [ ] A risk chart\n",
+        ]:
             self.assertIn(line, listed)
+        self.assertNotIn("main", state["attempts"])  # a red main is tried again
         self.assertNotIn("Confetti", listed)
         self.assertNotIn("Raise the floor", listed)
         self.assertEqual(list(chat.INBOX.glob("*.json")), [])
@@ -698,6 +815,8 @@ class Runner(ChatCase):
                 "A risk chart": "consumed",
                 "PR #5: Thing": "consumed",
                 "Fix x": "consumed",
+                long[:200]: "consumed",
+                "Fix failing checks on main": "consumed",
                 "Confetti": "declined",
                 "Raise the floor": "approved",
             },
@@ -738,15 +857,42 @@ class Runner(ChatCase):
                     "pushed": "abc",
                     "reasons": ["it touches .github/workflows/ci.yml"],
                 },
+                {  # an idea that became a pull request and then stopped
+                    "kind": "idea",
+                    "key": "idea-b",
+                    "title": "Add b",
+                    "pr": 13,
+                    "result": "blocked",
+                    "pushed": "def",
+                },
+                {
+                    "kind": "idea",
+                    "key": "idea-c",
+                    "title": "Add c",
+                    "result": "needs_user",
+                },
+                {
+                    "kind": "main",
+                    "key": "main",
+                    "title": "Fix main",
+                    "result": "blocked",
+                },
             ],
             "notes": [],
             "unreleased": {"tag": "v0.8.7", "merges": 2},
         }
+        self.team.ask(report, {"scheduled": True})
         self.team.tell(report, {"scheduled": True})
         asked = self.asked()
         self.assertEqual(
             [(p["kind"], p["title"], p["key"], p["job"], p["state"]) for p in asked],
-            [("question", "PR #5: Thing", "pr-5@abc", "pr-5", "queued")],
+            [
+                ("question", "PR #5: Thing", "pr-5@abc", "pr-5", "queued"),
+                # "Try again" has to name the job that will run: the PR.
+                ("question", "PR #13: Add b", "pr-13@def", "pr-13", "queued"),
+                ("question", "Add c", "idea-c@", "idea-c", "queued"),
+                ("question", "Fix main", "main@", "main", "queued"),
+            ],
         )
         self.assertIn("ci.yml", asked[0]["text"])
         self.assertEqual(
@@ -759,13 +905,33 @@ class Runner(ChatCase):
         for part in [
             "Merged: 1",
             "Add a (PR #12)",
-            "Stopped for you: 1",
+            "Stopped for you: 4",
             "Not in your app yet: 2",
         ]:
             self.assertIn(part, went[0])
-        # Telling it again (the same stop, the same commit) asks nothing new.
-        self.team.tell(report, {"scheduled": True})
-        self.assertEqual(len(self.asked()), 1)
+        # Asking again (the same stop, the same commit) asks nothing new.
+        self.team.ask(report, {"scheduled": True})
+        self.assertEqual(len(self.asked()), 4)
+
+    def test_a_night_that_will_be_tried_again_sends_no_report_yet(self):
+        report = {
+            "started": "2026-11-16T02:30",
+            "jobs": [],
+            "notes": ["could not reach GitHub; nothing was done"],
+        }
+        for _ in range(3):  # three hourly tries that got nowhere
+            self.team.tell(report, {"scheduled": True, "nothing_done": True})
+        self.assertEqual((self.fake.said(), self.outbox()), ([], []))
+        digest = json.loads(chat.DIGEST.read_text())
+        self.assertEqual(
+            (digest["date"], digest["tried"], digest["problem"]),
+            ("", dt.date.today().isoformat(), report["notes"][0]),
+        )
+        self.team.tell(dict(report, notes=[]), {"scheduled": True})  # the one that ran
+        self.assertEqual(len(self.fake.said() + self.outbox()), 1)
+        self.assertEqual(
+            json.loads(chat.DIGEST.read_text())["date"], dt.date.today().isoformat()
+        )
 
     def test_a_run_started_by_hand_texts_nobody(self):
         report = {
@@ -780,6 +946,7 @@ class Runner(ChatCase):
                 }
             ],
         }
+        self.team.ask(report, {"scheduled": False})
         self.team.tell(report, {"scheduled": False})
         self.assertEqual((self.fake.calls, self.asked(), self.outbox()), ([], [], []))
 
@@ -787,21 +954,25 @@ class Runner(ChatCase):
         self.fake.down = 500
         self.team.tell({"started": "2026-11-16T02:30", "jobs": []}, {"scheduled": True})
         chat.PROPOSALS.write_text("not json")
-        self.team.tell(
-            {
-                "started": "2026-11-16T02:30",
-                "jobs": [
-                    {
-                        "kind": "pr",
-                        "key": "pr-5",
-                        "title": "T",
-                        "pr": 5,
-                        "result": "blocked",
-                    }
-                ],
-            },
-            {"scheduled": True},
-        )
+        stopped = {
+            "started": "2026-11-16T02:30",
+            "jobs": [
+                {
+                    "kind": "pr",
+                    "key": "pr-5",
+                    "title": "T",
+                    "pr": 5,
+                    "result": "blocked",
+                }
+            ],
+        }
+        self.team.ask(stopped, {"scheduled": True})
+        self.team.tell(stopped, {"scheduled": True})
+        # A list that cannot be written must not cost the night either.
+        real = chat.propose
+        self.addCleanup(setattr, chat, "propose", real)
+        chat.propose = lambda *a, **k: (_ for _ in ()).throw(OSError("disk"))
+        self.team.ask(stopped, {"scheduled": True})
 
     def test_a_paused_team_lets_the_night_pass_without_spending_it(self):
         worked = []
@@ -839,12 +1010,14 @@ class Runner(ChatCase):
             "jobs": [],
             "asked": [
                 {"kind": "question", "title": "PR #5: Thing", "state": "sent"},
+                {"kind": "question", "title": "PR #6: New", "state": "queued"},
                 {"kind": "idea", "title": "Later one", "state": "queued"},
             ],
         }
         waiting = page.needs_you(report)
         self.assertEqual(len(waiting), 1)
-        self.assertIn("1 question wait", waiting[0])
+        self.assertIn("2 questions wait", waiting[0])
+        self.assertIn("PR #6: New", waiting[0])  # last night's, out with the morning
         self.assertIn("PR #5: Thing", waiting[0])
         self.assertNotIn("Later one", waiting[0])
 

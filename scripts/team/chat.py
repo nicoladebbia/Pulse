@@ -23,8 +23,10 @@ import datetime as dt
 import fcntl
 import getpass
 import hmac
+import http.client
 import json
 import os
+import re
 import secrets as random
 import subprocess
 import sys
@@ -117,6 +119,9 @@ class Bot:
             raise ChatError(
                 self._clean(f"{method}: HTTP {e.code} {detail}".strip()), e.code
             ) from None
+        except http.client.HTTPException as e:
+            # Its text can quote the address, and the token is part of that.
+            raise ChatError(f"{method}: {type(e).__name__}") from None
         except (OSError, ValueError) as e:
             raise ChatError(self._clean(f"{method}: {e}")) from None
         if not isinstance(body, dict) or not body.get("ok"):
@@ -231,17 +236,24 @@ def deliver(line: Bot, now: dt.datetime) -> int:
     """Text the proposals that are due. They are never urgent, so not at night."""
     if rules.send_at(now, serious=False) > now:
         return 0
-    sent = 0
     with proposals() as items:
-        for p in rules.due_proposals(items, now):
-            p["state"] = "sent"  # the buttons are built for the state it will have
-            try:
-                p["message_id"] = line.say(proposal_text(p), proposal_buttons(p))
-            except ChatError as e:
-                p["state"] = "queued"
-                log(f"could not send a proposal: {e}")
-                break
-            p["sent_at"], sent = _stamp(now), sent + 1
+        due = [dict(p) for p in rules.due_proposals(items, now)]
+    sent = 0
+    for p in due:
+        # Telegram is called without the lock, so a slow answer never holds up
+        # the runner, and each one is on disk before the next is sent.
+        p["state"] = "sent"  # the buttons are built for the state it will have
+        try:
+            message_id = line.say(proposal_text(p), proposal_buttons(p))
+        except ChatError as e:
+            log(f"could not send a proposal: {e}")
+            break
+        with proposals() as items:
+            for q in items:
+                if q.get("id") == p["id"] and q.get("state") == "queued":
+                    q["state"], q["message_id"] = "sent", message_id
+                    q["sent_at"] = _stamp(now)
+        sent += 1
     return sent
 
 
@@ -298,14 +310,18 @@ def send(
 
 
 def flush(line: Bot, now: dt.datetime) -> int:
-    """Send what waits in the outbox and is due, oldest first."""
-    sent = 0
+    """Send what waits in the outbox and is due, oldest first. A text that is
+    not serious keeps to the day, also when it is late only because Telegram
+    was down."""
+    sent, quiet = 0, rules.send_at(now, serious=False) > now
     for path in sorted(OUTBOX.glob("*.json")) if OUTBOX.is_dir() else []:
         item = _load(path, None)
         if not isinstance(item, dict) or not item.get("text"):
             path.unlink(missing_ok=True)
             continue
         if (item.get("not_before") or "") > _stamp(now):
+            continue
+        if quiet and not item.get("serious"):
             continue
         try:
             line.say(item["text"])
@@ -405,7 +421,12 @@ def on_text(line: Bot, message: dict, now: dt.datetime) -> None:
                     and p.get("message_id") == target
                     and p.get("state") in (*rules.OPEN_STATES, "approved")
                 ):
-                    p["note"] = f"{p.get('note', '')} {arg}".strip()[:1000]
+                    # Telegram hands an update over again when the listener
+                    # died before confirming it: the same text is kept once.
+                    seen = p.setdefault("note_ids", [])
+                    if message.get("message_id") not in seen:
+                        seen.append(message.get("message_id"))
+                        p["note"] = f"{p.get('note', '')} {arg}".strip()[:1000]
                     kept = True
         reply = "Noted. The builder will see it." if kept else rules.CHAT_HELP
     else:
@@ -434,7 +455,9 @@ def morning(line: Bot, now: dt.datetime, state: dict) -> None:
     today = now.date().isoformat()
     if state.get("morning") == today:
         return
-    if (_load(DIGEST, {}) or {}).get("date") == today:
+    digest = _load(DIGEST, {})
+    digest = digest if isinstance(digest, dict) else {}
+    if digest.get("date") == today:
         state["morning"] = today
         return
     team = _load(HOME / "state.json", {})
@@ -442,7 +465,13 @@ def morning(line: Bot, now: dt.datetime, state: dict) -> None:
     if started and 12 <= now.hour < 22:
         text = "The night team started last night and has not reported yet."
     elif not started and 8 <= now.hour < 12:
-        text = "No night report today: the night team did not run."
+        if PAUSED.exists():
+            why = "the team is paused. Send resume to go on"
+        elif digest.get("tried") == today and digest.get("problem"):
+            why = str(digest["problem"])[:300]  # every try of the night failed
+        else:
+            why = "the night team did not run"
+        text = f"No night report today: {why}."
     else:
         return
     with contextlib.suppress(ChatError):
@@ -504,8 +533,8 @@ def pair(base: str = "") -> int:
     token = getpass.getpass(
         "Paste the bot token from BotFather (it stays hidden): "
     ).strip()
-    if not token:
-        print("No token; nothing was saved.")
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", token):
+        print("That does not look like a bot token; nothing was saved.")
         return 1
     line = Bot(token, base=base)
     try:
@@ -538,7 +567,8 @@ def pair(base: str = "") -> int:
             if (
                 chat.get("type") == "private"
                 and words
-                and hmac.compare_digest(words[-1], code)
+                # As bytes: compare_digest refuses text that is not ASCII.
+                and hmac.compare_digest(words[-1].encode(), code.encode())
             ):
                 save_secrets(
                     {

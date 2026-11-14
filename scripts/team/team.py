@@ -1410,18 +1410,19 @@ def from_chat(state: dict, report: dict) -> None:
             if p["kind"] == "idea":
                 ideas.append(p.get("title", ""))
                 job = rules.idea_key(" ".join(p.get("title", "").split()))
-            elif job.startswith("pr-"):
+            elif job == "main" or job.startswith("pr-"):
                 rules.retry_now(state, job)
             elif job.startswith("idea-"):
-                reopen.append(p.get("title", ""))
+                reopen.append(job)
             if p.get("note") and job:
                 notes[job] = p["note"]
             p["state"] = "consumed"
     text = IDEAS.read_text() if IDEAS.exists() else "# Pulse ideas\n\n"
-    for title in reopen:
-        text = rules.reopen_idea(text, title)
+    before = text
+    for key in reopen:
+        text = rules.reopen_idea(text, key)
     text, added = rules.add_ideas(text, ideas)
-    if added or reopen:
+    if text != before:
         IDEAS.write_text(text)
     for path in inbox:  # only once the list holds them
         path.unlink(missing_ok=True)
@@ -1432,14 +1433,17 @@ def from_chat(state: dict, report: dict) -> None:
     save_json(HOME / "state.json", state)
 
 
-def tell(report: dict, run: dict) -> None:
-    """The night's text for Telegram, and a question for each job that stopped
-    for Nicola. Only for the scheduled night; a chat that is down never fails it."""
+def ask(report: dict, run: dict) -> None:
+    """A question in Telegram for each job that stopped for Nicola. Only for
+    the scheduled night; a chat that is down never fails it."""
     if not run.get("scheduled") or not chat.paired():
         return
     try:
         for j in report.get("jobs", []):
             if j.get("result") in ("needs_user", "blocked") and j.get("key"):
+                # Once there is a pull request it is the unit of work, also
+                # for an idea: "Try again" has to reach the job that will run.
+                job = f"pr-{j['pr']}" if j.get("pr") else j["key"]
                 where = f"PR #{j['pr']}: " if j.get("pr") else ""
                 why = rules.public_reasons(
                     j.get("reasons") or ["stopped"], str(Path.home())
@@ -1448,11 +1452,28 @@ def tell(report: dict, run: dict) -> None:
                     "question",
                     f"{where}{j.get('title', '')}",
                     "\n".join(why)[:800],
-                    key=f"{j['key']}@{j.get('pushed') or ''}",
-                    job=j["key"],
+                    key=f"{job}@{j.get('pushed') or ''}",
+                    job=job,
                 )
+    except Exception as e:  # noqa: BLE001
+        log(f"could not queue the night's questions: {type(e).__name__}")
+
+
+def tell(report: dict, run: dict) -> None:
+    """The night's text for Telegram. Only for the scheduled night; a chat that
+    is down never fails it."""
+    if not run.get("scheduled") or not chat.paired():
+        return
+    try:
+        today = dt.date.today().isoformat()
+        if run.get("nothing_done"):
+            # The next hourly wake-up tries this night again, so there is no
+            # report yet. If no try gets through, the morning text says why.
+            why = (report.get("notes") or ["nothing was done"])[-1]
+            save_json(chat.DIGEST, {"date": "", "tried": today, "problem": why})
+            return
         url = PAGE_URL.read_text().strip() if PAGE_URL.exists() else ""
-        save_json(chat.DIGEST, {"date": dt.date.today().isoformat()})
+        save_json(chat.DIGEST, {"date": today})
         chat.send(page.chat_digest(report, url))
     except Exception as e:  # noqa: BLE001
         log(f"could not text the night's report: {type(e).__name__}")
@@ -1475,6 +1496,7 @@ def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
     history = ([report] + load_json(HOME / "history.json", []))[:30]
     save_json(HOME / "history.json", history)
     save_json(HOME / "state.json", state)
+    ask(report, run)  # before the page, which lists what waits in Telegram
     report["asked"] = [
         {"kind": p.get("kind"), "title": p.get("title"), "state": p.get("state")}
         for p in load_json(chat.PROPOSALS, [])

@@ -121,7 +121,13 @@ def needs_you(report: dict) -> list[str]:
     for i in report.get("ideas", []):
         if i.get("state") == "waiting":
             out.append(f"Idea: {i['text']}")
-    asked = [a for a in report.get("asked") or [] if a.get("state") != "queued"]
+    # A queued question goes out with the morning text; a queued idea waits
+    # for its place in the week and is not waiting for an answer yet.
+    asked = [
+        a
+        for a in report.get("asked") or []
+        if a.get("state") != "queued" or a.get("kind") == "question"
+    ]
     if asked:
         out.append(
             f"{len(asked)} question{'s' if len(asked) != 1 else ''} wait for your answer in Telegram: "
