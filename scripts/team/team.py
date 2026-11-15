@@ -35,6 +35,7 @@ import chat  # noqa: E402
 import page  # noqa: E402
 
 import rules  # noqa: E402
+import scoreboard  # noqa: E402
 
 HOME = Path(os.environ.get("PULSE_TEAM_HOME") or Path.home() / ".pulse-team")
 REPO = Path(os.environ.get("PULSE_TEAM_REPO") or Path.home() / "dev/Pulse")
@@ -1479,6 +1480,36 @@ def tell(report: dict, run: dict) -> None:
         log(f"could not text the night's report: {type(e).__name__}")
 
 
+def weekly_scoreboard(run: dict, state: dict) -> None:
+    """After the first scheduled night of a week: the trading scoreboard for
+    the seven days before it, kept as a file and texted. Numbers from the
+    night's copy of the database; it never fails the night."""
+    today = dt.date.today()
+    if (
+        not run.get("scheduled")
+        or run.get("nothing_done")
+        or not DB_COPY.exists()
+        or not scoreboard.due(today, state.get("scoreboard_week", ""))
+    ):
+        return
+    try:
+        text = scoreboard_text(today - dt.timedelta(days=1))
+        (HOME / "scoreboard.txt").write_text(text + "\n")
+        state["scoreboard_week"] = scoreboard.week_of(today)
+        save_json(HOME / "state.json", state)
+        chat.send(text)
+    except Exception as e:  # noqa: BLE001
+        log(f"the trading scoreboard failed: {type(e).__name__}")
+
+
+def scoreboard_text(last_day: dt.date) -> str:
+    con = scoreboard.connect(DB_COPY)
+    try:
+        return scoreboard.as_text(scoreboard.build(con, last_day))
+    finally:
+        con.close()
+
+
 def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
     git("fetch", "origin", "--prune", "--tags")
     tag = git("describe", "--tags", "--abbrev=0", f"origin/{BASE}")[1]
@@ -1515,6 +1546,7 @@ def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
             else "page publish FAILED (local copy is current)"
         )
     tell(report, run)
+    weekly_scoreboard(run, state)
     return 0
 
 
@@ -1596,6 +1628,7 @@ def cmd_install(_args) -> int:
         "page.py",
         "guard.py",
         "chat.py",
+        "scoreboard.py",
         "checks.sh",
         "TEAM.md",
     ):
@@ -1738,6 +1771,18 @@ def cmd_status(_args) -> int:
     return 0
 
 
+def cmd_scoreboard(_args) -> int:
+    """The trading scoreboard for the last seven days, from the team's copy of
+    the database as it is now."""
+    if not DB_COPY.exists():
+        print(f"No database copy yet ({DB_COPY}); the night run makes it.")
+        return 1
+    age = dt.datetime.fromtimestamp(DB_COPY.stat().st_mtime)
+    print(scoreboard_text(dt.date.today()))
+    print(f"\n(from the database copy of {age:%d %b %H:%M})")
+    return 0
+
+
 def cmd_idea(args) -> int:
     HOME.mkdir(parents=True, exist_ok=True)
     text = " ".join(args.text).strip()
@@ -1779,6 +1824,9 @@ def main() -> int:
     i = sub.add_parser("idea")
     i.add_argument("text", nargs="+")
     i.set_defaults(fn=cmd_idea)
+    sub.add_parser(
+        "scoreboard", help="what Pulse bought and sold, against the S&P 500"
+    ).set_defaults(fn=cmd_scoreboard)
     c = sub.add_parser("chat", help="the Telegram line to Nicola")
     c.add_argument(
         "action", choices=("pair", "run", "status", "unpair", "say", "propose")

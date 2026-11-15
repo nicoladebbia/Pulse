@@ -43,6 +43,12 @@ Every PR is looked at again right before its job, because the night's list can b
 - **In.** Only the paired account, in its private chat, is answered. `idea: …` joins the idea list (through `inbox/`; the runner is the only writer of the list and takes it in at its next run), `status` sends the last report, `pause` stops new jobs and merges (the file `paused`; a paused night is not spent, so `resume` before 06:00 still starts it), `resume` lifts it. A reply to one of the team's questions is kept as a note the builder gets with that job. The first press on a button stands; a trading change is asked twice.
 - Nothing typed in Telegram runs as a command, and a chat that is down never fails a night.
 
+## The trading scoreboard
+
+After the first scheduled night of each week the team texts the trading scoreboard for the seven days before it and keeps it in `~/.pulse-team/scoreboard.txt` (`scoreboard.py`): what was bought and sold, the result against the S&P 500 this week and since the start (with its t, so luck is called luck), what Pulse's own learning report says about signals, what the stocks did after a stop sold them, whether each filter's skipped stocks went on to lag, any signal weight Pulse moved by itself, and why candidates were not bought. It counts the same trades as the go-live checklist (no merged fragments, no test trades, no close without a price).
+
+It is arithmetic on the night's copy of the database, opened read-only: no session, no AI, nothing proposed and nothing changed. A copy that cannot be read is an error in the log, never an empty week. `team.py scoreboard` prints the last seven days from the copy as it is now.
+
 ## Safety while it runs
 
 - Sessions work in a worktree of their own, `.claude/worktrees/team-job`, made fresh for every job and removed when it ends; the main checkout is never touched.
@@ -62,6 +68,7 @@ python3 scripts/team/team.py run --no-merge   # everything except the final merg
 python3 scripts/team/team.py idea "one line"  # add an idea
 python3 scripts/team/team.py status           # last night's report
 python3 scripts/team/team.py page <url>       # the artifact the nightly page is published to
+python3 scripts/team/team.py scoreboard       # the last 7 days of trading, against the S&P 500
 python3 scripts/team/team.py chat pair        # tie a Telegram bot to this Mac (asks for the token)
 python3 scripts/team/team.py chat status      # paired, listener alive, what waits
 python3 scripts/team/team.py chat say "text"  # text Nicola now
