@@ -151,7 +151,7 @@ class Findings(unittest.TestCase):
             keys(self.find(memory, bare=bare, events=failed)), ["stop:7"]
         )
 
-    def test_position_management_failing_two_hours_in_a_row_is_serious(self):
+    def test_position_management_failing_twice_in_a_row_is_serious(self):
         twice = [
             ("manage_start", at(10), ""),
             ("manage_fail", at(10), "1"),
@@ -161,9 +161,18 @@ class Findings(unittest.TestCase):
         found = self.find(events=twice)
         self.assertEqual(keys(found), ["manage"])
         self.assertTrue(found[0]["serious"])
-        self.assertIn("at 10:00 and 11:00, exit 101", found[0]["text"])
+        self.assertIn("failed twice in a row (at 10:00 and 11:00, exit 101)", found[0]["text"])
         once = [*twice[:2], ("manage_start", at(11), ""), ("manage_ok", at(11), "")]
         self.assertEqual(self.find(events=once), [])
+        # A slow briefing took the 11:00 turn: the runs of 10:00 and 12:00 are
+        # still two in a row.
+        slow = [*twice[:2], ("manage_start", at(12), ""), ("manage_fail", at(12), "1")]
+        found = self.find(now=at(12, 10), events=slow)
+        self.assertEqual(keys(found), ["manage"])
+        self.assertIn("(at 10:00 and 12:00, exit 1)", found[0]["text"])
+        # One turn tried twice within minutes is one failed turn.
+        retry = [*twice[:2], ("manage_start", at(10, 20), ""), ("manage_fail", at(10, 20), "1")]
+        self.assertEqual(self.find(now=at(10, 30), events=retry), [])
         # Yesterday's failures are not happening now.
         old = [(k, w - 24 * HOUR, d) for k, w, d in twice]
         self.assertNotIn("manage", keys(self.find(events=old, market="closed")))
@@ -175,12 +184,18 @@ class Findings(unittest.TestCase):
         ]
         self.assertEqual(self.find(events=apart), [])
 
-    def test_buying_failing_two_hours_in_a_row_is_serious(self):
+    def test_buying_failing_twice_in_a_row_is_serious(self):
         ok = [("manage_start", at(11), ""), ("manage_ok", at(11), "")]
         twice = [*ok, ("auto_fail", at(10), "1"), ("auto_fail", at(11), "1")]
         found = self.find(events=twice)
         self.assertEqual(keys(found), ["auto"])
         self.assertIn("No new positions are opened", found[0]["text"])
+        # With a turn lost to a slow briefing between the two.
+        slow = [("auto_fail", at(10), "1"), ("auto_fail", at(12), "1")]
+        ran = [("manage_start", at(12), ""), ("manage_ok", at(12), "")]
+        found = self.find(now=at(12, 10), events=[*slow, *ran])
+        self.assertEqual(keys(found), ["auto"])
+        self.assertIn("twice in a row (at 10:00 and 12:00", found[0]["text"])
         self.assertEqual(self.find(events=[*twice, ("auto_ok", at(11, 5), "")]), [])
         self.assertEqual(self.find(events=[*ok, ("auto_fail", at(11), "1")]), [])
         # The afternoon slot's last failure and the next morning's first.
@@ -201,6 +216,16 @@ class Findings(unittest.TestCase):
         )
         made = [*ok, *fails, ("brief_done", at(11, 9), "morning")]
         self.assertEqual(self.find(events=made), [])
+        # One made by the app or by hand is only in the database: the schedule
+        # stops trying, and the failures before it are over.
+        self.assertEqual(self.find(events=[*ok, *fails], briefings=[at(10, 40)]), [])
+        # One made before the failures (or on another day) changes nothing,
+        # and neither does a database that could not be read.
+        for rows in ([at(7, 30)], [at(10, 40, day=12)], None):
+            self.assertEqual(
+                keys(self.find(events=[*ok, *fails], briefings=rows)),
+                ["briefing:morning:2026-11-13"],
+            )
         # The evening has three turns before midnight: two failures are enough.
         quiet = {"market": None, "session_start": None}
         evening = [("brief_fail", at(h), "evening 101") for h in (21, 22)]
@@ -208,6 +233,9 @@ class Findings(unittest.TestCase):
         found = self.find(now=at(22, 10), events=evening, **quiet)
         self.assertEqual(keys(found), ["briefing:evening:2026-11-13"])
         self.assertIn("tries again every hour until midnight.", found[0]["text"])
+        # The morning's briefing is not the evening's.
+        found = self.find(now=at(22, 10), events=evening, briefings=[at(8, 28)], **quiet)
+        self.assertEqual(keys(found), ["briefing:evening:2026-11-13"])
         # A slow evening: each try works for an hour before it fails, and the
         # last one fails after midnight. It is still Friday's evening briefing.
         slow = [
@@ -491,7 +519,7 @@ class Alerts(unittest.TestCase):
     def test_a_briefing_that_was_never_made_is_closed_as_that(self):
         key = "briefing:evening:2026-11-13"
         sent = {"sent": "2026-11-13T22:10:00", "serious": True, "open": True}
-        nothing = {"events": []}
+        nothing = {"events": [], "briefings": [at(8, 28)]}  # only the morning's
         # The 23:00 try may still fail after midnight: the evening is not over.
         self.assertIsNone(rules.watch_over(key, sent, nothing, at(1, 0, day=14)))
         self.assertEqual(
@@ -499,7 +527,10 @@ class Alerts(unittest.TestCase):
             "The evening briefing of Fri 13 Nov was not made.",
         )
         # The next evening's briefing is not this one made "after all".
-        next_day = {"events": [("brief_done", at(21, 34, day=14), "evening")]}
+        next_day = {
+            "events": [("brief_done", at(21, 34, day=14), "evening")],
+            "briefings": [at(8, 28), at(8, 31, day=14), at(21, 34, day=14)],
+        }
         self.assertEqual(
             rules.watch_over(key, sent, next_day, at(21, 42, day=14)),
             "The evening briefing of Fri 13 Nov was not made.",
@@ -510,6 +541,14 @@ class Alerts(unittest.TestCase):
             rules.watch_over(key, sent, late, at(8, 2, day=14)),
             "Solved. The evening briefing was made after all, at 00:20.",
         )
+        # Made by the app or by hand that night: in the database, not in the log.
+        by_hand = {"events": [], "briefings": [at(8, 28), at(23, 40)]}
+        self.assertEqual(
+            rules.watch_over(key, sent, by_hand, at(8, 2, day=14)),
+            "Solved. The evening briefing was made after all, at Fri 23:40.",
+        )
+        # Without the database nobody knows: nothing is said until it is read.
+        self.assertIsNone(rules.watch_over(key, sent, {"events": []}, at(8, 2, day=14)))
         # The whole way: said once in the morning, by day, and then forgotten.
         memory = {"alerts": {key: dict(sent, first=sent["sent"])}}
         self.assertEqual(
@@ -517,6 +556,40 @@ class Alerts(unittest.TestCase):
             [("The evening briefing of Fri 13 Nov was not made.", False)],
         )
         self.assertEqual(rules.watch_alerts([], nothing, memory, at(8, 12, day=14)), [])
+
+    def test_a_problem_that_keeps_coming_and_going_goes_quiet_for_the_day(self):
+        memory, said = {}, []
+        start = at(10, 0)
+        for n in range(6):  # found on the hour, solved half an hour later
+            found_at = start + n * HOUR
+            said += rules.watch_alerts([self.SILENT], {"events": []}, memory, found_at)
+            ran = {"events": [("manage_start", found_at + 20 * MIN, "")]}
+            said += rules.watch_alerts([], ran, memory, found_at + 30 * MIN)
+        solved = ("Solved. Pulse is looking at its positions again (run at {}).", False)
+        self.assertEqual(
+            said,
+            [
+                ("Nobody looks.", True),
+                (solved[0].format("10:20"), False),
+                ("It is back. Nobody looks.", True),
+                (solved[0].format("11:20"), False),
+                ("It is back. Nobody looks.", True),
+                (solved[0].format("12:20"), False),
+                (
+                    "It is back again. Nobody looks. It keeps coming and going, so I "
+                    "will not text about it again until a day has passed.",
+                    True,
+                ),
+            ],
+        )
+        self.assertFalse(memory["alerts"]["silent"]["open"])
+        # A day after that last text it is a new problem, said plainly.
+        next_day = at(13, 0, day=14)
+        self.assertEqual(
+            rules.watch_alerts([self.SILENT], {"events": []}, memory, next_day),
+            [("Nobody looks.", True)],
+        )
+        self.assertNotIn("flaps", memory["alerts"]["silent"])
 
     def test_old_entries_leave_the_book(self):
         memory = {}
@@ -653,6 +726,39 @@ class Reading(unittest.TestCase):
         self.assertEqual(db.read_bytes(), before)
         db.write_text("not a database")
         self.assertIsNone(watch.read_bare(db))
+
+    def test_the_briefings_in_the_books_are_read_with_their_time_on_this_mac(self):
+        db = self.dir / "pulse.db"
+        now = at(11, 12)
+        self.assertIsNone(watch.read_briefings(db, now))
+        con = sqlite3.connect(db)
+        utc = "%Y-%m-%d %H:%M:%S"
+        made = [now - 3 * HOUR, now - 14 * HOUR, now - 5 * 24 * HOUR]
+        stamps = [f"{t.astimezone(dt.timezone.utc):{utc}}" for t in made]
+        con.executescript(
+            """CREATE TABLE briefings (id INTEGER PRIMARY KEY, date TEXT, created_at TEXT,
+                 story_count INTEGER, briefing_type TEXT);"""
+        )
+        con.executemany(
+            "INSERT INTO briefings (created_at, story_count, briefing_type) VALUES (?, ?, ?)",
+            [
+                (stamps[0], 120, "daily"),
+                (stamps[1], 140, "daily"),
+                (stamps[2], 120, "daily"),  # older than the watch looks back
+                (stamps[0], 0, "daily"),  # a run that made nothing
+                (stamps[0], 9, "freedoms"),  # not a daily briefing
+            ],
+        )
+        con.commit()
+        con.close()
+        before = db.read_bytes()
+        self.assertEqual(watch.read_briefings(db, now), [made[1], made[0]])
+        self.assertEqual(db.read_bytes(), before)
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["pulse.db"])
+        # A database from before the briefings table: unknown, not "none made".
+        db.unlink()
+        sqlite3.connect(db).close()
+        self.assertIsNone(watch.read_briefings(db, now))
 
     def test_reading_the_books_leaves_no_file_next_to_them(self):
         """Pulse's database uses a write-ahead log, as the installed one does."""
