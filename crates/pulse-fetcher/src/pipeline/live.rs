@@ -49,7 +49,7 @@ pub(crate) async fn run_live_signals(db_path: &Path, full_sources: bool) -> anyh
     };
 
     let slot = chrono::Local::now().timestamp() as usize / 300 % LIVE_FORM4_SHARES;
-    match fetch_targeted_form4(db_path, LIVE_FORM4_LIMIT, Some((slot, LIVE_FORM4_SHARES))).await {
+    match fetch_targeted_form4(db_path, LIVE_FORM4_LIMIT, Some((slot, LIVE_FORM4_SHARES)), false).await {
         Ok(n) => report.form4_new = n,
         Err(e) => tracing::warn!("Live: targeted Form 4 failed: {}", e),
     }
