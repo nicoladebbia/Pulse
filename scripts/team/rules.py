@@ -622,9 +622,10 @@ WATCH_GAP_MIN = 25  # two looks further apart than this: the Mac slept between
 # missed turn is a broker blip, and it is not worth a text at night.
 SILENT_MIN = 130
 CLOCK_MIN = 70  # the broker's clock silent at every look for this long
-# A failure older than this is no longer "happening now", and two failures
-# further apart than this are not "in a row".
+# A failure older than this is no longer "happening now".
 RECENT_MIN = 90
+# Two failed runs closer than this are one turn tried twice, not two turns.
+TURN_MIN = 45
 STALL_MIN = 130  # the hourly schedule has skipped two turns
 STUCK_FETCH_MIN = 180  # a briefing on local AI takes up to about 70 minutes
 DEAD_FETCH_MIN = 10
@@ -639,6 +640,9 @@ BRIEFING_DAY_ENDS_H = 3
 # One text per problem: a serious one is repeated once a day while it lasts,
 # anything else once a week.
 ALERT_AGAIN_H = {True: 24, False: 7 * 24}
+# A serious problem that keeps ending and coming back is texted as back this
+# many times; after that nothing more is said about it until a day has passed.
+FLAP_MAX = 3
 ALERT_KEEP_DAYS = 30
 SCHEDULERS = {
     "com.pulse.scheduled-fetch": "the hourly schedule (briefings and trading)",
@@ -738,8 +742,18 @@ def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
                 f"position{'s have' if len(bare) != 1 else ' has'} no stop at the broker: {names}.",
             )
 
+    def in_a_row(first: dt.datetime, second: dt.datetime) -> bool:
+        """Two failed turns of the same day, with the second still fresh. The
+        turns need not be an hour apart: a slow briefing takes the turn after
+        it, so two failures in a row can be two hours apart."""
+        return (
+            first.date() == second.date()
+            and second - first >= dt.timedelta(minutes=TURN_MIN)
+            and now - second <= dt.timedelta(minutes=RECENT_MIN)
+        )
+
     if events is not None:
-        # Position management failing two hours in a row.
+        # Position management failing twice in a row.
         runs: list[list] = []
         for kind, when, detail in events:
             if kind == "manage_start":
@@ -747,42 +761,39 @@ def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
             elif kind in ("manage_ok", "manage_fail") and runs and not runs[-1][1]:
                 runs[-1][1:] = [kind, detail]
         last = runs[-2:]
-        hourly = (dt.timedelta(minutes=45), dt.timedelta(minutes=RECENT_MIN))
         if (
             len(last) == 2
             and all(r[1] == "manage_fail" for r in last)
-            and hourly[0] <= last[1][0] - last[0][0] <= hourly[1]
-            and now - last[1][0] <= hourly[1]
+            and in_a_row(last[0][0], last[1][0])
         ):
             add(
                 "manage",
                 True,
-                f"Position management failed two hours in a row (at {hm(last[0][0])} and "
+                f"Position management failed twice in a row (at {hm(last[0][0])} and "
                 f"{hm(last[1][0])}, exit {last[1][2] or '?'}). Exits and stop updates are "
                 "not happening. The stops already at the broker still hold.",
             )
 
-        # Buying failing two hours in a row.
+        # Buying failing twice in a row.
         oks = [w for k, w, _ in events if k == "auto_ok"]
         fails = [(w, d) for k, w, d in events if k == "auto_fail" and (not oks or w > max(oks))]
-        if (
-            len(fails) >= 2
-            and hourly[0] <= fails[-1][0] - fails[-2][0] <= hourly[1]
-            and now - fails[-1][0] <= hourly[1]
-        ):
+        if len(fails) >= 2 and in_a_row(fails[-2][0], fails[-1][0]):
             add(
                 "auto",
                 True,
-                f"Buying failed two hours in a row (at {hm(fails[-2][0])} and "
+                f"Buying failed twice in a row (at {hm(fails[-2][0])} and "
                 f"{hm(fails[-1][0])}, exit {fails[-1][1] or '?'}). No new positions are "
                 "opened. The ones held are not affected.",
             )
 
-        # A briefing that keeps failing.
+        # A briefing that keeps failing. One made by the app or by hand is in
+        # the database and not in the log: after it the schedule stops trying,
+        # so the failures before it are over.
         day = briefing_day(now)
         today = [(k, w, d) for k, w, d in events if briefing_day(w) == day]
+        made = list(facts.get("briefings") or [])  # an earlier day's is before every try
         for slot, tries in BRIEFING_TRIES.items():
-            done = [w for k, w, d in today if k == "brief_done" and d == slot]
+            done = [w for k, w, d in today if k == "brief_done" and d == slot] + made
             failed = [
                 (w, d.split()[-1])
                 for k, w, d in today
@@ -947,14 +958,18 @@ def watch_over(key: str, alert: dict, facts: dict, now: dt.datetime) -> str | No
         return f"Solved. Buying works again (run at {_hm(t, now)})."
     if key.startswith("briefing:"):
         _, slot, day = key.split(":")
+        # In the log when the schedule made it, only in the database when the
+        # app or a hand did.
+        rows = facts.get("briefings")
         made = [
-            w
-            for k, w, d in events
-            if k == "brief_done" and d == slot and w > sent and briefing_day(w).isoformat() == day
-        ]
+            w for k, w, d in events if k == "brief_done" and d == slot and w > sent
+        ] + [w for w in rows or [] if w > sent]
+        made = [w for w in made if briefing_day(w).isoformat() == day]
         if made:
             return f"Solved. The {slot} briefing was made after all, at {_hm(max(made), now)}."
-        if briefing_day(now).isoformat() > day:
+        # "Not made" is only said with the database read: the log alone does
+        # not know a briefing made outside the schedule.
+        if rows is not None and briefing_day(now).isoformat() > day:
             when = dt.date.fromisoformat(day)
             return f"The {slot} briefing of {when:%a} {when.day} {when:%b} was not made."
     return None
@@ -970,7 +985,9 @@ def watch_alerts(
     week when it is not serious, however often it comes and goes). The end of
     a serious problem is said once, and only when it can be told for sure.
     After that the same problem coming back is a new text: its end was told,
-    so its return must be, or the next "Solved" would be about nothing."""
+    so its return must be, or the next "Solved" would be about nothing. One
+    that keeps coming and going is texted as back FLAP_MAX times; the last of
+    those says so, and then it is quiet until a day has passed."""
     book = memory.setdefault("alerts", {})
     out: list[tuple[str, bool]] = []
     for f in found:
@@ -982,6 +999,10 @@ def watch_alerts(
         if recent and not back:
             old["open"] = True
             continue
+        flaps = old.get("flaps", 0) + 1 if back and recent else 0
+        if flaps > FLAP_MAX:  # said for the last time today
+            old["open"] = True
+            continue
         first = old["first"] if lasting else _stamp(now)
         book[f["key"]] = {
             "first": first,
@@ -989,12 +1010,18 @@ def watch_alerts(
             "serious": bool(f["serious"]),
             "open": True,
             **({"name": f["name"]} if f.get("name") else {}),
+            **({"flaps": flaps} if flaps else {}),
         }
         text = f["text"]
         if lasting:
             since = _hm(dt.datetime.fromisoformat(first), now)
             text = f"Still not solved (first seen {since}). {text}"
-        elif back and recent:
+        elif flaps == FLAP_MAX:
+            text = (
+                f"It is back again. {text} It keeps coming and going, so I will not "
+                "text about it again until a day has passed."
+            )
+        elif flaps:
             text = f"It is back. {text}"
         out.append((text, bool(f["serious"])))
     listed = {f["key"] for f in found}
@@ -1004,7 +1031,8 @@ def watch_alerts(
                 alert["open"] = False
             elif over := watch_over(key, alert, facts, now):
                 alert["open"] = False
-                out.append((over, False))
+                if alert.get("flaps", 0) < FLAP_MAX:
+                    out.append((over, False))
         age = now - dt.datetime.fromisoformat(alert["sent"])
         if age > dt.timedelta(days=ALERT_KEEP_DAYS):
             del book[key]

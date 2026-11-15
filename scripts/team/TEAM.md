@@ -56,8 +56,8 @@ Every ten minutes `watch.py` (launchd `com.pulse.team.watch`, installed by `team
 | What it sees | Texted |
 | --- | --- |
 | A held position with no stop at the broker, still bare after one more position run (when the latest run was a dry one, `EXIT_DRY_RUN`, it is a notice by day instead) | at any hour |
-| Position management failing two hours in a row (two failures 45 to 90 minutes apart) | at any hour |
-| Buying failing two hours in a row | at any hour |
+| Position management failing twice in a row (two turns of the same day; a slow briefing can put them two hours apart) | at any hour |
+| Buying failing twice in a row | at any hour |
 | The market open and no position run for 130 minutes: two hourly turns missed, since one is a broker blip | at any hour |
 | The morning briefing failing 3 times, the evening one twice (it has three turns, and a slow failure takes the next turn with it; a try that fails after midnight still counts for the evening before) | at any hour |
 | The broker's clock silent for 70 minutes (an outage, a missing key) | by day |
@@ -66,7 +66,7 @@ Every ten minutes `watch.py` (launchd `com.pulse.team.watch`, installed by `team
 | A crash report of Pulse, a panic in the fetcher's error log | by day |
 | The team's own hourly wake-up or the Telegram listener gone silent | by day |
 
-One text per problem: a serious one is repeated once a day while it lasts, anything else once a week, however often it comes and goes. The end of a serious problem is texted once ("Solved. …"), and only when it can be told for sure (a new position run, the stop on the books again), never merely because the problem is no longer listed. A serious problem that comes back after its "Solved" is texted again ("It is back. …"), so no "Solved" is ever about something that was not told. A briefing that was never made is closed the next morning with one line by day. Without a paired bot a serious problem is a notification on the Mac. What the watch sees is also on `team.py status` and under "Needs you" on the night page.
+One text per problem: a serious one is repeated once a day while it lasts, anything else once a week, however often it comes and goes. The end of a serious problem is texted once ("Solved. …"), and only when it can be told for sure (a new position run, the stop on the books again), never merely because the problem is no longer listed. A serious problem that comes back after its "Solved" is texted again ("It is back. …"), so no "Solved" is ever about something that was not told. One that keeps coming and going is texted as back three times; the third says so, and then nothing more is said about it until a day has passed. A briefing made by the app or by hand is not in the schedule's log, so the watch also reads the briefings in the database (read-only): such a briefing ends the alert as "Solved". A briefing that was never made is closed the next morning with one line by day, and only once the database could be read. Without a paired bot a serious problem is a notification on the Mac. What the watch sees is also on `team.py status` and under "Needs you" on the night page.
 
 No false alarms by design: a fact that cannot be read is no finding; time the Mac slept is not counted (the watch only counts time between its own looks); a dry-run install (`EXIT_DRY_RUN`) is named once and is not an emergency. Known limits: the stop check reads Pulse's books, not the broker's order list, so a stop cancelled at the broker behind Pulse's back is not seen; the fetcher's error log has no times, so a panic is reported when it is written, not dated.
 

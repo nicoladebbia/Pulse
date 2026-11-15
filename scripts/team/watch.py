@@ -44,6 +44,11 @@ FETCHER = Path(
 )
 CRASHES = Path.home() / "Library/Logs/DiagnosticReports"
 MEMORY = HOME / "watch.json"  # the watch's notebook between two looks
+# The same count as Pulse's own schedule (`briefings_today` in
+# scripts/scheduled-fetch.sh). `created_at` is UTC.
+BRIEFINGS = """SELECT created_at FROM briefings
+               WHERE briefing_type = 'daily' AND story_count > 0 AND created_at >= ?"""
+BRIEFING_DAYS = 3
 ET = ZoneInfo("America/New_York")
 EVERY_S = 600
 LOG_TAIL = 1_500_000  # bytes of the hourly log read at each look: about four days
@@ -181,9 +186,9 @@ def read_progress(path: Path) -> dict | None:
     }
 
 
-def read_bare(db: Path) -> list[dict] | None:
-    """The held positions with no stop on Pulse's books. Read-only; None when
-    the database cannot be read right now.
+def read_db(db: Path, sql: str, args: tuple = ()) -> list[tuple] | None:
+    """One short query on Pulse's database. Read-only; None when the database
+    cannot be read right now.
 
     With no write-ahead log next to it nobody has the database open, and a
     plain read-only open would leave empty `-wal` and `-shm` files in Pulse's
@@ -197,11 +202,28 @@ def read_bare(db: Path) -> list[dict] | None:
         )
         try:
             con.execute("PRAGMA query_only = 1")
-            return [{"id": i, "ticker": t} for i, t in con.execute(BARE)]
+            return con.execute(sql, args).fetchall()
         finally:
             con.close()
     except sqlite3.Error:
         return None
+
+
+def read_bare(db: Path) -> list[dict] | None:
+    """The held positions with no stop on Pulse's books."""
+    rows = read_db(db, BARE)
+    return None if rows is None else [{"id": i, "ticker": t} for i, t in rows]
+
+
+def read_briefings(db: Path, now: dt.datetime) -> list[dt.datetime] | None:
+    """When the daily briefings of the last days were made, the ones that hold
+    stories. The schedule's log only knows the briefings it made itself: one
+    made by the app or by hand is only here."""
+    since = now.astimezone(dt.timezone.utc) - dt.timedelta(days=BRIEFING_DAYS)
+    rows = read_db(db, BRIEFINGS, (f"{since:%Y-%m-%d %H:%M:%S}",))
+    if rows is None:
+        return None
+    return sorted(t for t in (parse_time(r[0]) for r in rows) if t)
 
 
 def market(now: dt.datetime, fetcher: Path, run=subprocess.run):
@@ -303,6 +325,7 @@ def gather(now: dt.datetime, memory: dict, run=subprocess.run) -> dict:
         "events": read_events(LOGS / "fetch-stdout.log"),
         "progress": read_progress(APP / "fetch-progress.json"),
         "bare": read_bare(APP / "pulse.db"),
+        "briefings": read_briefings(APP / "pulse.db", now),
         "market": state,
         "session_start": session,
         "fetching": alive(["-x", "pulse-fetcher"], run),
