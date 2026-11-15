@@ -931,7 +931,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                     prev - emb_pct, prev, emb_pct
                 ));
             }
-        if !analysis_degraded {
+        // PULSE_LLM=local runs analyze on Ollama on purpose, so there is no Haiku
+        // row to expect and no fallback to report.
+        if !analysis_degraded && !pulse_llm::is_local() {
             // analyze succeeded — but on which provider? No anthropic row today
             // means the Haiku path silently fell back to Groq 70B.
             let anthropic_analyze_today: i64 = conn.query_row(

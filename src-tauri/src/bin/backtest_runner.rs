@@ -77,6 +77,9 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let db_path = resolve_db_path(&args.db_path);
+    if let Some(why) = pulse_lib::db::connection::live_db_refusal(&db_path) {
+        anyhow::bail!(why);
+    }
     if !db_path.exists() {
         anyhow::bail!("Database not found at {}. Use --db-path to specify location.", db_path.display());
     }
