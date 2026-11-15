@@ -23,8 +23,10 @@ CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, ticker TEXT, direction TEXT,
   entry_date TEXT, exit_date TEXT, exit_price REAL, status TEXT, order_status TEXT,
   pnl REAL, realized_pnl REAL, pnl_pct REAL, exit_reason TEXT, stop_order_id TEXT,
   entry_context TEXT, entry_trigger TEXT);
-CREATE TABLE trade_reviews (trade_id INTEGER, excess_pct REAL, exit_kind TEXT);
-CREATE TABLE trade_decisions (id INTEGER PRIMARY KEY, run_at TEXT, outcome TEXT, reason TEXT);
+CREATE TABLE trade_reviews (trade_id INTEGER, excess_pct REAL, exit_kind TEXT,
+  after10_pct REAL);
+CREATE TABLE trade_decisions (id INTEGER PRIMARY KEY, run_at TEXT, ticker TEXT,
+  outcome TEXT, reason TEXT);
 CREATE TABLE learning_reports (computed_at TEXT, weights_applied INTEGER, body TEXT);
 """
 
@@ -39,6 +41,7 @@ def trade(
     pct=None,
     excess=None,
     kind="signal_decay",
+    after10=None,
     **more,
 ):
     row = {
@@ -62,8 +65,8 @@ def trade(
     )
     if excess is not None:
         con.execute(
-            "INSERT INTO trade_reviews VALUES (?, ?, ?)",
-            (tid, excess, kind),
+            "INSERT INTO trade_reviews VALUES (?, ?, ?, ?)",
+            (tid, excess, kind, after10),
         )
 
 
@@ -201,6 +204,12 @@ class Board(unittest.TestCase):
                     "avg_after10": 18.1,
                 },
                 {
+                    "exit_kind": "broker_stop",
+                    "trades": 12,
+                    "avg_return": -0.4,
+                    "avg_after10": 2.1,
+                },
+                {
                     "exit_kind": "signal_decay",
                     "trades": 25,
                     "avg_return": 0.2,
@@ -229,6 +238,21 @@ class Board(unittest.TestCase):
                     "avg_excess": 0.9,
                     "t": 0.3,
                 },
+                # A high t on three stocks is still three stocks.
+                {
+                    "reason": "too_thin",
+                    "outcome": "skipped",
+                    "signals": 3,
+                    "avg_excess": 4.0,
+                    "t": 2.5,
+                },
+                {
+                    "reason": "too_calm (short)",
+                    "outcome": "skipped",
+                    "signals": 12,
+                    "avg_excess": -5.2,
+                    "t": -2.2,
+                },
             ],
             "weight_changes": [
                 {"dimension": "news", "from": 0.3, "to": 0.27, "why": "it lagged"}
@@ -246,35 +270,56 @@ class Board(unittest.TestCase):
             ("2026-11-13 17:00:00", 0, json.dumps(dict(report, weight_changes=[]))),
         ]
         self.con.executemany("INSERT INTO learning_reports VALUES (?, ?, ?)", rows)
+        # The reviews behind the report: every trailing stop has its ten days
+        # after the sale, only two of the twelve broker stops do.
         self.con.executemany(
-            "INSERT INTO trade_decisions (run_at, outcome, reason) VALUES (?, ?, ?)",
-            [("2026-11-10T10:00:09", "skipped", "universe")] * 3
-            + [("2026-11-10T13:00:09", "run_stopped", "no_candidates")]
-            + [("2026-11-10T10:00:09", "bought", "bought")]
-            + [("2026-11-02T10:00:09", "skipped", "earnings")],
+            "INSERT INTO trade_reviews VALUES (?, ?, ?, ?)",
+            [(100 + n, 0.0, "trailing_stop", 2.5) for n in range(12)]
+            + [(200 + n, 0.0, "broker_stop", 2.1 if n < 2 else None) for n in range(12)]
+            + [(300, 0.0, "hard_stop", 18.1)],
+        )
+        self.con.executemany(
+            "INSERT INTO trade_decisions (run_at, ticker, outcome, reason) VALUES (?, ?, ?, ?)",
+            # The same stock turned down by three runs is one stock.
+            [(f"2026-11-1{d}T10:00:09", "AAA", "skipped", "universe") for d in (0, 1, 2)]
+            + [("2026-11-10T10:00:09", "BBB", "skipped", "universe")]
+            + [("2026-11-10T10:00:09", "CCC", "skipped", "earnings")]
+            + [(f"2026-11-1{d}T13:00:09", "", "run_stopped", "no_candidates") for d in (0, 1)]
+            + [("2026-11-10T10:00:09", "DDD", "bought", "bought")]
+            + [("2026-11-02T10:00:09", "EEE", "skipped", "earnings")],
         )
         board = self.board()
         self.assertEqual(board["report_day"], "2026-11-13")
         self.assertEqual([c["dimension"] for c in board["weights_moved"]], ["news"])
         self.assertEqual(
-            board["skipped"],
-            [
-                {"reason": "universe", "times": 3},
-                {"reason": "no_candidates", "times": 1},
-            ],
+            (board["skipped"], board["ended_early"], board["runs"]),
+            (
+                [{"reason": "universe", "stocks": 2}, {"reason": "earnings", "stocks": 1}],
+                [{"reason": "no_candidates", "runs": 2}],
+                5,
+            ),
         )
         text = scoreboard.as_text(board)
         for part in [
             "• Signals: 60 measured.",
-            "Trailing stop: 12 trades, +1.4% on average. Ten days after the sale the stock "
-            "had moved +2.5% on average: on average the stop sold too early.",
+            "Trailing stop: 12 trades, +1.4% on average. Holding on ten more days would "
+            "have brought +2.5% on average: on average the stop sold too early.",
             # One trade says nothing about the rule.
-            "Hard stop: 1 trade, −16.4% on average. Ten days after the sale the stock "
-            "had moved +18.1% on average.",
+            "Hard stop: 1 trade, −16.4% on average. Holding on ten more days would "
+            "have brought +18.1% on average.",
+            # Nor do two measured trades out of twelve.
+            "Stop at the broker: 12 trades, −0.4% on average. Holding on ten more days "
+            "would have brought +2.1% on average (known for 2 of them so far).",
             "Not in the tradable universe: 40 skipped, they did −10.0 points (helped).",
             "Earnings too close: 3 skipped, they did +0.9 points (cost money, too few to be sure).",
+            "Too little trading volume: 3 skipped, they did +4.0 points "
+            "(cost money, too few to be sure).",
+            "The stock moves too little (shorts): 12 skipped, shorting them would have "
+            "done −5.2 points (helped).",
             "Pulse moved news from 0.30 to 0.27 by itself on 12 Nov: it lagged",
-            "3× not in the tradable universe, 1× no stock reached a buy grade",
+            "• Of its 5 buying runs, these ended before looking at a stock: "
+            "no stock reached a buy grade (2).",
+            "• Stocks it turned down: not in the tradable universe (2), earnings too close (1).",
         ]:
             self.assertIn(part, text)
         self.assertNotIn("Signal faded:", text)  # not a stop
@@ -332,8 +377,41 @@ class Board(unittest.TestCase):
                 excess=2.0 + n % 3,
             )
         self.assertIn(
-            "clearly better than the market", scoreboard.as_text(self.board())
+            "better than the market by more than luck usually explains",
+            scoreboard.as_text(self.board()),
         )
+
+    def test_an_order_that_never_filled_is_not_a_buy(self):
+        trade(self.con, 1, "FILLED", "2026-11-10")
+        trade(self.con, 2, "WAITING", "2026-11-10", order_status="pending")
+        self.assertIn("• Bought 1: FILLED\n", scoreboard.as_text(self.board()))
+
+    def test_long_lists_say_how_much_is_left_out(self):
+        for n in range(1, 16):
+            trade(
+                self.con,
+                n,
+                f"T{n}",
+                "2026-11-09",
+                "2026-11-12",
+                pnl=10,
+                pct=1,
+                excess=1.0,
+            )
+        text = scoreboard.as_text(self.board())
+        self.assertIn("T12, and 3 more", text)
+        self.assertIn("   T10 +1.0% (+$10), signal faded\n   and 5 more", text)
+
+    def test_a_board_too_long_for_one_text_loses_whole_sections_and_says_so(self):
+        text = "Top\n\n" + "\n\n".join(f"Section {n}\n" + "x" * 500 for n in range(12))
+        short = scoreboard.shorten(text, 2000)
+        self.assertLessEqual(len(short), 2000)
+        self.assertTrue(short.startswith("Top\n\nSection 0\n"))
+        self.assertTrue(short.endswith("(Shortened. The whole board: team.py scoreboard)"))
+        self.assertTrue(short.split("\n\n")[-2].endswith("x" * 500))  # no section cut in half
+        self.assertEqual(scoreboard.shorten("short"), "short")
+        # One section longer than a text is cut, still with the note.
+        self.assertLessEqual(len(scoreboard.shorten("y" * 5000, 2000)), 2000)
 
     def test_an_empty_or_older_database_still_gives_a_board(self):
         text = scoreboard.as_text(self.board())
@@ -366,6 +444,19 @@ class Board(unittest.TestCase):
         self.assertFalse(scoreboard.due(monday + dt.timedelta(days=6), "2026-W47"))
         self.assertTrue(scoreboard.due(monday + dt.timedelta(days=7), "2026-W47"))
 
+    def test_the_board_is_always_the_whole_week_before(self):
+        sunday = dt.date(2026, 11, 15)
+        # Sent on Monday, or on Tuesday after a Monday night that did nothing,
+        # or as late as the next Sunday: the same Monday-to-Sunday week.
+        for days in (1, 2, 7):
+            self.assertEqual(
+                scoreboard.last_week_end(sunday + dt.timedelta(days=days)), sunday
+            )
+        self.assertEqual(
+            scoreboard.last_week_end(sunday + dt.timedelta(days=8)),
+            sunday + dt.timedelta(days=7),
+        )
+
 
 class Weekly(unittest.TestCase):
     """What the runner does with it."""
@@ -390,9 +481,9 @@ class Weekly(unittest.TestCase):
         self.team.DB_COPY.parent.mkdir(parents=True)
         con = sqlite3.connect(self.team.DB_COPY)
         con.executescript(SCHEMA)
-        yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
-        trade(con, 1, "YDAY", yesterday)
-        trade(con, 2, "TODAY", dt.date.today().isoformat())
+        self.sunday = scoreboard.last_week_end(dt.date.today())
+        trade(con, 1, "LASTWEEK", self.sunday.isoformat())
+        trade(con, 2, "THISWEEK", (self.sunday + dt.timedelta(days=1)).isoformat())
         con.commit()
         con.close()
 
@@ -400,8 +491,9 @@ class Weekly(unittest.TestCase):
         state = {}
         self.team.weekly_scoreboard({"scheduled": True}, state)
         self.assertEqual(len(self.sent), 1)
-        # The night starts after midnight: the board ends with the day before.
-        self.assertIn("• Bought 1: YDAY", self.sent[0])
+        # The board is last week's, whichever night of this week sends it.
+        self.assertIn("• Bought 1: LASTWEEK", self.sent[0])
+        self.assertNotIn("database copy made on", self.sent[0])
         self.assertEqual(state["scoreboard_week"], scoreboard.week_of(dt.date.today()))
         self.assertEqual(
             (self.home / "scoreboard.txt").read_text(), self.sent[0] + "\n"
@@ -421,6 +513,32 @@ class Weekly(unittest.TestCase):
         self.team.DB_COPY.unlink()
         self.team.weekly_scoreboard({"scheduled": True}, state)
         self.assertEqual(self.sent, [])
+
+    def test_an_old_copy_of_the_database_is_named(self):
+        old = dt.datetime.combine(self.sunday, dt.time(2, 30)).timestamp()
+        os.utime(self.team.DB_COPY, (old, old))
+        self.team.weekly_scoreboard({"scheduled": True}, {})
+        self.assertIn(
+            f"database copy made on {self.sunday.day} {self.sunday:%b}: anything after it "
+            "is missing.",
+            self.sent[0],
+        )
+
+    def test_a_long_board_is_texted_short_and_kept_whole(self):
+        con = sqlite3.connect(self.team.DB_COPY)
+        report = {"headline": ["h" * 1200] * 5}
+        con.execute(
+            "INSERT INTO learning_reports VALUES (?, 0, ?)",
+            (self.sunday.isoformat(), json.dumps(report)),
+        )
+        con.commit()
+        con.close()
+        self.team.weekly_scoreboard({"scheduled": True}, {})
+        self.assertLessEqual(len(self.sent[0]), chat.TEXT_MAX)
+        self.assertIn("(Shortened.", self.sent[0])
+        whole = (self.home / "scoreboard.txt").read_text()
+        self.assertGreater(len(whole), 6000)
+        self.assertIn("Signal weights", whole)
 
     def test_a_scoreboard_that_fails_never_fails_the_night(self):
         self.team.DB_COPY.write_text("not a database")

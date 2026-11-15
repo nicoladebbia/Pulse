@@ -1482,8 +1482,8 @@ def tell(report: dict, run: dict) -> None:
 
 def weekly_scoreboard(run: dict, state: dict) -> None:
     """After the first scheduled night of a week: the trading scoreboard for
-    the seven days before it, kept as a file and texted. Numbers from the
-    night's copy of the database; it never fails the night."""
+    the week before (Monday to Sunday), kept whole as a file and texted.
+    Numbers from the night's copy of the database; it never fails the night."""
     today = dt.date.today()
     if (
         not run.get("scheduled")
@@ -1493,11 +1493,18 @@ def weekly_scoreboard(run: dict, state: dict) -> None:
     ):
         return
     try:
-        text = scoreboard_text(today - dt.timedelta(days=1))
+        last_day = scoreboard.last_week_end(today)
+        text = scoreboard_text(last_day)
+        made = dt.date.fromtimestamp(DB_COPY.stat().st_mtime)
+        if made <= last_day:  # tonight's copy failed and an older one was read
+            text += (
+                f"\n\nThese numbers come from a database copy made on {made.day} "
+                f"{made:%b}: anything after it is missing."
+            )
         (HOME / "scoreboard.txt").write_text(text + "\n")
         state["scoreboard_week"] = scoreboard.week_of(today)
         save_json(HOME / "state.json", state)
-        chat.send(text)
+        chat.send(scoreboard.shorten(text))
     except Exception as e:  # noqa: BLE001
         log(f"the trading scoreboard failed: {type(e).__name__}")
 

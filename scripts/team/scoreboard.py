@@ -43,6 +43,9 @@ REASONS = {
     "max_positions": "the portfolio is full",
     "untracked_holding": "already held outside Pulse's books",
     "no_candidates": "no stock reached a buy grade",
+    "no_cash": "no cash left",
+    "broker_unreadable": "the broker could not be read",
+    "bars_refused": "the price history was refused",
     "bought": "bought",
 }
 EXITS = {
@@ -57,6 +60,7 @@ EXITS = {
 }
 LUCK_T = 2.0  # below this a result is not told apart from luck
 ENOUGH = 10  # trades before an average is worth a word about the rule
+TEXT_LIMIT = 3800  # one Telegram text (its limit is 4096)
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -98,7 +102,8 @@ def build(con: sqlite3.Connection, today: dt.date, days: int = 7) -> dict:
         f"""SELECT pt.ticker, COALESCE(pt.direction, 'long'), COALESCE(pt.entry_trigger, '')
             FROM paper_trades pt
             WHERE substr(pt.entry_date, 1, 10) BETWEEN ? AND ?
-              AND pt.status IN ('open', 'closed', 'stopped_out') AND {NOT_A_FRAGMENT}
+              AND pt.status IN ('open', 'closed', 'stopped_out')
+              AND COALESCE(pt.order_status, 'filled') = 'filled' AND {NOT_A_FRAGMENT}
             ORDER BY pt.entry_date""",
         since,
         until,
@@ -126,14 +131,35 @@ def build(con: sqlite3.Connection, today: dt.date, days: int = 7) -> dict:
            FROM paper_trades WHERE status = 'open' AND order_status = 'filled'""",
     )
     held, bare = open_now[0] if open_now else (0, 0)
-    decisions = _rows(
+    # Every run writes one row per stock it looked at, and the runs of one day
+    # repeat each other: stocks are counted once, runs are counted as runs.
+    turned_down = _rows(
         con,
-        """SELECT reason, COUNT(*) FROM trade_decisions
-           WHERE substr(run_at, 1, 10) BETWEEN ? AND ?
-             AND outcome IN ('skipped', 'run_stopped')
-           GROUP BY reason ORDER BY COUNT(*) DESC""",
+        """SELECT reason, COUNT(DISTINCT ticker) FROM trade_decisions
+           WHERE substr(run_at, 1, 10) BETWEEN ? AND ? AND outcome = 'skipped'
+           GROUP BY reason ORDER BY 2 DESC, reason""",
         since,
         until,
+    )
+    ended_early = _rows(
+        con,
+        """SELECT reason, COUNT(DISTINCT run_at) FROM trade_decisions
+           WHERE substr(run_at, 1, 10) BETWEEN ? AND ? AND outcome = 'run_stopped'
+           GROUP BY reason ORDER BY 2 DESC, reason""",
+        since,
+        until,
+    )
+    runs = _rows(
+        con,
+        """SELECT COUNT(DISTINCT run_at) FROM trade_decisions
+           WHERE substr(run_at, 1, 10) BETWEEN ? AND ?""",
+        since,
+        until,
+    )
+    # How many trades of each exit already have their ten days after the sale:
+    # the report gives the average but not how many values are in it.
+    after_n = dict(
+        _rows(con, "SELECT exit_kind, COUNT(after10_pct) FROM trade_reviews GROUP BY exit_kind")
     )
     report, report_day = {}, ""
     latest = _rows(
@@ -185,10 +211,16 @@ def build(con: sqlite3.Connection, today: dt.date, days: int = 7) -> dict:
             "avg_excess": statistics.fmean(excess) if excess else None,
             "t": t_stat(excess),
         },
-        "skipped": [{"reason": r, "times": n} for r, n in decisions],
+        "skipped": [{"reason": r, "stocks": n} for r, n in turned_down],
+        "ended_early": [{"reason": r, "runs": n} for r, n in ended_early],
+        "runs": runs[0][0] if runs else 0,
         "report_day": report_day,
         "headline": [str(h) for h in report.get("headline") or []],
-        "exits": [e for e in report.get("exits") or [] if isinstance(e, dict)],
+        "exits": [
+            dict(e, after10_n=after_n.get(e.get("exit_kind"), 0))
+            for e in report.get("exits") or []
+            if isinstance(e, dict)
+        ],
         "gates": [g for g in report.get("gates") or [] if isinstance(g, dict)],
         "weights_moved": moved,
     }
@@ -214,8 +246,19 @@ def _day(iso: str) -> str:
     return f"{d.day} {d:%b}"
 
 
+def _more(shown: int, total: int) -> str:
+    return f", and {total - shown} more" if total > shown else ""
+
+
+def _reason(reason: str) -> tuple[str, bool]:
+    """A filter in words, and whether the row is about shorts."""
+    short = reason.endswith(" (short)")
+    key = reason.removesuffix(" (short)")
+    return REASONS.get(key, key.replace("_", " ")), short
+
+
 def as_text(board: dict) -> str:
-    """The scoreboard in plain words, short enough for one Telegram text."""
+    """The whole scoreboard in plain words (`shorten` fits it into one text)."""
     out = [
         f"Pulse trading, {_day(board['since'])} to {_day(board['until'])} (paper money)"
     ]
@@ -227,7 +270,7 @@ def as_text(board: dict) -> str:
             b["ticker"] + (" (short)" if b["direction"] == "short" else "")
             for b in bought[:12]
         )
-        out.append(f"• Bought {len(bought)}: {names}")
+        out.append(f"• Bought {len(bought)}: {names}{_more(12, len(bought))}")
     else:
         out.append("• Bought nothing.")
     if sold:
@@ -244,6 +287,8 @@ def as_text(board: dict) -> str:
                 f"   {s['ticker']} {_pct(s['pnl_pct'])} ({_money(s['pnl'])})"
                 + (f", {how}" if how else "")
             )
+        if len(sold) > 10:
+            out.append(f"   and {len(sold) - 10} more")
     else:
         out.append("• Sold nothing.")
     held, bare = board["open"]["held"], board["open"]["without_stop"]
@@ -275,7 +320,10 @@ def as_text(board: dict) -> str:
             )
         else:
             word = "better" if t > 0 else "worse"
-            out.append(f"• That is clearly {word} than the market (t = {_num(t)}).")
+            out.append(
+                f"• That is {word} than the market by more than luck usually explains "
+                f"(t = {_num(t)})."
+            )
 
     if board["headline"]:
         out.append(f"\nWhat Pulse learned (its report of {_day(board['report_day'])})")
@@ -293,11 +341,15 @@ def as_text(board: dict) -> str:
                 f"• {name.capitalize()}: {n} trade{'s' if n != 1 else ''}, "
                 f"{_pct(e.get('avg_return'))} on average."
             )
-            after = e.get("avg_after10")
-            if after is not None:
-                line += f" Ten days after the sale the stock had moved {_pct(after)} on average"
+            # The report signs this from the position's side (a short included):
+            # above zero means holding on would have paid.
+            after, known = e.get("avg_after10"), e.get("after10_n") or 0
+            if after is not None and known:
+                line += f" Holding on ten more days would have brought {_pct(after)} on average"
+                if known < n:
+                    line += f" (known for {known} of them so far)"
                 # A handful of trades says nothing about a rule.
-                if n >= ENOUGH:
+                if known >= ENOUGH:
                     line += (
                         ": on average the stop sold too early"
                         if after > 0
@@ -317,20 +369,25 @@ def as_text(board: dict) -> str:
         out.append(
             "\nDid the filters help? (what the skipped stocks did next, vs the S&P 500)"
         )
-        for g in sorted(gates, key=lambda g: g["avg_excess"]):
-            name = REASONS.get(g["reason"], g["reason"].replace("_", " "))
-            sure = abs(g.get("t") or 0) >= LUCK_T
+        for g in sorted(gates, key=lambda g: g["avg_excess"])[:8]:
+            name, short = _reason(g["reason"])
+            sure = abs(g.get("t") or 0) >= LUCK_T and g["signals"] >= ENOUGH
             verdict = ("helped" if g["avg_excess"] < 0 else "cost money") + (
                 "" if sure else ", too few to be sure"
             )
+            # For shorts the report already turns the number around: below zero
+            # means the short would have lost against the market.
+            did = "shorting them would have done" if short else "they did"
             out.append(
-                f"• {name.capitalize()}: {g['signals']} skipped, they did "
-                f"{_pct(g['avg_excess'], ' points')} ({verdict})."
+                f"• {name.capitalize()}{' (shorts)' if short else ''}: {g['signals']} skipped, "
+                f"{did} {_pct(g['avg_excess'], ' points')} ({verdict})."
             )
+        if len(gates) > 8:
+            out.append(f"• and {len(gates) - 8} more filters.")
 
     out.append("\nSignal weights")
     if board["weights_moved"]:
-        for c in board["weights_moved"]:
+        for c in board["weights_moved"][:8]:
             out.append(
                 f"• Pulse moved {c.get('dimension', '?')} from {c.get('from', 0):.2f} to "
                 f"{c.get('to', 0):.2f} by itself on {_day(c['day'])}: {c.get('why', '')}".rstrip(
@@ -340,22 +397,52 @@ def as_text(board: dict) -> str:
     else:
         out.append("• Pulse changed none by itself this week.")
 
-    if board["skipped"]:
+    if board["skipped"] or board["ended_early"]:
         out.append("\nWhy it did not buy this week")
-        out.append(
-            "• "
-            + ", ".join(
-                f"{s['times']}× {REASONS.get(s['reason'], s['reason'].replace('_', ' '))}"
-                for s in board["skipped"][:6]
+        if board["ended_early"]:
+            out.append(
+                f"• Of its {board['runs']} buying run{'s' if board['runs'] != 1 else ''}, "
+                "these ended before looking at a stock: "
+                + ", ".join(
+                    f"{_reason(s['reason'])[0]} ({s['runs']})" for s in board["ended_early"][:4]
+                )
+                + "."
             )
-        )
+        if board["skipped"]:
+            out.append(
+                "• Stocks it turned down: "
+                + ", ".join(
+                    f"{_reason(s['reason'])[0]} ({s['stocks']})" for s in board["skipped"][:6]
+                )
+                + _more(6, len(board["skipped"]))
+                + "."
+            )
     return "\n".join(out)
+
+
+def shorten(text: str, limit: int = TEXT_LIMIT) -> str:
+    """The board cut to one Telegram text: whole sections go, last one first,
+    and the text says that something is missing."""
+    if len(text) <= limit:
+        return text
+    note = "\n\n(Shortened. The whole board: team.py scoreboard)"
+    parts = text.split("\n\n")
+    while len(parts) > 1 and len("\n\n".join(parts)) + len(note) > limit:
+        parts.pop()
+    return "\n\n".join(parts)[: limit - len(note)] + note
 
 
 def week_of(day: dt.date) -> str:
     """The name of the week a scoreboard belongs to (ISO year and week)."""
     year, week, _ = day.isocalendar()
     return f"{year}-W{week:02d}"
+
+
+def last_week_end(today: dt.date) -> dt.date:
+    """The Sunday that closed the week before `today`'s. The board always
+    covers a whole Monday-to-Sunday week, whichever night of the new week
+    sends it, so no day falls between two boards."""
+    return today - dt.timedelta(days=today.weekday() + 1)
 
 
 def due(today: dt.date, last_week: str) -> bool:
