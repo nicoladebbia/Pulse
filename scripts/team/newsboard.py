@@ -31,8 +31,12 @@ BURIED_MIN = 100  # offered this often in the week before "almost never used" is
 BURIED_SHARE = 0.02
 QUIET_MIN = 80  # articles in the four weeks before, for "gone quiet"
 QUIET_DAYS = 28
-WINDOW = """FROM fetch_candidates c JOIN briefings b ON b.id = c.briefing_id
-            WHERE b.briefing_type = 'daily' AND b.date BETWEEN ? AND ?"""
+# A briefing is one that holds stories, as Pulse's own schedule counts them
+# (`briefings_today` in scripts/scheduled-fetch.sh): a run that made nothing
+# leaves a row too.
+MADE = "briefing_type = 'daily' AND story_count > 0"
+WINDOW = f"""FROM fetch_candidates c JOIN briefings b ON b.id = c.briefing_id
+            WHERE b.{MADE.replace(' AND ', ' AND b.')} AND b.date BETWEEN ? AND ?"""
 
 
 def build(con: sqlite3.Connection, today: dt.date, days: int = 7) -> dict:
@@ -43,7 +47,7 @@ def build(con: sqlite3.Connection, today: dt.date, days: int = 7) -> dict:
     # Not through `_rows`: without the briefings table this is not Pulse's
     # database, and that is an error, not a week without news.
     briefings = con.execute(
-        "SELECT COUNT(*) FROM briefings WHERE briefing_type = 'daily' AND date BETWEEN ? AND ?",
+        f"SELECT COUNT(*) FROM briefings WHERE {MADE} AND date BETWEEN ? AND ?",
         week,
     ).fetchone()[0]
     runs = _rows(
@@ -198,7 +202,7 @@ def as_text(board: dict) -> str:
         share = 100 * board["offered_again"] / board["offered"]
         out.append(
             f"• {share:.0f}% of what was offered had already been offered to an earlier "
-            "briefing of the week."
+            "briefing of these days."
         )
 
     if board["topics"]:

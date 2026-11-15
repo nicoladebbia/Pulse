@@ -129,10 +129,13 @@ def build(con: sqlite3.Connection, today: dt.date, days: int = 7) -> dict:
             ORDER BY pt.exit_date""",
         (since, until),
     ).fetchall()
+    # Up to the board's last day: a board sent some nights late must not
+    # count trades closed after the days it is about.
     every = con.execute(
         f"""SELECT COALESCE(pt.pnl, pt.realized_pnl), {excess_of}
             FROM paper_trades pt {reviews}
-            WHERE {REAL}"""
+            WHERE {REAL} AND substr(pt.exit_date, 1, 10) <= ?""",
+        (until,),
     ).fetchall()
     excess = [e for _, e in every if e is not None]
     held, bare = con.execute(
@@ -272,13 +275,25 @@ def _reason(reason: str) -> tuple[str, bool]:
     return REASONS.get(key, key.replace("_", " ")), short
 
 
+def _span(board: dict) -> str:
+    """The days a board covers, in words: more than a week when no board went
+    out for a while."""
+    days = (
+        dt.date.fromisoformat(board["until"]) - dt.date.fromisoformat(board["since"])
+    ).days + 1
+    if days <= 7:
+        return "this week"
+    return f"these {days // 7} weeks" if days % 7 == 0 else f"these {days} days"
+
+
 def as_text(board: dict) -> str:
     """The whole scoreboard in plain words (`shorten` fits it into one text)."""
     out = [
         f"Pulse trading, {_day(board['since'])} to {_day(board['until'])} (paper money)"
     ]
+    span = _span(board)
 
-    out.append("\nThis week")
+    out.append(f"\n{span.capitalize()}")
     bought, sold = board["bought"], board["sold"]
     if bought:
         names = ", ".join(
@@ -424,10 +439,10 @@ def as_text(board: dict) -> str:
                 )
             )
     else:
-        out.append("• Pulse changed none by itself this week.")
+        out.append(f"• Pulse changed none by itself {span}.")
 
     if board["skipped"] or board["ended_early"]:
-        out.append("\nWhy it did not buy this week")
+        out.append(f"\nWhy it did not buy {span}")
         if board["ended_early"]:
             out.append(
                 f"• Of its {board['runs']} buying run{'s' if board['runs'] != 1 else ''}, "
@@ -449,12 +464,15 @@ def as_text(board: dict) -> str:
     return "\n".join(out)
 
 
-def shorten(text: str, limit: int = TEXT_LIMIT, whole: str = "team.py scoreboard") -> str:
+def shorten(
+    text: str, limit: int = TEXT_LIMIT, whole: str = "team.py scoreboard", warning: str = ""
+) -> str:
     """The board cut to one Telegram text: whole sections go, last one first,
-    and the text says that something is missing and where the whole is."""
-    if len(text) <= limit:
-        return text
-    note = f"\n\n(Shortened. The whole board: {whole})"
+    and the text says that something is missing and where the whole is. A
+    `warning` about the numbers themselves is never what gets cut."""
+    if len(text) + len(warning) <= limit:
+        return text + warning
+    note = f"\n\n(Shortened. The whole board: {whole})" + warning
     parts = text.split("\n\n")
     while len(parts) > 1 and len("\n\n".join(parts)) + len(note) > limit:
         parts.pop()
@@ -468,10 +486,27 @@ def week_of(day: dt.date) -> str:
 
 
 def last_week_end(today: dt.date) -> dt.date:
-    """The Sunday that closed the week before `today`'s. The board always
-    covers a whole Monday-to-Sunday week, whichever night of the new week
-    sends it, so no day falls between two boards."""
+    """The Sunday that closed the week before `today`'s. A board always ends
+    there, whichever night of the new week sends it."""
     return today - dt.timedelta(days=today.weekday() + 1)
+
+
+MAX_WEEKS = 4
+
+
+def weeks_owed(today: dt.date, last_week: str) -> int:
+    """How many whole weeks the next board covers. One as a rule; more when
+    no board went out for a while (the Mac was off, the nights did nothing),
+    so that no day falls between two boards. Never more than MAX_WEEKS.
+
+    `last_week` names the week the last board was sent in: that one ended on
+    the Sunday before it."""
+    try:
+        year, week = last_week.split("-W")
+        covered = dt.date.fromisocalendar(int(year), int(week), 1) - dt.timedelta(days=1)
+    except ValueError:
+        return 1
+    return max(1, min((last_week_end(today) - covered).days // 7, MAX_WEEKS))
 
 
 def due(today: dt.date, last_week: str) -> bool:

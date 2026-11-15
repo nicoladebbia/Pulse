@@ -1509,33 +1509,36 @@ def weekly_board(run: dict, state: dict, name: str, text_of) -> None:
         return
     try:
         last_day = scoreboard.last_week_end(today)
-        text = text_of(last_day)
+        # More than one week when no board went out for a while.
+        weeks = scoreboard.weeks_owed(today, state.get(f"{name}_week", ""))
+        text = text_of(last_day, 7 * weeks)
         made = dt.date.fromtimestamp(DB_COPY.stat().st_mtime)
+        warning = ""
         if made <= last_day:  # tonight's copy failed and an older one was read
-            text += (
+            warning = (
                 f"\n\nThese numbers come from a database copy made on {made.day} "
                 f"{made:%b}: anything after it is missing."
             )
-        (HOME / f"{name}.txt").write_text(text + "\n")
+        (HOME / f"{name}.txt").write_text(text + warning + "\n")
         state[f"{name}_week"] = scoreboard.week_of(today)
         save_json(HOME / "state.json", state)
-        chat.send(scoreboard.shorten(text, whole=f"team.py {name}"))
+        chat.send(scoreboard.shorten(text, whole=f"team.py {name}", warning=warning))
     except Exception as e:  # noqa: BLE001
         log(f"the weekly {name} failed: {type(e).__name__}")
 
 
-def scoreboard_text(last_day: dt.date) -> str:
+def scoreboard_text(last_day: dt.date, days: int = 7) -> str:
     con = scoreboard.connect(DB_COPY)
     try:
-        return scoreboard.as_text(scoreboard.build(con, last_day))
+        return scoreboard.as_text(scoreboard.build(con, last_day, days))
     finally:
         con.close()
 
 
-def newsboard_text(last_day: dt.date) -> str:
+def newsboard_text(last_day: dt.date, days: int = 7) -> str:
     con = scoreboard.connect(DB_COPY)
     try:
-        return newsboard.as_text(newsboard.build(con, last_day))
+        return newsboard.as_text(newsboard.build(con, last_day, days))
     finally:
         con.close()
 

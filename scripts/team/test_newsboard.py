@@ -23,7 +23,7 @@ import scoreboard  # noqa: E402
 TODAY = dt.date(2026, 11, 15)  # a Sunday; the week is 9 to 15 November
 SCHEMA = """
 CREATE TABLE briefings (id INTEGER PRIMARY KEY, date TEXT,
-  briefing_type TEXT DEFAULT 'daily');
+  briefing_type TEXT DEFAULT 'daily', story_count INTEGER DEFAULT 120);
 CREATE TABLE fetch_candidates (id INTEGER PRIMARY KEY, briefing_id INTEGER,
   url_hash TEXT, source_name TEXT, sector TEXT, kept_by_precurate INTEGER,
   story_id INTEGER);
@@ -39,8 +39,8 @@ _url = itertools.count(1)
 _story = itertools.count(1)
 
 
-def briefing(con, bid, date, kind="daily"):
-    con.execute("INSERT INTO briefings VALUES (?, ?, ?)", (bid, date, kind))
+def briefing(con, bid, date, kind="daily", stories=120):
+    con.execute("INSERT INTO briefings VALUES (?, ?, ?, ?)", (bid, date, kind, stories))
 
 
 def offer(con, bid, source, n, made=0, kept=None, sector="tech", urls=None):
@@ -146,7 +146,7 @@ class Board(unittest.TestCase):
         self.assertEqual((board["offered"], board["offered_again"]), (4, 1))
         self.assertIn(
             "• 25% of what was offered had already been offered to an earlier briefing "
-            "of the week.\n",
+            "of these days.\n",
             self.text(),
         )
 
@@ -334,9 +334,10 @@ class Board(unittest.TestCase):
     def test_a_database_older_than_the_counting_still_gives_the_briefings(self):
         older = self.memory()
         older.execute(
-            "CREATE TABLE briefings (id INTEGER PRIMARY KEY, date TEXT, briefing_type TEXT)"
+            "CREATE TABLE briefings (id INTEGER PRIMARY KEY, date TEXT, briefing_type TEXT,"
+            " story_count INTEGER)"
         )
-        older.execute("INSERT INTO briefings VALUES (1, '2026-11-10', 'daily')")
+        older.execute("INSERT INTO briefings VALUES (1, '2026-11-10', 'daily', 120)")
         text = newsboard.as_text(newsboard.build(older, TODAY))
         self.assertIn(
             "• 1 briefing. What was offered to them was not recorded.\n", text
@@ -344,6 +345,30 @@ class Board(unittest.TestCase):
         self.assertNotIn("Sources", text)
         self.assertNotIn("By topic", text)
         self.assertIn("• Stories opened: 0 (0 since the start).", text)
+
+    def test_a_run_that_made_nothing_is_not_a_briefing(self):
+        briefing(self.con, 1, "2026-11-10")
+        briefing(self.con, 2, "2026-11-11", stories=0)  # the run failed midway
+        offer(self.con, 1, "A", 40, made=10)
+        offer(self.con, 2, "B", 60)
+        board = self.board()
+        self.assertEqual(
+            (board["briefings"], board["counted"], board["pool"], board["made"]),
+            (1, 1, 40, 10),
+        )
+        self.assertEqual(board["sources_offering"], 1)
+        self.assertIn("• 1 briefing.", self.text())
+        self.assertNotIn("Counted on", self.text())
+
+    def test_a_board_for_more_than_one_week_takes_all_its_days(self):
+        briefing(self.con, 1, "2026-11-03")  # the week before
+        briefing(self.con, 2, "2026-11-10")
+        offer(self.con, 1, "A", 40, made=10)
+        offer(self.con, 2, "A", 20, made=10)
+        self.assertEqual(self.board()["briefings"], 1)
+        board = newsboard.build(self.con, TODAY, 14)
+        self.assertEqual((board["briefings"], board["pool"]), (2, 30))
+        self.assertIn("Pulse news, 2 Nov to 15 Nov", newsboard.as_text(board))
 
     def test_briefings_whose_articles_were_not_recorded_are_not_averaged_in(self):
         briefing(self.con, 1, "2026-11-10")
@@ -431,7 +456,7 @@ class Weekly(unittest.TestCase):
         # This copy has the news tables and none of the trading ones' columns
         # matter to the news board; break the trading side only.
         state = {}
-        self.team.scoreboard_text = lambda day: 1 / 0
+        self.team.scoreboard_text = lambda day, days: 1 / 0
         self.team.weekly_scoreboard({"scheduled": True}, state)
         self.team.weekly_newsboard({"scheduled": True}, state)
         self.assertEqual(len(self.sent), 1)

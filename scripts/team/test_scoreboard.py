@@ -385,6 +385,33 @@ class Board(unittest.TestCase):
             self.assertIn(part, text)
         self.assertLess(len(text), chat.TEXT_MAX)
 
+    def test_since_the_start_ends_with_the_board(self):
+        trade(self.con, 1, "EARLY", "2026-10-01", "2026-10-20", pnl=100, pct=5, excess=2)
+        trade(self.con, 2, "INWEEK", "2026-11-09", "2026-11-12", pnl=50, pct=2, excess=1)
+        # Closed after the board's last day: a board sent some nights late
+        # must not count it.
+        trade(self.con, 3, "LATER", "2026-11-09", "2026-11-17", pnl=-400, pct=-9, excess=-8)
+        board = self.board()
+        self.assertEqual((board["all"]["trades"], board["all"]["measured"]), (2, 2))
+        self.assertAlmostEqual(board["all"]["pnl"], 150)
+        later = scoreboard.build(self.con, dt.date(2026, 11, 22))
+        self.assertEqual(later["all"]["trades"], 3)
+
+    def test_a_board_for_more_than_one_week_says_so(self):
+        trade(self.con, 1, "FIRST", "2026-11-03", "2026-11-05", pnl=10, pct=1)
+        trade(self.con, 2, "SECOND", "2026-11-10")
+        text = scoreboard.as_text(self.board(days=14))
+        for part in [
+            "Pulse trading, 2 Nov to 15 Nov (paper money)",
+            "\nThese 2 weeks\n",
+            "• Bought 2: FIRST, SECOND",
+            "• Sold 1: +$10 in total.",
+            "• Pulse changed none by itself these 2 weeks.",
+        ]:
+            self.assertIn(part, text)
+        self.assertNotIn("this week", text.lower())
+        self.assertIn("\nThese 10 days\n", scoreboard.as_text(self.board(days=10)))
+
     def test_a_clear_result_is_called_clear(self):
         for n in range(1, 31):
             trade(
@@ -433,6 +460,18 @@ class Board(unittest.TestCase):
         self.assertEqual(scoreboard.shorten("short"), "short")
         # One section longer than a text is cut, still with the note.
         self.assertLessEqual(len(scoreboard.shorten("y" * 5000, 2000)), 2000)
+        # A warning about the numbers is the last thing said, never what is cut.
+        warning = "\n\nThese numbers are old."
+        short = scoreboard.shorten(text, 2000, warning=warning)
+        self.assertLessEqual(len(short), 2000)
+        self.assertTrue(
+            short.endswith("(Shortened. The whole board: team.py scoreboard)" + warning)
+        )
+        self.assertEqual(scoreboard.shorten("short", warning=warning), "short" + warning)
+        # A text that fits alone and not with its warning is still shortened.
+        tight = "Top\n\n" + "z" * 1990
+        self.assertTrue(scoreboard.shorten(tight, 2000, warning=warning).endswith(warning))
+        self.assertLessEqual(len(scoreboard.shorten(tight, 2000, warning=warning)), 2000)
 
     def test_an_empty_or_older_database_still_gives_a_board(self):
         text = scoreboard.as_text(self.board())
@@ -529,6 +568,20 @@ class Board(unittest.TestCase):
         self.assertEqual(scoreboard.last_week_end(dt.date(2027, 1, 5)), dt.date(2027, 1, 3))
         self.assertEqual(scoreboard.last_week_end(dt.date(2026, 12, 29)), dt.date(2026, 12, 27))
 
+    def test_weeks_without_a_board_are_made_up_for(self):
+        monday = dt.date(2026, 11, 16)  # week 47; the board ends on Sunday the 15th
+        owed = scoreboard.weeks_owed
+        self.assertEqual(owed(monday, "2026-W46"), 1)  # the usual week
+        self.assertEqual(owed(monday + dt.timedelta(days=5), "2026-W46"), 1)
+        self.assertEqual(owed(monday, "2026-W45"), 2)  # no board went out last week
+        self.assertEqual(owed(monday, "2026-W40"), 4)  # never more than four
+        self.assertEqual(owed(monday, ""), 1)  # the first board ever
+        self.assertEqual(owed(monday, "nonsense"), 1)
+        self.assertEqual(owed(monday, "2026-W47"), 1)  # asked again in its own week
+        # Over the New Year: sent in the last week of 2026, next in the second of 2027.
+        self.assertEqual(owed(dt.date(2027, 1, 4), "2026-W53"), 1)
+        self.assertEqual(owed(dt.date(2027, 1, 11), "2026-W53"), 2)
+
     def test_the_board_is_always_the_whole_week_before(self):
         sunday = dt.date(2026, 11, 15)
         # Sent on Monday, or on Tuesday after a Monday night that did nothing,
@@ -607,6 +660,44 @@ class Weekly(unittest.TestCase):
             f"database copy made on {self.sunday.day} {self.sunday:%b}: anything after it "
             "is missing.",
             self.sent[0],
+        )
+
+    def test_a_week_without_a_board_is_in_the_next_one(self):
+        con = sqlite3.connect(self.team.DB_COPY)
+        trade(con, 3, "WEEKBEFORE", (self.sunday - dt.timedelta(days=7)).isoformat())
+        trade(con, 4, "TOOOLD", (self.sunday - dt.timedelta(days=14)).isoformat())
+        con.commit()
+        con.close()
+        # The last board went out two weeks ago: nothing was sent last week.
+        sent_in = scoreboard.week_of(dt.date.today() - dt.timedelta(days=14))
+        state = {"scoreboard_week": sent_in}
+        self.team.weekly_scoreboard({"scheduled": True}, state)
+        self.assertIn("• Bought 2: WEEKBEFORE, LASTWEEK", self.sent[0])
+        self.assertIn("These 2 weeks", self.sent[0])
+        first = self.sunday - dt.timedelta(days=13)
+        self.assertIn(f"Pulse trading, {first.day} {first:%b} to ", self.sent[0])
+        # And the one after it is one week again.
+        self.sent.clear()
+        state["scoreboard_week"] = scoreboard.week_of(dt.date.today() - dt.timedelta(days=7))
+        self.team.weekly_scoreboard({"scheduled": True}, state)
+        self.assertIn("• Bought 1: LASTWEEK", self.sent[0])
+
+    def test_a_long_board_from_an_old_copy_keeps_its_warning(self):
+        con = sqlite3.connect(self.team.DB_COPY)
+        con.execute(
+            "INSERT INTO learning_reports VALUES (?, 0, ?)",
+            (self.sunday.isoformat(), json.dumps({"headline": ["h" * 1200] * 5})),
+        )
+        con.commit()
+        con.close()
+        old = dt.datetime.combine(self.sunday, dt.time(2, 30)).timestamp()
+        os.utime(self.team.DB_COPY, (old, old))
+        self.team.weekly_scoreboard({"scheduled": True}, {})
+        self.assertLessEqual(len(self.sent[0]), chat.TEXT_MAX)
+        self.assertIn("(Shortened.", self.sent[0])
+        self.assertTrue(self.sent[0].endswith("anything after it is missing."))
+        self.assertTrue(
+            (self.home / "scoreboard.txt").read_text().endswith("is missing.\n")
         )
 
     def test_a_long_board_is_texted_short_and_kept_whole(self):
