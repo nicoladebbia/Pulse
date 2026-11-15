@@ -36,6 +36,7 @@ import page  # noqa: E402
 
 import rules  # noqa: E402
 import scoreboard  # noqa: E402
+import watch  # noqa: E402
 
 HOME = Path(os.environ.get("PULSE_TEAM_HOME") or Path.home() / ".pulse-team")
 REPO = Path(os.environ.get("PULSE_TEAM_REPO") or Path.home() / "dev/Pulse")
@@ -59,6 +60,8 @@ PLIST_LABEL = "com.pulse.team"
 PLIST = Path.home() / "Library/LaunchAgents" / f"{PLIST_LABEL}.plist"
 CHAT_LABEL = f"{PLIST_LABEL}.chat"  # the Telegram listener, always on
 CHAT_PLIST = PLIST.with_name(f"{CHAT_LABEL}.plist")
+WATCH_LABEL = f"{PLIST_LABEL}.watch"  # the look at the installed Pulse, every ten minutes
+WATCH_PLIST = PLIST.with_name(f"{WATCH_LABEL}.plist")
 
 
 def _int(name: str, default: int) -> int:
@@ -1535,6 +1538,12 @@ def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
     save_json(HOME / "history.json", history)
     save_json(HOME / "state.json", state)
     ask(report, run)  # before the page, which lists what waits in Telegram
+    seen = load_json(HOME / "watch.json", {})
+    report["watch"] = [
+        {"serious": bool(f.get("serious")), "text": str(f.get("text", ""))}
+        for f in (seen.get("found") if isinstance(seen, dict) else None) or []
+        if isinstance(f, dict)
+    ]
     report["asked"] = [
         {"kind": p.get("kind"), "title": p.get("title"), "state": p.get("state")}
         for p in load_json(chat.PROPOSALS, [])
@@ -1636,6 +1645,7 @@ def cmd_install(_args) -> int:
         "guard.py",
         "chat.py",
         "scoreboard.py",
+        "watch.py",
         "checks.sh",
         "TEAM.md",
     ):
@@ -1678,6 +1688,7 @@ def cmd_install(_args) -> int:
         print(f"launchctl failed: {(out + err).strip()}")
         return 1
     start_listener()
+    start_watch()
     print(
         f"Installed. Wakes every hour at :{RUN_AT[1]:02d} and starts the night shift at "
         f"{RUN_AT[0]:02d}:{RUN_AT[1]:02d}, from {bin_dir}. Ideas: {IDEAS}"
@@ -1701,6 +1712,46 @@ def chat_job(python: str, bin_dir: Path) -> dict:
             "PULSE_TEAM_HOME": str(HOME),
         },
     }
+
+
+def watch_job(python: str, bin_dir: Path) -> dict:
+    """The launchd agent for the watch: one look every ten minutes. launchd
+    does not fire while the Mac sleeps, and the watch counts no time it did
+    not see."""
+    return {
+        "Label": WATCH_LABEL,
+        "ProgramArguments": [python, str(bin_dir / "watch.py")],
+        "StartInterval": watch.EVERY_S,
+        "RunAtLoad": True,
+        "StandardOutPath": str(HOME / "watch.log"),
+        "StandardErrorPath": str(HOME / "watch.log"),
+        "EnvironmentVariables": {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": str(Path.home()),
+            "PULSE_TEAM_HOME": str(HOME),
+        },
+    }
+
+
+def stop_watch() -> None:
+    sh(["launchctl", "bootout", f"gui/{os.getuid()}/{WATCH_LABEL}"])
+    WATCH_PLIST.unlink(missing_ok=True)
+
+
+def start_watch() -> bool:
+    """(Re)start the watch from the installed copy: what watches is what was
+    merged, never a checkout."""
+    stop_watch()
+    if not (HOME / "bin/watch.py").exists():
+        return False
+    WATCH_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    WATCH_PLIST.write_bytes(
+        plistlib.dumps(watch_job(shutil.which("python3") or sys.executable, HOME / "bin"))
+    )
+    code, out, err = sh(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(WATCH_PLIST)])
+    if code != 0:
+        print(f"launchctl failed for the watch: {(out + err).strip()}")
+    return code == 0
 
 
 def stop_listener() -> None:
@@ -1768,6 +1819,7 @@ def cmd_uninstall(_args) -> int:
     sh(["launchctl", "bootout", f"gui/{os.getuid()}/{PLIST_LABEL}"])
     PLIST.unlink(missing_ok=True)
     stop_listener()
+    stop_watch()
     print(f"Removed the nightly job. {HOME} (ideas, reports) is left in place.")
     return 0
 
@@ -1775,7 +1827,14 @@ def cmd_uninstall(_args) -> int:
 def cmd_status(_args) -> int:
     latest = HOME / "latest.txt"
     print(latest.read_text() if latest.exists() else "The night team has not run yet.")
+    print(watch.as_text(load_json(HOME / "watch.json", {})))
     return 0
+
+
+def cmd_watch(args) -> int:
+    """One look at the installed Pulse, by hand. With --dry it only prints what
+    it sees: nothing is texted and the watch's notebook is left alone."""
+    return watch.main(["--dry"] if args.dry else [])
 
 
 def cmd_scoreboard(_args) -> int:
@@ -1834,6 +1893,9 @@ def main() -> int:
     sub.add_parser(
         "scoreboard", help="what Pulse bought and sold, against the S&P 500"
     ).set_defaults(fn=cmd_scoreboard)
+    w = sub.add_parser("watch", help="look at the installed Pulse now")
+    w.add_argument("--dry", action="store_true", help="only print, text nothing")
+    w.set_defaults(fn=cmd_watch)
     c = sub.add_parser("chat", help="the Telegram line to Nicola")
     c.add_argument(
         "action", choices=("pair", "run", "status", "unpair", "say", "propose")

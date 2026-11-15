@@ -49,6 +49,29 @@ After the first scheduled night of each week the team texts the trading scoreboa
 
 It is arithmetic on the night's copy of the database, opened read-only: no session, no AI, nothing proposed and nothing changed. A copy that cannot be read is an error in the log, never an empty week. `team.py scoreboard` prints the last seven days from the copy as it is now.
 
+## The watch
+
+Every ten minutes `watch.py` (launchd `com.pulse.team.watch`, installed by `team.py install`) looks at the installed Pulse and texts Nicola when something is wrong. It only reads: the hourly log, the progress file, the schedule stamps, launchd's list, and one read-only query on the database for held positions with no stop. It asks the broker's clock through the installed fetcher (`--mode market-open`, no lock, nothing written), so a holiday or an early close is simply "closed". It starts no session and changes nothing in Pulse; for now it only tells.
+
+| What it sees | Texted |
+| --- | --- |
+| A held position with no stop at the broker, still bare after one more position run | at any hour |
+| Position management failing two hours in a row | at any hour |
+| Buying failing two hours in a row | at any hour |
+| The market open and no position run for 70 minutes | at any hour |
+| The morning briefing failing 4 times, the evening one 3 times | at any hour |
+| The broker's clock silent for 70 minutes (an outage, a missing key) | by day |
+| A fetch running over 3 hours, or one that died midway | by day |
+| A schedule not loaded in launchd, or one that stopped running | by day |
+| A crash report of Pulse, a panic in the fetcher's error log | by day |
+| The team's own hourly wake-up or the Telegram listener gone silent | by day |
+
+One text per problem: a serious one is repeated once a day while it lasts, anything else once a week, however often it comes and goes. The end of a serious problem is texted once ("Solved. …"), and only when it can be told for sure (a new position run, the stop on the books again), never merely because the problem is no longer listed. Without a paired bot a serious problem is a notification on the Mac. What the watch sees is also on `team.py status` and under "Needs you" on the night page.
+
+No false alarms by design: a fact that cannot be read is no finding; time the Mac slept is not counted (the watch only counts time between its own looks); a dry-run install (`EXIT_DRY_RUN`) is named once and is not an emergency. Known limits: the stop check reads Pulse's books, not the broker's order list, so a stop cancelled at the broker behind Pulse's back is not seen; the fetcher's error log has no times, so a panic is reported when it is written, not dated.
+
+`team.py watch --dry` looks now and only prints. The rules are `watch_findings`, `watch_alerts` and `watch_over` in `rules.py`; the watch's notebook is `~/.pulse-team/watch.json`, its log `~/.pulse-team/watch.log`.
+
 ## Safety while it runs
 
 - Sessions work in a worktree of their own, `.claude/worktrees/team-job`, made fresh for every job and removed when it ends; the main checkout is never touched.
@@ -69,6 +92,7 @@ python3 scripts/team/team.py idea "one line"  # add an idea
 python3 scripts/team/team.py status           # last night's report
 python3 scripts/team/team.py page <url>       # the artifact the nightly page is published to
 python3 scripts/team/team.py scoreboard       # the last 7 days of trading, against the S&P 500
+python3 scripts/team/team.py watch --dry       # look at the installed Pulse now, text nothing
 python3 scripts/team/team.py chat pair        # tie a Telegram bot to this Mac (asks for the token)
 python3 scripts/team/team.py chat status      # paired, listener alive, what waits
 python3 scripts/team/team.py chat say "text"  # text Nicola now

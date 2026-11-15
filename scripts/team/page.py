@@ -121,6 +121,9 @@ def needs_you(report: dict) -> list[str]:
     for i in report.get("ideas", []):
         if i.get("state") == "waiting":
             out.append(f"Idea: {i['text']}")
+    # What the watch saw in the installed app when the night ended.
+    for f in report.get("watch") or []:
+        out.append(f"{'Serious, in' if f.get('serious') else 'In'} the running app: {f.get('text', '')}")
     # A queued question goes out with the morning text; a queued idea waits
     # for its place in the week and is not waiting for an answer yet.
     asked = [

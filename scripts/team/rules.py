@@ -608,3 +608,357 @@ def expire(proposals: list[dict], now: dt.datetime) -> int:
 
 def proposal_id(kind: str, key: str, created: str) -> str:
     return hashlib.sha1(f"{kind}|{key}|{created}".encode()).hexdigest()[:8]
+
+
+# ---------------------------------------------------------------- the watch --
+#
+# `watch.py` looks at the installed Pulse every ten minutes and hands what it
+# saw to `watch_findings`. A fact it could not read is None, and a check
+# without its facts says nothing: no reading is never read as "all is well"
+# or as "something is wrong".
+
+WATCH_GAP_MIN = 25  # two looks further apart than this: the Mac slept between
+SILENT_MIN = 70  # market open and no position run for this long
+RECENT_MIN = 90  # a failure older than this is no longer "happening now"
+STALL_MIN = 130  # the hourly schedule has skipped two turns
+STUCK_FETCH_MIN = 180  # a briefing on local AI takes up to about 70 minutes
+DEAD_FETCH_MIN = 10
+LISTENER_MIN = 15
+# Failed tries before a missing briefing is serious. The evening has only the
+# hours from 21:00 to midnight.
+BRIEFING_TRIES = {"morning": 4, "evening": 3}
+# One text per problem: a serious one is repeated once a day while it lasts,
+# anything else once a week.
+ALERT_AGAIN_H = {True: 24, False: 7 * 24}
+ALERT_KEEP_DAYS = 30
+SCHEDULERS = {
+    "com.pulse.scheduled-fetch": "the hourly schedule (briefings and trading)",
+    "com.pulse.live-signals": "the live signals",
+}
+
+
+def _hm(t: dt.datetime, now: dt.datetime) -> str:
+    return f"{t:%H:%M}" if t.date() == now.date() else f"{t:%a %H:%M}"
+
+
+def awake_since(
+    ticks: list[dt.datetime], now: dt.datetime, gap_min: int = WATCH_GAP_MIN
+) -> dt.datetime:
+    """Since when the watch has been looking without a break. A Mac that slept
+    saw nothing, so nothing is said about the time it was asleep."""
+    start = now
+    for t in sorted((t for t in ticks if t <= now), reverse=True):
+        if start - t > dt.timedelta(minutes=gap_min):
+            break
+        start = t
+    return start
+
+
+def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
+    """What is wrong right now, as [{key, serious, text}]. `memory` is the
+    watch's own notebook between looks (when a position was first seen without
+    a stop, since when the broker's clock is silent) and is updated here.
+
+    Serious means: texted at any hour. Everything else waits for the day."""
+    found: list[dict] = []
+    awake = facts.get("awake") or now
+    events = facts.get("events")
+    progress = facts.get("progress") or {}
+
+    def add(key: str, serious: bool, text: str, **more) -> None:
+        found.append({"key": key, "serious": serious, "text": text, **more})
+
+    def minutes(since: dt.datetime) -> int:
+        """How long something has lasted, counting only time the watch was awake."""
+        return int((now - max(since, awake)).total_seconds() // 60)
+
+    def hm(t: dt.datetime) -> str:
+        return _hm(t, now)
+
+    running = bool(
+        progress
+        and progress.get("stage") not in ("complete", "failed")
+        and progress.get("updated")
+        and now - progress["updated"] < dt.timedelta(minutes=DEAD_FETCH_MIN)
+    )
+
+    # A held position without a stop at the broker.
+    bare, seen = facts.get("bare"), memory.setdefault("bare", {})
+    if bare is not None and events is not None:
+        ids = {str(b["id"]) for b in bare}
+        for gone in [k for k in seen if k not in ids]:
+            del seen[gone]
+        day = dt.timedelta(hours=26)
+        dry = any(k == "manage_dry" and now - w <= day for k, w, _ in events)
+        for b in bare:
+            first = dt.datetime.fromisoformat(seen.setdefault(str(b["id"]), _stamp(now)))
+            passes = [w for k, w, _ in events if k == "manage_ok" and w > first]
+            if passes and not dry:
+                add(
+                    f"stop:{b['id']}",
+                    True,
+                    f"{b['ticker']} has no stop at the broker, and the position run at "
+                    f"{hm(passes[-1])} did not put one back. Nothing limits the loss on it "
+                    "until it has one.",
+                    name=str(b["ticker"]),
+                )
+        if dry and bare:
+            names = ", ".join(str(b["ticker"]) for b in bare[:10])
+            add(
+                "stop:dry",
+                False,
+                f"Exits are in dry-run mode (EXIT_DRY_RUN), so {len(bare)} open "
+                f"position{'s have' if len(bare) != 1 else ' has'} no stop at the broker: {names}.",
+            )
+
+    if events is not None:
+        # Position management failing two hours in a row.
+        runs: list[list] = []
+        for kind, when, detail in events:
+            if kind == "manage_start":
+                runs.append([when, "", ""])
+            elif kind in ("manage_ok", "manage_fail") and runs and not runs[-1][1]:
+                runs[-1][1:] = [kind, detail]
+        last = runs[-2:]
+        if (
+            len(last) == 2
+            and all(r[1] == "manage_fail" for r in last)
+            and last[1][0] - last[0][0] >= dt.timedelta(minutes=45)
+            and now - last[1][0] <= dt.timedelta(minutes=RECENT_MIN)
+        ):
+            add(
+                "manage",
+                True,
+                f"Position management failed two hours in a row (at {hm(last[0][0])} and "
+                f"{hm(last[1][0])}, exit {last[1][2] or '?'}). Exits and stop updates are "
+                "not happening. The stops already at the broker still hold.",
+            )
+
+        # Buying failing two hours in a row.
+        oks = [w for k, w, _ in events if k == "auto_ok"]
+        fails = [(w, d) for k, w, d in events if k == "auto_fail" and (not oks or w > max(oks))]
+        if (
+            len(fails) >= 2
+            and fails[-1][0] - fails[-2][0] >= dt.timedelta(minutes=45)
+            and now - fails[-1][0] <= dt.timedelta(minutes=RECENT_MIN)
+        ):
+            add(
+                "auto",
+                True,
+                f"Buying failed two hours in a row (at {hm(fails[-2][0])} and "
+                f"{hm(fails[-1][0])}, exit {fails[-1][1] or '?'}). No new positions are "
+                "opened. The ones held are not affected.",
+            )
+
+        # A briefing that keeps failing.
+        for slot, tries in BRIEFING_TRIES.items():
+            today = [(k, w, d) for k, w, d in events if w.date() == now.date()]
+            done = [w for k, w, d in today if k == "brief_done" and d == slot]
+            failed = [
+                (w, d.split()[-1])
+                for k, w, d in today
+                if k == "brief_fail" and d.split()[0] == slot and (not done or w > max(done))
+            ]
+            if len(failed) >= tries:
+                add(
+                    f"briefing:{slot}:{now.date().isoformat()}",
+                    True,
+                    f"The {slot} briefing failed {len(failed)} times today (last try "
+                    f"{hm(failed[-1][0])}, exit {failed[-1][1]}). The schedule keeps trying "
+                    "every hour.",
+                )
+
+    # The market is open and nobody looks at the positions.
+    market = facts.get("market")
+    if events is not None and market == "open" and facts.get("session_start"):
+        starts = [w for k, w, _ in events if k == "manage_start"]
+        base = max([facts["session_start"], *starts[-1:]])
+        idle = minutes(base)
+        if idle >= SILENT_MIN:
+            why = ""
+            if running and progress.get("started"):
+                why = (
+                    f" A fetch has been running since {hm(progress['started'])} and holds "
+                    "up the hourly schedule."
+                )
+            said = f"last at {hm(starts[-1])}" if starts else "no run in the log"
+            add(
+                "silent",
+                True,
+                f"The market is open and Pulse has not looked at its positions for {idle} "
+                f"minutes ({said}).{why} The stops at the broker still hold, but exits and "
+                "stop updates are not happening.",
+            )
+
+    # The broker's clock does not answer, so trading is skipped without a word.
+    if facts.get("session_start") and market == "unknown":
+        since = dt.datetime.fromisoformat(memory.setdefault("clock_bad", _stamp(now)))
+        if minutes(since) >= SILENT_MIN:
+            add(
+                "clock",
+                False,
+                f"The broker's clock has not answered for {minutes(since)} minutes. Pulse "
+                "skips trading while it cannot tell whether the market is open. That is an "
+                "outage at the broker, the network, or a missing key.",
+            )
+    else:
+        memory.pop("clock_bad", None)
+
+    # A fetch that hangs, or one that died midway.
+    if progress and progress.get("stage") not in ("complete", "failed"):
+        started, updated = progress.get("started"), progress.get("updated")
+        label = progress.get("label") or progress.get("stage") or "?"
+        if running and started and minutes(started) >= STUCK_FETCH_MIN:
+            add(
+                "fetch:stuck",
+                False,
+                f"A fetch has been running since {hm(started)} ({minutes(started)} minutes, "
+                f'now at "{label}"). While it runs the hourly schedule waits, trading included.',
+            )
+        elif (
+            updated
+            and facts.get("fetching") is False
+            and now - updated >= dt.timedelta(minutes=DEAD_FETCH_MIN)
+        ):
+            add(
+                f"fetch:died:{_stamp(started or updated)}",
+                False,
+                f"The fetch that started at {hm(started or updated)} stopped midway "
+                f'(at "{label}", last sign of life {hm(updated)}). The schedule tries again '
+                "at the next hour.",
+            )
+
+    # The schedulers.
+    for label, what in SCHEDULERS.items():
+        if (facts.get("loaded") or {}).get(label) is False:
+            add(
+                f"scheduler:{label}",
+                False,
+                f"{what[0].upper()}{what[1:]} is not loaded in launchd ({label}), so it does "
+                "not run. Running scripts/install-app.sh puts it back.",
+            )
+    stamp = facts.get("stamp")
+    if (
+        stamp
+        and stamp.date() == now.date()
+        and 9 <= now.hour <= 20
+        and not running
+        and facts.get("fetching") is not True  # a long run is busy, not stalled
+        and minutes(stamp) >= STALL_MIN
+    ):
+        add(
+            "scheduler:stalled",
+            False,
+            f"The hourly schedule has not run since {hm(stamp)}. Briefings and trading "
+            "depend on it.",
+        )
+
+    # Crashes.
+    for name in facts.get("crashes") or []:
+        add(f"crash:{name}", False, f"Pulse crashed (crash report {name}).")
+    for where in facts.get("panics") or []:
+        add(
+            f"panic:{where}:{now.date().isoformat()}",
+            False,
+            f"The fetcher crashed in its own code ({where}).",
+        )
+
+    # The team itself.
+    wake = facts.get("team_wake")
+    if wake and facts.get("team_running") is False and minutes(wake) >= STALL_MIN:
+        add(
+            "team",
+            False,
+            f"The team's own hourly wake-up has not run since {hm(wake)}, so the night "
+            "shift would not start.",
+        )
+    beat = facts.get("listener")
+    if facts.get("paired") and beat and minutes(beat) >= LISTENER_MIN:
+        add(
+            "listener",
+            False,
+            f"The Telegram listener has been silent since {hm(beat)}: buttons and commands "
+            "do nothing until it is back (team.py install restarts it).",
+        )
+    return found
+
+
+def watch_over(key: str, alert: dict, facts: dict, now: dt.datetime) -> str | None:
+    """What to say when a serious problem has ended, or None while that cannot
+    be told. A finding that is merely no longer listed is not the end of it:
+    the market may have closed, or the facts may be missing this time."""
+    events = facts.get("events")
+    if events is None:
+        return None
+    sent = dt.datetime.fromisoformat(alert["sent"])
+
+    def after(kind: str, detail: str | None = None) -> dt.datetime | None:
+        times = [
+            w for k, w, d in events if k == kind and w > sent and (detail is None or d == detail)
+        ]
+        return max(times) if times else None
+
+    if key.startswith("stop:") and key != "stop:dry":
+        bare = facts.get("bare")
+        if bare is None or key[5:] in {str(b["id"]) for b in bare}:
+            return None
+        return (
+            f"{alert.get('name') or 'The position'} is no longer open without a stop: it has "
+            "one now, or the position was closed."
+        )
+    if key == "silent" and (t := after("manage_start")):
+        return f"Pulse is looking at its positions again (run at {_hm(t, now)})."
+    if key == "manage" and (t := after("manage_ok")):
+        return f"Position management works again (run at {_hm(t, now)})."
+    if key == "auto" and (t := after("auto_ok")):
+        return f"Buying works again (run at {_hm(t, now)})."
+    if key.startswith("briefing:"):
+        slot = key.split(":")[1]
+        if t := after("brief_done", slot):
+            return f"The {slot} briefing was made after all, at {_hm(t, now)}."
+    return None
+
+
+def watch_alerts(
+    found: list[dict], facts: dict, memory: dict, now: dt.datetime
+) -> list[tuple[str, bool]]:
+    """The texts to send for what the watch found, as [(text, serious)], and
+    the watch's book of what it already said (kept in `memory`).
+
+    One text per problem: nothing is said twice within a day (a week when it
+    is not serious), however often the problem comes and goes. The end of a
+    serious problem is said once, and only when it can be told for sure."""
+    book = memory.setdefault("alerts", {})
+    out: list[tuple[str, bool]] = []
+    for f in found:
+        old = book.get(f["key"])
+        lasting = bool(old and old.get("open"))
+        again = dt.timedelta(hours=ALERT_AGAIN_H[bool(f["serious"])])
+        if old and now - dt.datetime.fromisoformat(old["sent"]) < again:
+            old["open"] = True
+            continue
+        first = old["first"] if lasting else _stamp(now)
+        book[f["key"]] = {
+            "first": first,
+            "sent": _stamp(now),
+            "serious": bool(f["serious"]),
+            "open": True,
+            **({"name": f["name"]} if f.get("name") else {}),
+        }
+        text = f["text"]
+        if lasting:
+            since = _hm(dt.datetime.fromisoformat(first), now)
+            text = f"Still not solved (first seen {since}). {text}"
+        out.append((text, bool(f["serious"])))
+    listed = {f["key"] for f in found}
+    for key, alert in list(book.items()):
+        if alert.get("open") and key not in listed:
+            if not alert.get("serious"):
+                alert["open"] = False
+            elif over := watch_over(key, alert, facts, now):
+                alert["open"] = False
+                out.append((f"Solved. {over}", False))
+        age = now - dt.datetime.fromisoformat(alert["sent"])
+        if age > dt.timedelta(days=ALERT_KEEP_DAYS):
+            del book[key]
+    return out
