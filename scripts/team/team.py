@@ -35,6 +35,7 @@ import chat  # noqa: E402
 import page  # noqa: E402
 
 import rules  # noqa: E402
+import newsboard  # noqa: E402
 import scoreboard  # noqa: E402
 import watch  # noqa: E402
 
@@ -1487,35 +1488,54 @@ def weekly_scoreboard(run: dict, state: dict) -> None:
     """After the first scheduled night of a week: the trading scoreboard for
     the week before (Monday to Sunday), kept whole as a file and texted.
     Numbers from the night's copy of the database; it never fails the night."""
+    weekly_board(run, state, "scoreboard", scoreboard_text)
+
+
+def weekly_newsboard(run: dict, state: dict) -> None:
+    """The same night, for the same week, a second text: the news board."""
+    weekly_board(run, state, "newsboard", newsboard_text)
+
+
+def weekly_board(run: dict, state: dict, name: str, text_of) -> None:
+    """One board a week. Each keeps its own week in the state, so one that
+    failed is tried again the next night without the other being sent twice."""
     today = dt.date.today()
     if (
         not run.get("scheduled")
         or run.get("nothing_done")
         or not DB_COPY.exists()
-        or not scoreboard.due(today, state.get("scoreboard_week", ""))
+        or not scoreboard.due(today, state.get(f"{name}_week", ""))
     ):
         return
     try:
         last_day = scoreboard.last_week_end(today)
-        text = scoreboard_text(last_day)
+        text = text_of(last_day)
         made = dt.date.fromtimestamp(DB_COPY.stat().st_mtime)
         if made <= last_day:  # tonight's copy failed and an older one was read
             text += (
                 f"\n\nThese numbers come from a database copy made on {made.day} "
                 f"{made:%b}: anything after it is missing."
             )
-        (HOME / "scoreboard.txt").write_text(text + "\n")
-        state["scoreboard_week"] = scoreboard.week_of(today)
+        (HOME / f"{name}.txt").write_text(text + "\n")
+        state[f"{name}_week"] = scoreboard.week_of(today)
         save_json(HOME / "state.json", state)
-        chat.send(scoreboard.shorten(text))
+        chat.send(scoreboard.shorten(text, whole=f"team.py {name}"))
     except Exception as e:  # noqa: BLE001
-        log(f"the trading scoreboard failed: {type(e).__name__}")
+        log(f"the weekly {name} failed: {type(e).__name__}")
 
 
 def scoreboard_text(last_day: dt.date) -> str:
     con = scoreboard.connect(DB_COPY)
     try:
         return scoreboard.as_text(scoreboard.build(con, last_day))
+    finally:
+        con.close()
+
+
+def newsboard_text(last_day: dt.date) -> str:
+    con = scoreboard.connect(DB_COPY)
+    try:
+        return newsboard.as_text(newsboard.build(con, last_day))
     finally:
         con.close()
 
@@ -1563,6 +1583,7 @@ def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
         )
     tell(report, run)
     weekly_scoreboard(run, state)
+    weekly_newsboard(run, state)
     return 0
 
 
@@ -1645,6 +1666,7 @@ def cmd_install(_args) -> int:
         "guard.py",
         "chat.py",
         "scoreboard.py",
+        "newsboard.py",
         "watch.py",
         "checks.sh",
         "TEAM.md",
@@ -1840,11 +1862,20 @@ def cmd_watch(args) -> int:
 def cmd_scoreboard(_args) -> int:
     """The trading scoreboard for the last seven days, from the team's copy of
     the database as it is now."""
+    return print_board(scoreboard_text)
+
+
+def cmd_newsboard(_args) -> int:
+    """The news board for the last seven days, from the same copy."""
+    return print_board(newsboard_text)
+
+
+def print_board(text_of) -> int:
     if not DB_COPY.exists():
         print(f"No database copy yet ({DB_COPY}); the night run makes it.")
         return 1
     age = dt.datetime.fromtimestamp(DB_COPY.stat().st_mtime)
-    print(scoreboard_text(dt.date.today()))
+    print(text_of(dt.date.today()))
     print(f"\n(from the database copy of {age:%d %b %H:%M})")
     return 0
 
@@ -1893,6 +1924,9 @@ def main() -> int:
     sub.add_parser(
         "scoreboard", help="what Pulse bought and sold, against the S&P 500"
     ).set_defaults(fn=cmd_scoreboard)
+    sub.add_parser(
+        "newsboard", help="how much news was fetched, and what made the briefings"
+    ).set_defaults(fn=cmd_newsboard)
     w = sub.add_parser("watch", help="look at the installed Pulse now")
     w.add_argument("--dry", action="store_true", help="only print, text nothing")
     w.set_defaults(fn=cmd_watch)

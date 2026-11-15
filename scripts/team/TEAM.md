@@ -49,6 +49,12 @@ After the first scheduled night of each week the team texts the trading scoreboa
 
 It is arithmetic on the night's copy of the database, opened read-only: no session, no AI, nothing proposed and nothing changed. A copy that cannot be read is an error in the log, never an empty week. `team.py scoreboard` prints the last seven days from the copy as it is now.
 
+## The news board
+
+The same night, for the same week, a second text (`newsboard.py`, kept whole in `~/.pulse-team/newsboard.txt`): how many articles a briefing fetched, how many were left once repeats were dropped, how many the first cut kept and how many made the briefing; how long a run took and in how many a source failed; the share of offers that an earlier briefing of the week had already been offered; for each topic what was offered, what was used and the AI's own average importance score; how many sources made the briefings, the most used, the ones offered 100 times or more and used under 2% of the time, and the ones that offered 80 or more in the four weeks before and nothing this week; and what was opened and marked in the Mac app (the phone app records nothing).
+
+A source here is the publisher's name on the article, so one Google News search is many sources, and "gone quiet" can mean a search that changed as well as a feed that broke. Each board keeps its own week in the state: one that fails is tried again the next night and the other is not sent twice. `team.py newsboard` prints the last seven days. Like the trading scoreboard it counts and reports; it changes no feed and proposes nothing.
+
 ## The watch
 
 Every ten minutes `watch.py` (launchd `com.pulse.team.watch`, installed by `team.py install`) looks at the installed Pulse and texts Nicola when something is wrong. It only reads: the hourly log, the progress file, the schedule stamps, launchd's list, and one read-only query on the database for held positions with no stop (when Pulse does not have the database open the file is read as it is, so no `-wal` or `-shm` file is left in Pulse's folder). It asks the broker's clock through the installed fetcher (`--mode market-open`, no lock, nothing written), so a holiday or an early close is simply "closed". It starts no session and changes nothing in Pulse; for now it only tells.
@@ -92,6 +98,7 @@ python3 scripts/team/team.py idea "one line"  # add an idea
 python3 scripts/team/team.py status           # last night's report
 python3 scripts/team/team.py page <url>       # the artifact the nightly page is published to
 python3 scripts/team/team.py scoreboard       # the last 7 days of trading, against the S&P 500
+python3 scripts/team/team.py newsboard        # the last 7 days of news: fetched, kept, used, read
 python3 scripts/team/team.py watch --dry       # look at the installed Pulse now, text nothing
 python3 scripts/team/team.py chat pair        # tie a Telegram bot to this Mac (asks for the token)
 python3 scripts/team/team.py chat status      # paired, listener alive, what waits

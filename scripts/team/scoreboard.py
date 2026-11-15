@@ -420,12 +420,12 @@ def as_text(board: dict) -> str:
     return "\n".join(out)
 
 
-def shorten(text: str, limit: int = TEXT_LIMIT) -> str:
+def shorten(text: str, limit: int = TEXT_LIMIT, whole: str = "team.py scoreboard") -> str:
     """The board cut to one Telegram text: whole sections go, last one first,
-    and the text says that something is missing."""
+    and the text says that something is missing and where the whole is."""
     if len(text) <= limit:
         return text
-    note = "\n\n(Shortened. The whole board: team.py scoreboard)"
+    note = f"\n\n(Shortened. The whole board: {whole})"
     parts = text.split("\n\n")
     while len(parts) > 1 and len("\n\n".join(parts)) + len(note) > limit:
         parts.pop()
