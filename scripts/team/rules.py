@@ -618,15 +618,24 @@ def proposal_id(kind: str, key: str, created: str) -> str:
 # or as "something is wrong".
 
 WATCH_GAP_MIN = 25  # two looks further apart than this: the Mac slept between
-SILENT_MIN = 70  # market open and no position run for this long
-RECENT_MIN = 90  # a failure older than this is no longer "happening now"
+# Market open and no position run for this long: two hourly turns missed. One
+# missed turn is a broker blip, and it is not worth a text at night.
+SILENT_MIN = 130
+CLOCK_MIN = 70  # the broker's clock silent at every look for this long
+# A failure older than this is no longer "happening now", and two failures
+# further apart than this are not "in a row".
+RECENT_MIN = 90
 STALL_MIN = 130  # the hourly schedule has skipped two turns
 STUCK_FETCH_MIN = 180  # a briefing on local AI takes up to about 70 minutes
 DEAD_FETCH_MIN = 10
 LISTENER_MIN = 15
 # Failed tries before a missing briefing is serious. The evening has only the
-# hours from 21:00 to midnight.
-BRIEFING_TRIES = {"morning": 4, "evening": 3}
+# turns of 21:00, 22:00 and 23:00, and a try that fails after an hour of work
+# takes the next turn with it: two failures are all a slow evening can show.
+BRIEFING_TRIES = {"morning": 3, "evening": 2}
+# A try that starts at 23:00 can fail after midnight and still belongs to the
+# evening before: a briefing's day ends at this hour of the next morning.
+BRIEFING_DAY_ENDS_H = 3
 # One text per problem: a serious one is repeated once a day while it lasts,
 # anything else once a week.
 ALERT_AGAIN_H = {True: 24, False: 7 * 24}
@@ -639,6 +648,11 @@ SCHEDULERS = {
 
 def _hm(t: dt.datetime, now: dt.datetime) -> str:
     return f"{t:%H:%M}" if t.date() == now.date() else f"{t:%a %H:%M}"
+
+
+def briefing_day(t: dt.datetime) -> dt.date:
+    """The day a briefing try belongs to (see BRIEFING_DAY_ENDS_H)."""
+    return (t - dt.timedelta(hours=BRIEFING_DAY_ENDS_H)).date()
 
 
 def awake_since(
@@ -688,17 +702,30 @@ def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
         ids = {str(b["id"]) for b in bare}
         for gone in [k for k in seen if k not in ids]:
             del seen[gone]
-        day = dt.timedelta(hours=26)
-        dry = any(k == "manage_dry" and now - w <= day for k, w, _ in events)
+        # Every finished position run, and whether it was a dry one: with
+        # EXIT_DRY_RUN it names what it would have done and places nothing.
+        # Only the latest run counts, so the alarm is back with the first real
+        # run after the exits are armed.
+        passes: list[tuple[dt.datetime, bool]] = []
+        dry_run = False
+        for kind, when, _ in events:
+            if kind == "manage_dry":
+                dry_run = True
+            elif kind in ("manage_start", "manage_fail"):
+                dry_run = False
+            elif kind == "manage_ok":
+                passes.append((when, dry_run))
+                dry_run = False
+        dry = bool(passes) and passes[-1][1]
         for b in bare:
             first = dt.datetime.fromisoformat(seen.setdefault(str(b["id"]), _stamp(now)))
-            passes = [w for k, w, _ in events if k == "manage_ok" and w > first]
-            if passes and not dry:
+            since = [p for p in passes if p[0] > first]
+            if since and not dry:
                 add(
                     f"stop:{b['id']}",
                     True,
                     f"{b['ticker']} has no stop at the broker, and the position run at "
-                    f"{hm(passes[-1])} did not put one back. Nothing limits the loss on it "
+                    f"{hm(since[-1][0])} did not put one back. Nothing limits the loss on it "
                     "until it has one.",
                     name=str(b["ticker"]),
                 )
@@ -720,11 +747,12 @@ def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
             elif kind in ("manage_ok", "manage_fail") and runs and not runs[-1][1]:
                 runs[-1][1:] = [kind, detail]
         last = runs[-2:]
+        hourly = (dt.timedelta(minutes=45), dt.timedelta(minutes=RECENT_MIN))
         if (
             len(last) == 2
             and all(r[1] == "manage_fail" for r in last)
-            and last[1][0] - last[0][0] >= dt.timedelta(minutes=45)
-            and now - last[1][0] <= dt.timedelta(minutes=RECENT_MIN)
+            and hourly[0] <= last[1][0] - last[0][0] <= hourly[1]
+            and now - last[1][0] <= hourly[1]
         ):
             add(
                 "manage",
@@ -739,8 +767,8 @@ def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
         fails = [(w, d) for k, w, d in events if k == "auto_fail" and (not oks or w > max(oks))]
         if (
             len(fails) >= 2
-            and fails[-1][0] - fails[-2][0] >= dt.timedelta(minutes=45)
-            and now - fails[-1][0] <= dt.timedelta(minutes=RECENT_MIN)
+            and hourly[0] <= fails[-1][0] - fails[-2][0] <= hourly[1]
+            and now - fails[-1][0] <= hourly[1]
         ):
             add(
                 "auto",
@@ -751,8 +779,9 @@ def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
             )
 
         # A briefing that keeps failing.
+        day = briefing_day(now)
+        today = [(k, w, d) for k, w, d in events if briefing_day(w) == day]
         for slot, tries in BRIEFING_TRIES.items():
-            today = [(k, w, d) for k, w, d in events if w.date() == now.date()]
             done = [w for k, w, d in today if k == "brief_done" and d == slot]
             failed = [
                 (w, d.split()[-1])
@@ -760,12 +789,13 @@ def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
                 if k == "brief_fail" and d.split()[0] == slot and (not done or w > max(done))
             ]
             if len(failed) >= tries:
+                until = " until midnight" if slot == "evening" else ""
                 add(
-                    f"briefing:{slot}:{now.date().isoformat()}",
+                    f"briefing:{slot}:{day.isoformat()}",
                     True,
-                    f"The {slot} briefing failed {len(failed)} times today (last try "
-                    f"{hm(failed[-1][0])}, exit {failed[-1][1]}). The schedule keeps trying "
-                    "every hour.",
+                    f"The {slot} briefing failed {len(failed)} times (last try "
+                    f"{hm(failed[-1][0])}, exit {failed[-1][1]}). The schedule tries again "
+                    f"every hour{until}.",
                 )
 
     # The market is open and nobody looks at the positions.
@@ -793,7 +823,7 @@ def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
     # The broker's clock does not answer, so trading is skipped without a word.
     if facts.get("session_start") and market == "unknown":
         since = dt.datetime.fromisoformat(memory.setdefault("clock_bad", _stamp(now)))
-        if minutes(since) >= SILENT_MIN:
+        if minutes(since) >= CLOCK_MIN:
             add(
                 "clock",
                 False,
@@ -886,7 +916,10 @@ def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
 def watch_over(key: str, alert: dict, facts: dict, now: dt.datetime) -> str | None:
     """What to say when a serious problem has ended, or None while that cannot
     be told. A finding that is merely no longer listed is not the end of it:
-    the market may have closed, or the facts may be missing this time."""
+    the market may have closed, or the facts may be missing this time.
+
+    "Solved" is said for a problem that went away. A briefing whose day ended
+    without it is over too, and that is said as it is."""
     events = facts.get("events")
     if events is None:
         return None
@@ -903,19 +936,27 @@ def watch_over(key: str, alert: dict, facts: dict, now: dt.datetime) -> str | No
         if bare is None or key[5:] in {str(b["id"]) for b in bare}:
             return None
         return (
-            f"{alert.get('name') or 'The position'} is no longer open without a stop: it has "
-            "one now, or the position was closed."
+            f"Solved. {alert.get('name') or 'The position'} is no longer open without a "
+            "stop: it has one now, or the position was closed."
         )
     if key == "silent" and (t := after("manage_start")):
-        return f"Pulse is looking at its positions again (run at {_hm(t, now)})."
+        return f"Solved. Pulse is looking at its positions again (run at {_hm(t, now)})."
     if key == "manage" and (t := after("manage_ok")):
-        return f"Position management works again (run at {_hm(t, now)})."
+        return f"Solved. Position management works again (run at {_hm(t, now)})."
     if key == "auto" and (t := after("auto_ok")):
-        return f"Buying works again (run at {_hm(t, now)})."
+        return f"Solved. Buying works again (run at {_hm(t, now)})."
     if key.startswith("briefing:"):
-        slot = key.split(":")[1]
-        if t := after("brief_done", slot):
-            return f"The {slot} briefing was made after all, at {_hm(t, now)}."
+        _, slot, day = key.split(":")
+        made = [
+            w
+            for k, w, d in events
+            if k == "brief_done" and d == slot and w > sent and briefing_day(w).isoformat() == day
+        ]
+        if made:
+            return f"Solved. The {slot} briefing was made after all, at {_hm(max(made), now)}."
+        if briefing_day(now).isoformat() > day:
+            when = dt.date.fromisoformat(day)
+            return f"The {slot} briefing of {when:%a} {when.day} {when:%b} was not made."
     return None
 
 
@@ -925,16 +966,20 @@ def watch_alerts(
     """The texts to send for what the watch found, as [(text, serious)], and
     the watch's book of what it already said (kept in `memory`).
 
-    One text per problem: nothing is said twice within a day (a week when it
-    is not serious), however often the problem comes and goes. The end of a
-    serious problem is said once, and only when it can be told for sure."""
+    One text per problem: while it lasts nothing is said twice within a day (a
+    week when it is not serious, however often it comes and goes). The end of
+    a serious problem is said once, and only when it can be told for sure.
+    After that the same problem coming back is a new text: its end was told,
+    so its return must be, or the next "Solved" would be about nothing."""
     book = memory.setdefault("alerts", {})
     out: list[tuple[str, bool]] = []
     for f in found:
         old = book.get(f["key"])
         lasting = bool(old and old.get("open"))
         again = dt.timedelta(hours=ALERT_AGAIN_H[bool(f["serious"])])
-        if old and now - dt.datetime.fromisoformat(old["sent"]) < again:
+        recent = bool(old) and now - dt.datetime.fromisoformat(old["sent"]) < again
+        back = bool(old) and bool(f["serious"]) and not lasting
+        if recent and not back:
             old["open"] = True
             continue
         first = old["first"] if lasting else _stamp(now)
@@ -949,6 +994,8 @@ def watch_alerts(
         if lasting:
             since = _hm(dt.datetime.fromisoformat(first), now)
             text = f"Still not solved (first seen {since}). {text}"
+        elif back and recent:
+            text = f"It is back. {text}"
         out.append((text, bool(f["serious"])))
     listed = {f["key"] for f in found}
     for key, alert in list(book.items()):
@@ -957,7 +1004,7 @@ def watch_alerts(
                 alert["open"] = False
             elif over := watch_over(key, alert, facts, now):
                 alert["open"] = False
-                out.append((f"Solved. {over}", False))
+                out.append((over, False))
         age = now - dt.datetime.fromisoformat(alert["sent"])
         if age > dt.timedelta(days=ALERT_KEEP_DAYS):
             del book[key]

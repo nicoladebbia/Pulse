@@ -183,12 +183,17 @@ def read_progress(path: Path) -> dict | None:
 
 def read_bare(db: Path) -> list[dict] | None:
     """The held positions with no stop on Pulse's books. Read-only; None when
-    the database cannot be read right now."""
+    the database cannot be read right now.
+
+    With no write-ahead log next to it nobody has the database open, and a
+    plain read-only open would leave empty `-wal` and `-shm` files in Pulse's
+    folder: then the file is read as it is, touching nothing."""
     if not db.exists():
         return None
+    how = "mode=ro" if db.with_name(db.name + "-wal").exists() else "mode=ro&immutable=1"
     try:
         con = sqlite3.connect(
-            f"file:{urllib.parse.quote(str(db))}?mode=ro", uri=True, timeout=2
+            f"file:{urllib.parse.quote(str(db))}?{how}", uri=True, timeout=2
         )
         try:
             con.execute("PRAGMA query_only = 1")

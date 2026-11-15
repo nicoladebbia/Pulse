@@ -127,6 +127,30 @@ class Findings(unittest.TestCase):
             "2 open positions have no stop at the broker: DFH, TBBK", found[0]["text"]
         )
 
+    def test_the_stop_alarm_is_back_with_the_first_real_run_after_a_dry_one(self):
+        bare = [{"id": 7, "ticker": "DFH"}]
+        memory = {"bare": {"7": "2026-11-12T13:00:00"}}
+        dry = [
+            ("manage_start", at(14, day=12), ""),
+            ("manage_dry", at(14, day=12), ""),
+            ("manage_ok", at(14, day=12), ""),
+        ]
+        real = [("manage_start", at(11), ""), ("manage_ok", at(11), "")]
+        # Exits armed overnight: the dry run of yesterday no longer excuses it.
+        found = self.find(memory, bare=bare, events=[*dry, *real])
+        self.assertEqual(keys(found), ["stop:7"])
+        self.assertTrue(found[0]["serious"])
+        # Switched back to dry: the latest run says so, and that is the notice.
+        again = [(k, at(11, 5), d) for k, _, d in dry]
+        self.assertEqual(
+            keys(self.find(memory, bare=bare, events=[*real, *again])), ["stop:dry"]
+        )
+        # A dry line of a run that failed says nothing about the next one.
+        failed = [*dry[:2], ("manage_fail", at(14, day=12), "1"), real[1]]
+        self.assertEqual(
+            keys(self.find(memory, bare=bare, events=failed)), ["stop:7"]
+        )
+
     def test_position_management_failing_two_hours_in_a_row_is_serious(self):
         twice = [
             ("manage_start", at(10), ""),
@@ -143,6 +167,13 @@ class Findings(unittest.TestCase):
         # Yesterday's failures are not happening now.
         old = [(k, w - 24 * HOUR, d) for k, w, d in twice]
         self.assertNotIn("manage", keys(self.find(events=old, market="closed")))
+        # Two failures with good hours or a night between them are not a streak.
+        apart = [
+            ("manage_start", at(15, day=12), ""),
+            ("manage_fail", at(15, day=12), "1"),
+            *twice[2:],
+        ]
+        self.assertEqual(self.find(events=apart), [])
 
     def test_buying_failing_two_hours_in_a_row_is_serious(self):
         ok = [("manage_start", at(11), ""), ("manage_ok", at(11), "")]
@@ -152,57 +183,89 @@ class Findings(unittest.TestCase):
         self.assertIn("No new positions are opened", found[0]["text"])
         self.assertEqual(self.find(events=[*twice, ("auto_ok", at(11, 5), "")]), [])
         self.assertEqual(self.find(events=[*ok, ("auto_fail", at(11), "1")]), [])
+        # The afternoon slot's last failure and the next morning's first.
+        apart = [*ok, ("auto_fail", at(15, day=12), "1"), ("auto_fail", at(11), "1")]
+        self.assertEqual(self.find(events=apart), [])
 
     def test_a_briefing_is_serious_after_its_failed_tries(self):
         ok = [("manage_start", at(11), ""), ("manage_ok", at(11), "")]
-        fails = [("brief_fail", at(h), "morning 101") for h in (8, 9, 10, 11)]
-        self.assertEqual(self.find(events=[*ok, *fails[:3]]), [])
+        fails = [("brief_fail", at(h), "morning 101") for h in (8, 9, 10)]
+        self.assertEqual(self.find(events=[*ok, *fails[:2]]), [])
         found = self.find(events=[*ok, *fails])
         self.assertEqual(keys(found), ["briefing:morning:2026-11-13"])
+        self.assertTrue(found[0]["serious"])
         self.assertIn(
-            "failed 4 times today (last try 11:00, exit 101)", found[0]["text"]
+            "failed 3 times (last try 10:00, exit 101). The schedule tries again every "
+            "hour.",
+            found[0]["text"],
         )
         made = [*ok, *fails, ("brief_done", at(11, 9), "morning")]
         self.assertEqual(self.find(events=made), [])
-        # The evening has three tries before midnight.
-        night = at(23, 10)
-        evening = [("brief_fail", at(h), "evening 101") for h in (21, 22, 23)]
-        found = self.find(now=night, events=evening, market=None, session_start=None)
+        # The evening has three turns before midnight: two failures are enough.
+        quiet = {"market": None, "session_start": None}
+        evening = [("brief_fail", at(h), "evening 101") for h in (21, 22)]
+        self.assertEqual(self.find(now=at(21, 10), events=evening[:1], **quiet), [])
+        found = self.find(now=at(22, 10), events=evening, **quiet)
         self.assertEqual(keys(found), ["briefing:evening:2026-11-13"])
+        self.assertIn("tries again every hour until midnight.", found[0]["text"])
+        # A slow evening: each try works for an hour before it fails, and the
+        # last one fails after midnight. It is still Friday's evening briefing.
+        slow = [
+            ("brief_fail", at(22, 10), "evening 101"),
+            ("brief_fail", at(0, 10, day=14), "evening 101"),
+        ]
+        found = self.find(now=at(0, 12, day=14), events=slow, **quiet)
+        self.assertEqual(keys(found), ["briefing:evening:2026-11-13"])
+        self.assertIn("failed 2 times (last try 00:10, exit 101)", found[0]["text"])
+        # By the next morning that evening is over.
+        self.assertEqual(self.find(now=at(8, 12, day=14), events=slow, **quiet), [])
         # Yesterday's failures are yesterday's.
         self.assertEqual(
             self.find(events=[*ok, *[(k, w - 24 * HOUR, d) for k, w, d in fails]]), []
         )
 
     def test_an_open_market_with_nobody_looking_is_serious(self):
-        found = self.find(events=[])
+        late = [("manage_start", at(10), ""), ("manage_ok", at(10), "")]
+        # One turn missed (the 11:00 one) is a blip, not a text at night.
+        self.assertEqual(self.find(events=[]), [])
+        self.assertEqual(self.find(events=late), [])
+        self.assertEqual(self.find(now=at(12, 9), events=late), [])
+        # Two turns missed.
+        noon = at(12, 12)
+        found = self.find(now=noon, events=[])
         self.assertEqual(keys(found), ["silent"])
         self.assertTrue(found[0]["serious"])
-        self.assertIn("for 72 minutes (no run in the log)", found[0]["text"])
-        late = [("manage_start", at(10), ""), ("manage_ok", at(10), "")]
+        self.assertIn("for 132 minutes (no run in the log)", found[0]["text"])
         self.assertIn(
-            "for 72 minutes (last at 10:00)", self.find(events=late)[0]["text"]
+            "for 132 minutes (last at 10:00)",
+            self.find(now=noon, events=late)[0]["text"],
         )
         # A holiday or an early close: the broker's clock says closed.
-        self.assertEqual(self.find(events=[], market="closed"), [])
+        self.assertEqual(self.find(now=noon, events=[], market="closed"), [])
         # Outside trading hours the question is not asked.
-        self.assertEqual(self.find(events=[], market=None, session_start=None), [])
+        self.assertEqual(
+            self.find(now=noon, events=[], market=None, session_start=None), []
+        )
 
     def test_time_the_mac_slept_is_not_counted(self):
-        self.assertEqual(self.find(events=[], awake=at(10, 40)), [])
-        self.assertEqual(keys(self.find(events=[], awake=at(10, 2))), ["silent"])
+        noon = at(12, 12)
+        self.assertEqual(self.find(now=noon, events=[], awake=at(10, 40)), [])
+        self.assertEqual(
+            keys(self.find(now=noon, events=[], awake=at(10, 2))), ["silent"]
+        )
 
     def test_a_long_fetch_is_named_as_the_reason_for_the_silence(self):
+        noon = at(12, 12)
         running = {
             "stage": "summarize",
             "label": "Summaries",
-            "started": at(8),
-            "updated": NOW,
+            "started": at(10, 30),
+            "updated": noon,
         }
-        found = self.find(events=[], progress=running, fetching=True)
+        found = self.find(now=noon, events=[], progress=running, fetching=True)
         self.assertIn("silent", keys(found))
         silent = next(f for f in found if f["key"] == "silent")
-        self.assertIn("A fetch has been running since 08:00", silent["text"])
+        self.assertIn("A fetch has been running since 10:30", silent["text"])
 
     def test_a_silent_broker_clock_is_an_outage_not_an_emergency(self):
         memory = {}
@@ -323,6 +386,35 @@ class Alerts(unittest.TestCase):
             [("Still not solved (first seen Fri 11:12). Not loaded.", False)],
         )
 
+    def test_a_serious_problem_that_was_solved_and_is_back_is_said_again(self):
+        memory = {}
+        rules.watch_alerts([self.SILENT], {"events": []}, memory, NOW)
+        ran = {"events": [("manage_start", NOW + 30 * MIN, "")]}
+        self.assertEqual(
+            rules.watch_alerts([], ran, memory, NOW + 40 * MIN),
+            [("Solved. Pulse is looking at its positions again (run at 11:42).", False)],
+        )
+        # Three hours later it stops again: muted, the next "Solved" would be
+        # about a problem nobody was told of.
+        back = NOW + 3 * HOUR
+        self.assertEqual(
+            rules.watch_alerts([self.SILENT], ran, memory, back),
+            [("It is back. Nobody looks.", True)],
+        )
+        self.assertEqual(
+            rules.watch_alerts([self.SILENT], ran, memory, back + 10 * MIN), []
+        )
+        again = {"events": [*ran["events"], ("manage_start", back + 15 * MIN, "")]}
+        self.assertEqual(
+            rules.watch_alerts([], again, memory, back + 20 * MIN),
+            [("Solved. Pulse is looking at its positions again (run at 14:27).", False)],
+        )
+        # Days later it is simply a new problem.
+        self.assertEqual(
+            rules.watch_alerts([self.SILENT], again, memory, NOW + 72 * HOUR),
+            [("Nobody looks.", True)],
+        )
+
     def test_a_serious_problem_that_lasts_is_repeated_once_a_day(self):
         memory = {}
         rules.watch_alerts([self.SILENT], {"events": []}, memory, NOW)
@@ -372,11 +464,12 @@ class Alerts(unittest.TestCase):
             ("brief_done", at(12), "morning"),
         ]
         cases = {
-            "stop:7": "DFH is no longer open without a stop: it has one now, or the position "
-            "was closed.",
-            "manage": "Position management works again (run at 12:00).",
-            "auto": "Buying works again (run at 12:01).",
-            "briefing:morning:2026-11-13": "The morning briefing was made after all, at 12:00.",
+            "stop:7": "Solved. DFH is no longer open without a stop: it has one now, or the "
+            "position was closed.",
+            "manage": "Solved. Position management works again (run at 12:00).",
+            "auto": "Solved. Buying works again (run at 12:01).",
+            "briefing:morning:2026-11-13": "Solved. The morning briefing was made after "
+            "all, at 12:00.",
         }
         for key, text in cases.items():
             self.assertEqual(
@@ -394,6 +487,36 @@ class Alerts(unittest.TestCase):
                 "briefing:evening:2026-11-13", sent, {"events": events}, later
             )
         )
+
+    def test_a_briefing_that_was_never_made_is_closed_as_that(self):
+        key = "briefing:evening:2026-11-13"
+        sent = {"sent": "2026-11-13T22:10:00", "serious": True, "open": True}
+        nothing = {"events": []}
+        # The 23:00 try may still fail after midnight: the evening is not over.
+        self.assertIsNone(rules.watch_over(key, sent, nothing, at(1, 0, day=14)))
+        self.assertEqual(
+            rules.watch_over(key, sent, nothing, at(8, 2, day=14)),
+            "The evening briefing of Fri 13 Nov was not made.",
+        )
+        # The next evening's briefing is not this one made "after all".
+        next_day = {"events": [("brief_done", at(21, 34, day=14), "evening")]}
+        self.assertEqual(
+            rules.watch_over(key, sent, next_day, at(21, 42, day=14)),
+            "The evening briefing of Fri 13 Nov was not made.",
+        )
+        # Made by the 23:00 try, even past midnight: that is the same evening.
+        late = {"events": [("brief_done", at(0, 20, day=14), "evening")]}
+        self.assertEqual(
+            rules.watch_over(key, sent, late, at(8, 2, day=14)),
+            "Solved. The evening briefing was made after all, at 00:20.",
+        )
+        # The whole way: said once in the morning, by day, and then forgotten.
+        memory = {"alerts": {key: dict(sent, first=sent["sent"])}}
+        self.assertEqual(
+            rules.watch_alerts([], nothing, memory, at(8, 2, day=14)),
+            [("The evening briefing of Fri 13 Nov was not made.", False)],
+        )
+        self.assertEqual(rules.watch_alerts([], nothing, memory, at(8, 12, day=14)), [])
 
     def test_old_entries_leave_the_book(self):
         memory = {}
@@ -530,6 +653,35 @@ class Reading(unittest.TestCase):
         self.assertEqual(db.read_bytes(), before)
         db.write_text("not a database")
         self.assertIsNone(watch.read_bare(db))
+
+    def test_reading_the_books_leaves_no_file_next_to_them(self):
+        """Pulse's database uses a write-ahead log, as the installed one does."""
+        db = self.dir / "pulse.db"
+        con = sqlite3.connect(db)
+        self.addCleanup(con.close)
+        con.execute("PRAGMA journal_mode = WAL")
+        con.executescript(
+            """CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, ticker TEXT, status TEXT,
+                 order_status TEXT, stop_order_id TEXT, broker_stop_filled_at TEXT,
+                 filled_qty REAL);
+               INSERT INTO paper_trades VALUES (1, 'BARE', 'open', 'filled', NULL, NULL, 10);"""
+        )
+        con.commit()
+        # Pulse has it open and wrote something that is still only in its log.
+        con.execute(
+            "INSERT INTO paper_trades VALUES (2, 'NEW', 'open', 'filled', NULL, NULL, 5)"
+        )
+        con.commit()
+        self.assertTrue((self.dir / "pulse.db-wal").exists())
+        self.assertEqual(
+            watch.read_bare(db),
+            [{"id": 1, "ticker": "BARE"}, {"id": 2, "ticker": "NEW"}],
+        )
+        # Pulse closed it: the log is gone, and the watch does not bring it back.
+        con.close()
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["pulse.db"])
+        self.assertEqual(len(watch.read_bare(db)), 2)
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["pulse.db"])
 
     def fetcher(self, code: int) -> Path:
         path = self.dir / "pulse-fetcher"
@@ -712,9 +864,9 @@ class Look(unittest.TestCase):
             echo_line(self.et(10), "market open: managing paper positions"),
             trace_line(self.et(10), "Position management complete: 0 action(s)"),
         )
-        self.assertEqual(self.looks(self.et(10, 2), self.et(11, 2)), [])
+        self.assertEqual(self.looks(self.et(10, 2), self.et(12, 2)), [])
         self.assertEqual(self.sent, [])
-        found = watch.look(self.et(11, 12), run=self.fake_run)
+        found = watch.look(self.et(12, 12), run=self.fake_run)
         self.assertEqual(keys(found), ["silent"])
         self.assertEqual(len(self.sent), 1)
         text, serious = self.sent[0]
@@ -722,14 +874,14 @@ class Look(unittest.TestCase):
         self.assertTrue(
             text.startswith(
                 "Serious problem in Pulse. The market is open and Pulse has not looked at "
-                "its positions for 70 minutes (last at "
+                "its positions for 130 minutes (last at "
             ),
             text,
         )
-        self.looks(self.et(11, 22), self.et(11, 52))
+        self.looks(self.et(12, 22), self.et(12, 52))
         self.assertEqual(len(self.sent), 1)
-        self.write(echo_line(self.et(12), "market open: managing paper positions"))
-        self.assertEqual(watch.look(self.et(12, 2), run=self.fake_run), [])
+        self.write(echo_line(self.et(13), "market open: managing paper positions"))
+        self.assertEqual(watch.look(self.et(13, 2), run=self.fake_run), [])
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(self.sent[1][1], False)
         self.assertTrue(
@@ -748,15 +900,15 @@ class Look(unittest.TestCase):
 
     def test_without_a_bot_a_serious_problem_is_a_notification_on_the_mac(self):
         self.reply = "off"
-        self.looks(self.et(10, 2), self.et(11, 12))
+        self.looks(self.et(10, 2), self.et(12, 12))
         self.assertEqual(len(self.banners), 1)
         self.assertIn("Serious problem in Pulse.", self.banners[0])
         self.assertIn("SERIOUS: The market is open", watch.as_text(watch.load()))
 
     def test_a_dry_look_texts_nothing_and_leaves_the_notebook_alone(self):
-        self.looks(self.et(10, 2), self.et(11, 2))
+        self.looks(self.et(10, 2), self.et(12, 2))
         before = watch.MEMORY.read_text()
-        found = watch.look(self.et(11, 12), tell=False, run=self.fake_run)
+        found = watch.look(self.et(12, 12), tell=False, run=self.fake_run)
         self.assertEqual(keys(found), ["silent"])
         self.assertEqual((self.sent, watch.MEMORY.read_text()), ([], before))
 
