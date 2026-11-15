@@ -130,12 +130,12 @@ class Board(unittest.TestCase):
             self.con,
             3,
             "TEST",
-            "2026-11-01",
+            "2026-11-09",
             day,
             pnl=50,
             entry_context=json.dumps({"event": {"test": True}}),
         )
-        trade(self.con, 4, "NOPRICE", "2026-11-01", day, pnl=50, exit_price=None)
+        trade(self.con, 4, "NOPRICE", "2026-11-09", day, pnl=50, exit_price=None)
         trade(self.con, 5, "NORESULT", "2026-11-01", day)
         trade(
             self.con,
@@ -155,7 +155,9 @@ class Board(unittest.TestCase):
         self.assertEqual([s["ticker"] for s in board["sold"]], ["REAL", "STOPPED"])
         self.assertEqual(board["all"]["trades"], 2)
         self.assertAlmostEqual(board["all"]["pnl"], 70)
-        self.assertEqual(board["bought"], [])  # a merged fragment was not a purchase
+        # A merged fragment and a test were not purchases. A close without a
+        # price was one: only its result is unknown.
+        self.assertEqual([b["ticker"] for b in board["bought"]], ["NOPRICE"])
         self.assertEqual((board["all"]["measured"], board["all"]["beat"]), (1, 1))
 
     def test_the_result_against_the_market_is_an_average_with_its_t(self):
@@ -210,6 +212,12 @@ class Board(unittest.TestCase):
                     "avg_after10": 2.1,
                 },
                 {
+                    "exit_kind": "fixed_stop",
+                    "trades": 12,
+                    "avg_return": -2.0,
+                    "avg_after10": 1.0,
+                },
+                {
                     "exit_kind": "signal_decay",
                     "trades": 25,
                     "avg_return": 0.2,
@@ -253,6 +261,14 @@ class Board(unittest.TestCase):
                     "avg_excess": -5.2,
                     "t": -2.2,
                 },
+                # Enough stocks, but an average their scatter could explain.
+                {
+                    "reason": "price",
+                    "outcome": "skipped",
+                    "signals": 25,
+                    "avg_excess": 1.5,
+                    "t": 0.8,
+                },
             ],
             "weight_changes": [
                 {"dimension": "news", "from": 0.3, "to": 0.27, "why": "it lagged"}
@@ -274,9 +290,11 @@ class Board(unittest.TestCase):
         # after the sale, only two of the twelve broker stops do.
         self.con.executemany(
             "INSERT INTO trade_reviews VALUES (?, ?, ?, ?)",
-            [(100 + n, 0.0, "trailing_stop", 2.5) for n in range(12)]
+            [(100 + n, 0.0, "trailing_stop", 2.0 + n % 2) for n in range(12)]
             + [(200 + n, 0.0, "broker_stop", 2.1 if n < 2 else None) for n in range(12)]
-            + [(300, 0.0, "hard_stop", 18.1)],
+            + [(300, 0.0, "hard_stop", 18.1)]
+            # Twelve that swing between −8 and +10: an average of +1 says nothing.
+            + [(400 + n, 0.0, "fixed_stop", 10.0 if n % 2 else -8.0) for n in range(12)],
         )
         self.con.executemany(
             "INSERT INTO trade_decisions (run_at, ticker, outcome, reason) VALUES (?, ?, ?, ?)",
@@ -311,7 +329,10 @@ class Board(unittest.TestCase):
             "Stop at the broker: 12 trades, −0.4% on average. Holding on ten more days "
             "would have brought +2.1% on average (known for 2 of them so far).",
             "Not in the tradable universe: 40 skipped, they did −10.0 points (helped).",
+            "Fixed stop: 12 trades, −2.0% on average. Holding on ten more days would "
+            "have brought +1.0% on average: that could be luck.",
             "Earnings too close: 3 skipped, they did +0.9 points (cost money, too few to be sure).",
+            "Price under $5: 25 skipped, they did +1.5 points (cost money, could be luck).",
             "Too little trading volume: 3 skipped, they did +4.0 points "
             "(cost money, too few to be sure).",
             "The stock moves too little (shorts): 12 skipped, shorting them would have "
@@ -432,6 +453,59 @@ class Board(unittest.TestCase):
             "• Sold nothing.", scoreboard.as_text(scoreboard.build(older, TODAY))
         )
 
+    def test_an_older_database_never_hides_its_trades(self):
+        older = self.memory()  # the trades, and none of the later tables
+        older.executescript(SCHEMA.split("CREATE TABLE trade_reviews")[0])
+        older.execute(
+            "INSERT INTO paper_trades (id, ticker, entry_date, exit_date, exit_price, status,"
+            " order_status, pnl, pnl_pct) VALUES (1, 'AAA', '2026-11-09', '2026-11-12', 10.0,"
+            " 'closed', 'filled', 40.0, 4.0)"
+        )
+        board = scoreboard.build(older, TODAY)
+        self.assertEqual([s["ticker"] for s in board["sold"]], ["AAA"])
+        self.assertEqual([b["ticker"] for b in board["bought"]], ["AAA"])
+        self.assertEqual((board["all"]["trades"], board["all"]["measured"]), (1, 0))
+        text = scoreboard.as_text(board)
+        self.assertIn("• Sold 1: +$40 in total.", text)
+        self.assertIn("(1 closed trades)", text)
+        self.assertNotIn("S&P 500", text)  # nothing to compare with, so no claim
+        # A reviews table from before the comparison existed is the same case.
+        older.execute("CREATE TABLE trade_reviews (trade_id INTEGER, story TEXT)")
+        self.assertEqual(scoreboard.build(older, TODAY)["all"]["trades"], 1)
+        # A trades table too old for a column the board needs is an error, never
+        # "sold nothing".
+        for column in ("realized_pnl", "stop_order_id", "entry_context"):
+            bare = self.memory()
+            bare.executescript(SCHEMA.replace(f" {column} REAL,", "").replace(f" {column} TEXT,", ""))
+            self.assertNotIn(column, [r[1] for r in bare.execute("PRAGMA table_info(paper_trades)")])
+            with self.assertRaises(sqlite3.OperationalError):
+                scoreboard.build(bare, TODAY)
+
+    def test_the_filters_with_the_most_behind_them_are_shown_whichever_way_they_point(self):
+        gates = [
+            {"reason": f"helped_{n}", "outcome": "skipped", "signals": 4, "avg_excess": -9.0 - n, "t": -1.0}
+            for n in range(8)
+        ] + [
+            {"reason": "price", "outcome": "skipped", "signals": 60, "avg_excess": 3.0, "t": 2.6},
+            {"reason": "earnings", "outcome": "skipped", "signals": 30, "avg_excess": 2.0, "t": 1.1},
+        ]
+        self.con.execute(
+            "INSERT INTO learning_reports VALUES ('2026-11-13', 0, ?)",
+            (json.dumps({"gates": gates}),),
+        )
+        lines = [
+            line
+            for line in scoreboard.as_text(self.board()).split("\n")
+            if "skipped, " in line
+        ]
+        self.assertEqual(len(lines), 8)
+        # The sure one first, then the most stocks: the two that cost money
+        # are not the ones cut.
+        self.assertIn("Price under $5: 60 skipped, they did +3.0 points (cost money).", lines[0])
+        self.assertIn("Earnings too close: 30 skipped", lines[1])
+        self.assertIn("could be luck", lines[1])
+        self.assertIn("• and 2 more filters.", scoreboard.as_text(self.board()))
+
     def test_a_database_that_is_not_pulse_is_an_error_not_an_empty_week(self):
         with self.assertRaises(sqlite3.Error):
             scoreboard.build(self.memory(), TODAY)
@@ -443,6 +517,17 @@ class Board(unittest.TestCase):
         self.assertTrue(scoreboard.due(monday, "2026-W46"))
         self.assertFalse(scoreboard.due(monday + dt.timedelta(days=6), "2026-W47"))
         self.assertTrue(scoreboard.due(monday + dt.timedelta(days=7), "2026-W47"))
+
+    def test_the_weeks_hold_over_the_new_year(self):
+        # 2026 has 53 ISO weeks; Friday 1 January 2027 still belongs to the last.
+        self.assertEqual(scoreboard.week_of(dt.date(2026, 12, 28)), "2026-W53")
+        self.assertEqual(scoreboard.week_of(dt.date(2027, 1, 1)), "2026-W53")
+        self.assertEqual(scoreboard.week_of(dt.date(2027, 1, 4)), "2027-W01")
+        self.assertFalse(scoreboard.due(dt.date(2027, 1, 3), "2026-W53"))
+        self.assertTrue(scoreboard.due(dt.date(2027, 1, 4), "2026-W53"))
+        # The board sent in the first week of 2027 ends on Sunday 3 January.
+        self.assertEqual(scoreboard.last_week_end(dt.date(2027, 1, 5)), dt.date(2027, 1, 3))
+        self.assertEqual(scoreboard.last_week_end(dt.date(2026, 12, 29)), dt.date(2026, 12, 27))
 
     def test_the_board_is_always_the_whole_week_before(self):
         sunday = dt.date(2026, 11, 15)

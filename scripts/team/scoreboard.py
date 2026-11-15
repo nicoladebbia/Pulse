@@ -70,10 +70,18 @@ def connect(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{where}?mode=ro&immutable=1", uri=True)
 
 
+def _has(con: sqlite3.Connection, table: str, *columns: str) -> bool:
+    """Whether this database has the table, with these columns."""
+    have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+    return bool(have) and set(columns) <= have
+
+
 def _rows(con: sqlite3.Connection, sql: str, *args) -> list[tuple]:
-    """Rows, or none when this database is older than the table or column
-    asked for. Anything else (a damaged file, a locked one) is an error: a
-    board from a database that cannot be read would say "nothing happened"."""
+    """Rows of an extra (the decisions, the reports), or none when this
+    database is older than the table or column asked for. Anything else (a
+    damaged file, a locked one) is an error. The trades themselves are never
+    read through this: a board that could not read them would say "sold
+    nothing" about a database full of trades."""
     try:
         return con.execute(sql, args).fetchall()
     except sqlite3.OperationalError as e:
@@ -95,42 +103,42 @@ def build(con: sqlite3.Connection, today: dt.date, days: int = 7) -> dict:
     """The scoreboard as plain data, for the `days` up to and including `today`."""
     since = (today - dt.timedelta(days=days - 1)).isoformat()
     until = today.isoformat()
-    # Without the trades table this is not Pulse's database: say so, loudly.
-    con.execute("SELECT 1 FROM paper_trades LIMIT 1")
-    bought = _rows(
-        con,
+    # The trades are read strictly: a database without the trades table, or
+    # too old for one of these columns, is an error and never an empty week.
+    # The reviews are an extra. Without them the trades still count and only
+    # the comparison with the S&P 500 is missing.
+    if _has(con, "trade_reviews", "trade_id", "excess_pct", "exit_kind"):
+        excess_of, kind_of = "tr.excess_pct", "COALESCE(tr.exit_kind, '')"
+        reviews = "LEFT JOIN trade_reviews tr ON tr.trade_id = pt.id"
+    else:
+        excess_of, kind_of, reviews = "NULL", "''", ""
+    bought = con.execute(
         f"""SELECT pt.ticker, COALESCE(pt.direction, 'long'), COALESCE(pt.entry_trigger, '')
             FROM paper_trades pt
             WHERE substr(pt.entry_date, 1, 10) BETWEEN ? AND ?
               AND pt.status IN ('open', 'closed', 'stopped_out')
               AND COALESCE(pt.order_status, 'filled') = 'filled' AND {NOT_A_FRAGMENT}
             ORDER BY pt.entry_date""",
-        since,
-        until,
-    )
-    sold = _rows(
-        con,
-        f"""SELECT pt.ticker, COALESCE(pt.pnl, pt.realized_pnl), pt.pnl_pct, tr.excess_pct,
-                   COALESCE(tr.exit_kind, ''), COALESCE(pt.direction, 'long')
-            FROM paper_trades pt LEFT JOIN trade_reviews tr ON tr.trade_id = pt.id
+        (since, until),
+    ).fetchall()
+    sold = con.execute(
+        f"""SELECT pt.ticker, COALESCE(pt.pnl, pt.realized_pnl), pt.pnl_pct, {excess_of},
+                   {kind_of}, COALESCE(pt.direction, 'long')
+            FROM paper_trades pt {reviews}
             WHERE substr(pt.exit_date, 1, 10) BETWEEN ? AND ? AND {REAL}
             ORDER BY pt.exit_date""",
-        since,
-        until,
-    )
-    every = _rows(
-        con,
-        f"""SELECT COALESCE(pt.pnl, pt.realized_pnl), tr.excess_pct
-            FROM paper_trades pt LEFT JOIN trade_reviews tr ON tr.trade_id = pt.id
-            WHERE {REAL}""",
-    )
+        (since, until),
+    ).fetchall()
+    every = con.execute(
+        f"""SELECT COALESCE(pt.pnl, pt.realized_pnl), {excess_of}
+            FROM paper_trades pt {reviews}
+            WHERE {REAL}"""
+    ).fetchall()
     excess = [e for _, e in every if e is not None]
-    open_now = _rows(
-        con,
+    held, bare = con.execute(
         """SELECT COUNT(*), COALESCE(SUM(COALESCE(stop_order_id, '') = ''), 0)
-           FROM paper_trades WHERE status = 'open' AND order_status = 'filled'""",
-    )
-    held, bare = open_now[0] if open_now else (0, 0)
+           FROM paper_trades WHERE status = 'open' AND order_status = 'filled'"""
+    ).fetchone()
     # Every run writes one row per stock it looked at, and the runs of one day
     # repeat each other: stocks are counted once, runs are counted as runs.
     turned_down = _rows(
@@ -156,11 +164,14 @@ def build(con: sqlite3.Connection, today: dt.date, days: int = 7) -> dict:
         since,
         until,
     )
-    # How many trades of each exit already have their ten days after the sale:
-    # the report gives the average but not how many values are in it.
-    after_n = dict(
-        _rows(con, "SELECT exit_kind, COUNT(after10_pct) FROM trade_reviews GROUP BY exit_kind")
-    )
+    # The ten days after each sale, by exit: the report gives their average
+    # but not how many values are in it, nor how much they scatter.
+    after: dict[str, list[float]] = {}
+    for kind, value in _rows(
+        con,
+        "SELECT exit_kind, after10_pct FROM trade_reviews WHERE after10_pct IS NOT NULL",
+    ):
+        after.setdefault(kind, []).append(value)
     report, report_day = {}, ""
     latest = _rows(
         con,
@@ -217,7 +228,11 @@ def build(con: sqlite3.Connection, today: dt.date, days: int = 7) -> dict:
         "report_day": report_day,
         "headline": [str(h) for h in report.get("headline") or []],
         "exits": [
-            dict(e, after10_n=after_n.get(e.get("exit_kind"), 0))
+            dict(
+                e,
+                after10_n=len(after.get(e.get("exit_kind"), [])),
+                after10_t=t_stat(after.get(e.get("exit_kind"), [])),
+            )
             for e in report.get("exits") or []
             if isinstance(e, dict)
         ],
@@ -348,13 +363,17 @@ def as_text(board: dict) -> str:
                 line += f" Holding on ten more days would have brought {_pct(after)} on average"
                 if known < n:
                     line += f" (known for {known} of them so far)"
-                # A handful of trades says nothing about a rule.
+                # A handful of trades says nothing about a rule, and neither
+                # does an average its own scatter could explain.
                 if known >= ENOUGH:
-                    line += (
-                        ": on average the stop sold too early"
-                        if after > 0
-                        else ": on average the stop was right"
-                    )
+                    if abs(e.get("after10_t") or 0) >= LUCK_T:
+                        line += (
+                            ": on average the stop sold too early"
+                            if after > 0
+                            else ": on average the stop was right"
+                        )
+                    else:
+                        line += ": that could be luck"
                 line += "."
             out.append(line)
 
@@ -369,12 +388,22 @@ def as_text(board: dict) -> str:
         out.append(
             "\nDid the filters help? (what the skipped stocks did next, vs the S&P 500)"
         )
-        for g in sorted(gates, key=lambda g: g["avg_excess"])[:8]:
+
+        def sure(g: dict) -> bool:
+            return abs(g.get("t") or 0) >= LUCK_T and g["signals"] >= ENOUGH
+
+        # The filters with the most behind them first, whichever way they
+        # point: a list sorted by result would cut the ones that cost money.
+        for g in sorted(gates, key=lambda g: (not sure(g), -g["signals"]))[:8]:
             name, short = _reason(g["reason"])
-            sure = abs(g.get("t") or 0) >= LUCK_T and g["signals"] >= ENOUGH
-            verdict = ("helped" if g["avg_excess"] < 0 else "cost money") + (
-                "" if sure else ", too few to be sure"
+            doubt = (
+                ""
+                if sure(g)
+                else ", too few to be sure"
+                if g["signals"] < ENOUGH
+                else ", could be luck"
             )
+            verdict = ("helped" if g["avg_excess"] < 0 else "cost money") + doubt
             # For shorts the report already turns the number around: below zero
             # means the short would have lost against the market.
             did = "shorting them would have done" if short else "they did"
