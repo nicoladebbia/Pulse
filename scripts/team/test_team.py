@@ -2148,6 +2148,45 @@ class Fence(unittest.TestCase):
         self.assertEqual([cmd[len(fence)] for cmd in seen], ["claude", "bash"])
 
     @unittest.skipUnless(os.path.exists("/usr/bin/sandbox-exec"), "needs macOS")
+    def test_a_session_that_only_reads_the_web_gets_nothing_back(self):
+        """Without a worktree the fence makes no exception: what a session
+        that builds may write is shut to one that only reads the web."""
+        live, home, repo, wt = self.live, self.home, self.repo, self.wt
+        cwd = home / "runs/now/market"
+        cwd.mkdir(parents=True)
+        (home / "secrets").mkdir()
+        (home / "secrets/telegram.json").write_text('{"token": "T"}\n')
+
+        def fenced(script):
+            return subprocess.run(
+                self.team.fenced(["bash", "-c", script], None),
+                cwd=cwd,
+                env=dict(os.environ, **self.team.NO_PUBLISH),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        for script in [
+            "echo x > note.txt",  # its own folder
+            f"echo x > '{home}/target/built'",
+            f"echo x >> '{home}/db/job.db'",
+            f"echo x > '{home}/market.json'",
+            f"echo x > '{wt}/src/new.txt'",
+            f"echo x > '{repo}/src/a.txt'",
+            f"echo x > '{repo}/.git/objects/x'",
+            f"cat '{home}/secrets/telegram.json'",
+            f"cat '{live}/pulse.db'",
+            f"cat '{repo}/.env'",
+        ]:
+            done = fenced(script)
+            self.assertNotEqual(done.returncode, 0, script)
+            self.assertIn("not permitted", (done.stdout + done.stderr).lower(), script)
+        done = fenced(f"cat '{repo}/src/a.txt' && test -d '{home}'")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(sorted(x.name for x in cwd.iterdir()), [])
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/sandbox-exec"), "needs macOS")
     def test_the_system_keeps_the_fence_whatever_the_spelling(self):
         self.assertEqual(self.team.fence_problem(), "")
         live, home, repo, wt = self.live, self.home, self.repo, self.wt

@@ -46,6 +46,7 @@ body{background:var(--bg);color:var(--ink);font-family:var(--text);font-size:16p
 .nt .scroll{overflow-x:auto}.nt table{border-collapse:collapse;width:100%;font-size:.9rem;font-variant-numeric:tabular-nums}
 .nt th{font-family:var(--mono);font-size:.72rem;font-weight:500;letter-spacing:.06em;text-transform:uppercase;color:var(--soft);text-align:left}
 .nt th,.nt td{padding:.4rem .9rem .4rem 0;border-bottom:1px solid var(--line);white-space:nowrap}
+.nt table.wrap td{white-space:normal;vertical-align:top;overflow-wrap:anywhere}.nt table.wrap td:first-child{white-space:nowrap}
 .nt code{font-family:var(--mono);font-size:.88em;background:var(--quiet-bg);padding:.05rem .3rem;border-radius:3px}
 """
 
@@ -207,7 +208,61 @@ def chat_digest(report: dict, url: str = "") -> str:
     return "\n".join(lines)
 
 
-def render(history: list[dict]) -> str:
+def _day(iso) -> str:
+    try:
+        d = dt.date.fromisoformat(str(iso))
+    except ValueError:
+        return "—"
+    return f"{d.day} {d:%b}"
+
+
+def market_section(market) -> str:
+    """The market scout's map: products like Pulse, what they sell and charge.
+    Every word and link in it came from the web through a session, so all of it
+    is escaped, and a link is only made of a plain web address."""
+    market = market if isinstance(market, dict) else {}
+    rows, kind = "", None
+    for p in market.get("map") or []:
+        if not isinstance(p, dict):
+            continue
+        url = str(p.get("url") or "")
+        if not url.startswith(("https://", "http://")):
+            continue
+        if p.get("kind") != kind:
+            kind = p.get("kind")
+            rows += f'<tr><th colspan="3">{e(str(kind or "other"))}</th></tr>'
+        stale = (
+            ""
+            if p.get("seen") == market.get("made")
+            else f' <span class="sub">(last seen {e(_day(p.get("seen")))})</span>'
+        )
+        changed = (
+            f'<br><span class="sub">Changed: {e(str(p["changed"]))}</span>'
+            if p.get("changed")
+            else ""
+        )
+        rows += (
+            f'<tr><td><a href="{e(url)}" rel="noreferrer noopener">{e(str(p.get("name") or ""))}</a></td>'
+            f"<td>{e(str(p.get('price') or 'price not seen'))}{stale}</td>"
+            f"<td>{e(str(p.get('offer') or ''))}{changed}</td></tr>"
+        )
+    if not rows:
+        return ""
+    summary = (
+        f"<p>{e(str(market['summary']))}</p>" if market.get("summary") else ""
+    )
+    missing = [str(x) for x in market.get("not_checked") or [] if isinstance(x, str)]
+    return (
+        f'<section id="market"><h2>Products like Pulse</h2>{summary}'
+        '<div class="scroll"><table class="wrap"><thead><tr><th>Product</th><th>Price</th>'
+        f"<th>What it sells</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        f'<p class="sub">Read from the web by the market scout on {e(_day(market.get("made")))}. '
+        "It only reads; an idea from it is built only after your yes.</p>"
+        f"{_items('Could not check', missing)}</section>"
+    )
+
+
+def render(history: list[dict], market: dict | None = None) -> str:
     report = history[0] if history else {}
     repo = report.get("repo", "")
     main = report.get("main") or {}
@@ -264,6 +319,8 @@ def render(history: list[dict]) -> str:
         "The team builds from the top, after open pull requests.</p></section>"
     )
 
+    sections.append(market_section(market))
+
     if len(history) > 1:
         rows = ""
         for r in history[:14]:
@@ -290,6 +347,6 @@ def render(history: list[dict]) -> str:
         '<main class="nt">\n<header><h1>Pulse Night Team</h1>'
         f'<div class="row"><span class="stamp">Last run {_when(report.get("started", ""))} · {report.get("minutes", 0)} min · '
         f"${report.get('cost', 0):.2f} usage</span>{main_pill}</div></header>\n"
-        + "\n".join(sections)
+        + "\n".join(s for s in sections if s)
         + "\n</main>\n"
     )

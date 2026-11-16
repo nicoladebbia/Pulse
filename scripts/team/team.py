@@ -37,6 +37,7 @@ import page  # noqa: E402
 import rules  # noqa: E402
 import newsboard  # noqa: E402
 import scoreboard  # noqa: E402
+import scout  # noqa: E402
 import watch  # noqa: E402
 
 HOME = Path(os.environ.get("PULSE_TEAM_HOME") or Path.home() / ".pulse-team")
@@ -54,6 +55,8 @@ DB_COPY = HOME / "db/pulse-copy.db"  # tonight's copy of the live database
 DB_JOB = HOME / "db/job.db"  # what sessions use; a fresh clone of the copy per job
 IDEAS = HOME / "IDEAS.md"
 PAGE_URL = HOME / "page-url.txt"  # the artifact the nightly page is published to
+MARKET = HOME / "market.json"  # the living map of products like Pulse
+FINDINGS = HOME / "findings.json"  # what the scouts told already, so nothing is told twice
 WORKTREE = ".claude/worktrees/team-job"  # every job's worktree, one at a time
 BASE = "main"
 LABEL = "needs-you"
@@ -75,6 +78,7 @@ BUILDER_MIN = _int("PULSE_TEAM_BUILDER_MIN", 75)
 REVIEWER_MIN = _int("PULSE_TEAM_REVIEWER_MIN", 40)
 CHECKS_MIN = _int("PULSE_TEAM_CHECKS_MIN", 60)
 CI_MIN = _int("PULSE_TEAM_CI_MIN", 45)
+SCOUT_MIN = _int("PULSE_TEAM_SCOUT_MIN", 30)  # the weekly look at the market
 JOB_MIN = _int("PULSE_TEAM_JOB_MIN", 180)  # one job starts no new pass after this
 MAX_FIX_ROUNDS = _int("PULSE_TEAM_FIX_ROUNDS", 2)
 MAX_MAIN_MOVES = 2  # times a job starts over because main changed under it
@@ -362,7 +366,7 @@ def worktree_entry(worktree: Path) -> Path:
     return entries / worktree.name
 
 
-def fence_profile(worktree: Path) -> str:
+def fence_profile(worktree: Path | None) -> str:
     """A macOS sandbox profile for everything that runs what a session wrote:
     the sessions themselves and the checks. guard.py reads the words of a
     command, and a command can be spelled in ways no pattern sees (a glob, a
@@ -379,6 +383,10 @@ def fence_profile(worktree: Path) -> str:
       read. Git's settings and hooks stay shut (both can name a program that
       the runner's own git would start), and so do the main checkout's own
       HEAD and index.
+
+    Without a worktree (a session that only reads the web) none of the
+    exceptions are made: the team's folder and the main checkout are read-only
+    as a whole.
 
     Everything else stays as it is. A later rule wins over an earlier one."""
 
@@ -403,25 +411,31 @@ def fence_profile(worktree: Path) -> str:
         *rule("deny file-write*", "subpath", HOME),
         # The Telegram token: whoever holds it can text Nicola as the team.
         *rule("deny file-read-data", "subpath", chat.SECRETS.parent),
+    ]
+    if worktree:
         # The build folder; the copy, what SQLite keeps beside it and the
         # fetcher's lock file.
-        *rule("allow file-write*", "subpath", HOME / "target", DB_JOB.parent),
-        *rule("deny file-write*", "subpath", REPO),
-        *rule(
-            "allow file-write*",
-            "subpath",
-            worktree,
-            worktree_entry(worktree),
-            *(store / part for part in ("objects", "refs", "logs", "rr-cache")),
-        ),
-        *rule(
-            "allow file-write*",
-            "literal",
-            *(
-                store / name
-                for name in ("packed-refs", "packed-refs.lock", "packed-refs.new")
+        lines += rule("allow file-write*", "subpath", HOME / "target", DB_JOB.parent)
+    lines += rule("deny file-write*", "subpath", REPO)
+    if worktree:
+        lines += [
+            *rule(
+                "allow file-write*",
+                "subpath",
+                worktree,
+                worktree_entry(worktree),
+                *(store / part for part in ("objects", "refs", "logs", "rr-cache")),
             ),
-        ),
+            *rule(
+                "allow file-write*",
+                "literal",
+                *(
+                    store / name
+                    for name in ("packed-refs", "packed-refs.lock", "packed-refs.new")
+                ),
+            ),
+        ]
+    lines += [
         *rule("deny file-read-data", "literal", *secrets),
         *rule("deny file-write*", "literal", *sorted(settings, key=str)),
         *rule("deny file-write*", "subpath", GIT_GLOBAL_DIR),
@@ -429,7 +443,7 @@ def fence_profile(worktree: Path) -> str:
     return "\n".join(lines)
 
 
-def fenced(cmd: list[str], worktree: Path) -> list[str]:
+def fenced(cmd: list[str], worktree: Path | None) -> list[str]:
     return [SANDBOX_EXEC, "-p", fence_profile(worktree), *cmd]
 
 
@@ -444,10 +458,12 @@ def brief() -> str:
     return text.split("# Brief for sessions", 1)[1].strip()
 
 
-def guard_settings(worktree: Path) -> dict:
+def guard_settings(worktree: Path, web_only: bool = False) -> dict:
     """guard.py as a PreToolUse hook on every tool call of a session that may
-    write only inside `worktree`."""
+    write only inside `worktree`. With `web_only` it refuses every tool but the
+    web search, the page fetch and the answer."""
     parts = ["python3", str(HERE / "guard.py"), str(REPO), str(worktree)]
+    parts += ["web"] if web_only else []
     hook = {
         "type": "command",
         "command": " ".join(shlex.quote(part) for part in parts),
@@ -483,11 +499,20 @@ def session(
     code, out, err = sh(
         fenced(cmd, cwd), cwd=cwd, timeout=minutes * 60, env=night_env(), reap=True
     )
+    return session_outcome(code, out, err, minutes, name, run)
+
+
+def session_outcome(
+    code: int, out: str, err: str, minutes: int, name: str, run: dict
+) -> dict:
+    """What a `claude -p` call came to: {ok, data, error}. Its output is kept
+    in the run's folder and its usage is added to the run's."""
     (run["dir"] / f"{name}.json").write_text(out or err)
     try:
         res = json.loads(out)
     except ValueError:
         res = {}
+    res = res if isinstance(res, dict) else {}
     run["cost"] += res.get("total_cost_usd") or 0
     data = res.get("structured_output")
     if code == 0 and not res.get("is_error") and isinstance(data, dict):
@@ -498,6 +523,53 @@ def session(
     if res.get("is_error") and USAGE_LIMIT.search(error):
         run["abort"] = "Claude's usage limit was reached"
     return {"ok": False, "data": {}, "error": error}
+
+
+WEB_TOOLS = "WebSearch,WebFetch"
+
+
+def web_session(prompt: str, schema: dict, minutes: int, name: str, run: dict) -> dict:
+    """One unattended session that can only read the web. Returns {ok, data,
+    error} like `session`.
+
+    It is started with two tools, a search and a page fetch, and without the
+    settings, instructions, skills and connectors of this Mac (`--restricted`),
+    so it has no way to read a file, run a command or change anything, and it
+    is told nothing but `prompt`: not the brief for sessions, which is about
+    code. It runs in an empty folder, inside the fence with nothing left
+    writable, and guard.py refuses any other tool, should one be there after
+    all. What it returns is text from the web: the caller treats it as that."""
+    cwd = run["dir"] / name
+    cwd.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "claude",
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--json-schema",
+        json.dumps(schema),
+        "--restricted",
+        "--tools",
+        WEB_TOOLS,
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--permission-mode",
+        "auto",
+        "--permission-prompts",
+        "none",
+        "--settings",
+        json.dumps(guard_settings(cwd, web_only=True)),
+        "-n",
+        name,
+    ]
+    if MODEL:
+        cmd += ["--model", MODEL]
+    code, out, err = sh(
+        fenced(cmd, None), cwd=cwd, timeout=minutes * 60, env=night_env(), reap=True
+    )
+    return session_outcome(code, out, err, minutes, name, run)
 
 
 def head(wt: Path) -> str:
@@ -1338,6 +1410,8 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
         "failed_step": run["main_step"],
     }
 
+    weekly_market(run, state, report)
+
     if re.fullmatch(r"pr-\d+", args.only or ""):
         rules.retry_now(state, args.only)  # asked for by name: forget its last stop
     jobs, report["skipped"] = rules.select_jobs(
@@ -1484,6 +1558,85 @@ def tell(report: dict, run: dict) -> None:
         log(f"could not text the night's report: {type(e).__name__}")
 
 
+def weekly_market(run: dict, state: dict, report: dict) -> None:
+    """On the first scheduled night of a week: one look at the market (see
+    scout.py). A look that fails is tried again the next night, at most
+    scout.TRIES_PER_WEEK times a week, and never fails the night."""
+    week = scoreboard.week_of(dt.date.today())
+    if (
+        not run.get("scheduled")
+        or run.get("abort")
+        or paused()
+        or state.get("market_week") == week
+    ):
+        return
+    tries = state.get("market_tries")
+    tries = tries if isinstance(tries, dict) and tries.get("week") == week else {}
+    n = tries.get("n") if isinstance(tries.get("n"), int) else 0
+    if n >= scout.TRIES_PER_WEEK:
+        return
+    # Counted before the session starts: a try that takes the run down with it
+    # is still a try.
+    state["market_tries"] = {"week": week, "n": n + 1}
+    save_json(HOME / "state.json", state)
+    log("the weekly look at the market")
+    try:
+        done, note = market_scout(run, dt.date.today())
+    except Exception as e:  # noqa: BLE001 - the night goes on without it
+        done, note = False, f"the market scout failed ({type(e).__name__})"
+    if done:
+        state["market_week"] = week
+        state.pop("market_tries", None)
+        save_json(HOME / "state.json", state)
+    elif n + 1 < scout.TRIES_PER_WEEK:
+        note += "; it tries again tomorrow night"
+    else:
+        note += "; it waits for next week"
+    report["notes"].append(note)
+
+
+def market_scout(run: dict, today: dt.date) -> tuple[bool, str]:
+    """One look at the market: the session, then the map, the memory of what
+    was told, the ideas that wait for a yes and the weekly text. Returns
+    whether it worked and a line for the night's report."""
+    market = load_json(MARKET, {})
+    market = market if isinstance(market, dict) else {}
+    memory = load_json(FINDINGS, {})
+    res = web_session(
+        scout.prompt(market.get("map"), scout.told(memory, today)),
+        scout.SCHEMA,
+        SCOUT_MIN,
+        f"{stamp()}-market",
+        run,
+    )
+    if not res["ok"]:
+        # The reason can hold words from a web page: one short plain line.
+        return False, f"the market scout did not finish ({scout.one_line(res['error'], 120)})"
+    result = scout.clean(res["data"])
+    if not result["products"]:
+        return False, "the market scout named no product with a page to check it on"
+    new = scout.fresh(result["findings"], memory, today)
+    market = {
+        "made": today.isoformat(),
+        "summary": result["summary"],
+        "not_checked": result["not_checked"],
+        "map": scout.merge(market.get("map"), result["products"], today),
+    }
+    save_json(MARKET, market)
+    save_json(FINDINGS, scout.remember(memory, new, today))
+    (HOME / "market.txt").write_text(scout.as_text(market) + "\n")
+    queued = 0
+    for f in new:
+        if f["kind"] == "proposal" and queued < scout.PROPOSALS_MAX:
+            title, text, key = scout.proposal(f)
+            queued += bool(chat.propose("idea", title, text, key=key))
+    chat.send(scout.week_text(result, new, queued))
+    note = f"the market scout checked {len(result['products'])} products like Pulse"
+    if queued:
+        note += f"; {queued} idea{'s' if queued != 1 else ''} from it wait for your yes"
+    return True, note
+
+
 def weekly_scoreboard(run: dict, state: dict) -> None:
     """After the first scheduled night of a week: the trading scoreboard for
     the week before (Monday to Sunday), kept whole as a file and texted.
@@ -1575,7 +1728,7 @@ def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
     (HOME / "latest.txt").write_text(page.as_text(report))
     html = HOME / "page/index.html"
     html.parent.mkdir(parents=True, exist_ok=True)
-    html.write_text(page.render(history))
+    html.write_text(page.render(history, load_json(MARKET, {})))
     log(page.as_text(report))
     url = PAGE_URL.read_text().strip() if PAGE_URL.exists() else ""
     if url:
@@ -1670,6 +1823,7 @@ def cmd_install(_args) -> int:
         "chat.py",
         "scoreboard.py",
         "newsboard.py",
+        "scout.py",
         "watch.py",
         "checks.sh",
         "TEAM.md",
@@ -1873,6 +2027,38 @@ def cmd_newsboard(_args) -> int:
     return print_board(newsboard_text)
 
 
+def cmd_market(args) -> int:
+    """The map of products like Pulse as the market scout left it. With --now
+    the scout looks now, by hand: the same session, map, ideas and text as on
+    its weekly night, without touching the week's bookkeeping."""
+    if not args.now:
+        print(scout.as_text(load_json(MARKET, {})))
+        return 0
+    HOME.mkdir(parents=True, exist_ok=True)
+    with open(HOME / "lock", "w") as lock:  # never beside a night run
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("A run is in progress; try again when it is over.")
+            return 1
+        problem = fence_problem()
+        if problem:
+            print(f"The file fence for sessions could not be put up ({problem}).")
+            return 1
+        run = {
+            "dir": HOME / "runs" / dt.datetime.now().strftime("%Y-%m-%d_%H%M"),
+            "cost": 0.0,
+            "abort": "",
+        }
+        run["dir"].mkdir(parents=True, exist_ok=True)
+        done, note = market_scout(run, dt.date.today())
+    print(note[:1].upper() + note[1:] + ".")
+    if done:
+        print()
+        print(scout.as_text(load_json(MARKET, {})))
+    return 0 if done else 1
+
+
 def print_board(text_of) -> int:
     if not DB_COPY.exists():
         print(f"No database copy yet ({DB_COPY}); the night run makes it.")
@@ -1930,6 +2116,9 @@ def main() -> int:
     sub.add_parser(
         "newsboard", help="how much news was fetched, and what made the briefings"
     ).set_defaults(fn=cmd_newsboard)
+    m = sub.add_parser("market", help="what products like Pulse offer and charge")
+    m.add_argument("--now", action="store_true", help="send the scout to look now")
+    m.set_defaults(fn=cmd_market)
     w = sub.add_parser("watch", help="look at the installed Pulse now")
     w.add_argument("--dry", action="store_true", help="only print, text nothing")
     w.set_defaults(fn=cmd_watch)

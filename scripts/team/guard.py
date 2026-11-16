@@ -151,6 +151,9 @@ SECRET_DIRS = (
 BLOCKED_TOOLS = {"CronCreate", "CronDelete", "RemoteTrigger"}
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_TOOLS = {"Read", "Grep", "Glob"}
+# All a session that only reads the web may call: the search, the page fetch
+# and the call that hands back its answer.
+WEB_TOOLS = {"WebSearch", "WebFetch", "StructuredOutput"}
 
 
 def _without_comment(segment: str) -> str:
@@ -391,10 +394,16 @@ def write_block_reason(path: str, cwd: str, worktree: str = "") -> str | None:
     return f"write only inside your worktree ({root}) or a temp folder"
 
 
-def decide(event: dict, repo: str, worktree: str = "") -> str | None:
+def decide(
+    event: dict, repo: str, worktree: str = "", web_only: bool = False
+) -> str | None:
     tool = event.get("tool_name") or ""
     args = event.get("tool_input") or {}
     cwd = event.get("cwd") or os.getcwd()
+    if web_only and tool not in WEB_TOOLS:
+        # The session is started without any other tool. This is the second
+        # lock on the same door, should one ever be there after all.
+        return f"{tool or 'this tool'} is not for a session that only reads the web"
     if tool.startswith("mcp__"):
         return "connectors (mail, calendar, drive and the rest) are not for unattended sessions"
     if tool in BLOCKED_TOOLS:
@@ -418,8 +427,8 @@ def main() -> int:
         return 2  # fail closed
     # The runner passes both paths on the command line, so a session's shell
     # never has a variable that points at the main checkout.
-    args = sys.argv[1:] + ["", ""]
-    reason = decide(event, args[0], args[1])
+    args = sys.argv[1:] + ["", "", ""]
+    reason = decide(event, args[0], args[1], web_only=args[2] == "web")
     if reason:
         print(f"Blocked by the night-team guard: {reason}.", file=sys.stderr)
         return 2

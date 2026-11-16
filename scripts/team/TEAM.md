@@ -55,6 +55,14 @@ The same night, for the same week, a second text (`newsboard.py`, kept whole in 
 
 A source here is the publisher's name on the article, so one Google News search is many sources, and "gone quiet" can mean a search that changed as well as a feed that broke. A briefing is a daily one that holds stories, as Pulse's own schedule counts them: a run that made nothing is not one. Each board keeps its own week in the state: one that fails is tried again the next night and the other is not sent twice, and weeks without a board are made up for as on the trading scoreboard. `team.py newsboard` prints the last seven days. Like the trading scoreboard it counts and reports; it changes no feed and proposes nothing.
 
+## The market scout
+
+On the first scheduled night of each week one session looks at what products like Pulse offer and charge (`scout.py`; `web_session` in `team.py`). It reads the public web and nothing else. It is started with a search and a page fetch as its only tools and without this Mac's settings, instructions, skills and connectors, in an empty folder, inside the fence with nothing left writable, and `guard.py` refuses any other tool. It is told only its own brief (the map as it stands and what it told before), never the brief for sessions below, which is about code.
+
+What it returns is treated as text a stranger wrote, because a page it read may have tried to steer it. `scout.clean` keeps only the fields that were asked for, each as one capped line, and drops any product or finding whose source is not a plain public web address. The products are folded into one living map, `~/.pulse-team/market.json` (at most 60; a product nobody has seen for 26 weeks leaves it), which the night page shows and `team.py market` prints. Nicola gets one text for the week with at most three things it saw, each with its link. A finding that suggests something to build is queued as an idea with the usual `Build it` / `Not now` / `No` buttons, at most 3 from one look and inside the 3 ideas a week: nothing read on the web is built without his yes. `~/.pulse-team/findings.json` remembers what was told, so the same finding is not told twice within 26 weeks.
+
+A look that fails is tried once more the next night and then waits for the next week; it never fails the night, and a paused team does not look. `team.py market --now` sends the scout by hand (never beside a night run) without touching the week's bookkeeping.
+
 ## The watch
 
 Every ten minutes `watch.py` (launchd `com.pulse.team.watch`, installed by `team.py install`) looks at the installed Pulse and texts Nicola when something is wrong. It only reads: the hourly log, the progress file, the schedule stamps, launchd's list, and one read-only query on the database for held positions with no stop (when Pulse does not have the database open the file is read as it is, so no `-wal` or `-shm` file is left in Pulse's folder). It asks the broker's clock through the installed fetcher (`--mode market-open`, no lock, nothing written), so a holiday or an early close is simply "closed". It starts no session and changes nothing in Pulse; for now it only tells.
@@ -99,6 +107,7 @@ python3 scripts/team/team.py status           # last night's report
 python3 scripts/team/team.py page <url>       # the artifact the nightly page is published to
 python3 scripts/team/team.py scoreboard       # the last 7 days of trading, against the S&P 500
 python3 scripts/team/team.py newsboard        # the last 7 days of news: fetched, kept, used, read
+python3 scripts/team/team.py market           # the map of products like Pulse (--now: look now)
 python3 scripts/team/team.py watch --dry       # look at the installed Pulse now, text nothing
 python3 scripts/team/team.py chat pair        # tie a Telegram bot to this Mac (asks for the token)
 python3 scripts/team/team.py chat status      # paired, listener alive, what waits
