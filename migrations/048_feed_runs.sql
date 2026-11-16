@@ -17,19 +17,23 @@
 -- A run that stops early (too few new articles) still has its rows:
 -- `briefing_id` is set only when the run went on to make a briefing. A feed has
 -- no row for a run in which its whole source was abandoned before the feed
--- answered, so rates are over the rows that exist.
+-- answered, so rates are over the rows that exist. A feed that had answered when
+-- its source failed as a whole has `ok = 0` and an error that says so (its
+-- articles were dropped with the source); `entries` keeps what it answered.
 --
 --   entries  entries in the feed's answer, before any of this app's filters
---            (NULL when the fetch failed)
+--            (NULL when the feed's own fetch failed)
 --   fetched  articles the feed handed to the run (after the feed's own limits:
 --            its newest entries, recent enough, with a title and a link)
 --   offered  of those, the ones this run could use (its topics, fresh enough):
 --            what went into the repeat check
 --   pooled   of those, the ones left once repeats were dropped
 --
--- So `entries > 0` with `fetched = 0` is a feed that answers but has nothing
--- recent, `offered - pooled` is what was dropped as a repeat, and a feed of
--- another mode's topics has `fetched > 0` and `offered = 0`.
+-- So `ok = 1`, `entries > 0` and `fetched = 0` is a feed that answers but has
+-- nothing recent (or, for a subreddit, only posts an earlier subreddit already
+-- gave: crossposts are kept once), `offered - pooled` is what was dropped as a
+-- repeat, and a feed of another mode's topics has `fetched > 0` and
+-- `offered = 0`.
 --
 -- Rows are kept 180 days (`feed_runs::KEEP_DAYS`). No foreign keys, for the
 -- reason 033 and 034 give, so a briefing that is replaced later the same day

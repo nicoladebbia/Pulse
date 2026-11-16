@@ -227,6 +227,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::error!("RSS feeds FAILED: {}", e);
             failed.push("RSS feeds");
+            crate::feed_runs::abandoned("rss");
         }
     }
     match hn {
@@ -237,6 +238,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::error!("Hacker News FAILED: {}", e);
             failed.push("Hacker News");
+            crate::feed_runs::abandoned("hacker_news");
         }
     }
     match google {
@@ -247,6 +249,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::error!("Google News FAILED: {}", e);
             failed.push("Google News");
+            crate::feed_runs::abandoned("google_news");
         }
     }
     match reddit_posts {
@@ -257,6 +260,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::warn!("Reddit FAILED (non-fatal): {}", e);
             failed.push("Reddit");
+            crate::feed_runs::abandoned("reddit");
         }
     }
     match arxiv_papers {
@@ -267,6 +271,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::warn!("ArXiv FAILED (non-fatal): {}", e);
             failed.push("ArXiv");
+            crate::feed_runs::abandoned("arxiv");
         }
     }
     match biorxiv_papers {
@@ -277,6 +282,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::warn!("bioRxiv FAILED (non-fatal): {}", e);
             failed.push("bioRxiv");
+            crate::feed_runs::abandoned("biorxiv");
         }
     }
 

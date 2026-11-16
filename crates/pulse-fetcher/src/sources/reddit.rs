@@ -101,7 +101,9 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
                 for p in posts {
                     if !is_quality_post(&p, tier) { continue; }
 
-                    // Dedupe crossposts by URL across subs
+                    // Dedupe crossposts by URL across subs: the first subreddit keeps the
+                    // post, so in `feed_runs` a later one can answer in full and hand over
+                    // nothing (`entries` 25, `fetched` 0) without anything being wrong.
                     let canonical_url = if p.is_self {
                         format!("https://www.reddit.com{}", p.permalink)
                     } else {
@@ -194,4 +196,22 @@ fn is_quality_post(p: &RedditPost, tier: &str) -> bool {
     if p.num_comments < min_comments { return false; }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `feed_runs` holds one row per feed id per run: two feeds sharing an id
+    /// would be counted as one.
+    #[test]
+    fn every_feed_has_its_own_id() {
+        let mut seen = std::collections::HashSet::new();
+        let repeated: Vec<_> = SUBREDDITS
+            .iter()
+            .map(|(sub, _, _, _)| feed_id(sub))
+            .filter(|id| !seen.insert(id.clone()))
+            .collect();
+        assert!(repeated.is_empty(), "feed ids used twice: {repeated:?}");
+    }
 }

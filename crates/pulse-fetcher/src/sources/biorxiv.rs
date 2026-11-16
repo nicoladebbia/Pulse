@@ -80,3 +80,21 @@ async fn fetch_single(
     }
     Ok((articles, entries))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `feed_runs` holds one row per feed id per run: two feeds sharing an id
+    /// would be counted as one.
+    #[test]
+    fn every_feed_has_its_own_id() {
+        let mut seen = std::collections::HashSet::new();
+        let repeated: Vec<_> = BIORXIV_FEEDS
+            .iter()
+            .map(|(_, _, url)| feed_id(url))
+            .filter(|id| !seen.insert(id.clone()))
+            .collect();
+        assert!(repeated.is_empty(), "feed ids used twice: {repeated:?}");
+    }
+}

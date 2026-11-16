@@ -88,6 +88,18 @@ pub fn note(
     });
 }
 
+/// What a feed's row says when it answered and its source then failed as a whole.
+const SOURCE_ABANDONED: &str = "answered, but its source failed as a whole and its articles were dropped";
+
+/// A whole source failed (it ran past its time limit, say) after some of its feeds
+/// had answered: their articles went with it. Their rows say so, where they would
+/// otherwise read as feeds that answer and have nothing recent.
+pub fn abandoned(kind: &str) {
+    for fetch in notes().iter_mut().filter(|f| f.kind == kind && f.error.is_none()) {
+        fetch.error = Some(SOURCE_ABANDONED.to_string());
+    }
+}
+
 /// Run one feed's fetch, note how it went, and hand back its articles. The fetch
 /// returns its articles and the number of entries the feed's answer held.
 pub async fn watch(
@@ -552,17 +564,61 @@ mod tests {
         assert_eq!((fine.error.as_deref(), fine.entries), (None, Some(3)));
     }
 
-    #[tokio::test]
-    async fn watching_a_fetch_passes_its_articles_and_its_error_through() {
-        let good = watch("watch_good".into(), "rss", "Good", "ai", async {
+    /// Not a tokio test: the list is emptied here, so the lock is held throughout,
+    /// and a lock is not to be held across an await.
+    #[test]
+    fn watching_a_fetch_notes_it_and_passes_its_articles_and_its_error_through() {
+        let _alone = alone();
+        begin();
+        let good = futures::executor::block_on(watch("watch_good".into(), "rss", "Good", "ai", async {
             Ok((vec![article("watch_good", "news")], 9))
-        })
-        .await
+        }))
         .unwrap();
         assert_eq!(good.len(), 1);
 
-        let bad = watch("watch_bad".into(), "rss", "Bad", "ai", async { anyhow::bail!("HTTP 500: nope") }).await;
+        let bad = futures::executor::block_on(watch("watch_bad".into(), "rss", "Bad", "ai", async {
+            anyhow::bail!("HTTP 500: nope")
+        }));
         assert_eq!(bad.unwrap_err().to_string(), "HTTP 500: nope");
+
+        let got = std::mem::take(&mut *notes());
+        let good = got.iter().find(|f| f.feed_id == "watch_good").expect("the good fetch was noted");
+        assert_eq!((good.kind, good.name.as_str(), good.sector.as_str()), ("rss", "Good", "ai"));
+        assert_eq!((good.error.as_deref(), good.entries), (None, Some(9)));
+        let bad = got.iter().find(|f| f.feed_id == "watch_bad").expect("the failed fetch was noted");
+        assert_eq!((bad.error.as_deref(), bad.entries), (Some("HTTP 500: nope"), None));
+    }
+
+    #[test]
+    fn beginning_a_collect_forgets_the_one_before() {
+        let _alone = alone();
+        note("begin_old".into(), "rss", "Old", "ai", Instant::now(), Ok(1));
+        begin();
+        assert!(!notes().iter().any(|f| f.feed_id == "begin_old"));
+    }
+
+    /// A source that fails as a whole takes the articles of the feeds that had
+    /// answered with it: those rows must not read as healthy feeds with nothing new.
+    #[test]
+    fn a_source_that_failed_as_a_whole_marks_the_feeds_that_had_answered() {
+        let failed = anyhow::anyhow!("HTTP 403");
+        let _alone = alone();
+        begin();
+        note("reddit:answered".into(), "reddit", "r/answered", "ai", Instant::now(), Ok(25));
+        note("reddit:refused".into(), "reddit", "r/refused", "ai", Instant::now(), Err(&failed));
+        note("rss_other_source".into(), "rss", "Other", "ai", Instant::now(), Ok(4));
+        abandoned("reddit");
+        let got = std::mem::take(&mut *notes());
+
+        let by_id = |id: &str| got.iter().find(|f| f.feed_id == id).expect("the fetch was noted");
+        assert_eq!(by_id("reddit:answered").error.as_deref(), Some(SOURCE_ABANDONED));
+        assert_eq!(by_id("reddit:answered").entries, Some(25), "what the feed answered is kept");
+        assert_eq!(by_id("reddit:refused").error.as_deref(), Some("HTTP 403"), "its own error stays");
+        assert_eq!(by_id("rss_other_source").error, None, "another source's feeds are untouched");
+
+        let rows = rows(got, &Tally::new(), &Tally::new(), &Tally::new());
+        let answered = rows.iter().find(|r| r.feed_id == "reddit:answered").unwrap();
+        assert!(answered.error.is_some() && answered.fetched == 0);
     }
 
     /// The whole path the pipeline uses, on a real file: record, then attach.
