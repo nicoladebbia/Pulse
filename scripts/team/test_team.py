@@ -2373,6 +2373,39 @@ class Jobs(unittest.TestCase):
         self.team.after_job(self.IDEA, res, state)
         self.assertEqual(state["held"], {})
 
+    def test_a_pull_request_stopped_before_any_fix_leaves_no_branch_behind(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        self.main_moves()  # so the runner merges main in before the checks
+
+        def checks(wt, run, name):
+            raise self.team.Yielded("a serious problem came first")
+
+        self.team.run_checks = checks
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "yielded")
+        self.assertEqual(res["reasons"], ["it stepped aside: a serious problem came first"])
+        self.assertEqual(self.kept("night-kept/*"), {})
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])
+
+    def test_a_fix_for_a_pull_request_that_is_stopped_midway_is_kept(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        self.checks = [(False, "clippy", "boom")]
+
+        def stopped_midway(cwd):
+            commit(cwd, "src/fix.txt", "half\n", "half a fix")
+            (cwd / "src/more.txt").write_text("not committed yet\n")
+            raise self.team.Yielded("paused from Telegram")
+
+        self.script["fix"] = [stopped_midway]
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "yielded")
+        ((name, sha),) = self.kept("night-kept/pr-5-*").items()
+        self.assertIn(name, res["reasons"][-1])
+        files = g("ls-tree", "-r", "--name-only", sha, cwd=self.repo).split()
+        self.assertIn("src/fix.txt", files)
+        self.assertIn("src/more.txt", files)  # also what was not committed yet
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])  # nothing was pushed
+
     def test_a_job_whose_kept_branch_is_gone_starts_over(self):
         state = {}
         rules.hold(state, self.IDEA["key"], "feat/night-gone-1116", dt.datetime.now())

@@ -1496,10 +1496,13 @@ def run_job(job: dict, run: dict) -> dict:
                 res["reasons"].append(
                     f"what the stopped session had not committed could not be kept: {lost}"
                 )
-        if wt and (built or aside) and job["kind"] == "pr" and res["result"] not in DONE:
+        if wt and built and job["kind"] == "pr" and res["result"] not in DONE:
             # Fix commits for someone's PR sit on no branch at all. Whatever
             # way the job ended (a runner error included), they are kept
-            # before the worktree goes.
+            # before the worktree goes. `built` is set before a fix session
+            # starts, so one that is stopped midway counts; a job stopped
+            # before any session (during the checks, say) has made nothing
+            # but the runner's own merge of main, and keeps no branch.
             keep_attempt(job, res, Path(wt), job["head"])
         if res.get("pr") and res["result"] in ("needs_user", "blocked"):
             park(res)
