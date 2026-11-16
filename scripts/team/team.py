@@ -966,7 +966,7 @@ def publish(wt: Path, branch: str, res: dict, title: str, body: str) -> str:
     body_file = wt.parent / f"{wt.name}-pr-body.md"
     body_file.write_text(
         (body or res["summary"] or title)
-        + "\n\n_Built overnight by the Pulse night team._\n"
+        + "\n\n_Built by the Pulse team, with nobody at the keyboard._\n"
     )
     code, out = gh(
         "pr",
