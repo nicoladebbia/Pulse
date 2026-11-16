@@ -96,6 +96,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     progress.start_stage(1);
     tracing::info!("Phase 1: Collecting from sources...");
     sources::API_CALLS.reset();
+    // Per-feed counts for `feed_runs`: taken at three points below and written as
+    // soon as the repeats are gone, so a run that stops there still leaves them.
+    let feeds_run_at = crate::feed_runs::now();
     let mut all_articles = sources::collect_all().await?;
 
     // Wikipedia Pageviews — needs DB access for entity lookup (non-fatal)
@@ -109,6 +112,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Wikipedia Pageviews FAILED (non-fatal): {}", e),
     }
 
+    let feeds_fetched = crate::feed_runs::tally(&all_articles);
     let raw_articles: Vec<_> = all_articles.into_iter()
         .filter(|a| !a.sector.starts_with("freedom_"))
         .collect();
@@ -133,6 +137,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let (raw_news, raw_financial): (Vec<_>, Vec<_>) = raw_articles
         .into_iter()
         .partition(|a| a.source_type != "financial");
+    let feeds_offered = crate::feed_runs::tally(&raw_news);
 
     // Log API calls for quota tracking — 1 row per actual HTTP request,
     // not per batch. Each source module bumps its atomic counter inside
@@ -177,6 +182,14 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     };
     let news_articles = crate::dedup::deduplicate_with_history(raw_news, historical_hashes, historical_titles);
     tracing::info!("{} news articles after dedup", news_articles.len());
+    crate::feed_runs::record(
+        db_path,
+        &feeds_run_at,
+        "daily",
+        &feeds_fetched,
+        &feeds_offered,
+        &crate::feed_runs::tally(&news_articles),
+    );
 
     // Abort if too few new articles (not worth API cost for a thin briefing)
     let total_unique = news_articles.len() + financial_stories.len();
@@ -519,6 +532,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
             ),
             Err(e) => tracing::warn!("Fetch candidate record failed (non-fatal): {}", e),
         }
+        crate::feed_runs::attach(db_path, &feeds_run_at, "daily", briefing_id);
     }
 
     // Phase 8.5: Auto-backfill missing embeddings from previous failed runs (non-fatal)
@@ -1874,7 +1888,10 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     // articles, and it is the guard that makes a stale source list survivable.
     tracing::info!("Freedoms: Collecting articles...");
     sources::API_CALLS.reset();
+    // Per-feed counts for `feed_runs`, as in the daily run.
+    let feeds_run_at = crate::feed_runs::now();
     let all_articles = sources::collect_freedoms().await?;
+    let feeds_fetched = crate::feed_runs::tally(&all_articles);
     // Log per-call API usage for this fetch run
     {
         if let Ok(conn) = rusqlite::Connection::open(db_path) {
@@ -1920,8 +1937,19 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     tracing::info!("Freedoms: freshness filter dropped {} stale articles (news >72h, academic >14d); {} remain", dropped, freedom_articles.len());
     log_freedom_histogram("after-freshness", freedom_articles.iter().map(|a| a.sector.as_str()));
 
+    let feeds_offered = crate::feed_runs::tally(&freedom_articles);
+
     if freedom_articles.is_empty() {
         tracing::warn!("Freedoms: No freedom articles found, skipping");
+        // The run with nothing to offer is the one whose feeds most need a record.
+        crate::feed_runs::record(
+            db_path,
+            &feeds_run_at,
+            "freedoms",
+            &feeds_fetched,
+            &feeds_offered,
+            &crate::feed_runs::Tally::new(),
+        );
         return Ok(());
     }
 
@@ -1940,6 +1968,14 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     };
     let unique = crate::dedup::deduplicate_with_history(freedom_articles, historical_hashes, historical_titles);
     tracing::info!("Freedoms: {} after dedup", unique.len());
+    crate::feed_runs::record(
+        db_path,
+        &feeds_run_at,
+        "freedoms",
+        &feeds_fetched,
+        &feeds_offered,
+        &crate::feed_runs::tally(&unique),
+    );
     log_freedom_histogram("after-dedup (pre_curate INPUT)", unique.iter().map(|a| a.sector.as_str()));
 
     // Phase 2.5: Pre-curate if many articles
@@ -2085,7 +2121,8 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 5: Write to database
     tracing::info!("Freedoms: Writing to database...");
-    write_freedoms_to_db(db_path, &curated)?;
+    let briefing_id = write_freedoms_to_db(db_path, &curated)?;
+    crate::feed_runs::attach(db_path, &feeds_run_at, "freedoms", briefing_id);
 
     // Phase 5.5: Generate executive summary for freedoms (non-fatal)
     tracing::info!("Freedoms: Generating executive summary...");
@@ -2254,7 +2291,7 @@ fn extract_json_str(text: &str) -> &str {
 fn write_freedoms_to_db(
     db_path: &Path,
     curated: &[(&str, &crate::claude::SummarizedStory)],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i64> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2412,7 +2449,7 @@ fn write_freedoms_to_db(
         total, briefing_id, time_count, wealth_count, location_count, health_count, whoop_count
     );
 
-    Ok(())
+    Ok(briefing_id)
 }
 
 /// Drop articles that duplicate an EARLIER ARTICLE IN THE SAME BATCH.

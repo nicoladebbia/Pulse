@@ -397,6 +397,7 @@ pub(crate) async fn collect_financial_sources() -> (Vec<RawArticle>, Vec<&'stati
 pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
     SOURCES_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
     SOURCES_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::feed_runs::begin();
     // Both halves run concurrently and every source inside them keeps its own
     // time budget, so all SOURCE_COUNT sources are still in flight at once.
     let ((mut articles, mut failed_sources), (financial, financial_failed)) =
@@ -434,6 +435,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
 pub async fn collect_freedoms() -> anyhow::Result<Vec<RawArticle>> {
     SOURCES_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
     SOURCES_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::feed_runs::begin();
 
     let (articles, failed) = collect_news_sources().await;
 

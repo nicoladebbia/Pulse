@@ -85,7 +85,17 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
             format!("https://www.reddit.com/r/{}/hot.json?limit=25&raw_json=1", sub)
         };
 
-        match fetch_listing(&client, &url).await {
+        let started = std::time::Instant::now();
+        let listing = fetch_listing(&client, &url).await;
+        crate::feed_runs::note(
+            feed_id(sub),
+            "reddit",
+            &format!("r/{sub}"),
+            sector,
+            started,
+            listing.as_ref().map(|posts| posts.len()),
+        );
+        match listing {
             Ok(posts) => {
                 let mut kept = 0;
                 for p in posts {
@@ -118,7 +128,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
                         published_at,
                         content_snippet,
                         sector: sector.to_string(),
-                        feed_id: format!("reddit:{}", sub),
+                        feed_id: feed_id(sub),
                         language: "en".to_string(),
                         source_type: "news".to_string(),
                         financial_metadata: None,
@@ -134,6 +144,11 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
     }
 
     Ok(articles)
+}
+
+/// The id a subreddit's posts carry, and its row in `feed_runs`.
+fn feed_id(sub: &str) -> String {
+    format!("reddit:{sub}")
 }
 
 async fn fetch_listing(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<RedditPost>> {
