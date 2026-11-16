@@ -123,6 +123,23 @@ const FEEDS: &[(&str, &str, &str)] = &[
     ("freedom_whoop", "Whoop: Competitors & Ecosystem", "https://news.google.com/rss/search?q=Whoop+vs+Oura+OR+Whoop+vs+%22Apple+Watch%22+OR+%22Whoop+integration%22+OR+%22Will+Ahmed%22+Whoop+when:7d&hl=en-US&gl=US&ceid=US:en"),
 ];
 
+/// The id a query's articles carry, and its row in `feed_runs`: one per query,
+/// made from the query's name ("Google News AI Companies" is
+/// `google_news_ai_companies`, "Freedom: Productivity" is
+/// `google_news_freedom_productivity`).
+///
+/// It used to be one id per topic, which hid the hundred-odd queries behind five
+/// ids. Nothing reads a news article's feed id but the feed counts.
+fn feed_id(name: &str) -> String {
+    let name = name.strip_prefix("Google News ").unwrap_or(name);
+    let mut id = String::from("google_news");
+    for word in name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+        id.push('_');
+        id.push_str(&word.to_lowercase());
+    }
+    id
+}
+
 pub async fn fetch_all() -> anyhow::Result<Vec<RawArticle>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -137,7 +154,10 @@ pub async fn fetch_all() -> anyhow::Result<Vec<RawArticle>> {
             let sector = sector.to_string();
             let name = name.to_string();
             let url = url.to_string();
-            async move { fetch_feed(&client, &sector, &name, &url).await }
+            async move {
+                let fetch = fetch_feed(&client, &sector, &name, &url);
+                crate::feed_runs::watch(feed_id(&name), "google_news", &name, &sector, fetch).await
+            }
         })
         .collect();
 
@@ -157,17 +177,21 @@ async fn fetch_feed(
     sector: &str,
     name: &str,
     url: &str,
-) -> anyhow::Result<Vec<RawArticle>> {
+) -> anyhow::Result<(Vec<RawArticle>, usize)> {
     super::API_CALLS.google_news.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let response = client
+    let reply = client
         .get(url)
         .header("User-Agent", "Pulse/0.1")
         .send()
-        .await?
-        .bytes()
         .await?;
+    let status = reply.status();
+    let response = reply.bytes().await?;
 
-    let feed = feed_rs::parser::parse(&response[..])?;
+    // A refused query answers with a page that is not a feed. The status is the
+    // useful half of that error, so it goes in front.
+    let feed = feed_rs::parser::parse(&response[..])
+        .map_err(|e| anyhow::anyhow!("HTTP {}: {}", status.as_u16(), e))?;
+    let entries = feed.entries.len();
     let mut articles = Vec::new();
 
     for entry in feed.entries.iter().take(25) {
@@ -207,7 +231,7 @@ async fn fetch_feed(
                 published_at: published,
                 content_snippet: snippet,
                 sector: sector.to_string(),
-                feed_id: format!("google_news_{}", sector),
+                feed_id: feed_id(name),
                 language: "en".to_string(),
                 source_type: "news".to_string(),
                 financial_metadata: None,
@@ -216,5 +240,31 @@ async fn fetch_feed(
     }
 
     tracing::info!("Fetched {} articles from {}", articles.len(), name);
-    Ok(articles)
+    Ok((articles, entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_query_is_named_after_what_it_searches() {
+        assert_eq!(feed_id("Google News AI Companies"), "google_news_ai_companies");
+        assert_eq!(feed_id("Google News Miami"), "google_news_miami");
+        assert_eq!(feed_id("Freedom: Productivity"), "google_news_freedom_productivity");
+        assert_eq!(feed_id("Whoop: Product & Company"), "google_news_whoop_product_company");
+    }
+
+    /// `feed_runs` holds one row per feed id per run: two queries sharing an id
+    /// would be counted as one.
+    #[test]
+    fn every_query_has_its_own_id() {
+        let mut seen = std::collections::HashSet::new();
+        let repeated: Vec<_> = FEEDS
+            .iter()
+            .map(|(_, name, _)| feed_id(name))
+            .filter(|id| !seen.insert(id.clone()))
+            .collect();
+        assert!(repeated.is_empty(), "feed ids used twice: {repeated:?}");
+    }
 }

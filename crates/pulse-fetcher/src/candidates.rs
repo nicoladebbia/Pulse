@@ -70,8 +70,8 @@ pub fn record(
             "INSERT OR IGNORE INTO fetch_candidates (
                 briefing_id, url_hash, url, title, source_name, sector, language,
                 published_at, content_snippet, pool_position, precurate_ran,
-                kept_by_precurate, summarized
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                kept_by_precurate, summarized, feed_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?;
         for (i, a) in pool.iter().enumerate() {
             let hash = crate::dedup::url_hash(&a.url);
@@ -89,6 +89,7 @@ pub fn record(
                 outcome.precurate_cut as i64,
                 outcome.kept.contains(&hash),
                 outcome.summarized.contains(&hash),
+                a.feed_id,
             ])?;
         }
     }
@@ -207,6 +208,27 @@ mod tests {
         assert_eq!(rows[1], ("https://a.com/summarized-only".into(), 1, 1, None, 1));
         assert_eq!(rows[2], ("https://a.com/kept-summary-failed".into(), 1, 0, None, 2));
         assert_eq!(rows[3], ("https://a.com/cut".into(), 0, 0, None, 3));
+    }
+
+    /// The feed is what joins the pool to `feed_runs`: "which feeds fill the pool
+    /// and which make the briefing" needs it on every row.
+    #[test]
+    fn records_the_feed_each_article_came_from() {
+        let conn = db();
+        let bid = new_briefing(&conn);
+        let mut pool = vec![article("https://a.com/one", "ai"), article("https://a.com/two", "ai")];
+        pool[1].feed_id = "google_news_ai_companies".into();
+        let outcome = StageOutcome { precurate_cut: PreCurateCut::None, kept: HashSet::new(), summarized: HashSet::new() };
+        record(&conn, bid, &pool, &outcome).unwrap();
+
+        let feeds: Vec<Option<String>> = conn
+            .prepare("SELECT feed_id FROM fetch_candidates ORDER BY pool_position")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(feeds, vec![Some("feed".to_string()), Some("google_news_ai_companies".to_string())]);
     }
 
     /// A filing that shares a URL with a news article must not claim the link, and a
