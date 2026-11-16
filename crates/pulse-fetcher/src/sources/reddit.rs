@@ -24,7 +24,10 @@
 //! stands in for them: both listings come best first, and only the first
 //! `KEEP_PER_SUBREDDIT` usable posts of each subreddit are kept. Still rejected:
 //! AutoModerator and deleted authors, removed posts, and image/video domains (we
-//! want articles).
+//! want articles), now with Reddit's own image galleries among them.
+//!
+//! A post's page on reddit.com is never fetched for more text: Reddit serves a
+//! bot challenge there (`article_text::wants_body`). What the feed gives is all.
 
 use super::RawArticle;
 use std::collections::HashSet;
@@ -329,6 +332,8 @@ fn is_quality_post(p: &Post) -> bool {
         for bad in BLACKLISTED_DOMAINS {
             if host.contains(bad) { return false; }
         }
+        // Several images in one post: Reddit's own gallery page, images just the same.
+        if crate::article_text::is_reddit_page(link) && link.contains("/gallery/") { return false; }
     }
 
     true
@@ -489,6 +494,9 @@ mod tests {
         assert!(!is_quality_post(&linked("https://i.imgur.com/abc123.png")));
         assert!(!is_quality_post(&linked("https://www.youtube.com/watch?v=abc&t=1s")));
         assert!(!is_quality_post(&linked("https://youtu.be/abc")));
+        assert!(!is_quality_post(&linked("https://www.reddit.com/gallery/1abc23")));
+        // A link to another Reddit post (a crosspost) is still something to read.
+        assert!(is_quality_post(&linked("https://www.reddit.com/r/longevity/comments/1abc/a_post/")));
     }
 
     /// The feed has no scores, so its ranking is the quality bar: a busy

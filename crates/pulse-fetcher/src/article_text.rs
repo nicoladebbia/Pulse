@@ -138,6 +138,26 @@ pub fn extract_paragraphs(html: &str) -> String {
     out
 }
 
+/// A page on Reddit. Reddit answers a script's page fetch with a bot challenge,
+/// and with HTTP 200: its text ("Complete the challenge below…") was appended as
+/// the article and summarized as if it were the story. A post's own text comes
+/// with its feed entry (`sources::reddit`), so there is nothing to fetch for.
+pub(crate) fn is_reddit_page(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "reddit.com" || host.ends_with(".reddit.com"))
+}
+
+/// Whether `enrich` should fetch this article's page for its body text.
+fn wants_body(a: &RawArticle) -> bool {
+    a.source_type == "news"
+        && !a.url.is_empty()
+        // Already grounded at parse time (RSS content:encoded).
+        && !a.content_snippet.contains("\n\nArticle text: ")
+        && !is_reddit_page(&a.url)
+}
+
 async fn fetch_body(client: &reqwest::Client, url: &str) -> Option<String> {
     let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -177,12 +197,7 @@ pub async fn enrich(mut articles: Vec<RawArticle>) -> Vec<RawArticle> {
         articles
             .iter()
             .enumerate()
-            .filter(|(_, a)| {
-                a.source_type == "news"
-                    && !a.url.is_empty()
-                    // Already grounded at parse time (RSS content:encoded).
-                    && !a.content_snippet.contains("\n\nArticle text: ")
-            })
+            .filter(|(_, a)| wants_body(a))
             .map(|(i, a)| {
                 let client = client.clone();
                 let url = a.url.clone();
@@ -268,6 +283,52 @@ mod tests {
     #[test]
     fn empty_on_paragraphless_html() {
         assert_eq!(extract_paragraphs("<div>short</div>"), "");
+    }
+
+    fn article(url: &str, snippet: &str) -> RawArticle {
+        RawArticle {
+            title: "A title".to_string(),
+            url: url.to_string(),
+            source_name: "A source".to_string(),
+            source_url: String::new(),
+            published_at: None,
+            content_snippet: snippet.to_string(),
+            sector: "freedom_health".to_string(),
+            feed_id: "a_feed".to_string(),
+            language: "en".to_string(),
+            source_type: "news".to_string(),
+            financial_metadata: None,
+        }
+    }
+
+    /// Reddit serves a bot challenge in place of a post's page, with HTTP 200.
+    /// Fetched, its text became the "article" of every Reddit story.
+    #[test]
+    fn a_reddit_page_is_never_fetched_for_its_body() {
+        assert!(wants_body(&article("https://www.statnews.com/2026/11/16/a-story/", "A snippet.")));
+
+        for url in [
+            "https://www.reddit.com/r/whoop/comments/1abc/a_post/",
+            "https://www.reddit.com/gallery/1abc",
+            "https://old.reddit.com/r/whoop/comments/1abc/a_post/",
+            "https://reddit.com/r/whoop/",
+            "https://WWW.REDDIT.COM/r/whoop/",
+        ] {
+            assert!(!wants_body(&article(url, "The post's own text.")), "{url}");
+        }
+        // A site that only has "reddit.com" somewhere in its address is not Reddit.
+        assert!(wants_body(&article("https://notreddit.com/a-story", "A snippet.")));
+        assert!(wants_body(&article("https://example.org/why-reddit.com-blocks-bots", "A snippet.")));
+    }
+
+    #[test]
+    fn only_news_with_a_url_and_no_body_yet_is_fetched() {
+        let news = article("https://example.org/a-story", "A snippet.");
+        assert!(wants_body(&news));
+        assert!(!wants_body(&RawArticle { source_type: "financial".to_string(), ..news.clone() }));
+        assert!(!wants_body(&RawArticle { url: String::new(), ..news.clone() }));
+        let grounded = "A snippet.\n\nArticle text: The whole article, from the feed.";
+        assert!(!wants_body(&RawArticle { content_snippet: grounded.to_string(), ..news }));
     }
 
     /// Content with no <p> structure but substantial text (common in
