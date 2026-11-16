@@ -436,6 +436,23 @@ class TradingFiles(unittest.TestCase):
         ]
         self.assertEqual(len(rules.trading_violations(changes)), len(changes))
 
+    def test_what_a_buy_is_decided_on_counts_as_trading(self):
+        changes = [
+            ("M", "crates/pulse-fetcher/src/pipeline/form4.rs"),
+            ("M", "crates/pulse-fetcher/src/sources/edgar.rs"),
+            ("M", "crates/pulse-fetcher/src/decisions.rs"),
+            ("M", "src-tauri/src/services/cross_signals.rs"),
+            ("M", "src-tauri/src/services/signals.rs"),
+            ("M", "src-tauri/src/services/risk.rs"),
+        ]
+        self.assertEqual(len(rules.trading_violations(changes)), len(changes))
+
+    def test_every_trading_file_named_is_there(self):
+        # A file that is moved or renamed must not drop out of the list unseen.
+        repo = Path(__file__).resolve().parents[2]
+        for glob in rules.TRADING_GLOBS:
+            self.assertTrue(list(repo.glob(glob)), glob)
+
     def test_the_rest_of_pulse_is_not_trading(self):
         changes = [
             ("M", "crates/pulse-fetcher/src/article_text.rs"),
@@ -482,6 +499,63 @@ class LogForASession(unittest.TestCase):
             self.assertNotIn(secret, out)
         self.assertIn("symbol=AAPL", out)
         self.assertIn("token=[removed]", out)
+
+    def test_a_secret_is_removed_however_its_name_or_value_is_written(self):
+        for line, secret in (
+            ("mytoken=abc", "abc"),
+            ("authtoken=abcd", "abcd"),
+            ("accessToken=tok5", "tok5"),
+            ("refresh_token: r3fr", "r3fr"),
+            ("SECRETKEY=xyz9", "xyz9"),
+            ("ACCESSTOKEN=q1w2", "q1w2"),
+            ("sessionid=s3ss", "s3ss"),
+            ("PHPSESSID=p4p5", "p4p5"),
+            ("sid=abc1", "abc1"),
+            ("X-Auth: zz11", "zz11"),
+            ("api_key%3Dabc77", "abc77"),
+            ("api_key => abc88", "abc88"),
+            ('api_key: Some("abc99")', "abc99"),
+            ('password="my pass word"', "pass word"),
+            ("db_password='p w'", "p w"),
+            ("passphrase=open sesame", "open"),
+            ("password hunter22", "hunter22"),
+            ("Authorization Bearer abc123456", "abc123456"),
+            ("Cookie: a=1; b=2", "a=1"),
+            ("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig_tail-9x here", "sig_tail"),
+            ("bot123456789:AAHfiqksKZ8WmR2zSjiQ7_v4TMAKdiHm9T0/sendMessage", "AAHfiq"),
+            ("sk-ant-api03-abcdefghijklmnop used", "abcdefghijklmnop"),
+        ):
+            self.assertNotIn(secret, rules.redact_log(line), line)
+
+    def test_what_only_looks_like_the_name_of_a_secret_keeps_its_value(self):
+        for line in (
+            "signal_score=0.30",
+            "tokens: 1532",
+            "author: Jane",
+            "monkey=3",
+            "design: new",
+            "inside: yes",
+            "client_order_id=pulse-manual-7",
+            "order 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90 filled",
+            "key_count: 3",
+            "sig_count=4",
+            "bearer_count=2",
+            "token_type=Bearer",
+            "Secretary: Yellen said",
+            "authorization failed for the feed",
+            "Basic authentication is off",
+            "token expired",
+            "the secret santa list",
+        ):
+            self.assertEqual(rules.redact_log(line), line)
+
+    def test_a_very_long_line_does_not_hold_it_up(self):
+        import time
+
+        started = time.monotonic()
+        for piece in ("secret", "key_", "a", "token=", 'password="', "eyJ", "Bearer ", "x-sig-", "key: Some("):
+            rules.redact_log(piece * 20000)
+        self.assertLess(time.monotonic() - started, 5)
 
     def test_anything_long_enough_to_be_a_key_is_removed(self):
         out = rules.redact_log("sent with 9f8e7d6c5b4a39281706f5e4d3c2b1a0 ok")

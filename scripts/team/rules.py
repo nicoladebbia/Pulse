@@ -105,6 +105,9 @@ TRADING_GLOBS = [
     "crates/pulse-fetcher/src/pipeline/trading.rs",
     "crates/pulse-fetcher/src/pipeline/signals.rs",
     "crates/pulse-fetcher/src/pipeline/live.rs",
+    "crates/pulse-fetcher/src/pipeline/form4.rs",  # which insider buys become trades
+    "crates/pulse-fetcher/src/sources/edgar.rs",
+    "crates/pulse-fetcher/src/decisions.rs",  # runs inside every buy
     "crates/pulse-fetcher/src/candidates.rs",
     "crates/pulse-fetcher/src/market_prices.rs",
     "crates/pulse-fetcher/src/entry_filters.rs",
@@ -118,6 +121,9 @@ TRADING_GLOBS = [
     "crates/pulse-snapshot/src/ledger.rs",
     "crates/pulse-snapshot/src/risk.rs",
     "src-tauri/src/services/paper_trading.rs",
+    "src-tauri/src/services/cross_signals.rs",
+    "src-tauri/src/services/signals.rs",
+    "src-tauri/src/services/risk.rs",
     "src-tauri/src/commands/trading.rs",
 ]
 
@@ -749,19 +755,42 @@ INCIDENT_KEYS = ("stop:", "manage", "auto", "silent", "briefing:")
 EVIDENCE_MAX = 6000
 LOG_LINE_MAX = 300
 ANSI_CODES = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-# A value that follows a name like these, in an address, a header or a setting.
-# The name has to stand as a word of its own (`SECRET_KEY`, `apiKey`, `sig`),
-# so that `signal=0.3`, `tokens: 1532` or `author: x` keep their values.
+# A value that follows a name like these, in an address, a header or a setting:
+# `name=value`, `name: value`, `name => value`, `name%3Dvalue`, with the value
+# in quotes (all of it, spaces too) or in Rust's `Some(…)`.
+# - Names that only ever mean a secret count wherever they stand in a word
+#   (`db_password`, `SECRETKEY`, `PHPSESSID`), and so does `token` at a word's
+#   end (`mytoken`, `accessToken`).
+# - The short ones have to stand as a word of their own (`sig`, `apiKey`,
+#   `X-Auth`), so that `signal=0.3`, `tokens: 1532`, `author: x` or `monkey=3`
+#   keep their values.
+# - A name that ends in what is counted or pointed at (`key_count`,
+#   `token_type`, `secret_name`) is no secret either.
+_SEP = r"\s*(?:=>|%3[Dd]|[=:])\s*"
+_SURE = (
+    r"secret(?!ar)|password|passwd|passphrase|credential|private[-_]?key"
+    r"|access[-_]?key|api[-_]?key|sess(?:ion)?[-_]?id"
+)
+_OWN_WORD = r"key|pwd|signature|sig|auth|authorization|bearer|session|sid"
+_COUNTED = r"count|len|length|size|total|limit|type|name|path|file|dir"
 SECRET_VALUE = re.compile(
-    r"(?i)((?:(?<![A-Za-z])|(?-i:(?<=[a-z])(?=[A-Z])))"
-    r"(?:token|api[-_]?key|apikey|key|secrets?|password|passwd|pwd|signature|sig|auth"
-    r"|authorization|bearer|credentials?|session|sid)(?![a-z])[\w-]*[\"']?\s*[=:]\s*[\"']?"
-    r"(?:(?:bearer|basic|token)\s+)?)[^\s&\"',;]+"
+    r"(?i)((?:" + _SURE + r"|token(?![a-z])"
+    r"|(?:(?<![A-Za-z])|(?-i:(?<=[a-z])(?=[A-Z])))(?:" + _OWN_WORD + r")(?![a-z]))"
+    r"(?![\w-]{0,40}(?:" + _COUNTED + r")s?[\"']?" + _SEP + r")"
+    r"[\w-]{0,40}[\"']?" + _SEP + r"(?:Some\(\s*)?(?:(?:bearer|basic|token)\s+)?)"
+    r"(?:\"[^\"]*\"?|'[^']*'?|[^\s&\"',;]+)"
 )
-# The same names with only a space before the value, as a header is sometimes printed.
+# The same with only a space before the value, as a header is sometimes
+# printed. Words stay ("authorization failed", "Basic authentication"): the
+# value has to look like a key, with a digit in it or 16 characters long.
 SECRET_WORD = re.compile(
-    r"(?i)\b((?:bearer|basic|x-api-key|authorization)[\"']?\s+)[^\s\"',;]{6,}"
+    r"(?i)\b((?:(?:proxy-)?authorization[\"']?\s+)?(?:bearer|basic)\s+"
+    r"|(?:x-api-key|authorization|password|passwd|passphrase|secret|token|api[-_]?key)"
+    r"[\"']?\s+)"
+    r"(?:(?=[^\s\"',;]*\d)[^\s\"',;]{6,}|[^\s\"',;]{16,})"
 )
+# A signed web token: three runs with dots between, the first always `eyJ…`.
+WEB_TOKEN = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}(?:\.[A-Za-z0-9_\-]*)?")
 COOKIES = re.compile(r"(?i)((?:set-)?cookie[\"']?\s*[=:]\s*).*")
 # Keys that say what they are by how they start, with the - and _ inside them.
 KNOWN_KEY = re.compile(
@@ -807,7 +836,8 @@ def redact_log(text: str, home: str = "") -> str:
     """The end of a log, made fit to show a session: no colour codes, the home
     folder as `~`, and nothing that looks like a key or a password. A session
     is never handed a secret, and a failed request can print the address it
-    called with the key in it."""
+    called with the key in it. It is a net, not a proof: a short secret after
+    a bare word ("token abc") or under a name of its own passes."""
     lines = []
     for line in ANSI_CODES.sub("", text).splitlines():
         line = "".join(c for c in line if c == "\t" or c.isprintable())
@@ -817,6 +847,7 @@ def redact_log(text: str, home: str = "") -> str:
         line = COOKIES.sub(r"\1[removed]", line)
         line = SECRET_VALUE.sub(r"\1[removed]", line)
         line = SECRET_WORD.sub(r"\1[removed]", line)
+        line = WEB_TOKEN.sub("[removed]", line)
         line = KNOWN_KEY.sub("[removed]", line)
         line = ID_AND_KEY.sub("[removed]", line)
         line = LONG_TOKEN.sub("[removed]", line)

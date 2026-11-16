@@ -849,23 +849,31 @@ def backup_database(src: Path, dst: Path) -> str:
 
     def backup(source: str, *flags: str) -> str:
         dst.unlink(missing_ok=True)
+        # By its bare name, from its folder: a `'` in the path would end the quote.
         code, _, err = sh(
-            ["sqlite3", *flags, source, f".backup '{dst}'"], timeout=900
+            ["sqlite3", *flags, source, f".backup '{dst.name}'"],
+            cwd=dst.parent,
+            timeout=900,
         )
         if code == 0 and dst.exists() and dst.stat().st_size:
             return ""
         return err.strip() or f"sqlite3 ended with code {code}"
 
     def mark() -> tuple:
-        wal = Path(f"{src}-wal")
         at = src.stat()
-        return at.st_mtime_ns, at.st_size, wal.stat().st_size if wal.exists() else 0
+        try:
+            waiting = Path(f"{src}-wal").stat().st_size
+        except FileNotFoundError:  # gone with the last one who had it open
+            waiting = 0
+        return at.st_mtime_ns, at.st_size, waiting
 
     # macOS's sqlite cannot open a database read-only while its -wal and -shm
     # files are gone, and that is how Pulse leaves it when it closes. Nothing
     # waits in a -wal then: the one file is all of it, and it is read as it is,
     # without locks. A write that lands meanwhile shows in the file's time or
-    # in a -wal: that copy is thrown away and both ways are tried once more.
+    # in a -wal: that copy (or the error it ended in) is thrown away and both
+    # ways are tried once more.
+    src, dst = src.absolute(), dst.absolute()
     err = ""
     for _ in range(2):
         err = backup(str(src), "-readonly")
@@ -876,10 +884,8 @@ def backup_database(src: Path, dst: Path) -> str:
             if before[2]:  # something waits in the -wal: the one file is not all of it
                 return err
             err = backup(f"file:{urllib.parse.quote(str(src))}?immutable=1")
-            if err:
-                return err
             if mark() == before:
-                return ""
+                return err  # '' when the copy is there
         except OSError as e:
             return f"{err}; {e}".lstrip("; ")
         err = "Pulse wrote to its database during the copy"

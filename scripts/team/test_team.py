@@ -1323,6 +1323,38 @@ class DatabaseCopy(unittest.TestCase):
         self.assertFalse(self.copy.exists())
         self.assertEqual(self.leftovers(), [])
 
+    def test_a_copy_that_broke_while_pulse_wrote_is_made_again(self):
+        once = [3]
+
+        def sh(cmd, **kw):
+            self.calls.append(cmd)
+            if "-readonly" in cmd:
+                return 1, "", "Error: unable to open database file\n"
+            if once:
+                self.write(once.pop())
+                return 1, "", "Error: database disk image is malformed\n"
+            return self.real_sh(cmd, **kw)
+
+        self.team.sh = sh
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(self.rows(self.copy), [1, 3])
+
+    def test_a_copy_that_breaks_by_itself_is_a_failure(self):
+        def sh(cmd, **kw):
+            self.calls.append(cmd)
+            return 1, "", "Error: disk I/O error\n"
+
+        self.team.sh = sh
+        self.assertEqual(self.team.copy_database(), "Error: disk I/O error")
+        self.assertEqual(len(self.calls), 2)  # nothing changed meanwhile: no second round
+        self.assertFalse(self.copy.exists())
+
+    def test_a_folder_with_a_quote_in_its_name_is_copied_into(self):
+        self.team.DB_COPY = self.copy.parent.parent / "the team's" / "pulse-copy.db"
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(self.rows(self.team.DB_COPY), [1])
+
     def test_a_write_meanwhile_is_copied_the_usual_way(self):
         held = []
         self.addCleanup(lambda: [con.close() for con in held])
