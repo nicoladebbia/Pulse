@@ -95,11 +95,18 @@ def protected_violations(changes: list[tuple[str, str]]) -> list[str]:
 
 
 # What decides how Pulse buys and sells. A change here that the team thought
-# of by itself (a fix for an incident) is Nicola's to merge.
+# of by itself (a fix for an incident) is Nicola's to merge. The list errs on
+# the wide side: the fetcher's entry point and its pipeline hold the switches
+# for trading (which mode runs, dry runs, the stop for a new position) next to
+# code that has nothing to do with it.
 TRADING_GLOBS = [
+    "crates/pulse-fetcher/src/main.rs",
+    "crates/pulse-fetcher/src/pipeline/mod.rs",
     "crates/pulse-fetcher/src/pipeline/trading.rs",
     "crates/pulse-fetcher/src/pipeline/signals.rs",
     "crates/pulse-fetcher/src/pipeline/live.rs",
+    "crates/pulse-fetcher/src/candidates.rs",
+    "crates/pulse-fetcher/src/market_prices.rs",
     "crates/pulse-fetcher/src/entry_filters.rs",
     "crates/pulse-fetcher/src/position_management.rs",
     "crates/pulse-fetcher/src/position_sizing.rs",
@@ -109,6 +116,7 @@ TRADING_GLOBS = [
     "crates/pulse-weights/*",
     "crates/pulse-alpaca/*",
     "crates/pulse-snapshot/src/ledger.rs",
+    "crates/pulse-snapshot/src/risk.rs",
     "src-tauri/src/services/paper_trading.rs",
     "src-tauri/src/commands/trading.rs",
 ]
@@ -590,10 +598,11 @@ def yield_reason(
     """Why the job that is running has to stop now and keep its work, or ''.
     `pause` stops everything. A serious problem comes before any other job.
     By day the team also steps aside for Nicola and stays inside its budget;
-    work on an incident does neither."""
+    work on an incident does neither. Kind `check` is the night's own check
+    of main, which only `pause` stops."""
     if paused:
         return "paused from Telegram"
-    if kind == "incident":
+    if kind in ("incident", "check"):
         return ""
     if incident:
         return "a serious problem came first"
@@ -697,7 +706,7 @@ def incident_jobs(
         else:
             why, new = "", new + 1
         if why:
-            dropped.append(_dropped(t, why))
+            dropped.append(_dropped(t, why, key))
             continue
         jobs.append(
             {
@@ -713,9 +722,19 @@ def incident_jobs(
     return jobs, dropped
 
 
-def _dropped(trigger: dict, why: str) -> dict:
+def incident_wanted(new: dict, queued: list[dict], state: dict, now: dt.datetime) -> bool:
+    """Would the runner take this trigger, beside what already waits in the
+    queue? The watch asks before it queues a problem and says the team is on
+    it, so that it never promises a look that the day's limits rule out."""
+    mark = "\0the new one"
+    jobs, _ = incident_jobs([*queued, {**new, "file": mark}], state, now)
+    return any(j["file"] == mark for j in jobs)
+
+
+def _dropped(trigger: dict, why: str, key: str = "") -> dict:
     return {
         "kind": "incident",
+        "key": key,  # of the job it would have been ('' when it cannot be read)
         "file": str(trigger.get("file") or ""),
         "title": " ".join(str(trigger.get("text") or "a trigger").split())[:120],
         "why": why,
@@ -730,13 +749,34 @@ INCIDENT_KEYS = ("stop:", "manage", "auto", "silent", "briefing:")
 EVIDENCE_MAX = 6000
 LOG_LINE_MAX = 300
 ANSI_CODES = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-# A value that follows a name like these, in an address or a setting.
+# A value that follows a name like these, in an address, a header or a setting.
+# The name has to stand as a word of its own (`SECRET_KEY`, `apiKey`, `sig`),
+# so that `signal=0.3`, `tokens: 1532` or `author: x` keep their values.
 SECRET_VALUE = re.compile(
-    r"(?i)((?:token|api[-_]?key|apikey|key|secret|password|passwd|signature|sig|auth"
-    r"|authorization|bearer|credential)[\w-]*[\"']?\s*[=:]\s*[\"']?(?:bearer\s+)?)[^\s&\"',;]+"
+    r"(?i)((?:(?<![A-Za-z])|(?-i:(?<=[a-z])(?=[A-Z])))"
+    r"(?:token|api[-_]?key|apikey|key|secrets?|password|passwd|pwd|signature|sig|auth"
+    r"|authorization|bearer|credentials?|session|sid)(?![a-z])[\w-]*[\"']?\s*[=:]\s*[\"']?"
+    r"(?:(?:bearer|basic|token)\s+)?)[^\s&\"',;]+"
 )
-# Anything long enough to be a key, whatever it is called.
-LONG_TOKEN = re.compile(r"(?<![A-Za-z0-9/_.-])[A-Za-z0-9_\-]{24,}(?![A-Za-z0-9/_.-])")
+# The same names with only a space before the value, as a header is sometimes printed.
+SECRET_WORD = re.compile(
+    r"(?i)\b((?:bearer|basic|x-api-key|authorization)[\"']?\s+)[^\s\"',;]{6,}"
+)
+COOKIES = re.compile(r"(?i)((?:set-)?cookie[\"']?\s*[=:]\s*).*")
+# Keys that say what they are by how they start, with the - and _ inside them.
+KNOWN_KEY = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk|pk|rk|pa|gsk|ghp|gho|ghs|github_pat|xox[abprs])[-_][A-Za-z0-9_\-]{10,}"
+)
+# A number, a colon and a long tail: how a bot's token is written into an address.
+ID_AND_KEY = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{0,6}\d{6,}:[A-Za-z0-9_\-]{20,}")
+# A run of letters and digits long enough to be a key, whatever it is called:
+# 20 or more with both letters and digits in it, or 32 or more of anything.
+# Words joined by - or _ (an order's id, a function's name, a UUID) are not one
+# run, so what a cause is found with stays readable.
+LONG_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{20,}"
+    r"|[A-Za-z0-9]{32,})(?![A-Za-z0-9])"
+)
 USERINFO = re.compile(r"(://)[^/\s:@]+:[^/\s@]+@")
 
 
@@ -774,7 +814,11 @@ def redact_log(text: str, home: str = "") -> str:
         if home:
             line = line.replace(home, "~")
         line = USERINFO.sub(r"\1[removed]@", line)
+        line = COOKIES.sub(r"\1[removed]", line)
         line = SECRET_VALUE.sub(r"\1[removed]", line)
+        line = SECRET_WORD.sub(r"\1[removed]", line)
+        line = KNOWN_KEY.sub("[removed]", line)
+        line = ID_AND_KEY.sub("[removed]", line)
         line = LONG_TOKEN.sub("[removed]", line)
         lines.append(line[:LOG_LINE_MAX])
     out = "\n".join(lines).strip()

@@ -1298,7 +1298,7 @@ class WebSession(unittest.TestCase):
         self.team.sh = self.fake_sh
         self.run_ = {"dir": self.home / "runs/now", "cost": 1.0}
 
-    def fake_sh(self, cmd, cwd=None, timeout=600, env=None, reap=False):
+    def fake_sh(self, cmd, cwd=None, timeout=600, env=None, reap=False, cancel=None):
         self.calls.append(
             {
                 "cmd": cmd,
@@ -1306,6 +1306,7 @@ class WebSession(unittest.TestCase):
                 "timeout": timeout,
                 "env": env,
                 "reap": reap,
+                "cancel": cancel,
                 "files": sorted(p.name for p in Path(cwd).iterdir()),
             }
         )

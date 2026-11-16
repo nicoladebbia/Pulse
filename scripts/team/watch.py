@@ -383,7 +383,11 @@ def look(
     queued = [
         f["text"]
         for f in found
-        if acts and f["key"] in texted and rules.incident_worthy(f) and enqueue(f, now)
+        if acts
+        and f["key"] in texted
+        and rules.incident_worthy(f)
+        and wanted(f, now)
+        and enqueue(f, now)
     ]
     if queued:
         wake_team(run)
@@ -415,6 +419,23 @@ def evidence() -> str:
         if tail:
             parts.append(f"== the end of {name} ==\n{tail}")
     return "\n\n".join(parts)
+
+
+def wanted(finding: dict, now: dt.datetime) -> bool:
+    """Would the runner take this problem now? Not while the team is paused,
+    and not past the day's limits (rules.incident_jobs, on the runner's own
+    book and on what already waits). Asked first, so that a text never says
+    the team is on something it will not look into."""
+    if chat.PAUSED.exists():
+        return False
+    waiting = []
+    for path in sorted(QUEUE.glob("*.json")) if QUEUE.is_dir() else []:
+        item = chat._load(path, {})
+        waiting.append({**(item if isinstance(item, dict) else {}), "file": path.name})
+    state = chat._load(HOME / "state.json", {})
+    return rules.incident_wanted(
+        rules.trigger(finding, "", now), waiting, state if isinstance(state, dict) else {}, now
+    )
 
 
 def enqueue(finding: dict, now: dt.datetime) -> bool:

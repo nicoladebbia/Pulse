@@ -214,6 +214,7 @@ class Incidents(unittest.TestCase):
             dropped[0],
             {
                 "kind": "incident",
+                "key": "",  # it never became a job
                 "file": "a.json",
                 "title": "a trigger",
                 "why": "it could not be read",
@@ -423,10 +424,23 @@ class TradingFiles(unittest.TestCase):
             "changes how Pulse trades: crates/pulse-fetcher/src/position_management.rs",
         )
 
+    def test_where_the_switches_for_trading_are_counts_as_trading(self):
+        # The fetcher's entry point and its pipeline choose which trading runs
+        # and whether it is a dry run, next to code that has nothing to do with it.
+        changes = [
+            ("M", "crates/pulse-fetcher/src/main.rs"),
+            ("M", "crates/pulse-fetcher/src/pipeline/mod.rs"),
+            ("M", "crates/pulse-fetcher/src/candidates.rs"),
+            ("M", "crates/pulse-fetcher/src/market_prices.rs"),
+            ("M", "crates/pulse-snapshot/src/risk.rs"),
+        ]
+        self.assertEqual(len(rules.trading_violations(changes)), len(changes))
+
     def test_the_rest_of_pulse_is_not_trading(self):
         changes = [
             ("M", "crates/pulse-fetcher/src/article_text.rs"),
-            ("M", "crates/pulse-fetcher/src/pipeline/mod.rs"),
+            ("M", "crates/pulse-fetcher/src/pipeline/notify.rs"),
+            ("M", "crates/pulse-fetcher/src/sources/reddit.rs"),
             ("M", "src/routes/signals/+page.svelte"),
             ("M", "crates/pulse-snapshot/src/explain.rs"),
             ("A", "docs/trading/notes.md"),
@@ -1121,6 +1135,158 @@ class TheQueue(unittest.TestCase):
         lines = said.getvalue().splitlines()
         self.assertEqual(lines[:2], ["Off: the watch only texts."] * 2)
         self.assertTrue(lines[2].startswith("On"))
+
+
+class TheRunLoop(unittest.TestCase):
+    """team.work from the list of jobs to the report, against a temporary
+    home. GitHub and the jobs themselves are played by the test."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name).resolve()
+        self.home, self.sessions = root / "team", root / "sessions"
+        self.home.mkdir()
+        team = self.team = team_at(self, self.home, self.sessions)
+        team.fence_problem = lambda: ""
+        team.git = lambda *a, **k: (0, "sha")
+        team.gh_json = lambda *a: (
+            {"owner": {"login": OWNER}, "nameWithOwner": f"{OWNER}/Pulse"}
+            if a[0] == "repo"
+            else []
+        )
+        team.copy_database = lambda: ""
+        team.weekly_market = lambda run, state, report: None
+        self.ran, self.play = [], []
+        team.run_job = self.run_job
+        self.state = {"main_ok_sha": "sha"}
+        self.report = {"jobs": [], "skipped": [], "notes": [], "repo": ""}
+        self.run = {
+            "dir": root,
+            "cost": 0.0,
+            "abort": "",
+            "scheduled": True,
+            "shift": "night",
+            "state": self.state,
+            "main_step": "",
+            "main_tail": "",
+        }
+        self.args = type("Args", (), {"only": "", "max_jobs": 3, "no_merge": True})()
+        team.IDEAS.write_text("# Pulse ideas\n\n- [ ] fix: the clock\n- [ ] dark mode\n")
+
+    def run_job(self, job, run):
+        """Each job ends as the next entry of `play` says: a result, or a
+        function of the job that gives one. Without an entry it is merged."""
+        self.ran.append(job["key"].split("-")[0])
+        step = self.play.pop(0) if self.play else "merged"
+        res = step(job) if callable(step) else step
+        if isinstance(res, str):
+            res = {"result": res}
+        return {
+            "kind": job["kind"],
+            "key": job["key"],
+            "title": job["title"],
+            "pr": 7 if res["result"] == "merged" else None,
+            "reasons": [],
+            "minutes": 3,
+            **res,
+        }
+
+    def work(self):
+        self.team.work(self.args, self.run, self.state, self.report, dt.datetime.now())
+        return [(j["kind"], j["result"]) for j in self.report["jobs"]]
+
+    def test_the_night_does_its_jobs_in_order(self):
+        self.assertEqual(self.work(), [("idea", "merged"), ("idea", "merged")])
+        self.assertEqual(self.report["notes"], [])
+
+    def test_pause_ends_the_run_and_the_note_counts_what_ended(self):
+        def paused(job):
+            chat.PAUSED.write_text("now\n")
+            return "yielded"
+
+        self.play = [paused]
+        self.assertEqual(self.work(), [("idea", "yielded")])
+        self.assertEqual(
+            self.report["notes"],
+            ["paused from Telegram after 0 of 2 jobs; the rest wait"],
+        )
+        self.assertEqual(self.ran, ["idea"])  # nothing was started after the pause
+        self.assertIn("- [ ] fix: the clock", self.team.IDEAS.read_text())
+
+    def test_a_job_that_stepped_aside_for_a_serious_problem_goes_on_in_the_same_run(self):
+        def a_problem_comes_in(job):
+            self.trigger = queue_problem(self.team)
+            return "yielded"
+
+        self.play = [
+            a_problem_comes_in,
+            {"result": "blocked", "reasons": ["the broker was down"], "minutes": 4},
+            {"result": "merged", "minutes": 5},
+        ]
+        self.assertEqual(
+            self.work(),
+            [("incident", "blocked"), ("idea", "merged"), ("idea", "merged")],
+        )
+        self.assertEqual(self.ran, ["idea", "incident", "idea", "idea"])
+        # one line for the job that went on, with all its time
+        self.assertEqual([j["minutes"] for j in self.report["jobs"]], [4, 8, 3])
+        self.assertFalse(self.trigger.exists())  # the problem was looked into: it is gone
+        self.assertEqual(rules.incidents_today(self.state, dt.date.today()), ["manage"])
+        self.assertEqual(self.state["held"], {})
+
+    def test_a_job_that_keeps_stepping_aside_is_left_for_the_next_turn(self):
+        self.play = ["yielded"] * 3
+        self.assertEqual(self.work(), [("idea", "yielded"), ("idea", "merged")])
+        self.assertEqual(self.ran, ["idea"] * 4)  # three starts for the first, no more
+        self.assertEqual(self.report["jobs"][0]["minutes"], 9)
+        key = self.report["jobs"][0]["key"]
+        self.assertIsNotNone(rules.waiting(self.state, key, dt.datetime.now()))
+
+    def test_by_day_only_the_small_fix_and_not_while_nicola_works(self):
+        self.run["shift"] = "day"
+        self.assertEqual(self.work(), [("idea", "merged")])
+        self.assertIn("- [ ] dark mode", self.team.IDEAS.read_text())
+        self.team.IDEAS.write_text("# Pulse ideas\n\n- [ ] fix: the date\n")
+        self.report["jobs"], self.ran = [], []
+        nicola_works(self.sessions)
+        self.assertEqual(self.work(), [])
+        self.assertEqual(self.ran, [])
+        self.assertEqual(
+            self.report["notes"][-1],
+            "stopped after 0 of 1 jobs (Nicola started using Claude on this Mac); "
+            "the rest wait",
+        )
+
+    def test_by_day_nothing_is_built_on_a_main_nobody_checked(self):
+        self.run["shift"] = "day"
+        self.state["main_ok_sha"] = "an older one"
+        self.assertEqual(self.work(), [])
+        self.assertNotIn("main", self.report)  # and the day says nothing about main
+
+    def test_a_turn_for_a_serious_problem_does_that_alone(self):
+        self.run["shift"] = "incident"
+        queue_problem(self.team)
+        self.assertEqual(self.work(), [("incident", "merged")])
+
+    def test_a_serious_problem_is_not_held_back_by_the_nights_time_or_job_limit(self):
+        queue_problem(self.team)
+        self.team.BUDGET_MIN = -1
+        self.args.max_jobs = 1
+        self.assertEqual(self.work(), [("incident", "merged")])
+        self.assertEqual(
+            self.report["notes"],
+            [
+                "1 more wait for the next run: dark mode",
+                "ran out of time after 1 of 2 jobs; the rest wait for tomorrow",
+            ],
+        )
+
+    def test_a_run_for_one_named_job_takes_nothing_from_the_queue(self):
+        trigger = queue_problem(self.team)
+        self.args.only = "idea"
+        self.assertEqual(self.work(), [("idea", "merged"), ("idea", "merged")])
+        self.assertTrue(trigger.exists())
 
 
 if __name__ == "__main__":

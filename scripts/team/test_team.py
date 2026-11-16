@@ -4,6 +4,8 @@ import datetime as dt
 import importlib
 import json
 import os
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1190,6 +1192,186 @@ class Runner(unittest.TestCase):
         code, out, _ = self.team.sh(["bash", "-c", "printf 'ok \\xff\\n'"])
         self.assertEqual(code, 0)
         self.assertTrue(out.startswith("ok"))
+
+
+@unittest.skipUnless(shutil.which("sqlite3"), "needs the sqlite3 command")
+class DatabaseCopy(unittest.TestCase):
+    """The copy of the live database that sessions read, against real files."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        saved = os.environ.get("PULSE_TEAM_HOME")
+        os.environ["PULSE_TEAM_HOME"] = str(root / "home")
+        self.team = importlib.reload(importlib.import_module("team"))
+        if saved is None:
+            os.environ.pop("PULSE_TEAM_HOME", None)
+        else:
+            os.environ["PULSE_TEAM_HOME"] = saved
+        # A space in the path, as in "Application Support".
+        self.live = root / "the app" / "pulse.db"
+        self.live.parent.mkdir()
+        self.team.LIVE_DB = self.live
+        self.copy = self.team.DB_COPY
+        self.real_sh, self.calls = self.team.sh, []
+        self.team.log = lambda _msg: None
+        self.write(1)
+
+    def write(self, n, closed=True):
+        """Put row `n` in the live database, the way Pulse does (with a -wal).
+        `closed`: as Pulse leaves it when it closes, with the -wal folded in
+        and gone."""
+        was = self.live.stat().st_mtime_ns if self.live.exists() else 0
+        con = sqlite3.connect(self.live)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA wal_autocheckpoint=0")
+        con.execute("CREATE TABLE IF NOT EXISTS t(x)")
+        con.execute("INSERT INTO t VALUES (?)", (n,))
+        con.commit()
+        if closed:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            con.close()
+            for suffix in ("-wal", "-shm"):
+                Path(f"{self.live}{suffix}").unlink(missing_ok=True)
+            if self.live.stat().st_mtime_ns <= was:
+                # Two writes within one tick of a coarse file-system clock.
+                os.utime(self.live, ns=(was + 10**7, was + 10**7))
+        return con
+
+    def rows(self, path):
+        con = sqlite3.connect(path)
+        try:
+            return [x for (x,) in con.execute("SELECT x FROM t ORDER BY x")]
+        finally:
+            con.close()
+
+    def no_read_only(self, during=None):
+        """macOS's sqlite on a closed database: opening it read-only fails.
+        `during` runs in the middle of the other way of copying."""
+
+        def sh(cmd, **kw):
+            self.calls.append(cmd)
+            if "-readonly" in cmd:
+                return 1, "", "Error: unable to open database file\n"
+            if during:
+                during()
+            return self.real_sh(cmd, **kw)
+
+        self.team.sh = sh
+
+    def leftovers(self):
+        return sorted(
+            x.name for x in self.copy.parent.iterdir() if x.name != self.copy.name
+        )
+
+    def test_the_live_database_is_copied(self):
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(self.rows(self.copy), [1])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_database_that_pulse_has_closed_is_copied_too(self):
+        self.no_read_only()
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(self.rows(self.copy), [1])
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("immutable=1", self.calls[1][1])
+        self.assertIn("the%20app", self.calls[1][1])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_the_live_database_is_never_written_to(self):
+        before = self.live.read_bytes(), self.live.stat().st_mtime_ns
+        self.no_read_only()
+        self.team.copy_database()
+        self.assertEqual((self.live.read_bytes(), self.live.stat().st_mtime_ns), before)
+        self.assertEqual([x.name for x in self.live.parent.iterdir()], ["pulse.db"])
+
+    def test_what_waits_in_a_wal_is_never_left_out(self):
+        con = self.write(2, closed=False)  # row 2 is only in the -wal
+        self.addCleanup(con.close)
+        self.no_read_only()
+        self.assertIn("unable to open", self.team.copy_database())
+        self.assertEqual(len(self.calls), 1)  # the one file alone was not read
+        self.assertFalse(self.copy.exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_copy_that_pulse_wrote_into_is_thrown_away(self):
+        self.team.copy_database()
+        held = []
+        self.addCleanup(lambda: [con.close() for con in held])
+        self.no_read_only(during=lambda: held.append(self.write(2, closed=False)))
+        self.assertIn("unable to open", self.team.copy_database())
+        # read-only, the other way, and read-only once more now that Pulse is open
+        self.assertEqual(["-readonly" in c for c in self.calls], [True, False, True])
+        self.assertEqual(self.rows(self.copy), [1])  # the earlier copy stays
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_write_that_came_and_went_meanwhile_is_in_the_copy(self):
+        once = [3]
+        self.no_read_only(during=lambda: once and self.write(once.pop()))
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(["-readonly" in c for c in self.calls], [True, False] * 2)
+        self.assertEqual(self.rows(self.copy), [1, 3])
+
+    def test_a_database_that_never_stops_changing_is_given_up(self):
+        n = iter(range(2, 99))
+        self.no_read_only(during=lambda: self.write(next(n)))
+        self.assertEqual(
+            self.team.copy_database(), "Pulse wrote to its database during the copy"
+        )
+        self.assertEqual(len(self.calls), 4)
+        self.assertFalse(self.copy.exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_write_meanwhile_is_copied_the_usual_way(self):
+        held = []
+        self.addCleanup(lambda: [con.close() for con in held])
+        first = []
+
+        def sh(cmd, **kw):
+            self.calls.append(cmd)
+            if "-readonly" in cmd and not first:
+                first.append(cmd)
+                return 1, "", "Error: unable to open database file\n"
+            if "-readonly" not in cmd:
+                held.append(self.write(2, closed=False))
+            return self.real_sh(cmd, **kw)
+
+        self.team.sh = sh
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.rows(self.copy), [1, 2])
+
+    def test_no_live_database_is_no_failure(self):
+        self.live.unlink()
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertFalse(self.copy.exists())
+
+    def test_a_failed_copy_is_in_the_report_with_the_age_of_the_one_read(self):
+        report = {"notes": []}
+        self.team.fresh_database(report)
+        self.assertEqual(report["notes"], [])
+        old = dt.datetime(2026, 11, 15, 2, 30).timestamp()
+        os.utime(self.copy, (old, old))
+        self.team.sh = lambda cmd, **kw: (1, "", "Error: disk I/O error")
+        self.team.fresh_database(report)
+        self.team.fresh_database(report)  # said once
+        self.assertEqual(
+            report["notes"],
+            [
+                "Pulse's database could not be copied, so sessions read the copy "
+                "of Sun 15 Nov, 02:30"
+            ],
+        )
+
+    def test_a_failed_copy_with_none_before_it_is_said_too(self):
+        report = {"notes": []}
+        self.team.sh = lambda cmd, **kw: (1, "", "")
+        self.team.fresh_database(report)
+        self.assertEqual(
+            report["notes"],
+            ["Pulse's database could not be copied, so sessions had none to read"],
+        )
 
 
 def g(*args, cwd):

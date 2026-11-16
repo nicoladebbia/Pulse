@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -154,7 +155,9 @@ SAFE_ENV = {
     "CLAUDE_TEAM_NIGHT": "1",  # ~/.claude/hooks/notify.sh stays quiet
 }
 USAGE_LIMIT = re.compile(r"usage limit|hit your limit|limit reached|rate.?limit", re.I)
-STOPPED = 125  # sh(): the command was stopped because the job has to step aside
+# sh(): the command was stopped because the job has to step aside. Not a code
+# a program can end with (those are 0 to 255), so it is never taken for one.
+STOPPED = 1000
 POLL_S = 5  # how often a running command asks whether it has to
 ACTIVE_EVERY_S = 60  # how often the session logs are read for that
 
@@ -635,6 +638,8 @@ def session_outcome(
     error = str(res.get("result") or err or raw or "no output")[-400:].strip()
     if code == 124:
         error = f"timed out after {minutes} min"
+    if code == STOPPED:
+        error = "stopped midway: the team was paused"
     if res.get("is_error") and USAGE_LIMIT.search(error):
         run["abort"] = "Claude's usage limit was reached"
     return {"ok": False, "data": {}, "error": error}
@@ -692,7 +697,12 @@ def web_session(prompt: str, schema: dict, minutes: int, name: str, run: dict) -
         shutil.copy(HERE / "guard.py", cwd / "guard.py")
         run["dir"].mkdir(parents=True, exist_ok=True)
         code, out, err = sh(
-            fenced(cmd, None), cwd=cwd, timeout=minutes * 60, env=night_env(), reap=True
+            fenced(cmd, None),
+            cwd=cwd,
+            timeout=minutes * 60,
+            env=night_env(),
+            reap=True,
+            cancel=pause_asked,  # no job of the queue, so only `pause` stops it
         )
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
@@ -816,20 +826,82 @@ def reset_job_db() -> None:
             shutil.copy2(DB_COPY, DB_JOB)
 
 
-def copy_database() -> None:
-    """A consistent copy of the live database for sessions to run against."""
+def copy_database() -> str:
+    """A consistent copy of the live database for sessions to run against.
+    Gives '' when it is there (or there is no live database), else what went
+    wrong: the copy of an earlier run then stays as it was."""
     if not LIVE_DB.exists():
-        return
+        return ""
     DB_COPY.parent.mkdir(parents=True, exist_ok=True)
     tmp = DB_COPY.with_suffix(".tmp")
-    tmp.unlink(missing_ok=True)
-    code, _, err = sh(
-        ["sqlite3", "-readonly", str(LIVE_DB), f".backup '{tmp}'"], timeout=900
-    )
-    if code == 0 and tmp.exists():
-        tmp.replace(DB_COPY)
-    else:
+    err = backup_database(LIVE_DB, tmp)
+    if err:
+        tmp.unlink(missing_ok=True)
         log(f"database copy failed: {err[-200:]}")
+        return err
+    tmp.replace(DB_COPY)
+    return ""
+
+
+def backup_database(src: Path, dst: Path) -> str:
+    """sqlite's own backup of `src` into `dst`, never writing to `src`: '' or
+    what went wrong."""
+
+    def backup(source: str, *flags: str) -> str:
+        dst.unlink(missing_ok=True)
+        code, _, err = sh(
+            ["sqlite3", *flags, source, f".backup '{dst}'"], timeout=900
+        )
+        if code == 0 and dst.exists() and dst.stat().st_size:
+            return ""
+        return err.strip() or f"sqlite3 ended with code {code}"
+
+    def mark() -> tuple:
+        wal = Path(f"{src}-wal")
+        at = src.stat()
+        return at.st_mtime_ns, at.st_size, wal.stat().st_size if wal.exists() else 0
+
+    # macOS's sqlite cannot open a database read-only while its -wal and -shm
+    # files are gone, and that is how Pulse leaves it when it closes. Nothing
+    # waits in a -wal then: the one file is all of it, and it is read as it is,
+    # without locks. A write that lands meanwhile shows in the file's time or
+    # in a -wal: that copy is thrown away and both ways are tried once more.
+    err = ""
+    for _ in range(2):
+        err = backup(str(src), "-readonly")
+        if not err:
+            return ""
+        try:
+            before = mark()
+            if before[2]:  # something waits in the -wal: the one file is not all of it
+                return err
+            err = backup(f"file:{urllib.parse.quote(str(src))}?immutable=1")
+            if err:
+                return err
+            if mark() == before:
+                return ""
+        except OSError as e:
+            return f"{err}; {e}".lstrip("; ")
+        err = "Pulse wrote to its database during the copy"
+    return err
+
+
+def fresh_database(report: dict) -> None:
+    """Copy the live database for the sessions. When that fails they read the
+    copy of an earlier run, or none, and the report says so."""
+    log("copying the database for sessions")
+    if not copy_database():
+        return
+    if DB_COPY.exists():
+        made = dt.datetime.fromtimestamp(DB_COPY.stat().st_mtime)
+        note = (
+            "Pulse's database could not be copied, so sessions read the copy of "
+            f"{made:%a} {made.day} {made:%b}, {made:%H:%M}"
+        )
+    else:
+        note = "Pulse's database could not be copied, so sessions had none to read"
+    if note not in report["notes"]:
+        report["notes"].append(note)
 
 
 def wait_ci(pr: int, sha: str, cancel=None) -> str:
@@ -1102,14 +1174,17 @@ def land(
         res["reasons"] += violations
         keep_work(job, res, wt, branch, base, title, body, built, violations)
         return ""
-    if job["kind"] == "incident":
+    if job["kind"] == "incident" or branch.startswith(rules.INCIDENT_PREFIX):
+        # Looked at on the commit that would merge, on every run: a later fix
+        # round on the pull request can add what its first version did not have.
         trading = gate_violations(wt, base, sha, trading=True)
         if trading:
             res["result"] = "needs_user"
-            res["reasons"] += [
-                *trading,
-                "the checks pass and the reviewer has no objection, so merging it is your call",
-            ]
+            res["reasons"] += trading
+            if job["kind"] == "incident":
+                res["reasons"].append(
+                    "the checks pass and the reviewer has no objection, so merging it is your call"
+                )
             keep_work(job, res, wt, branch, base, title, body, built)
             return ""
     now = fetch_base()
@@ -1248,27 +1323,32 @@ def do_job(job: dict, res: dict, run: dict) -> None:
             problems, short = MERGE_MAIN, f"it conflicts with the latest {BASE}"
         else:
             sha = head(wt)
-            ok, step, tail = run_checks(wt, run, f"{name}-{passes}")
-            # The checks run the change's own code. Whatever that did to the
-            # checkout is dropped: what is reviewed and merged is the commit
-            # that was checked.
-            git("reset", "--hard", sha, cwd=wt)
-            git("clean", "-fd", cwd=wt)
+            try:
+                ok, step, tail = run_checks(wt, run, f"{name}-{passes}")
+            finally:
+                # The checks run the change's own code. Whatever that did to
+                # the checkout is dropped, also when they were stopped midway:
+                # what is reviewed, merged or kept is the commit that was checked.
+                git("reset", "--hard", sha, cwd=wt)
+                git("clean", "-fd", cwd=wt)
             if not ok:
                 problems = f'The check "{step}" fails. The end of its output:\n\n```\n{tail}\n```'
                 short = f'the check "{step}" fails'
             else:
-                r = session(
-                    REVIEW.format(request=request, base=BASE),
-                    wt,
-                    REVIEW_SCHEMA,
-                    REVIEWER_MIN,
-                    f"{name}-review{passes}",
-                    run,
-                )
-                # A reviewer must not change what it reviewed.
-                git("reset", "--hard", sha, cwd=wt)
-                git("clean", "-fd", cwd=wt)
+                try:
+                    r = session(
+                        REVIEW.format(request=request, base=BASE),
+                        wt,
+                        REVIEW_SCHEMA,
+                        REVIEWER_MIN,
+                        f"{name}-review{passes}",
+                        run,
+                    )
+                finally:
+                    # A reviewer must not change what it reviewed, stopped
+                    # midway or not.
+                    git("reset", "--hard", sha, cwd=wt)
+                    git("clean", "-fd", cwd=wt)
                 if not r["ok"]:
                     res["result"] = "error"
                     res["reasons"].append(f"the review session failed: {r['error']}")
@@ -1348,17 +1428,33 @@ def do_job(job: dict, res: dict, run: dict) -> None:
 DONE = ("merged", "ready")  # results after which GitHub has everything
 
 
-def snapshot(wt: Path) -> None:
-    """Commit what a stopped session left uncommitted, so the job's branch
+def snapshot(wt: Path) -> str:
+    """Commit what a stopped builder left uncommitted, so the job's branch
     holds all of its work. Local only: nothing is pushed from here, and the
-    gate looks at the whole change again before anything is."""
+    gate looks at the whole change again before anything is. Returns '' or why
+    it could not be kept."""
     if git("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=wt)[0] == 0:
         git("merge", "--abort", cwd=wt)  # a merge stopped halfway is done again
-    if not git("status", "--porcelain", cwd=wt)[1]:
-        return
-    git("add", "-A", cwd=wt)
-    # No hooks: the runner never runs a program the change itself could name.
-    git("-c", "core.hooksPath=/dev/null", "commit", "--no-verify", "-q", "-m", SNAPSHOT, cwd=wt)
+    out = ""
+    for attempt in (1, 2):
+        code, out = git("status", "--porcelain", cwd=wt)
+        if code == 0 and not out:
+            return ""
+        if code == 0:
+            code, out = git("add", "-A", cwd=wt)
+        if code == 0:
+            # No hooks: the runner never runs a program the change could name.
+            code, out = git(
+                "-c", "core.hooksPath=/dev/null", "commit", "--no-verify", "-q", "-m", SNAPSHOT, cwd=wt
+            )
+        if code == 0:
+            return ""
+        # The session's own git was stopped with everything else and can have
+        # left its lock behind. Nothing else works in this worktree.
+        lock = git("rev-parse", "--git-path", "index.lock", cwd=wt)
+        if attempt == 1 and lock[0] == 0 and lock[1]:
+            (wt / lock[1]).unlink(missing_ok=True)
+    return out[-200:] or "git could not commit it"
 
 
 def run_job(job: dict, run: dict) -> dict:
@@ -1385,9 +1481,16 @@ def run_job(job: dict, run: dict) -> dict:
         res["reasons"].append(f"runner error: {e}")
     try:
         wt, built = res.pop("wt", None), res.pop("built", False)
-        if wt and res["result"] == "yielded" and job["kind"] != "pr":
-            snapshot(Path(wt))  # also what the stopped session had not committed
-        if wt and built and job["kind"] == "pr" and res["result"] not in DONE:
+        aside = res["result"] == "yielded"
+        if wt and aside:
+            # Also what the stopped session had not committed. (What the checks
+            # or a reviewer did to the checkout is gone by now: see do_job.)
+            lost = snapshot(Path(wt))
+            if lost:
+                res["reasons"].append(
+                    f"what the stopped session had not committed could not be kept: {lost}"
+                )
+        if wt and (built or aside) and job["kind"] == "pr" and res["result"] not in DONE:
             # Fix commits for someone's PR sit on no branch at all. Whatever
             # way the job ended (a runner error included), they are kept
             # before the worktree goes.
@@ -1604,6 +1707,8 @@ def locked_run(args, started: dt.datetime, scheduled: bool) -> int:
         # A turn by day or for an incident that had no job leaves no report.
         for note in report["notes"]:
             log(f"note: {note}")
+        for s in report["skipped"]:
+            log(f"left alone: {s.get('title', '')} — {s.get('why', '')}")
         save_json(HOME / "state.json", state)
         with contextlib.suppress(OSError):
             run["dir"].rmdir()  # only when nothing was kept in it
@@ -1636,7 +1741,14 @@ def incidents(state: dict, report: dict | None = None) -> list[dict]:
     jobs, dropped = rules.incident_jobs(triggers(), state, dt.datetime.now())
     for d in dropped if report is not None else []:
         drop_trigger(d["file"])
-        report["skipped"].append({"kind": "incident", "title": d["title"], "why": d["why"]})
+        why = d["why"]
+        if d.get("key"):
+            # A job for it that stepped aside will not go on any more.
+            kept = rules.held_branch(state, d["key"], dt.datetime.now())
+            rules.release(state, d["key"])
+            if kept:
+                why += f"; its unfinished work stays on this Mac as branch {kept}"
+        report["skipped"].append({"kind": "incident", "title": d["title"], "why": why})
     return jobs
 
 
@@ -1748,9 +1860,16 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
     if not main_ok and shift == "night":
         log(f"checking {BASE} ({main_sha[:7]})")
         wt = make_worktree(f"origin/{BASE}", None)
+        run["job"], run["yielded"] = CHECKING_MAIN, ""
         try:
             main_ok, run["main_step"], run["main_tail"] = run_checks(wt, run, "main")
+        except Yielded as y:
+            # Nothing was done yet: a resume before morning starts the night again.
+            report["notes"].append(f"stopped while checking {BASE}: {y}")
+            run["nothing_done"] = True
+            return
         finally:
+            run["job"] = None
             git("worktree", "remove", "--force", str(wt))
         if main_ok:
             state["main_ok_sha"] = main_sha
@@ -1792,8 +1911,7 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
             + "; ".join(j["title"][:70] for j in later[:5])
         )
     if jobs:
-        log("copying the database for sessions")
-        copy_database()
+        fresh_database(report)
     queue, done, again = collections.deque(jobs), 0, {}
     while True:
         if run["abort"]:
@@ -1805,7 +1923,7 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
         for job in reversed(waiting):
             if all(job["key"] != q["key"] for q in queue):
                 if not DB_COPY.exists() or not jobs:
-                    copy_database()
+                    fresh_database(report)
                 queue.appendleft(job)
         if not queue:
             break
@@ -1850,6 +1968,14 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
         finally:
             run["job"] = None
         done += 1
+        for earlier in [
+            j
+            for j in report["jobs"]
+            if j.get("key") == job["key"] and j.get("result") == "yielded"
+        ]:
+            # It went on in this run: one line for the job, with all its time.
+            report["jobs"].remove(earlier)
+            res["minutes"] = res.get("minutes", 0) + earlier.get("minutes", 0)
         report["jobs"].append(res)
         try:
             after_job(job, res, state)
@@ -1862,11 +1988,21 @@ def work(args, run: dict, state: dict, report: dict, started: dt.datetime) -> No
             # It goes on in this same run once what it stepped aside for is
             # over. (When that is not over, the look above ends the run.)
             queue.appendleft(job)
+            done -= 1  # not over yet: `done` counts the jobs that ended
 
 
 def paused() -> bool:
     """Nicola sent `pause`: nothing new starts and nothing merges until `resume`."""
     return chat.PAUSED.exists()
+
+
+def pause_asked() -> str:
+    """For work that is no job of the queue (sh's `cancel`): only `pause` stops it."""
+    return "paused from Telegram" if paused() else ""
+
+
+# While the night checks main, this stands in for the job that is running.
+CHECKING_MAIN = {"kind": "check", "key": "main-check", "title": f"checking {BASE}"}
 
 
 def from_chat(state: dict, report: dict) -> None:
@@ -2151,11 +2287,14 @@ def finish(report: dict, run: dict, state: dict, started: dt.datetime) -> int:
         for p in load_json(chat.PROPOSALS, [])
         if isinstance(p, dict) and p.get("state") in (*rules.OPEN_STATES, "queued")
     ]
-    (HOME / "latest.txt").write_text(page.as_text(report))
+    # After a turn by day or for a serious problem, what the last night left
+    # for Nicola still waits: it is carried along.
+    night = page.last_night(history)
+    (HOME / "latest.txt").write_text(page.as_text(report, night))
     html = HOME / "page/index.html"
     html.parent.mkdir(parents=True, exist_ok=True)
     html.write_text(page.render(history, load_json(MARKET, {})))
-    log(page.as_text(report))
+    log(page.as_text(report, night))
     url = PAGE_URL.read_text().strip() if PAGE_URL.exists() else ""
     if url:
         log(
@@ -2435,9 +2574,11 @@ def cmd_status(_args) -> int:
     print(watch.as_text(load_json(HOME / "watch.json", {})))
     if paused():
         print("Paused from Telegram: nothing runs until resume.")
-    held = load_state().get("held")
-    if isinstance(held, dict) and held:
-        print(f"Stepped aside midway, waiting to go on: {', '.join(sorted(held))}")
+    state, now = load_state(), dt.datetime.now()
+    held = state.get("held") if isinstance(state.get("held"), dict) else {}
+    held = sorted(k for k in held if rules.waiting(state, k, now))
+    if held:
+        print(f"Stepped aside midway, waiting to go on: {', '.join(held)}")
     waiting = len(triggers())
     if waiting:
         print(f"Serious problems in the queue: {waiting}")

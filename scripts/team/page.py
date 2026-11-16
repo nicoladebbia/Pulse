@@ -99,8 +99,19 @@ def _job(job: dict, repo: str) -> str:
     return f'<div class="entry">{"".join(parts)}</div>'
 
 
-def needs_you(report: dict) -> list[str]:
-    """Plain lines for everything waiting on Nicola."""
+def last_night(history: list[dict]) -> dict | None:
+    """The newest night's report, when the newest report of all is a turn by
+    day or for a serious problem. Such a turn looks at no pull request and
+    does not check main, so what that night left for Nicola still waits."""
+    if not history or history[0].get("shift") not in SHIFTS:
+        return None
+    return next((r for r in history[1:] if r.get("shift") not in SHIFTS), None)
+
+
+def _left(report: dict, handled: frozenset = frozenset()) -> list[str]:
+    """What a run's own work left for Nicola: a red main, jobs that stopped,
+    pull requests it left alone. `handled` are the pull requests a later turn
+    worked on, which says where they stand itself."""
     out = []
     main = report.get("main") or {}
     if (
@@ -113,7 +124,7 @@ def needs_you(report: dict) -> list[str]:
             f"main is failing its checks ({main.get('failed_step') or 'unknown step'}) and the team could not fix it."
         )
     for j in report.get("jobs", []):
-        if j.get("result") in ("needs_user", "blocked"):
+        if j.get("result") in ("needs_user", "blocked") and j.get("pr") not in handled:
             where = f"PR #{j['pr']}: " if j.get("pr") else ""
             out.append(
                 f"{where}{j.get('title', '')} — {(j.get('reasons') or ['stopped'])[0]}"
@@ -123,8 +134,19 @@ def needs_you(report: dict) -> list[str]:
             "waiting for you" in s.get("why", "")
             or "no change" in s.get("why", "")
             or "nights in a row" in s.get("why", "")
-        ):
+        ) and s.get("pr") not in handled:
             out.append(f"{_pr(s)}{s.get('title', '')} — {s['why']}")
+    return out
+
+
+def needs_you(report: dict, night: dict | None = None) -> list[str]:
+    """Plain lines for everything waiting on Nicola. `night` is the last
+    night's report when `report` is a later turn (`last_night`): what the
+    night left is carried along."""
+    out = _left(report)
+    if night:
+        handled = frozenset(j["pr"] for j in report.get("jobs", []) if j.get("pr"))
+        out += [w for w in _left(night, handled) if w not in out]
     for i in report.get("ideas", []):
         if i.get("state") == "waiting":
             out.append(f"Idea: {i['text']}")
@@ -182,7 +204,7 @@ def incident_lines(job: dict) -> list[str]:
     return [f"Problem: {str(job.get('title', ''))[:300]}", said]
 
 
-def as_text(report: dict) -> str:
+def as_text(report: dict, night: dict | None = None) -> str:
     lines = [
         f"{_team(report, 'night ')} — {_when(report.get('started', ''))} ({report.get('minutes', 0)} min)"
     ]
@@ -194,7 +216,7 @@ def as_text(report: dict) -> str:
     if not report.get("jobs"):
         lines.append("  Nothing to work on.")
     lines += [f"  note: {n}" for n in report.get("notes", [])]
-    waiting = needs_you(report)
+    waiting = needs_you(report, night)
     if waiting:
         lines.append("Needs you:")
         lines += [f"  - {w}" for w in waiting]
@@ -307,8 +329,9 @@ def market_section(market) -> str:
 
 def render(history: list[dict], market: dict | None = None) -> str:
     report = history[0] if history else {}
+    night = last_night(history)
     repo = report.get("repo", "")
-    main = report.get("main") or {}
+    main = report.get("main") or (night or {}).get("main") or {}
     main_pill = (
         '<span class="pill good">main passes its checks</span>'
         if main.get("ok")
@@ -316,7 +339,7 @@ def render(history: list[dict], market: dict | None = None) -> str:
         if main
         else ""
     )
-    waiting = needs_you(report)
+    waiting = needs_you(report, night)
     jobs = report.get("jobs", [])
     sections = []
 
@@ -336,6 +359,13 @@ def render(history: list[dict], market: dict | None = None) -> str:
     sections.append(
         f'<section id="last-night"><h2>{what}</h2>{body}{notes}</section>'
     )
+    if night:
+        # Under a turn by day or for a serious problem: the night before it.
+        body = "".join(_job(j, night.get("repo", "") or repo) for j in night.get("jobs", []))
+        notes = "".join(f'<p class="sub">{e(n)}</p>' for n in night.get("notes", []))
+        sections.append(
+            f'<section id="the-night"><h2>Last night</h2>{body or "<p>Nothing to work on.</p>"}{notes}</section>'
+        )
 
     skipped = [s for s in report.get("skipped", [])]
     if skipped:
