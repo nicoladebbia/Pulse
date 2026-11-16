@@ -18,41 +18,54 @@ pub(crate) async fn run_targeted_form4(db_path: &Path) -> anyhow::Result<usize> 
     let conn = rusqlite::Connection::open(db_path)?;
     crate::db::run_migrations(&conn)?;
     drop(conn);
-    fetch_targeted_form4(db_path, TARGETED_FORM4_LIMIT, None).await
+    fetch_targeted_form4(db_path, WIDE_FORM4_LIMIT, None, true).await
 }
 
-/// Companies checked per daily run. The live run passes a larger number: it
-/// runs every few minutes, so the extra calls spread thin against SEC's limit.
-pub(crate) const TARGETED_FORM4_LIMIT: usize = 150;
+/// The daily run also checks companies with no recent cross-signal, so an
+/// insider buy at a name nothing else has flagged yet is still seen. Names
+/// with a recent signal come first, so a cap would drop the quietest ones.
+pub(crate) const WIDE_FORM4_LIMIT: usize = 3000;
+
+/// The (CIK, ticker) pairs to check, strongest recent signal first. `wide`
+/// adds ticker-mapped companies with no cross-signal in the last 30 days
+/// after all the signalled ones; without it only signalled companies count.
+fn form4_targets(
+    conn: &rusqlite::Connection,
+    limit: usize,
+    share: Option<(usize, usize)>,
+    wide: bool,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT et.cik, et.ticker
+         FROM entity_tickers et
+         LEFT JOIN cross_signals cs ON cs.entity_id = et.entity_id
+             AND cs.computed_at >= date('now', '-30 days')
+         WHERE et.cik IS NOT NULL AND et.cik != ''{}
+         GROUP BY et.cik
+         ORDER BY MAX(cs.compound_score) DESC
+         LIMIT ?1",
+        if wide { "" } else { " AND cs.entity_id IS NOT NULL" }
+    ))?;
+    Ok(stmt
+        .query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .enumerate()
+        .filter(|(i, _)| share.is_none_or(|(k, n)| i % n == k))
+        .map(|(_, c)| c)
+        .collect())
+}
 
 /// `share = Some((k, n))` checks only every n-th company, starting at k, so
 /// back-to-back live runs split the list instead of re-asking SEC about all
 /// of it every few minutes.
-pub(crate) async fn fetch_targeted_form4(db_path: &Path, limit: usize, share: Option<(usize, usize)>) -> anyhow::Result<usize> {
+pub(crate) async fn fetch_targeted_form4(db_path: &Path, limit: usize, share: Option<(usize, usize)>, wide: bool) -> anyhow::Result<usize> {
     let conn = rusqlite::Connection::open(db_path)?;
 
     // Target CIKs: ticker-mapped entities that have appeared in cross_signals
     // recently (the companies that actually feed the watchlist), strongest
     // first so the cap drops the weakest names, not an arbitrary subset.
     // ~1 SEC request per company plus the throttle below.
-    let ciks: Vec<(String, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT et.cik, et.ticker
-             FROM entity_tickers et
-             JOIN cross_signals cs ON cs.entity_id = et.entity_id
-             WHERE et.cik IS NOT NULL AND et.cik != ''
-               AND cs.computed_at >= date('now', '-30 days')
-             GROUP BY et.cik
-             ORDER BY MAX(cs.compound_score) DESC
-             LIMIT ?1"
-        )?;
-        stmt.query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .enumerate()
-            .filter(|(i, _)| share.is_none_or(|(k, n)| i % n == k))
-            .map(|(_, c)| c)
-            .collect()
-    };
+    let ciks = form4_targets(&conn, limit, share, wide)?;
 
     if ciks.is_empty() {
         return Ok(0);
@@ -493,4 +506,52 @@ pub(crate) async fn classify_ambiguous_8ks(db_path: &Path) -> anyhow::Result<usi
     }
 
     Ok(classified)
+}
+
+#[cfg(test)]
+mod targets_tests {
+    use super::form4_targets;
+
+    fn conn() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE entity_tickers (entity_id INTEGER, ticker TEXT, cik TEXT);
+             CREATE TABLE cross_signals (entity_id INTEGER, compound_score REAL, computed_at TEXT);
+             INSERT INTO entity_tickers VALUES (1,'HOT','111'),(2,'WARM','222'),(3,'QUIET','333'),(4,'NOCIK',''),(5,'NULLCIK',NULL);
+             INSERT INTO cross_signals VALUES (1,0.9,date('now')),(2,0.4,date('now')),(2,0.2,date('now','-1 day'));
+             -- a signal older than 30 days does not count as recent
+             INSERT INTO cross_signals VALUES (3,0.8,date('now','-60 day'));",
+        )
+        .unwrap();
+        c
+    }
+
+    fn tickers(v: Vec<(String, String)>) -> Vec<String> {
+        v.into_iter().map(|(_, t)| t).collect()
+    }
+
+    #[test]
+    fn narrow_checks_only_recently_signalled_companies() {
+        let got = tickers(form4_targets(&conn(), 100, None, false).unwrap());
+        assert_eq!(got, ["HOT", "WARM"]);
+    }
+
+    #[test]
+    fn wide_adds_quiet_companies_after_the_signalled_ones() {
+        let got = tickers(form4_targets(&conn(), 100, None, true).unwrap());
+        assert_eq!(got, ["HOT", "WARM", "QUIET"]);
+    }
+
+    #[test]
+    fn the_limit_drops_the_quietest_first() {
+        let got = tickers(form4_targets(&conn(), 2, None, true).unwrap());
+        assert_eq!(got, ["HOT", "WARM"]);
+    }
+
+    #[test]
+    fn share_splits_the_list_between_runs() {
+        let a = tickers(form4_targets(&conn(), 100, Some((0, 2)), true).unwrap());
+        let b = tickers(form4_targets(&conn(), 100, Some((1, 2)), true).unwrap());
+        assert_eq!((a, b), (vec!["HOT".to_string(), "QUIET".to_string()], vec!["WARM".to_string()]));
+    }
 }

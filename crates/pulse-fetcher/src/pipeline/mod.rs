@@ -70,7 +70,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // companies blind on insider, the largest-weighted signal). Runs before enrichment
     // so today's new filings get their transaction details filled in the same run.
     tracing::info!("Phase 0a: Fetching targeted Form 4 filings for tracked companies...");
-    match fetch_targeted_form4(db_path, form4::TARGETED_FORM4_LIMIT, None).await {
+    match fetch_targeted_form4(db_path, form4::WIDE_FORM4_LIMIT, None, true).await {
         Ok(count) => {
             if count > 0 {
                 tracing::info!("Targeted Form 4: inserted {} new insider filings", count);
@@ -945,7 +945,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                     prev - emb_pct, prev, emb_pct
                 ));
             }
-        if !analysis_degraded {
+        // PULSE_LLM=local runs analyze on Ollama on purpose, so there is no Haiku
+        // row to expect and no fallback to report.
+        if !analysis_degraded && !pulse_llm::is_local() {
             // analyze succeeded — but on which provider? No anthropic row today
             // means the Haiku path silently fell back to Groq 70B.
             let anthropic_analyze_today: i64 = conn.query_row(
