@@ -25,11 +25,16 @@ Exit 2 blocks the tool call and shows the reason to the session.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
 import shlex
+import socket
 import sys
+import threading
+import unicodedata
+import urllib.parse
 
 # A command word can follow the start, white space, a shell separator, a quote
 # (bash -c "git push") or a slash (/usr/bin/git push).
@@ -154,6 +159,52 @@ READ_TOOLS = {"Read", "Grep", "Glob"}
 # All a session that only reads the web may call: the search, the page fetch
 # and the call that hands back its answer.
 WEB_TOOLS = {"WebSearch", "WebFetch", "StructuredOutput"}
+# The two of them that send something to a site: the words of a search and the
+# address of a page.
+SENDING_TOOLS = {"WebSearch", "WebFetch"}
+# The runner lists here, one to a line, what names the owner of this Mac: the
+# local part of the account's e-mail address, the user name, the full name.
+# Every session knows them (the CLI tells it the address, every path holds the
+# user name), and a web page may ask for them.
+PRIVATE_ENV = "PULSE_TEAM_PRIVATE"
+PRIVATE_MIN = 6  # a shorter word would refuse ordinary searches
+
+
+def plain(text) -> str:
+    """Letters and digits only, lower case, with percent signs decoded: the
+    form in which `J.Doe@x`, `j%2Edoe%40x` and `J Doe at x` are all `jdoex`."""
+    text = str(text)
+    for _ in range(3):  # an address can be encoded more than once
+        text = urllib.parse.unquote(text)
+    text = unicodedata.normalize("NFKD", text).lower()
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+def private_words(listed: str) -> list[str]:
+    words = {plain(line) for line in listed.splitlines()}
+    return sorted(w for w in words if len(w) >= PRIVATE_MIN)
+
+
+def sending_block_reason(
+    args: dict, private: str | None, web_only: bool
+) -> str | None:
+    """A search or a page fetch may not carry the owner's name or address:
+    in capitals or small letters, with other signs between the letters,
+    percent-encoded or backwards. It is a net, not a proof: a name in a code
+    of its own (base64, say) or in look-alike letters of another alphabet
+    passes."""
+    if private is None:
+        # Only a session that reads nothing but the web must have the list.
+        return "the runner did not say what is private" if web_only else None
+    words = private_words(private)
+    if web_only and not words:
+        # An empty list would switch the check off without a word.
+        return "the runner did not say what is private"
+    said = plain(json.dumps(args, ensure_ascii=False))
+    for word in words:
+        if word in said or word[::-1] in said:
+            return "a search or a page address may not name the owner of this Mac"
+    return None
 
 
 def _without_comment(segment: str) -> str:
@@ -394,8 +445,120 @@ def write_block_reason(path: str, cwd: str, worktree: str = "") -> str | None:
     return f"write only inside your worktree ({root}) or a temp folder"
 
 
+# Endings a network keeps for itself, or that lead nowhere on the public web.
+OWN_ENDINGS = {
+    "arpa",
+    "corp",
+    "home",
+    "internal",
+    "intranet",
+    "invalid",
+    "lan",
+    "local",
+    "localdomain",
+    "localhost",
+    "onion",
+    "private",
+    "test",
+}
+LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+LOOKUP_S = 5  # well inside the hook's own time limit
+
+
+def ascii_host(host: str) -> str:
+    """A host in the plain spelling it is looked up by (`münchen.de` is
+    `xn--mnchen-3ya.de`), or '' when it has none."""
+    try:
+        return host.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        return ""
+
+
+def public_host(host: str) -> bool:
+    """Whether a host can only be a site on the public web, by its spelling:
+    two or more parts of plain letters, digits and hyphens, the last one a
+    word. That leaves out a bare machine name, a number in any spelling
+    (`127.1`, `0x7f.1`, `1.2.3.4.`) and the names networks keep for
+    themselves (`printer.local`, `db.internal`)."""
+    host = host.lower()
+    host = host[:-1] if host.endswith(".") else host
+    labels = host.split(".")
+    if len(host) > 253 or len(labels) < 2:
+        return False
+    if not all(LABEL.fullmatch(label) for label in labels):
+        return False
+    last = labels[-1]
+    return (last.isalpha() or last.startswith("xn--")) and last not in OWN_ENDINGS
+
+
+def _addresses(host: str) -> list[str] | None:
+    """Where a name leads, or None when that could not be found out in time."""
+    found: list = []
+
+    def look() -> None:
+        try:
+            found.append([item[4][0] for item in socket.getaddrinfo(host, None)])
+        except (OSError, UnicodeError):
+            found.append(None)
+
+    thread = threading.Thread(target=look, daemon=True)
+    thread.start()
+    thread.join(LOOKUP_S)
+    return found[0] if found else None
+
+
+# IPv6 ranges that only wrap an IPv4 address: the address inside is what counts.
+_WRAPS_V4 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::/96"))
+
+
+def _public_address(address) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(address).split("%")[0])
+    except ValueError:
+        return False
+    if ip.version == 6:
+        inner = ip.ipv4_mapped
+        if inner is None and any(ip in net for net in _WRAPS_V4):
+            inner = ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
+        if inner is not None:
+            return inner.is_global
+    return ip.is_global
+
+
+def fetch_block_reason(url: str, lookup=None) -> str | None:
+    """A session that only reads the web fetches pages of the public web and
+    nothing nearer: not this Mac, not its network. A page it read can ask it
+    for an address, so the address is judged by its spelling and by where its
+    name leads (a public-looking name can point at this Mac)."""
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        host = parts.hostname or ""
+        parts.port  # noqa: B018 - reading it is what checks it
+    except ValueError:
+        return "that is not a web address"
+    if parts.scheme.lower() not in ("http", "https") or "@" in parts.netloc:
+        return "a page fetch takes a plain http(s) address"
+    host = ascii_host(host)
+    if not public_host(host):
+        return (
+            "a page fetch is for a site on the public web, "
+            "not for a machine or a network of its own"
+        )
+    addresses = (lookup or _addresses)(host)
+    if not addresses:
+        return "that site's name could not be looked up"
+    if not all(_public_address(address) for address in addresses):
+        return "that site's name leads into a private network"
+    return None
+
+
 def decide(
-    event: dict, repo: str, worktree: str = "", web_only: bool = False
+    event: dict,
+    repo: str,
+    worktree: str = "",
+    web_only: bool = False,
+    private: str | None = None,
+    lookup=None,
 ) -> str | None:
     tool = event.get("tool_name") or ""
     args = event.get("tool_input") or {}
@@ -404,6 +567,11 @@ def decide(
         # The session is started without any other tool. This is the second
         # lock on the same door, should one ever be there after all.
         return f"{tool or 'this tool'} is not for a session that only reads the web"
+    if tool in SENDING_TOOLS:
+        reason = sending_block_reason(args, private, web_only)
+        if reason or not web_only or tool != "WebFetch":
+            return reason
+        return fetch_block_reason(str(args.get("url") or ""), lookup)
     if tool.startswith("mcp__"):
         return "connectors (mail, calendar, drive and the rest) are not for unattended sessions"
     if tool in BLOCKED_TOOLS:
@@ -428,7 +596,19 @@ def main() -> int:
     # The runner passes both paths on the command line, so a session's shell
     # never has a variable that points at the main checkout.
     args = sys.argv[1:] + ["", "", ""]
-    reason = decide(event, args[0], args[1], web_only=args[2] == "web")
+    try:
+        reason = decide(
+            event,
+            args[0],
+            args[1],
+            web_only=args[2] == "web",
+            private=os.environ.get(PRIVATE_ENV),
+        )
+    except Exception as error:  # noqa: BLE001 - whatever it is, the answer is no
+        # Any exit but 2 lets the call through, so a guard that broke on an
+        # input it did not expect must still say no.
+        print(f"night-team guard: could not judge this call ({type(error).__name__})", file=sys.stderr)
+        return 2
     if reason:
         print(f"Blocked by the night-team guard: {reason}.", file=sys.stderr)
         return 2

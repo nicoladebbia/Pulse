@@ -21,13 +21,13 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
-import ipaddress
 import json
 import sys
 import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import guard  # noqa: E402
 import rules  # noqa: E402
 
 KINDS = ("investor research", "signals and trackers", "auto-trading", "AI news")
@@ -40,6 +40,7 @@ PROPOSALS_MAX = 3  # ideas queued for a yes from one look
 FORGET_WEEKS = 26  # an unseen product leaves the map; a finding may be told again
 TRIES_PER_WEEK = 2  # nights a failing scout is tried before the week is given up
 URL_MAX = 300
+SUGGESTION_MAX = 150  # with IDEA_MARK it still fits a proposal's title
 CHECK = "market"  # the name of this scout in the shared memory of findings
 
 SCHEMA = {
@@ -98,7 +99,7 @@ Stop when the map is covered or after about 40 page fetches, whichever comes fir
 - Public pages only. Sign up nowhere, log in nowhere, buy nothing, submit no form. Search for product names and topics and nothing else; send no site anything about Pulse or its owner.
 - Every product and every finding carries the address of a page you actually opened for it (`url`, `where`). A price you did not see on the product's own page ends with "(third-party)". What you could not see is left out and named in `not_checked`. Never guess a price.
 - Plain words, for a reader who is not a developer. One line per field: `offer` and `price` under 120 characters, `title` under 100, `suggestion` under 200, `evidence` under 300.
-- `changed` says what is different from the map's entry, and stays empty when nothing is.
+- `changed` says what is different from the map's entry, and stays empty when nothing is. On the map, `price_seen` is the day a price was last read on a page and `seen` the day the product was last checked: a price read long before is the first to read again.
 - Do not repeat a finding from the "already told" list unless something new happened to it.
 
 ## The map as it stands
@@ -109,7 +110,7 @@ Stop when the map is covered or after about 40 page fetches, whichever comes fir
 
 {told}
 
-Return `summary` (two or three sentences on the week), `products` (every product you checked, the unchanged ones too), `findings` and `not_checked`."""
+Return `summary` (two or three sentences on the week), `products` (every product you checked, the unchanged ones too), `findings` and `not_checked`. Hand the answer in once, whole, when the work is done: never a trial or an empty one first, because the first answer is the one that is used."""
 
 
 # ------------------------------------------------------------------ cleaning --
@@ -127,8 +128,9 @@ def one_line(value, limit: int) -> str:
 
 def web_address(value) -> str:
     """A link to a public web page as it was given, or '' for anything else:
-    another scheme, a name and password in it, a bare machine name or number,
-    a space or a control character, or more than URL_MAX characters."""
+    another scheme, a name and password in it, a host that is not a site on
+    the public web by its spelling (`guard.public_host`), a space or a control
+    character, or more than URL_MAX characters."""
     text = value.strip() if isinstance(value, str) else ""
     if not text or len(text) > URL_MAX:
         return ""
@@ -142,17 +144,8 @@ def web_address(value) -> str:
         return ""
     if parts.scheme not in ("http", "https") or "@" in parts.netloc:
         return ""
-    if "." not in host.strip(".") or _is_number(host):
-        return ""
-    return text
-
-
-def _is_number(host: str) -> bool:
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return True
+    # The same rule the guard holds a page fetch to.
+    return text if guard.public_host(guard.ascii_host(host)) else ""
 
 
 def _dicts(value) -> list[dict]:
@@ -189,7 +182,7 @@ def clean(data) -> dict:
         evidence = one_line(f.get("evidence"), 400)
         if not title or not where or not evidence:
             continue
-        suggestion = one_line(f.get("suggestion"), 200)
+        suggestion = one_line(f.get("suggestion"), SUGGESTION_MAX)
         findings.append(
             {
                 # An idea with nothing to build is a note, and so is any kind
@@ -236,6 +229,8 @@ def _entry(p: dict) -> dict | None:
         "changed": "",  # a change belongs to the look that saw it
         "first": _day(p.get("first")),
         "seen": _day(p.get("seen")),
+        # The day the price was read. Older maps have none: the day it was seen.
+        "price_seen": _day(p.get("price_seen")) or _day(p.get("seen")),
     }
 
 
@@ -248,10 +243,12 @@ def _day(value) -> str:
 
 def merge(old, new: list[dict], today: dt.date) -> list[dict]:
     """The map with this look's products folded in. A product seen again takes
-    its new fields (an empty one keeps what the map had) and today's date; one
-    that was not seen stays as it was, until nobody has seen it for
-    FORGET_WEEKS. At most MAP_MAX products, the longest unseen leave first.
-    Sorted by kind, then name."""
+    its new fields and today's date; a field the look left empty keeps what the
+    map had, and a price kept that way keeps the day it was read
+    (`price_seen`), so an old price is never shown as today's. A product that
+    was not seen stays as it was, until nobody has seen it for FORGET_WEEKS.
+    At most MAP_MAX products, the longest unseen leave first. Sorted by kind,
+    then name."""
     day = today.isoformat()
     by_name = {}
     for p in _dicts(old):
@@ -270,6 +267,10 @@ def merge(old, new: list[dict], today: dt.date) -> list[dict]:
         entry["changed"] = p.get("changed", "") if was else ""
         entry["first"] = was.get("first") or day
         entry["seen"] = day
+        if p.get("price"):
+            entry["price_seen"] = day
+        else:
+            entry["price_seen"] = was.get("price_seen", "") if entry["price"] else ""
         by_name[p["name"].casefold()] = entry
     limit = (today - dt.timedelta(weeks=FORGET_WEEKS)).isoformat()
     kept = [p for p in by_name.values() if p["seen"] >= limit]
@@ -346,19 +347,26 @@ def told(memory, today: dt.date, limit: int = 30) -> list[str]:
 def prompt(market_map, already_told: list[str]) -> str:
     """The scout's brief. The map goes in as data lines, one product each."""
     entries = [e for e in (_entry(p) for p in _dicts(market_map)) if e]
-    lines = [
-        json.dumps(
-            {k: p[k] for k in ("name", "kind", "offer", "price", "url", "seen")},
-            ensure_ascii=False,
-        )
-        for p in entries
-    ]
+    keys = ("name", "kind", "offer", "price", "price_seen", "url", "seen")
+    lines = [json.dumps({k: p[k] for k in keys}, ensure_ascii=False) for p in entries]
     return PROMPT.format(
         kinds=", ".join(KINDS),
         findings=FINDINGS_MAX,
         map="\n".join(lines) or "(empty: this is the first look)",
         told="\n".join(f"- {title}" for title in already_told) or "(nothing yet)",
     )
+
+
+IDEA_MARK = " (an idea from the web, by the market scout)"
+
+
+def idea_line(suggestion: str) -> str:
+    """The line that joins the idea list if Nicola says yes, and that a builder
+    then reads as its job. It says where it came from, and it carries no quote
+    that could end the quote it is given in and no dash the list reads as the
+    end of an idea."""
+    line = suggestion.replace('"', "'").replace("—", "-").replace("–", "-")
+    return " ".join(line.split()) + IDEA_MARK
 
 
 def proposal(f: dict) -> tuple[str, str, str]:
@@ -370,7 +378,7 @@ def proposal(f: dict) -> tuple[str, str, str]:
         "From the weekly market scout, which only reads the web. "
         "Nothing is built unless you say yes."
     )
-    return f["suggestion"], text, finding_key(f)
+    return idea_line(f["suggestion"]), text, finding_key(f)
 
 
 def week_text(result: dict, new: list[dict], queued: int) -> str:
@@ -418,7 +426,12 @@ def as_text(market) -> str:
         lines = [kind.capitalize() if kind != "AI news" else kind]
         for p in rows:
             price = p["price"] or "price not seen"
-            stale = "" if p["seen"] == made else f" (last seen {_date(p['seen'])})"
+            if p["seen"] != made:
+                stale = f" (last seen {_date(p['seen'])})"
+            elif p["price"] and p["price_seen"] not in ("", made):
+                stale = f" (price read {_date(p['price_seen'])})"
+            else:
+                stale = ""
             lines.append(f"• {p['name']}: {price}{stale}")
             if p["offer"]:
                 lines.append(f"  {p['offer']}")

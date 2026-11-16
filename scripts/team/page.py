@@ -226,16 +226,17 @@ def market_section(market) -> str:
         if not isinstance(p, dict):
             continue
         url = str(p.get("url") or "")
-        if not url.startswith(("https://", "http://")):
+        if not url.lower().startswith(("https://", "http://")):
             continue
         if p.get("kind") != kind:
             kind = p.get("kind")
             rows += f'<tr><th colspan="3">{e(str(kind or "other"))}</th></tr>'
-        stale = (
-            ""
-            if p.get("seen") == market.get("made")
-            else f' <span class="sub">(last seen {e(_day(p.get("seen")))})</span>'
-        )
+        if p.get("seen") != market.get("made"):
+            stale = f' <span class="sub">(last seen {e(_day(p.get("seen")))})</span>'
+        elif p.get("price") and p.get("price_seen") not in (None, "", p.get("seen")):
+            stale = f' <span class="sub">(price read {e(_day(p.get("price_seen")))})</span>'
+        else:
+            stale = ""
         changed = (
             f'<br><span class="sub">Changed: {e(str(p["changed"]))}</span>'
             if p.get("changed")
