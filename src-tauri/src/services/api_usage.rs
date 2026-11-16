@@ -20,7 +20,7 @@ pub const FINANCIAL_RATE_LIMITS: &[(&str, i64, i64, i64, &str)] = &[
     // News / content APIs
     ("google_news",        -1,   -1,   -1,     "Google News RSS"),
     ("hacker_news",        -1,   -1,   -1,     "Hacker News (Algolia)"),
-    ("reddit",             -1,  600,   -1,     "Reddit (600/hr)"),
+    ("reddit",             -1,   60,   -1,     "Reddit feeds (1/min)"),
     ("arxiv",              -1,   -1,   -1,     "ArXiv"),
     ("biorxiv",            -1,   -1,   -1,     "bioRxiv"),
     ("rss_feeds",          -1,   -1,   -1,     "RSS Feeds"),
