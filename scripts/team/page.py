@@ -15,6 +15,12 @@ LABELS = {
     "blocked": ("Stopped", "bad"),
     "error": ("Failed, will retry", "bad"),
     "no_change": ("Nothing to do", "quiet"),
+    "yielded": ("Stepped aside, goes on later", "quiet"),
+}
+# The team's turns that are not the night's: (in a heading, after "Pulse team").
+SHIFTS = {
+    "day": ("Today, by day", ", by day"),
+    "incident": ("A serious problem", ", on a serious problem"),
 }
 
 CSS = """
@@ -147,9 +153,38 @@ def needs_you(report: dict) -> list[str]:
     return out
 
 
+def _team(report: dict, night: str = "") -> str:
+    """Who reports: the night team, or the team by day or on an incident."""
+    shift = SHIFTS.get(report.get("shift"))
+    return f"Pulse team{shift[1]}" if shift else f"Pulse {night}team"
+
+
+def incident_lines(job: dict) -> list[str]:
+    """What became of a serious problem the team looked into, in plain words."""
+    pr = f" (PR #{job['pr']})" if job.get("pr") else ""
+    why = str((job.get("reasons") or ["no reason was given"])[0])[:600]
+    result = job.get("result")
+    if result == "merged":
+        said = (
+            f"Cause found and fixed{pr}. The fix is on main; your installed app gets it "
+            "with the next release."
+        )
+    elif result == "ready":
+        said = f"A fix is ready to merge{pr}."
+    elif result in ("needs_user", "blocked") and pr:
+        said = f"A fix waits for you{pr}: {why}"
+    elif result in ("needs_user", "blocked"):
+        said = f"Not fixed by the team: {why}"
+    elif result == "yielded":
+        said = f"The work on it stopped midway and goes on at the next turn ({why})."
+    else:
+        said = f"The look into it failed: {why}"
+    return [f"Problem: {str(job.get('title', ''))[:300]}", said]
+
+
 def as_text(report: dict) -> str:
     lines = [
-        f"Pulse night team — {_when(report.get('started', ''))} ({report.get('minutes', 0)} min)"
+        f"{_team(report, 'night ')} — {_when(report.get('started', ''))} ({report.get('minutes', 0)} min)"
     ]
     for j in report.get("jobs", []):
         label = LABELS.get(j.get("result"), (j.get("result"), ""))[0]
@@ -169,8 +204,12 @@ def as_text(report: dict) -> str:
 def chat_digest(report: dict, url: str = "") -> str:
     """The night in a few lines, for Telegram. Each job that stopped for Nicola
     gets its own message with buttons, so here it is only counted."""
-    jobs = report.get("jobs", [])
-    lines = [f"Pulse team — {_when(report.get('started', ''))}"]
+    every = report.get("jobs", [])
+    lines = [f"{_team(report)} — {_when(report.get('started', ''))}"]
+    for j in every:
+        if j.get("kind") == "incident":
+            lines += incident_lines(j)
+    jobs = [j for j in every if j.get("kind") != "incident"]
     for result, word in (("merged", "Merged"), ("ready", "Ready to merge")):
         done = [j for j in jobs if j.get("result") == result]
         if done:
@@ -185,14 +224,17 @@ def chat_digest(report: dict, url: str = "") -> str:
     retry = sum(1 for j in jobs if j.get("result") == "error")
     if retry:
         lines.append(f"Failed and will be tried again: {retry}")
-    if not jobs:
+    aside = sum(1 for j in jobs if j.get("result") == "yielded")
+    if aside:
+        lines.append(f"Stepped aside midway, goes on later: {aside}")
+    if not every:
         lines.append("Nothing to work on.")
     lines += [f"Note: {n}" for n in (report.get("notes") or [])[:4]]
     main = report.get("main") or {}
     if (
         main
         and not main.get("ok")
-        and not any(j.get("result") == "merged" for j in jobs)
+        and not any(j.get("result") == "merged" for j in every)
     ):
         lines.append(
             f"main is failing its checks ({main.get('failed_step') or 'unknown step'}) and the team could not fix it."
@@ -285,13 +327,14 @@ def render(history: list[dict], market: dict | None = None) -> str:
         )
     else:
         sections.append(
-            '<section id="needs-you"><h2>Needs you</h2><p>Nothing. Everything from last night is handled.</p></section>'
+            '<section id="needs-you"><h2>Needs you</h2><p>Nothing. Everything from the last run is handled.</p></section>'
         )
 
     body = "".join(_job(j, repo) for j in jobs) or "<p>Nothing to work on.</p>"
     notes = "".join(f'<p class="sub">{e(n)}</p>' for n in report.get("notes", []))
+    what = SHIFTS.get(report.get("shift"), ("Last night",))[0]
     sections.append(
-        f'<section id="last-night"><h2>Last night</h2>{body}{notes}</section>'
+        f'<section id="last-night"><h2>{what}</h2>{body}{notes}</section>'
     )
 
     skipped = [s for s in report.get("skipped", [])]
@@ -330,12 +373,13 @@ def render(history: list[dict], market: dict | None = None) -> str:
             stuck = sum(
                 1 for j in js if j.get("result") in ("needs_user", "blocked", "error")
             )
+            turn = SHIFTS.get(r.get("shift"), ("", ""))[1]
             rows += (
-                f"<tr><td>{_when(r.get('started', ''))}</td><td>{merged}</td><td>{stuck}</td>"
+                f"<tr><td>{_when(r.get('started', ''))}{turn}</td><td>{merged}</td><td>{stuck}</td>"
                 f"<td>{r.get('minutes', 0)} min</td><td>${r.get('cost', 0):.2f}</td></tr>"
             )
         sections.append(
-            '<section id="earlier"><h2>Earlier nights</h2><div class="scroll"><table><thead><tr><th>Night</th>'
+            '<section id="earlier"><h2>Earlier runs</h2><div class="scroll"><table><thead><tr><th>Run</th>'
             f"<th>Merged</th><th>Stuck</th><th>Took</th><th>Usage</th></tr></thead><tbody>{rows}</tbody></table></div>"
             '<p class="sub">Usage is what the sessions would cost at API prices; on your plan it counts against your limits instead.</p></section>'
         )

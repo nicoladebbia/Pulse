@@ -6,6 +6,8 @@ Every night `team.py run` works through Pulse without anyone watching:
 2. Otherwise finish the open pull requests, oldest first.
 3. Then build ideas from the top of `~/.pulse-team/IDEAS.md`.
 
+By day it does light work only, and at any hour it looks into a serious problem the watch saw: see "By day, serious problems and the stop button" below.
+
 Each job is done by a **builder** session, checked by `checks.sh` (the same checks as CI), then judged by a separate **reviewer** session that did not write the code. The runner, not a session, decides whether to merge. It writes one page a night (`~/.pulse-team/page/index.html`, also published as a private artifact) that starts with what needs you.
 
 ## The merge gate (in `team.py` and `rules.py`)
@@ -40,7 +42,7 @@ Every PR is looked at again right before its job, because the night's list can b
 `team.py chat pair` ties one bot to one chat: the token from BotFather is typed once (hidden), then the phone sends the bot a one-time code. The token lives in `~/.pulse-team/secrets/telegram.json` (owner-only) and is read by `chat.py` alone; sessions are fenced off from that folder. A listener (launchd `com.pulse.team.chat`, started by `install` and by `chat pair` from the installed copy, always on) waits on Telegram.
 
 - **Out.** After a scheduled night: the report in a few lines, and one question with buttons for every job that stopped for Nicola (`Try again` / `Leave it`). Ideas the team wants to propose (`team.py chat propose`) go out with `Build it` / `Not now` / `No`, at most 3 a week; `Not now` comes back after 14 days and a text nobody answered closes after 7. Ordinary texts go between 08:00 and 22:00 on this Mac's clock and wait in `outbox/` otherwise; a serious one (`chat.send(serious=True)`) goes at any hour, and shows as a notification on the Mac when Telegram cannot be reached. A morning with no night report says so once.
-- **In.** Only the paired account, in its private chat, is answered. `idea: …` joins the idea list (through `inbox/`; the runner is the only writer of the list and takes it in at its next run), `status` sends the last report, `pause` stops new jobs and merges (the file `paused`; a paused night is not spent, so `resume` before 06:00 still starts it), `resume` lifts it. A reply to one of the team's questions is kept as a note the builder gets with that job. The first press on a button stands; a trading change is asked twice.
+- **In.** Only the paired account, in its private chat, is answered. `idea: …` joins the idea list (through `inbox/`; the runner is the only writer of the list and takes it in at its next run), `status` sends the last report, `pause` is the stop button: the job that is running stops within seconds and keeps its work, and nothing starts or merges (the file `paused`; a paused night is not spent, so `resume` before 06:00 still starts it), `resume` lifts it and what was stopped goes on at the next hourly turn. A reply to one of the team's questions is kept as a note the builder gets with that job. The first press on a button stands; a trading change is asked twice.
 - Nothing typed in Telegram runs as a command, and a chat that is down never fails a night.
 
 ## The trading scoreboard
@@ -67,7 +69,7 @@ A look that fails is tried once more the next night and then waits for the next 
 
 ## The watch
 
-Every ten minutes `watch.py` (launchd `com.pulse.team.watch`, installed by `team.py install`) looks at the installed Pulse and texts Nicola when something is wrong. It only reads: the hourly log, the progress file, the schedule stamps, launchd's list, and one read-only query on the database for held positions with no stop (when Pulse does not have the database open the file is read as it is, so no `-wal` or `-shm` file is left in Pulse's folder). It asks the broker's clock through the installed fetcher (`--mode market-open`, no lock, nothing written), so a holiday or an early close is simply "closed". It starts no session and changes nothing in Pulse; for now it only tells.
+Every ten minutes `watch.py` (launchd `com.pulse.team.watch`, installed by `team.py install`) looks at the installed Pulse and texts Nicola when something is wrong. It only reads: the hourly log, the progress file, the schedule stamps, launchd's list, and one read-only query on the database for held positions with no stop (when Pulse does not have the database open the file is read as it is, so no `-wal` or `-shm` file is left in Pulse's folder). It asks the broker's clock through the installed fetcher (`--mode market-open`, no lock, nothing written), so a holiday or an early close is simply "closed". It starts no session and changes nothing in Pulse. In its first week it only tells; after that a serious problem is also left for the team to look into (next section).
 
 | What it sees | Texted |
 | --- | --- |
@@ -87,6 +89,25 @@ One text per problem: a serious one is repeated once a day while it lasts, anyth
 No false alarms by design: a fact that cannot be read is no finding; time the Mac slept is not counted (the watch only counts time between its own looks); a dry-run install (`EXIT_DRY_RUN`) is named once and is not an emergency. Known limits: the stop check reads Pulse's books, not the broker's order list, so a stop cancelled at the broker behind Pulse's back is not seen; the fetcher's error log has no times, so a panic is reported when it is written, not dated.
 
 `team.py watch --dry` looks now and only prints. The rules are `watch_findings`, `watch_alerts` and `watch_over` in `rules.py`; the watch's notebook is `~/.pulse-team/watch.json`, its log `~/.pulse-team/watch.log`.
+
+## By day, serious problems and the stop button
+
+launchd wakes the runner every hour at :30. `rules.shift_due` says what that hour is for:
+
+- **The night** (02:30, as above): everything, heavy work included.
+- **A serious problem** waits in the queue: a turn for that and nothing else, at any hour, whoever is at the Mac.
+- **By day** (09:00 to 21:00): light work only, and only when some waits. Light work is an open idea whose line starts with `fix:`, and bringing in what Nicola sent through Telegram. Pull requests, a red `main`, features, the weekly boards and the market scout stay night work; when `main` changed since a night last checked it, the small fixes wait for the night too. A day has 120 minutes for the team in all (`PULSE_TEAM_DAY_MIN`), and an hour with nothing to do leaves no report and no text.
+- **Nothing**, when the team is paused.
+
+By day the team steps aside for Nicola. He counts as working when one of his own Claude sessions on this Mac wrote to its log in the last 10 minutes (`rules.owner_active` reads the times of the logs under `~/.claude/projects`, never what is in them). The team's own sessions and the ones other programs start in temporary folders do not count. No day turn starts while he works, and one that is running stops.
+
+**Stepping aside.** Every few seconds a running session, the checks and the wait for CI ask whether the job has to stop (`rules.yield_reason`): `pause` stops any job; a serious problem that comes in stops any other job; by day so do Nicola starting to work and the day's minutes running out. The job's programs are stopped at once and its work is kept: what the session had not committed yet is committed on the job's branch, on this Mac only, and the state remembers the branch for 7 days (`held`). At its next turn the builder goes on from that branch instead of starting over. Stepping aside is not a failure: nothing is counted against the job, and its idea stays open. A job that stepped aside while its pull request waited for CI is simply taken up as that pull request.
+
+**Serious problems.** After its first week (so that its alarms can be seen to be true ones first) the watch leaves a serious problem in `~/.pulse-team/queue/` at the moment it texts it, and wakes the runner. Only problems whose cause can be in Pulse's own code are queued: a position left without a stop, position management or buying failing twice, trading gone silent while the market is open, a briefing that keeps failing. The file holds what the watch saw and the end of Pulse's two fetch logs, cleaned first (`rules.redact_log`: anything that looks like a key, a token or a password is removed, as is any long string of letters and digits; the home folder reads `~`), because a session is never handed a secret.
+
+The runner turns it into one job: a builder on a new branch from the latest `main` (`fix/night-incident-…`) gets the alarm and the log as data, looks for the root cause and reproduces it on the database copy. A cause in the code is fixed with a test, and the fix goes through the same gate as everything else: checks, an independent reviewer, CI. It merges by itself unless it changes how Pulse trades (`rules.TRADING_GLOBS`: the trading pipeline, entry filters, position management and sizing, event signals, learning, weights, the broker crate, the ledger). Such a fix is pushed as a pull request that waits for Nicola, and stays his to merge on every later run. A cause outside the code (the broker or a source was down, the Mac slept, a key or a setting) changes nothing, and the team says what it found. Either way the outcome is texted when the job ends, at any hour, like the alarm. A merged fix reaches the installed app with the next release, which is still Nicola's.
+
+Limits, so one broken night cannot become a storm: one job per problem per day, two incident jobs a day at most, and a trigger older than a day is thrown away (what was thrown away and why is on the page under "Left alone"). The work on a serious problem is not held back by the night's time budget or by Nicola working, only by `pause`. `team.py incidents off` makes the watch only text again (`on` lifts it); `team.py incident "what is wrong" --logs` queues a problem by hand, with the end of the logs.
 
 ## Safety while it runs
 
@@ -111,6 +132,8 @@ python3 scripts/team/team.py scoreboard       # the last 7 days of trading, agai
 python3 scripts/team/team.py newsboard        # the last 7 days of news: fetched, kept, used, read
 python3 scripts/team/team.py market           # the map of products like Pulse (--now: look now)
 python3 scripts/team/team.py watch --dry       # look at the installed Pulse now, text nothing
+python3 scripts/team/team.py incident "what is wrong" --logs  # queue a problem for the team to look into
+python3 scripts/team/team.py incidents off    # the watch only texts (on | off | status)
 python3 scripts/team/team.py chat pair        # tie a Telegram bot to this Mac (asks for the token)
 python3 scripts/team/team.py chat status      # paired, listener alive, what waits
 python3 scripts/team/team.py chat say "text"  # text Nicola now

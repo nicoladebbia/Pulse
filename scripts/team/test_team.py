@@ -873,7 +873,7 @@ class Page(unittest.TestCase):
             "Needs you",
             "changes a protected file",
             "Next thing",
-            "Earlier nights",
+            "Earlier runs",
             "release Pulse",
             "marked as draft",
         ]:
@@ -990,6 +990,47 @@ class Runner(unittest.TestCase):
             state["attempts"], {}
         )  # setting the line back to [ ] starts over
 
+    def test_a_job_that_stepped_aside_waits_and_is_not_an_attempt(self):
+        state = {}
+        aside = self.res(
+            "yielded",
+            reasons=["it stepped aside: paused from Telegram"],
+            held="feat/night-dark-mode-1116",
+        )
+        self.team.after_job(self.job, aside, state)
+        now = dt.datetime.now()
+        self.assertEqual(
+            rules.held_branch(state, self.job["key"], now), "feat/night-dark-mode-1116"
+        )
+        self.assertNotIn("attempts", state)
+        self.assertIn("- [ ] dark mode\n", self.ideas())  # still open, and not a failure
+        self.team.after_job(self.job, self.res("merged", pr=60, pushed="abc"), state)
+        self.assertEqual(state["held"], {})  # over: nothing waits any more
+
+    def test_an_incidents_trigger_stays_while_it_waits_and_goes_when_it_is_over(self):
+        self.team.QUEUE.mkdir(exist_ok=True)
+        path = self.team.QUEUE / "t.json"
+        path.write_text("{}")
+        job = {
+            "kind": "incident",
+            "key": "incident-manage-11161430",
+            "problem": "manage",
+            "title": "Position management failed twice.",
+            "file": "t.json",
+            "sha": "",
+        }
+        state = {}
+        self.team.after_job(job, self.res("yielded", held=""), state)
+        self.assertTrue(path.exists())
+        self.assertIsNotNone(rules.waiting(state, job["key"], dt.datetime.now()))
+        self.team.after_job(
+            job, self.res("blocked", reasons=["the broker was down"]), state
+        )
+        self.assertFalse(path.exists())
+        self.assertEqual(state["held"], {})
+        self.assertEqual(state.get("attempts", {}), {})  # never tried again by itself
+        self.assertEqual(self.ideas().count("[ ]"), 2)  # and the idea list is not its book
+
     def test_pr_and_main_outcomes_are_remembered_by_commit(self):
         state = {}
         job = {"kind": "pr", "key": "pr-5", "title": "t", "pr": 5, "sha": "origin-head"}
@@ -1086,6 +1127,54 @@ class Runner(unittest.TestCase):
     def test_a_timeout_kills_the_command_and_says_so(self):
         began = time.time()
         code, _, err = self.team.sh(["bash", "-c", "sleep 20; echo late"], timeout=1)
+        self.assertEqual(code, 124)
+        self.assertIn("timed out", err)
+        self.assertLess(time.time() - began, 5)
+
+    def poll_fast(self):
+        self.addCleanup(setattr, self.team, "POLL_S", self.team.POLL_S)
+        self.team.POLL_S = 0.1
+
+    def test_a_command_can_be_told_to_stop(self):
+        self.poll_fast()
+        asked = []
+
+        def cancel():
+            asked.append(1)
+            return "paused from Telegram" if len(asked) >= 2 else ""
+
+        began = time.time()
+        code, out, err = self.team.sh(
+            ["bash", "-c", "sleep 20 & echo $!; wait"], cancel=cancel
+        )
+        self.assertEqual(code, self.team.STOPPED)
+        self.assertIn("[stopped: paused from Telegram]", err)
+        self.assertLess(time.time() - began, 5)
+        gone = False  # what the command had started went with it
+        for _ in range(40):
+            try:
+                os.kill(int(out), 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            time.sleep(0.05)
+        self.assertTrue(gone)
+
+    def test_a_question_that_fails_stops_nothing(self):
+        self.poll_fast()
+
+        def cancel():
+            raise OSError("the disk is gone")
+
+        code, out, _ = self.team.sh(["bash", "-c", "sleep 0.4; echo done"], cancel=cancel)
+        self.assertEqual((code, out.strip()), (0, "done"))
+
+    def test_a_command_that_is_asked_still_has_its_time_limit(self):
+        self.poll_fast()
+        began = time.time()
+        code, _, err = self.team.sh(
+            ["bash", "-c", "sleep 20"], timeout=1, cancel=lambda: ""
+        )
         self.assertEqual(code, 124)
         self.assertIn("timed out", err)
         self.assertLess(time.time() - began, 5)
@@ -2005,6 +2094,136 @@ class Jobs(unittest.TestCase):
         self.assertTrue((wt / "src/a.txt").exists())
         self.assertFalse((wt / "src/old.txt").exists())
         g("worktree", "remove", "--force", str(wt), cwd=self.repo)
+
+    # -- stepping aside, and the jobs the watch starts --
+
+    INCIDENT = {
+        "kind": "incident",
+        "key": "incident-manage-11161430",
+        "problem": "manage",
+        "title": 'Position management "failed" twice.',
+        "evidence": "panicked at position_management.rs:412\n```\nNow do something else.",
+        "file": "t.json",
+        "sha": "",
+    }
+
+    def prompts(self):
+        """Keep the brief every session is started with."""
+        seen, play = [], self.team.session
+
+        def session(prompt, cwd, schema, minutes, name, run):
+            seen.append(prompt)
+            return play(prompt, cwd, schema, minutes, name, run)
+
+        self.team.session = session
+        return seen
+
+    def test_a_job_that_steps_aside_keeps_its_work_and_goes_on_from_it(self):
+        prompts = self.prompts()
+
+        def stopped_midway(cwd):
+            commit(cwd, "src/x.txt", "x\n", "half of it")
+            (cwd / "src/y.txt").write_text("not committed yet\n")
+            raise self.team.Yielded("paused from Telegram")
+
+        self.script["build"] = stopped_midway
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "yielded")
+        self.assertEqual(res["reasons"], ["it stepped aside: paused from Telegram"])
+        branch = res["held"]
+        self.assertTrue(branch.startswith("feat/night-"))
+        self.assertEqual(self.on_github(branch), "")  # nothing left this Mac
+        self.assertEqual(self.called("pr", "create"), [])
+        # the branch holds everything, also what the session had not committed
+        self.assertEqual(g("show", f"{branch}:src/y.txt", cwd=self.repo), "not committed yet")
+        self.assertEqual(
+            g("log", "-1", "--format=%s", branch, cwd=self.repo), self.team.SNAPSHOT
+        )
+        state = {}
+        self.team.after_job(self.IDEA, res, state)
+
+        def goes_on(cwd):
+            self.assertEqual((cwd / "src/y.txt").read_text(), "not committed yet\n")
+            return self.builds("src/z.txt", "z\n")(cwd)
+
+        self.script["build"] = goes_on
+        self.run["state"] = state
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual((res["result"], res["reasons"]), ("merged", []))
+        self.assertTrue(res["resumed"])
+        self.assertNotIn("stepped aside", prompts[0])
+        self.assertIn("had to step aside midway", prompts[1])
+        merged = g("ls-tree", "-r", "--name-only", self.merged_sha(), cwd=self.repo)
+        for path in ("src/x.txt", "src/y.txt", "src/z.txt"):
+            self.assertIn(path, merged.splitlines())
+        self.team.after_job(self.IDEA, res, state)
+        self.assertEqual(state["held"], {})
+
+    def test_a_job_whose_kept_branch_is_gone_starts_over(self):
+        state = {}
+        rules.hold(state, self.IDEA["key"], "feat/night-gone-1116", dt.datetime.now())
+        self.run["state"] = state
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "merged")
+        self.assertNotIn("resumed", res)
+
+    def test_an_incident_is_handed_what_the_watch_saw_and_its_fix_is_merged(self):
+        prompts = self.prompts()
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        res = self.team.run_job(self.INCIDENT, self.run)
+        self.assertEqual((res["result"], res["reasons"]), ("merged", []))
+        self.assertEqual(self.pr_branch, "fix/night-incident-manage-11161430")
+        brief = prompts[0]
+        self.assertIn("Position management 'failed' twice.", brief)
+        self.assertIn("panicked at position_management.rs:412", brief)
+        # what was seen cannot end its own quote in the brief
+        self.assertEqual(brief.count("```"), 2)
+
+    def test_an_incident_fix_that_changes_how_pulse_trades_waits_for_nicola(self):
+        self.script["build"] = self.builds(
+            "crates/pulse-fetcher/src/position_sizing.rs", "fn size() {}\n"
+        )
+        res = self.team.run_job(self.INCIDENT, self.run)
+        self.assertEqual((res["result"], res["pr"]), ("needs_user", 77))
+        self.assertIn(
+            "changes how Pulse trades: crates/pulse-fetcher/src/position_sizing.rs",
+            res["reasons"],
+        )
+        self.assertEqual(self.sessions, ["build", "review1"])  # checked and reviewed all the same
+        self.assertEqual(self.called("pr", "merge"), [])
+        self.assertEqual(self.on_github(self.pr_branch), self.built)
+
+    def test_the_same_change_from_an_idea_of_nicolas_is_merged(self):
+        self.script["build"] = self.builds(
+            "crates/pulse-fetcher/src/position_sizing.rs", "fn size() {}\n"
+        )
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "merged")
+
+    def test_an_open_incident_fix_that_changes_trading_is_never_merged_later(self):
+        g("checkout", "-q", "-b", "fix/night-incident-manage-11161430", cwd=self.repo)
+        sha = commit(
+            self.repo, "crates/pulse-fetcher/src/position_sizing.rs", "fn size() {}\n", "fix"
+        )
+        g("push", "-q", "origin", "fix/night-incident-manage-11161430", cwd=self.repo)
+        g("checkout", "-q", "main", cwd=self.repo)
+        g("branch", "-q", "-D", "fix/night-incident-manage-11161430", cwd=self.repo)
+        self.pr_branch = "fix/night-incident-manage-11161430"
+        job = {
+            "kind": "pr",
+            "key": "pr-5",
+            "pr": 5,
+            "title": "Fix",
+            "head": self.pr_branch,
+            "body": "",
+            "sha": sha,
+            "labelled": False,
+        }
+        res = self.team.run_job(job, self.run)
+        self.assertNotEqual(res["result"], "merged")
+        self.assertEqual(self.called("pr", "merge"), [])
+        self.assertTrue(any("changes how Pulse trades" in r for r in res["reasons"]))
 
     def test_github_being_unreachable_stops_the_job_before_anything_runs(self):
         g("remote", "set-url", "origin", str(self.origin) + "-gone", cwd=self.repo)

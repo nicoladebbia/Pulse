@@ -47,7 +47,7 @@ def set_home(home: Path) -> None:
     PROPOSALS = HOME / "proposals.json"  # what the team asked, what was answered
     OUTBOX = HOME / "outbox"  # texts waiting for the morning, or for Telegram
     INBOX = HOME / "inbox"  # ideas Nicola texted, for the runner to put on the list
-    PAUSED = HOME / "paused"  # exists = nothing new starts and nothing merges
+    PAUSED = HOME / "paused"  # exists = everything stops, also the job that is running
     CHAT_STATE = HOME / "chat.json"  # the listener's own: update offset, heartbeat
     DIGEST = HOME / "digest.json"  # the day of the last night report
 
@@ -345,7 +345,7 @@ def status_text() -> str:
     ]
     if PAUSED.exists():
         parts.append(
-            "Paused: nothing new starts and nothing merges. Send resume to go on."
+            "Paused: nothing runs and nothing merges. Send resume to go on."
         )
     waiting = [p for p in _load(PROPOSALS, []) if p.get("state") in rules.OPEN_STATES]
     if waiting:
@@ -407,10 +407,14 @@ def on_text(line: Bot, message: dict, now: dt.datetime) -> None:
         reply = status_text()
     elif command == "pause":
         PAUSED.write_text(_stamp(now) + "\n")
-        reply = "Paused. Nothing new starts and nothing merges until you send resume."
+        reply = (
+            "Paused. The job that is running stops within seconds and keeps its work; "
+            "nothing starts and nothing merges until you send resume. The watch still "
+            "texts you about serious problems."
+        )
     elif command == "resume":
         PAUSED.unlink(missing_ok=True)
-        reply = "Back to work."
+        reply = "Back to work. What was stopped goes on at the next hourly turn."
     elif command == "note":
         target = (message.get("reply_to_message") or {}).get("message_id")
         kept = False

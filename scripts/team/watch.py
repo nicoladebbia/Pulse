@@ -6,7 +6,9 @@ It only reads: Pulse's logs, its progress file, its schedule stamps, launchd's
 list, and one short read-only query on the database. It asks the broker's
 clock through the installed fetcher (`--mode market-open`, which takes no lock
 and writes nothing), the same call Pulse's own schedule makes. It starts no
-session, changes nothing in Pulse and fixes nothing.
+session, changes nothing in Pulse and fixes nothing itself. After its first
+week a serious problem it texts is also left in the team's queue (one file in
+`queue/`) and the runner is woken, so the team looks for the cause.
 
 A fact that cannot be read is None, and a check without its facts says
 nothing.
@@ -44,6 +46,11 @@ FETCHER = Path(
 )
 CRASHES = Path.home() / "Library/Logs/DiagnosticReports"
 MEMORY = HOME / "watch.json"  # the watch's notebook between two looks
+QUEUE = HOME / "queue"  # serious problems for the team to look into, one file each
+INCIDENTS_OFF = HOME / "incidents-off"  # exists = the watch only texts
+TEAM_LABEL = "com.pulse.team"  # the runner's launchd agent
+EVIDENCE_TAIL = 12_000  # bytes read from the end of each log for an incident
+ON_IT = " The team is looking for the cause now and will text what it finds."
 # The same count as Pulse's own schedule (`briefings_today` in
 # scripts/scheduled-fetch.sh). `created_at` is UTC.
 BRIEFINGS = """SELECT created_at FROM briefings
@@ -362,16 +369,77 @@ def look(
     if not tell:
         return found
     texts = rules.watch_alerts(found, facts, memory, now)
+    acts = rules.watch_acts(memory, now, off=INCIDENTS_OFF.exists())
     memory["looked"] = now.isoformat(timespec="seconds")
     memory["found"] = found
     chat._save(MEMORY, memory)  # before the texts: a crash must not send them twice
+    # A serious problem that is texted now is also left for the team, which
+    # looks for its cause (rules.incident_jobs decides whether it does).
+    texted = {
+        key
+        for key, alert in (memory.get("alerts") or {}).items()
+        if alert.get("sent") == now.isoformat(timespec="seconds")
+    }
+    queued = [
+        f["text"]
+        for f in found
+        if acts and f["key"] in texted and rules.incident_worthy(f) and enqueue(f, now)
+    ]
+    if queued:
+        wake_team(run)
     for text, serious in texts:
+        if serious and any(q in text for q in queued):
+            text += ON_IT
         text = ("Serious problem in Pulse. " if serious else "Pulse watch: ") + text
         result = chat.send(text, serious=serious, now=now)
         if result == "off" and serious:
             chat.banner(text)  # no bot yet: at least a notification on the Mac
         log(f"[{result}] {text}")
     return found
+
+
+def evidence() -> str:
+    """The end of Pulse's logs, for the session that looks for the cause:
+    made fit to show first (rules.redact_log), since a session is never handed
+    a key and a failed request can print one."""
+    parts = []
+    for name in ("fetch-stdout.log", "fetch-stderr.log"):
+        try:
+            with open(LOGS / name, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - EVIDENCE_TAIL))
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        tail = rules.redact_log(tail, str(Path.home()))[-rules.EVIDENCE_MAX // 2 :]
+        if tail:
+            parts.append(f"== the end of {name} ==\n{tail}")
+    return "\n\n".join(parts)
+
+
+def enqueue(finding: dict, now: dt.datetime) -> bool:
+    """Leave a serious problem in the team's queue. True when it is there."""
+    try:
+        QUEUE.mkdir(parents=True, exist_ok=True)
+        name = f"{now:%Y%m%d-%H%M%S}-{rules.slug(str(finding['key']), 30)}.json"
+        chat._save(QUEUE / name, rules.trigger(finding, evidence(), now))
+        return True
+    except OSError as e:
+        log(f"could not queue {finding.get('key')}: {type(e).__name__}")
+        return False
+
+
+def wake_team(run=subprocess.run) -> None:
+    """Start the runner now instead of at its next hourly turn. When a run is
+    in progress this does nothing: that run reads the queue by itself."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        run(
+            ["launchctl", "kickstart", f"gui/{os.getuid()}/{TEAM_LABEL}"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
 
 
 def as_text(memory: dict) -> str:

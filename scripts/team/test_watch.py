@@ -922,6 +922,8 @@ class Look(unittest.TestCase):
             "LOGS": self.logs,
             "CRASHES": root / "crashes",
             "MEMORY": self.home / "watch.json",
+            "QUEUE": self.home / "queue",
+            "INCIDENTS_OFF": self.home / "incidents-off",
             "FETCHER": root / "pulse-fetcher",
         }.items():
             self.addCleanup(setattr, watch, name, getattr(watch, name))

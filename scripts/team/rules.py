@@ -51,7 +51,8 @@ CI_PASS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 # Branches the team makes for its own work. A red main is fixed on MAIN_FIX_PREFIX.
 MAIN_FIX_PREFIX = "fix/night-main-"
-TEAM_PREFIXES = (MAIN_FIX_PREFIX, "feat/night-")
+INCIDENT_PREFIX = "fix/night-incident-"
+TEAM_PREFIXES = (MAIN_FIX_PREFIX, INCIDENT_PREFIX, "feat/night-")
 
 IDEA_LINE = re.compile(r"^(\s*[-*]\s+)(?:\[( |x|X|\?)\]\s+)?(\S.*)$")
 
@@ -91,6 +92,36 @@ def protected_violations(changes: list[tuple[str, str]]) -> list[str]:
             # A migration already applied to the live database is frozen.
             reasons.append(f"edits or removes an existing migration: {path}")
     return reasons
+
+
+# What decides how Pulse buys and sells. A change here that the team thought
+# of by itself (a fix for an incident) is Nicola's to merge.
+TRADING_GLOBS = [
+    "crates/pulse-fetcher/src/pipeline/trading.rs",
+    "crates/pulse-fetcher/src/pipeline/signals.rs",
+    "crates/pulse-fetcher/src/pipeline/live.rs",
+    "crates/pulse-fetcher/src/entry_filters.rs",
+    "crates/pulse-fetcher/src/position_management.rs",
+    "crates/pulse-fetcher/src/position_sizing.rs",
+    "crates/pulse-fetcher/src/event_signals.rs",
+    "crates/pulse-fetcher/src/learning.rs",
+    "crates/pulse-fetcher/src/calibration.rs",
+    "crates/pulse-weights/*",
+    "crates/pulse-alpaca/*",
+    "crates/pulse-snapshot/src/ledger.rs",
+    "src-tauri/src/services/paper_trading.rs",
+    "src-tauri/src/commands/trading.rs",
+]
+
+
+def trading_violations(changes: list[tuple[str, str]]) -> list[str]:
+    """Reasons a change the team started by itself needs Nicola: it touches
+    how Pulse trades."""
+    return [
+        f"changes how Pulse trades: {path}"
+        for _status, path in changes
+        if any(fnmatch.fnmatch(path, g) for g in TRADING_GLOBS)
+    ]
 
 
 def forbidden_content(diff: str) -> list[str]:
@@ -385,9 +416,14 @@ def select_jobs(
     base: str,
     label: str,
     main_sha: str = "",
+    incidents: list[dict] | None = None,
+    shift: str = "night",
 ) -> tuple[list[dict], list[dict]]:
-    """Tonight's queue, in the agreed order: a broken main first, then open PRs
-    (oldest first), then ideas from the top of the list. Returns (jobs, skipped)."""
+    """This shift's queue, in the agreed order: incidents first, then a broken
+    main, then open PRs (oldest first), then ideas from the top of the list.
+    A shift started for an incident does that and nothing else. By day only
+    the light work is taken: the ideas that are small fixes (`small_fix`), and
+    none while main is not known to pass. Returns (jobs, skipped)."""
 
     def pr_why(pr: dict) -> str | None:
         key, sha = f"pr-{pr['number']}", pr.get("headRefOid") or ""
@@ -412,6 +448,9 @@ def select_jobs(
         }
 
     by_age = sorted(prs, key=lambda p: p.get("createdAt") or "")
+    jobs, skipped = list(incidents or []), []
+    if shift == "incident" or (shift == "day" and not main_ok):
+        return jobs, skipped
     if not main_ok:
         # Nothing else can pass its checks while main is red. If an earlier
         # night already opened a fix, carry on with that one instead of a second.
@@ -421,13 +460,17 @@ def select_jobs(
                 pr.get("author") or {}
             ).get("login") == owner:
                 why = pr_why(pr)
-                return ([], [skip_pr(pr, why)]) if why else ([pr_job(pr, label)], [])
+                if why:
+                    return jobs, [skip_pr(pr, why)]
+                return [*jobs, pr_job(pr, label)], []
         why = stuck(state, "main", main_sha) or error_cap(state, "main", main_sha)
         if why:
-            return [], [{"kind": "main", "title": title, "why": why}]
-        return [{"kind": "main", "key": "main", "title": title, "sha": main_sha}], []
-    jobs, skipped = [], []
+            return jobs, [{"kind": "main", "title": title, "why": why}]
+        main = {"kind": "main", "key": "main", "title": title, "sha": main_sha}
+        return [*jobs, main], []
     for pr in by_age:
+        if shift == "day":
+            break  # checking and reviewing pull requests is night work
         why = pr_why(pr)
         if why:
             skipped.append(skip_pr(pr, why))
@@ -436,6 +479,8 @@ def select_jobs(
     for idea in ideas:
         if idea["state"] != "open":
             continue
+        if shift == "day" and not small_fix(idea["text"]):
+            continue  # building a feature is night work
         key = idea_key(idea["text"])
         why = error_cap(state, key, "")
         if why:
@@ -443,6 +488,307 @@ def select_jobs(
         else:
             jobs.append({"kind": "idea", "key": key, "title": idea["text"], "sha": ""})
     return jobs, skipped
+
+
+# -------------------------------------------------------------- shifts --
+# The Mac wakes the team every hour. These rules say what that hour is for,
+# and when work that is running has to step aside.
+
+DAY_HOURS = (9, 21)  # light work by day starts from 09:00 and before 21:00
+ACTIVE_MIN = 10  # a session log of Nicola's own changed this recently: he is working
+INCIDENTS_PER_DAY = 2
+INCIDENT_MAX_AGE_H = 24  # an older trigger is about a problem already texted again
+HELD_DAYS = 7  # how long a job that stepped aside may go on from where it stopped
+ACT_AFTER_DAYS = 7  # the watch only texts for its first week, then it also acts
+SMALL_FIX = re.compile(r"fix:\s*\S", re.I)
+
+
+def small_fix(idea: str) -> bool:
+    """An idea line that starts with `fix:` is a small fix: light enough for
+    the day."""
+    return bool(SMALL_FIX.match(idea.strip()))
+
+
+def project_folder(path: str) -> str:
+    """The name of the folder the Claude CLI keeps a working folder's session
+    logs in: the path with everything but letters and digits turned to `-`."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def owner_active(
+    logs: list[tuple[str, float]],
+    now: float,
+    home: str,
+    own: tuple[str, ...],
+    minutes: int = ACTIVE_MIN,
+) -> bool:
+    """Is Nicola using Claude on this Mac right now? `logs` is every project
+    folder with the time its newest session log changed. His own sessions run
+    in folders under his home folder (`home`); the team's (`own`) do not count,
+    and neither do the ones other programs start in temporary folders."""
+    mine = project_folder(home)
+    theirs = tuple(project_folder(path) for path in own)
+    return any(
+        (name == mine or name.startswith(mine + "-"))
+        and not name.startswith(theirs)
+        and 0 <= now - changed < minutes * 60
+        for name, changed in logs
+    )
+
+
+def day_used(state: dict, today: dt.date) -> int:
+    """Minutes of day work already done today."""
+    day = state.get("day")
+    if not isinstance(day, dict) or day.get("date") != today.isoformat():
+        return 0
+    minutes = day.get("minutes")
+    return minutes if isinstance(minutes, int) and minutes > 0 else 0
+
+
+def add_day_minutes(state: dict, today: dt.date, minutes: int) -> None:
+    state["day"] = {
+        "date": today.isoformat(),
+        "minutes": day_used(state, today) + max(0, minutes),
+    }
+
+
+def shift_due(
+    now: dt.datetime,
+    night: str,
+    state: dict,
+    *,
+    paused: bool,
+    incident: bool,
+    active: bool,
+    day_budget: int,
+    hours: tuple[int, int] = DAY_HOURS,
+) -> str:
+    """What an hourly wake-up is for: "night" (`night` is the date `night_due`
+    gave), "incident" (a serious problem waits, at any hour), "day" (light
+    work, inside the day's hours and its time budget, and only while Nicola is
+    not using Claude on this Mac), or "" for nothing. Paused, it is nothing."""
+    if paused:
+        return ""
+    if night:
+        return "night"  # it takes the incidents first
+    if incident:
+        return "incident"
+    if active or not hours[0] <= now.hour < hours[1]:
+        return ""
+    return "day" if day_used(state, now.date()) < day_budget else ""
+
+
+def yield_reason(
+    kind: str,
+    shift: str,
+    *,
+    paused: bool,
+    incident: bool,
+    active: bool,
+    over_budget: bool,
+) -> str:
+    """Why the job that is running has to stop now and keep its work, or ''.
+    `pause` stops everything. A serious problem comes before any other job.
+    By day the team also steps aside for Nicola and stays inside its budget;
+    work on an incident does neither."""
+    if paused:
+        return "paused from Telegram"
+    if kind == "incident":
+        return ""
+    if incident:
+        return "a serious problem came first"
+    if shift == "day" and active:
+        return "Nicola started using Claude on this Mac"
+    if shift == "day" and over_budget:
+        return "the day's time for the team is used up"
+    return ""
+
+
+def waiting(state: dict, key: str, now: dt.datetime) -> dict | None:
+    """The note left for a job that stepped aside and has not gone on yet, or
+    None. A note older than HELD_DAYS is no longer one: main has moved on, and
+    starting over is better than going on."""
+    held = state.get("held")
+    item = held.get(key) if isinstance(held, dict) else None
+    if not isinstance(item, dict):
+        return None
+    try:
+        age = now - dt.datetime.fromisoformat(str(item.get("at")))
+    except (TypeError, ValueError):
+        return None
+    return item if dt.timedelta(0) <= age <= dt.timedelta(days=HELD_DAYS) else None
+
+
+def hold(state: dict, key: str, branch: str, now: dt.datetime) -> None:
+    """A job stepped aside. `branch` holds its unfinished work on this Mac
+    ('' when it had none yet); its next turn goes on from there. Notes too old
+    to count are thrown away here, so the book never grows."""
+    if not isinstance(state.get("held"), dict):
+        state["held"] = {}
+    held = state["held"]
+    for old in [k for k in held if waiting(state, k, now) is None]:
+        del held[old]
+    held[key] = {"branch": branch, "at": now.isoformat(timespec="seconds")}
+
+
+def release(state: dict, key: str) -> None:
+    held = state.get("held")
+    if isinstance(held, dict):
+        held.pop(key, None)
+
+
+def held_branch(state: dict, key: str, now: dt.datetime) -> str:
+    """The branch a job that stepped aside goes on from, or ''."""
+    item = waiting(state, key, now) or {}
+    return item["branch"] if isinstance(item.get("branch"), str) else ""
+
+
+def incidents_today(state: dict, today: dt.date) -> list[str]:
+    """The problems an incident job was started for today."""
+    book = state.get("incidents")
+    if not isinstance(book, dict) or book.get("date") != today.isoformat():
+        return []
+    return [k for k in book.get("keys") or [] if isinstance(k, str)]
+
+
+def record_incident(state: dict, problem: str, today: dt.date) -> None:
+    state["incidents"] = {
+        "date": today.isoformat(),
+        "keys": [*incidents_today(state, today), problem],
+    }
+
+
+def incident_jobs(
+    triggers: list[dict], state: dict, now: dt.datetime, per_day: int = INCIDENTS_PER_DAY
+) -> tuple[list[dict], list[dict]]:
+    """The incident jobs to do for the triggers in the queue, oldest first, and
+    the triggers to throw away with the reason: (jobs, dropped). A trigger is
+    {file, key, text, evidence, at}, written by the watch or by hand. One job
+    per problem per day and `per_day` jobs a day at most; a trigger that is
+    malformed or older than a day is dropped. A job that was started and had
+    to stop midway (`hold`) is not a second one: it goes on."""
+    jobs, dropped = [], []
+    done = incidents_today(state, now.date())
+    new = 0
+    for t in sorted(triggers, key=lambda t: str(t.get("at") or "")):
+        problem, text = t.get("key"), t.get("text")
+        try:
+            at = dt.datetime.fromisoformat(str(t.get("at")))
+            if at.tzinfo is not None:  # the runner's clock has no zone
+                raise ValueError
+        except ValueError:
+            at = None
+        readable = isinstance(problem, str) and problem and isinstance(text, str) and text
+        if not readable or at is None:
+            dropped.append(_dropped(t, "it could not be read"))
+            continue
+        key = f"incident-{slug(problem, 30)}-{at:%m%d%H%M}"
+        going = waiting(state, key, now) is not None
+        if now - at > dt.timedelta(hours=INCIDENT_MAX_AGE_H):
+            why = "it is more than a day old"
+        elif any(j["problem"] == problem for j in jobs):
+            why = "this problem is in the queue already"
+        elif going:
+            why = ""
+        elif problem in done:
+            why = "this problem was already worked on today"
+        elif len(done) + new >= per_day:
+            why = f"{per_day} incidents a day is the limit"
+        else:
+            why, new = "", new + 1
+        if why:
+            dropped.append(_dropped(t, why))
+            continue
+        jobs.append(
+            {
+                "kind": "incident",
+                "key": key,
+                "problem": problem,
+                "title": " ".join(text.split())[:300],
+                "evidence": str(t.get("evidence") or "")[:EVIDENCE_MAX],
+                "file": str(t.get("file") or ""),
+                "sha": "",
+            }
+        )
+    return jobs, dropped
+
+
+def _dropped(trigger: dict, why: str) -> dict:
+    return {
+        "kind": "incident",
+        "file": str(trigger.get("file") or ""),
+        "title": " ".join(str(trigger.get("text") or "a trigger").split())[:120],
+        "why": why,
+    }
+
+
+# What of the watch's findings the team also works on: the serious ones whose
+# cause can be in Pulse's own code. A position without a stop that the next run
+# did not repair, trading runs that keep failing, trading that went silent, a
+# briefing that keeps failing.
+INCIDENT_KEYS = ("stop:", "manage", "auto", "silent", "briefing:")
+EVIDENCE_MAX = 6000
+LOG_LINE_MAX = 300
+ANSI_CODES = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# A value that follows a name like these, in an address or a setting.
+SECRET_VALUE = re.compile(
+    r"(?i)((?:token|api[-_]?key|apikey|key|secret|password|passwd|signature|sig|auth"
+    r"|authorization|bearer|credential)[\w-]*[\"']?\s*[=:]\s*[\"']?(?:bearer\s+)?)[^\s&\"',;]+"
+)
+# Anything long enough to be a key, whatever it is called.
+LONG_TOKEN = re.compile(r"(?<![A-Za-z0-9/_.-])[A-Za-z0-9_\-]{24,}(?![A-Za-z0-9/_.-])")
+USERINFO = re.compile(r"(://)[^/\s:@]+:[^/\s@]+@")
+
+
+def incident_worthy(finding: dict) -> bool:
+    key = str(finding.get("key") or "")
+    return (
+        bool(finding.get("serious"))
+        and key != "stop:dry"
+        and any(key == k or (k.endswith(":") and key.startswith(k)) for k in INCIDENT_KEYS)
+    )
+
+
+def watch_acts(memory: dict, now: dt.datetime, off: bool) -> bool:
+    """May the watch start an incident job, or does it only text? Only texts
+    while switched off, and for the first week after its first look (kept in
+    `memory`), so its alarms can be seen to be true ones first."""
+    since = memory.setdefault("since", _stamp(now))
+    if off:
+        return False
+    try:
+        return now - dt.datetime.fromisoformat(str(since)) >= dt.timedelta(days=ACT_AFTER_DAYS)
+    except ValueError:
+        memory["since"] = _stamp(now)
+        return False
+
+
+def redact_log(text: str, home: str = "") -> str:
+    """The end of a log, made fit to show a session: no colour codes, the home
+    folder as `~`, and nothing that looks like a key or a password. A session
+    is never handed a secret, and a failed request can print the address it
+    called with the key in it."""
+    lines = []
+    for line in ANSI_CODES.sub("", text).splitlines():
+        line = "".join(c for c in line if c == "\t" or c.isprintable())
+        if home:
+            line = line.replace(home, "~")
+        line = USERINFO.sub(r"\1[removed]@", line)
+        line = SECRET_VALUE.sub(r"\1[removed]", line)
+        line = LONG_TOKEN.sub("[removed]", line)
+        lines.append(line[:LOG_LINE_MAX])
+    out = "\n".join(lines).strip()
+    return out[-EVIDENCE_MAX:]
+
+
+def trigger(finding: dict, evidence: str, now: dt.datetime) -> dict:
+    """What the watch leaves in the queue for the runner."""
+    return {
+        "key": str(finding["key"]),
+        "text": str(finding["text"]),
+        "evidence": evidence[-EVIDENCE_MAX:],
+        "at": now.isoformat(timespec="seconds"),
+    }
 
 
 # ---------------------------------------------------------------- chat --
@@ -453,7 +799,7 @@ CHAT_HELP = (
     "I understand:\n"
     "idea: <what you want> — goes on the team's list\n"
     "status — what the team did last and what waits for you\n"
-    "pause — nothing new starts and nothing merges\n"
+    "pause — everything stops, also the job that is running\n"
     "resume — back to work\n"
     "To add a note to something I asked, reply to that message."
 )

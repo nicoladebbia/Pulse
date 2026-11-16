@@ -1076,10 +1076,14 @@ class Weekly(unittest.TestCase):
         self.assertIn("Nothing new worth telling.", self.sent[1])
         self.assertEqual(len(self.saved("proposals.json")), 1)
 
-    def test_a_run_by_hand_a_stopped_run_and_a_paused_team_do_not_look(self):
+    def test_a_run_by_hand_a_turn_by_day_a_stopped_run_and_a_paused_team_do_not_look(
+        self,
+    ):
         for run in [
             dict(self.run_, scheduled=False),
             dict(self.run_, abort="out of time"),
+            dict(self.run_, shift="day"),
+            dict(self.run_, shift="incident"),
         ]:
             state = {}
             self.assertEqual(self.night(state, run), [])
