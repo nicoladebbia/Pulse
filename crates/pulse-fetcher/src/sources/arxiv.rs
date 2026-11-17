@@ -20,7 +20,10 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
         let sector = sector.to_string();
         let name = name.to_string();
         let url = url.to_string();
-        async move { fetch_single(&client, &sector, &name, &url).await }
+        async move {
+            let fetch = fetch_single(&client, &sector, &name, &url);
+            crate::feed_runs::watch(feed_id(&url), "arxiv", &name, &sector, fetch).await
+        }
     }).collect();
 
     let results = futures::future::join_all(futures).await;
@@ -35,15 +38,21 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
     Ok(articles)
 }
 
+/// The id a feed's articles carry, and its row in `feed_runs`.
+fn feed_id(url: &str) -> String {
+    format!("arxiv:{url}")
+}
+
 async fn fetch_single(
     client: &reqwest::Client,
     sector: &str,
     name: &str,
     url: &str,
-) -> anyhow::Result<Vec<RawArticle>> {
+) -> anyhow::Result<(Vec<RawArticle>, usize)> {
     super::API_CALLS.arxiv.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let bytes = client.get(url).send().await?.error_for_status()?.bytes().await?;
     let feed = feed_rs::parser::parse(&bytes[..])?;
+    let entries = feed.entries.len();
 
     let mut articles = Vec::new();
     for entry in feed.entries {
@@ -63,11 +72,29 @@ async fn fetch_single(
             published_at,
             content_snippet: summary,
             sector: sector.to_string(),
-            feed_id: format!("arxiv:{}", url),
+            feed_id: feed_id(url),
             language: "en".to_string(),
             source_type: "news".to_string(),
             financial_metadata: None,
         });
     }
-    Ok(articles)
+    Ok((articles, entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `feed_runs` holds one row per feed id per run: two feeds sharing an id
+    /// would be counted as one.
+    #[test]
+    fn every_feed_has_its_own_id() {
+        let mut seen = std::collections::HashSet::new();
+        let repeated: Vec<_> = ARXIV_FEEDS
+            .iter()
+            .map(|(_, _, url)| feed_id(url))
+            .filter(|id| !seen.insert(id.clone()))
+            .collect();
+        assert!(repeated.is_empty(), "feed ids used twice: {repeated:?}");
+    }
 }

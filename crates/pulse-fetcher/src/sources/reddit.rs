@@ -85,13 +85,25 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
             format!("https://www.reddit.com/r/{}/hot.json?limit=25&raw_json=1", sub)
         };
 
-        match fetch_listing(&client, &url).await {
+        let started = std::time::Instant::now();
+        let listing = fetch_listing(&client, &url).await;
+        crate::feed_runs::note(
+            feed_id(sub),
+            "reddit",
+            &format!("r/{sub}"),
+            sector,
+            started,
+            listing.as_ref().map(|posts| posts.len()),
+        );
+        match listing {
             Ok(posts) => {
                 let mut kept = 0;
                 for p in posts {
                     if !is_quality_post(&p, tier) { continue; }
 
-                    // Dedupe crossposts by URL across subs
+                    // Dedupe crossposts by URL across subs: the first subreddit keeps the
+                    // post, so in `feed_runs` a later one can answer in full and hand over
+                    // nothing (`entries` 25, `fetched` 0) without anything being wrong.
                     let canonical_url = if p.is_self {
                         format!("https://www.reddit.com{}", p.permalink)
                     } else {
@@ -118,7 +130,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
                         published_at,
                         content_snippet,
                         sector: sector.to_string(),
-                        feed_id: format!("reddit:{}", sub),
+                        feed_id: feed_id(sub),
                         language: "en".to_string(),
                         source_type: "news".to_string(),
                         financial_metadata: None,
@@ -134,6 +146,11 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
     }
 
     Ok(articles)
+}
+
+/// The id a subreddit's posts carry, and its row in `feed_runs`.
+fn feed_id(sub: &str) -> String {
+    format!("reddit:{sub}")
 }
 
 async fn fetch_listing(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<RedditPost>> {
@@ -179,4 +196,22 @@ fn is_quality_post(p: &RedditPost, tier: &str) -> bool {
     if p.num_comments < min_comments { return false; }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `feed_runs` holds one row per feed id per run: two feeds sharing an id
+    /// would be counted as one.
+    #[test]
+    fn every_feed_has_its_own_id() {
+        let mut seen = std::collections::HashSet::new();
+        let repeated: Vec<_> = SUBREDDITS
+            .iter()
+            .map(|(sub, _, _, _)| feed_id(sub))
+            .filter(|id| !seen.insert(id.clone()))
+            .collect();
+        assert!(repeated.is_empty(), "feed ids used twice: {repeated:?}");
+    }
 }
