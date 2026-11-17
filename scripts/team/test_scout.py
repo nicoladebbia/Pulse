@@ -1073,6 +1073,11 @@ class Weekly(unittest.TestCase):
         self.assertTrue(notes[0].startswith("the market scout checked 2 products"))
         self.assertTrue(notes[0].endswith("; " + self.team.NOT_ITS_OWN), notes[0])
         self.assertIn("e-mail address", notes[0])
+        # Also when the look itself came to nothing.
+        self.answers = [{"summary": "nothing", "products": [], "findings": []}]
+        notes = self.night({})
+        self.assertTrue(notes[0].startswith("the market scout named no product"))
+        self.assertIn("; " + self.team.NOT_ITS_OWN + "; it tries again", notes[0])
 
     def test_the_next_look_gets_the_map_and_tells_nothing_twice(self):
         self.night({})

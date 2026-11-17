@@ -454,12 +454,17 @@ def no_account(cwd: Path) -> dict:
     of the usual folder), so the session is still signed in.
 
     Checked on CLI 2.1.325 by reading what real sessions sent: the address was
-    in every request before, and in none with this. The CLI does look the
-    account up again while the session runs and writes it into this folder,
-    which is deleted with the session's folder; what the session was told at
-    its start is not built again in a run of this length. It is not a promise
-    of the CLI, so guard.py still keeps the owner's names out of every search
-    and page address, and `web_session` says so when the folder was not used."""
+    in every request before, and in none with this. Those sessions were short
+    (up to eight requests). The CLI does look the account up again while a
+    session runs and writes it into this folder, which is deleted with the
+    session's folder; a long session whose context is built again could be
+    told the address then. And it is not a promise of the CLI. So guard.py
+    still keeps the owner's names out of every search and page address, and
+    `web_session` says so when the folder was not used.
+
+    A runner whose own sessions sign in from another settings folder
+    (CLAUDE_CONFIG_DIR) hands that folder on as the place of the login. That
+    follows how the CLI names its keychain entry; it was read, not run."""
     folder = cwd / WEB_SETTINGS
     folder.mkdir()
     login = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR") or os.environ.get(
@@ -2215,8 +2220,10 @@ def market_scout(run: dict, today: dt.date) -> tuple[bool, str]:
         # The reason can hold words from a web page: one short plain line.
         return False, f"the market scout did not finish ({scout.one_line(res['error'], 120)})"
     result = scout.clean(res["data"])
+    # What the session has to say about itself is told however the look ends.
+    aside = f"; {res['note']}" if res.get("note") else ""
     if not result["products"]:
-        return False, "the market scout named no product with a page to check it on"
+        return False, "the market scout named no product with a page to check it on" + aside
     new = scout.fresh(result["findings"], memory, today)
     market = {
         "made": today.isoformat(),
@@ -2247,9 +2254,7 @@ def market_scout(run: dict, today: dt.date) -> tuple[bool, str]:
     note = f"the market scout checked {len(result['products'])} products like Pulse"
     if queued:
         note += f"; {queued} idea{'s' if queued != 1 else ''} from it wait for your yes"
-    if res.get("note"):
-        note += f"; {res['note']}"
-    return True, note
+    return True, note + aside
 
 
 def weekly_scoreboard(run: dict, state: dict) -> None:
