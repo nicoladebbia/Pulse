@@ -992,7 +992,7 @@ class Weekly(unittest.TestCase):
         self.sent = []
         self.addCleanup(setattr, chat, "send", chat.send)
         chat.send = lambda text, **k: self.sent.append(text) or "sent"
-        self.answers, self.briefs = [], []
+        self.answers, self.briefs, self.extra = [], [], {}
         self.team.web_session = self.fake_session
         self.week = scoreboard.week_of(dt.date.today())
         self.run_ = {"scheduled": True, "dir": self.home / "runs/now", "cost": 0.0}
@@ -1007,7 +1007,7 @@ class Weekly(unittest.TestCase):
             raise answer
         if isinstance(answer, str):
             return {"ok": False, "data": {}, "error": answer}
-        return {"ok": True, "data": answer, "error": ""}
+        return {"ok": True, "data": answer, "error": "", **self.extra}
 
     def night(self, state, run=None):
         report = {"notes": []}
@@ -1065,6 +1065,14 @@ class Weekly(unittest.TestCase):
         # The same week again: no second look.
         self.assertEqual(self.night(state), [])
         self.assertEqual((len(self.briefs), len(self.sent)), (1, 1))
+
+    def test_what_the_session_has_to_say_about_itself_is_in_the_report(self):
+        self.extra = {"note": self.team.NOT_ITS_OWN}
+        notes = self.night({})
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith("the market scout checked 2 products"))
+        self.assertTrue(notes[0].endswith("; " + self.team.NOT_ITS_OWN), notes[0])
+        self.assertIn("e-mail address", notes[0])
 
     def test_the_next_look_gets_the_map_and_tells_nothing_twice(self):
         self.night({})
@@ -1295,7 +1303,9 @@ class WebSession(unittest.TestCase):
             os.environ["PULSE_TEAM_HOME"] = saved
         self.calls = []
         self.reply = (0, stream({"a": 1}, total_cost_usd=0.4), "")
+        self.uses_its_folder = True
         self.team.sh = self.fake_sh
+        self.team.log = lambda msg: None
         self.run_ = {"dir": self.home / "runs/now", "cost": 1.0}
 
     def fake_sh(self, cmd, cwd=None, timeout=600, env=None, reap=False, cancel=None):
@@ -1307,11 +1317,17 @@ class WebSession(unittest.TestCase):
                 "env": env,
                 "reap": reap,
                 "cancel": cancel,
-                "files": sorted(p.name for p in Path(cwd).iterdir()),
+                "files": sorted(
+                    str(p.relative_to(cwd)) for p in Path(cwd).rglob("*")
+                ),
             }
         )
         if isinstance(self.reply, Exception):
             raise self.reply
+        if self.uses_its_folder:
+            # Like the CLI: its settings file goes where CLAUDE_CONFIG_DIR says.
+            settings = Path(env["CLAUDE_CONFIG_DIR"]) / ".claude.json"
+            settings.write_text('{"oauthAccount": {"emailAddress": "j@mail.example"}}')
         return self.reply
 
     def start(self):
@@ -1360,7 +1376,8 @@ class WebSession(unittest.TestCase):
         self.start()
         call = self.calls[0]
         cwd = Path(call["cwd"])
-        self.assertEqual(call["files"], ["guard.py"])  # nothing else to find
+        # Nothing else to find: the guard and an empty folder for its settings.
+        self.assertEqual(call["files"], ["guard.py", "settings"])
         self.assertFalse(cwd.exists())
         self.assertNotIn(Path.home().name, str(cwd))
         self.assertFalse(str(cwd).startswith(str(self.home)))
@@ -1386,6 +1403,69 @@ class WebSession(unittest.TestCase):
         self.assertEqual(len(made), 1)
         self.assertFalse(Path(made[0]).exists())
         self.assertEqual(len(self.calls), 2)  # it was never started
+
+    def test_it_is_started_without_the_account(self):
+        clean = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        }
+        with mock.patch.dict(os.environ, clean, clear=True):
+            self.assertEqual(self.start(), {"ok": True, "data": {"a": 1}})
+        call = self.calls[0]
+        env = call["env"]
+        # Settings of its own, new and empty, in the folder that is deleted
+        # with it; the login stays with the usual folder.
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], f"{call['cwd']}/settings")
+        self.assertEqual(env["CLAUDE_SECURESTORAGE_CONFIG_DIR"], "")
+        self.assertIn("settings", call["files"])
+        self.assertNotIn("settings/.claude.json", call["files"])
+        self.assertNotIn(Path.home().name, env["CLAUDE_CONFIG_DIR"])
+        self.assertFalse(Path(env["CLAUDE_CONFIG_DIR"]).exists())
+        # The rest of the night's environment is still there.
+        self.assertEqual(env["AUTO_TRADE_ENABLED"], "false")
+        self.assertIn(guard.PRIVATE_ENV, env)
+        # A runner whose own sessions sign in from another folder: the login
+        # stays with that one.
+        for mine, login in [
+            ({"CLAUDE_CONFIG_DIR": "/elsewhere/claude"}, "/elsewhere/claude"),
+            (
+                {
+                    "CLAUDE_CONFIG_DIR": "/elsewhere/claude",
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/login/here",
+                },
+                "/login/here",
+            ),
+        ]:
+            with mock.patch.dict(os.environ, {**clean, **mine}, clear=True):
+                self.start()
+            env = self.calls[-1]["env"]
+            self.assertEqual(env["CLAUDE_SECURESTORAGE_CONFIG_DIR"], login)
+            self.assertEqual(
+                env["CLAUDE_CONFIG_DIR"], f"{self.calls[-1]['cwd']}/settings"
+            )
+        # A session that builds keeps the settings of this Mac.
+        self.assertNotIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", self.team.night_env())
+
+    def test_a_session_that_did_not_use_its_own_settings_says_so(self):
+        logged = []
+        self.team.log = logged.append
+        self.uses_its_folder = False
+        res = self.start()
+        self.assertEqual((res["ok"], res["data"]), (True, {"a": 1}))
+        self.assertEqual(res["note"], self.team.NOT_ITS_OWN)
+        self.assertIn("e-mail address", res["note"])
+        self.assertEqual(logged, [f"1116-market: {self.team.NOT_ITS_OWN}"])
+        # One that never ran has nothing to say about it.
+        self.reply = (127, "", "claude: command not found")
+        res = self.start()
+        self.assertFalse(res["ok"])
+        self.assertNotIn("note", res)
+        self.assertEqual(len(logged), 1)
+        # And one that did use it says nothing.
+        self.uses_its_folder = True
+        self.reply = (0, stream({"a": 1}), "")
+        self.assertNotIn("note", self.start())
 
     def test_it_is_told_what_to_keep_back(self):
         self.team.private_words = lambda: ["jdoe", "Jane Doe", "jane.doe77"]

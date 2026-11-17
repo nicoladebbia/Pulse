@@ -417,8 +417,9 @@ def private_words() -> list[str]:
     session sends to the web: the user name, the full name and the account's
     e-mail address without its domain. A session knows them without being
     told by the team: every path holds the user name, and the CLI puts the
-    account's address into every session's context (only `--bare` leaves it
-    out, and that does not run on the subscription login)."""
+    account's address into a session's context. A session that only reads the
+    web is started without it (`no_account`); this list is the net under
+    that."""
     words = [Path.home().name]
     try:
         words.append(pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0])
@@ -431,6 +432,40 @@ def private_words() -> list[str]:
     words.append(str(account.get("fullName") or ""))
     words.append(str(account.get("emailAddress") or "").split("@")[0])
     return [w for w in words if w.strip()]
+
+
+WEB_SETTINGS = "settings"  # a web session's own settings folder, in its folder
+NOT_ITS_OWN = (
+    "the session did not use its own settings folder, so it may have been told "
+    "the account's e-mail address: check `no_account` against this version of the CLI"
+)
+
+
+def no_account(cwd: Path) -> dict:
+    """The environment that starts a session in `cwd` without the account's
+    e-mail address.
+
+    The CLI tells every session the address of the account that is signed in.
+    It reads it from its settings folder (`oauthAccount` in `.claude.json`),
+    and no flag turns that off. So the session gets a settings folder of its
+    own, new and empty: no account is written there when the session starts,
+    and it is told none. CLAUDE_SECURESTORAGE_CONFIG_DIR keeps the login
+    where the runner's own sessions have it (set but empty: the keychain entry
+    of the usual folder), so the session is still signed in.
+
+    Checked on CLI 2.1.325 by reading what real sessions sent: the address was
+    in every request before, and in none with this. The CLI does look the
+    account up again while the session runs and writes it into this folder,
+    which is deleted with the session's folder; what the session was told at
+    its start is not built again in a run of this length. It is not a promise
+    of the CLI, so guard.py still keeps the owner's names out of every search
+    and page address, and `web_session` says so when the folder was not used."""
+    folder = cwd / WEB_SETTINGS
+    folder.mkdir()
+    login = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR") or os.environ.get(
+        "CLAUDE_CONFIG_DIR", ""
+    )
+    return {"CLAUDE_CONFIG_DIR": str(folder), "CLAUDE_SECURESTORAGE_CONFIG_DIR": login}
 
 
 def worktree_entry(worktree: Path) -> Path:
@@ -651,20 +686,22 @@ WEB_TMP = Path("/private/tmp")  # the default temp folder can sit under the home
 
 def web_session(prompt: str, schema: dict, minutes: int, name: str, run: dict) -> dict:
     """One unattended session that can only read the web. Returns {ok, data,
-    error} like `session`.
+    error} like `session`, and a `note` when something about it has to be
+    looked at.
 
     It is started with two tools, a search and a page fetch, and without the
     settings, instructions, skills and connectors of this Mac (`--restricted`),
     so it has no way to read a file, run a command or change anything, and it
     is told nothing but `prompt`: not the brief for sessions, which is about
-    code. It runs in a folder of its own whose path does not hold the user
-    name, inside the fence with none of its exceptions (the team's folder and
-    the main checkout are read-only as a whole). guard.py refuses any other
-    tool, should one be there after all, any search or page address that
-    names the owner (`private_words`), and any page fetch that does not go to
-    a site on the public web. What it returns is text from the web: the caller
-    treats it as that. Every step of it is kept, as `<name>.jsonl` in the
-    run's folder, so a look that went wrong can be read."""
+    code, and not the account's e-mail address (`no_account`). It runs in a
+    folder of its own whose path does not hold the user name, inside the fence
+    with none of its exceptions (the team's folder and the main checkout are
+    read-only as a whole). guard.py refuses any other tool, should one be
+    there after all, any search or page address that names the owner
+    (`private_words`), and any page fetch that does not go to a site on the
+    public web. What it returns is text from the web: the caller treats it as
+    that. Every step of it is kept, as `<name>.jsonl` in the run's folder, so
+    a look that went wrong can be read."""
     base = WEB_TMP if WEB_TMP.is_dir() else None
     cwd = Path(tempfile.mkdtemp(prefix="pulse-web-", dir=base))
     cmd = [
@@ -700,13 +737,19 @@ def web_session(prompt: str, schema: dict, minutes: int, name: str, run: dict) -
             fenced(cmd, None),
             cwd=cwd,
             timeout=minutes * 60,
-            env=night_env(),
+            env={**night_env(), **no_account(cwd)},
             reap=True,
             cancel=pause_asked,  # no job of the queue, so only `pause` stops it
         )
+        # The CLI keeps its settings file in the folder it works from.
+        its_own = (cwd / WEB_SETTINGS / ".claude.json").is_file()
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
-    return session_outcome(code, out, err, minutes, name, run, kept="jsonl")
+    res = session_outcome(code, out, err, minutes, name, run, kept="jsonl")
+    if res["ok"] and not its_own:
+        log(f"{name}: {NOT_ITS_OWN}")
+        res["note"] = NOT_ITS_OWN
+    return res
 
 
 def head(wt: Path) -> str:
@@ -2204,6 +2247,8 @@ def market_scout(run: dict, today: dt.date) -> tuple[bool, str]:
     note = f"the market scout checked {len(result['products'])} products like Pulse"
     if queued:
         note += f"; {queued} idea{'s' if queued != 1 else ''} from it wait for your yes"
+    if res.get("note"):
+        note += f"; {res['note']}"
     return True, note
 
 
