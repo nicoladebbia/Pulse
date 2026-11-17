@@ -77,7 +77,10 @@ pub fn strip_tags(html: &str) -> String {
 /// function — unit-tested below.
 pub fn extract_paragraphs(html: &str) -> String {
     let mut out = String::new();
-    let lower = html.to_lowercase();
+    // ASCII lowercase only: the offsets found in `lower` slice `html`, so the
+    // two must stay byte for byte the same length. `to_lowercase()` does not
+    // keep it ('İ' grows from 2 bytes to 3), and tag names are ASCII anyway.
+    let lower = html.to_ascii_lowercase();
     let mut pos = 0usize;
     while let Some(start_rel) = lower[pos..].find("<p") {
         let start = pos + start_rel;
@@ -270,6 +273,18 @@ mod tests {
         let text2 = extract_paragraphs(&format!("<div>{}</div>", body));
         assert!(text2.len() <= BODY_CAP);
         assert!(!text2.is_empty());
+    }
+
+    /// Regression: offsets found in a lowercased copy were used to slice the
+    /// original. `to_lowercase()` changes byte lengths ('İ' is 2 bytes and
+    /// becomes 3), so the slice landed off the paragraph or inside a char and
+    /// panicked. Repro of the 2026-11-09 evening briefing crash (exit 101).
+    #[test]
+    fn letters_that_change_length_in_lowercase_do_not_shift_the_paragraphs() {
+        let para = "İstanbul'da bugün açıklanan yeni kurallar, tüm yapay zekâ sağlayıcılarının \
+                    eğitim verisi kaynaklarını açıklamasını zorunlu kılıyor.";
+        let html = format!("<div>{}</div><P CLASS=\"x\">{}</P><p>İİİ</p>", "İ".repeat(7), para);
+        assert_eq!(extract_paragraphs(&html), para);
     }
 
     #[test]

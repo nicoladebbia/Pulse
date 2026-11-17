@@ -1106,7 +1106,10 @@ fn clean_theme_output(raw: &str) -> String {
         "the most important story is",
         "today's most important story is",
     ];
-    let lower = s.to_lowercase();
+    // ASCII lowercase keeps every byte where it is, so `p.len()` is a valid
+    // cut in `s`. `to_lowercase()` can change a letter's length (the Kelvin
+    // sign becomes a one-byte "k"), which would cut `s` inside a char.
+    let lower = s.to_ascii_lowercase();
     for p in &preambles {
         if lower.starts_with(p) {
             s = s[p.len()..].trim_start_matches([':', ' ', '-', '—']).trim().to_string();
@@ -3005,6 +3008,28 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
     }
 
     Ok(total)
+}
+
+#[cfg(test)]
+mod clean_theme_output_tests {
+    use super::clean_theme_output;
+
+    #[test]
+    fn a_preamble_is_cut_off_whatever_its_case() {
+        assert_eq!(
+            clean_theme_output("The Most Important Story Today Is: chips are scarce."),
+            "chips are scarce."
+        );
+        assert_eq!(clean_theme_output("TODAY'S THEME — rates fall."), "rates fall.");
+    }
+
+    #[test]
+    fn letters_that_change_length_in_lowercase_are_left_alone() {
+        // 'İ' is 2 bytes and lowercases to 3; the Kelvin sign is 3 and lowercases to 1.
+        for text in ["İstanbul'da seçim: sonuçlar belli oldu.", "\u{212A}elvin scale explained."] {
+            assert_eq!(clean_theme_output(text), text);
+        }
+    }
 }
 
 #[cfg(test)]
