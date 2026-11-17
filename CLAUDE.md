@@ -26,6 +26,7 @@ cargo build -p pulse-fetcher    # Build fetcher only
 - Voyage-3-lite for embeddings (512 dims)
 - All news sources are free APIs (Google News RSS, HN, direct RSS)
 - Magazine layout, dark mode only, vim-style keyboard shortcuts
+- Feed counts: every `daily` and `freedoms` run writes one `feed_runs` row per news feed (migration 048, `crates/pulse-fetcher/src/feed_runs.rs`): whether it answered, `entries` in its answer, `fetched` (handed to the run), `offered` (usable by this run), `pooled` (left after repeats), kept 180 days. `fetch_candidates.feed_id` joins the pool to it. Each Google News query has its own id (`google_news_<query name>`). A new news source must wrap each feed's fetch in `feed_runs::watch` (or call `note`), or its feeds show up as kind `other` with no fetch outcome.
 
 ## Crash Prevention Rules
 - **NEVER use `.unwrap()` on `partial_cmp()`** — f64 NaN values return None. Always use `.unwrap_or(std::cmp::Ordering::Equal)`.
