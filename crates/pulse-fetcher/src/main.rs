@@ -23,6 +23,7 @@ pub(crate) mod event_signals;
 pub(crate) mod position_sizing;
 pub(crate) mod edge_report;
 pub(crate) mod research;
+pub(crate) mod contact;
 
 use clap::Parser;
 use std::path::PathBuf;

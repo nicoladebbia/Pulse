@@ -37,7 +37,7 @@ cargo build -p pulse-fetcher    # Build fetcher only
 - **Test nullable DB columns** — use `Option<T>` for any column that can be NULL, even if a WHERE clause filters NULLs.
 
 ## Environment Variables
-Required in `.env`: ANTHROPIC_API_KEY, VOYAGE_API_KEY, GROQ_API_KEY — or `PULSE_LLM=local` to run every AI call on Ollama with no keys (`crates/pulse-llm`, `scripts/setup-local-ai.sh`). In local mode `PULSE_CLOUD_TASKS=summarize` (comma list of `GroqClient::call` endpoints, or `all`) still sends those tasks to Groq with the real `GROQ_API_KEY`, falling back to Ollama on error. New AI call sites must go through `pulse_llm` (`messages_url`, `messages_body`, `api_key`, `embeddings_body`) or they will silently bypass local mode.
+Required in `.env`: ANTHROPIC_API_KEY, VOYAGE_API_KEY, GROQ_API_KEY — or `PULSE_LLM=local` to run every AI call on Ollama with no keys (`crates/pulse-llm`, `scripts/setup-local-ai.sh`). In local mode `PULSE_CLOUD_TASKS=summarize` (comma list of `GroqClient::call` endpoints, or `all`) still sends those tasks to Groq with the real `GROQ_API_KEY`, falling back to Ollama on error. New AI call sites must go through `pulse_llm` (`messages_url`, `messages_body`, `api_key`, `embeddings_body`) or they will silently bypass local mode. Optional: `PULSE_CONTACT_EMAIL` (arXiv research reader) and `PULSE_REDDIT_USER` (Reddit) add a contact to those User-Agents (`crates/pulse-fetcher/src/contact.rs`); no address or account name belongs in the code, the repo is public. Without `PULSE_REDDIT_USER` Reddit answered every feed request with a 404 (2026-11-17), so set it where Reddit posts are wanted.
 
 ## Trading (Alpaca paper)
 - All orders go to `paper-api.alpaca.markets` only. Keys: `ALPACA_API_KEY` / `ALPACA_SECRET_KEY`.

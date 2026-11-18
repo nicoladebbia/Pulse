@@ -33,8 +33,6 @@ use super::RawArticle;
 use std::collections::HashSet;
 use std::time::Duration;
 
-const USER_AGENT: &str = "macos:com.pulse.fetcher:0.1.0 (by /u/nicoladebbia)";
-
 const BASE_URL: &str = "https://www.reddit.com";
 
 /// (subreddit, listing, sector)
@@ -137,7 +135,7 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
 
 fn client() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(crate::contact::reddit_user_agent())
         .timeout(Duration::from_secs(15))
 }
 
@@ -625,7 +623,7 @@ mod tests {
         for request in &requests {
             assert!(request.starts_with("get /r/digitalnomad+longevity+expats/top/.rss?t=day&limit=100 "), "{request}");
             // Reddit turns away clients that do not say who they are.
-            assert!(request.contains(&format!("user-agent: {}", USER_AGENT.to_lowercase())), "{request}");
+            assert!(request.contains(&format!("user-agent: {}", crate::contact::reddit_user_agent().to_lowercase())), "{request}");
         }
     }
 
