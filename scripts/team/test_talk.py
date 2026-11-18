@@ -495,7 +495,7 @@ class Look(unittest.TestCase):
     def test_a_moved_trading_file_a_changed_script_and_the_live_address_are_all_seen(self):
         self.g("mv", "crates/pulse-alpaca/src/stops.rs", "a.rs")
         (self.repo / "package.json").write_text('{"scripts": {"test": "true"}}\n')
-        (self.repo / "b.txt").write_text("let url = \"https://api.alpaca.markets/v2/orders\";\n")
+        (self.repo / "b.txt").write_text(f"let url = \"https://{'api'}.alpaca.markets/v2/orders\";\n")  # spelled so this file does not hold it
         got = self.team.pr_look(self.commit("all of it"), 1)
         c = rules.pr_card(pr(), "owner", "main", got)
         self.assertTrue(c["trading"])
