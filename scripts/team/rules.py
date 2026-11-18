@@ -871,8 +871,12 @@ def trigger(finding: dict, evidence: str, now: dt.datetime) -> dict:
 # or a button press means, and nothing else in the team reads the words.
 
 CHAT_HELP = (
-    "I understand:\n"
-    "idea: <what you want> — goes on the team's list\n"
+    "Text me in plain words what you want: a question, or a job like "
+    "\"merge the open pull requests and release\", \"stop buying\" or "
+    "\"build me a chart of my risk\". Before a merge, a release or a trading "
+    "setting changes, I show you the plan with a button.\n"
+    "Fixed words that always work:\n"
+    "idea: <what you want> — goes on the team's list for the night\n"
     "status — what the team did last and what waits for you\n"
     "pause — everything stops, also the job that is running\n"
     "resume — back to work\n"
@@ -885,17 +889,20 @@ BUTTONS = {
     "idea": (("Build it", "yes"), ("Not now", "later"), ("No", "no")),
     "question": (("Try again", "yes"), ("Leave it", "no")),
     "trading": (("Apply it", "yes"), ("No", "no")),
+    "action": (("Do it", "yes"), ("Cancel", "no")),
 }
 CONFIRM = (("Yes, apply it", "confirm"), ("Cancel", "cancel"))
 APPROVED = {
     "idea": "Build it. It joins the list and the team builds it at night.",
     "question": "Trying again on the next run.",
     "trading": "Applying it on the next run.",
+    "action": "Doing it now.",
 }
 DECLINED = {
     "idea": "No. I will not bring it up again.",
     "question": "Left as it is.",
     "trading": "No. Nothing changes.",
+    "action": "Cancelled. Nothing was done.",
 }
 OPEN_STATES = ("sent", "confirming")  # texted, no final answer yet
 IDEAS_PER_WEEK = 3
@@ -918,6 +925,302 @@ def parse_chat(text: str) -> tuple[str, str]:
     if head in CHAT_COMMANDS and not rest.strip():
         return (head, "")
     return ("note", text) if text else ("help", "")
+
+
+# ---- plain words -----------------------------------------------------------
+# A text that is none of the fixed words goes to a session that can only read.
+# It answers, and may ask for actions from the list below. The words it sends
+# back are data too: `talk_plan` decides what each one comes to. What changes
+# main, the installed app or how Pulse trades is only ever a plan: nothing of
+# it happens before Nicola pressed the button under it.
+
+TALK_ACTIONS = ("merge", "task", "idea", "pause", "resume", "release", "setting")
+TALK_MAX_ACTIONS = 20
+PLAN_MAX = 10  # steps in one plan: all of them must fit in the text he sees
+PLAN_TITLE = 90
+PLAN_FRESH_MIN = 60  # a yes older than this is not carried out any more
+PLAN_OPEN_MIN = 120  # a plan shown longer ago than this is too old to say yes to
+SWITCH_DEFAULT_ON = frozenset(
+    {"SHORTS_ENABLED", "EVENT_TRADES_ENABLED", "LEARNING_AUTO_APPLY", "EXIT_DRY_RUN"}
+)
+TALK_HISTORY = 8  # earlier turns a session is shown
+TALK_TEXT_MAX = 1500  # of one text from Nicola
+# The switches a plan may flip in the installed app's settings, and what each
+# one does when it is on. All of them are about the paper account.
+# SWITCH_DEFAULT_ON: what the fetcher does when a switch is not set (it reads
+# these as "on unless false or 0"; the others as "off unless true or 1").
+TRADING_SWITCHES = {
+    "AUTO_TRADE_ENABLED": "Pulse buys by itself",
+    "SHORTS_ENABLED": "Pulse may sell short",
+    "NEWS_TRADES_ENABLED": "news surprises are traded",
+    "EVENT_TRADES_ENABLED": "event signals are traded",
+    "LEARNING_AUTO_APPLY": "what Pulse learned changes its signal weights by itself",
+    "EXIT_DRY_RUN": "exits are only logged, nothing is sold",
+}
+
+
+def pr_card(pr: dict, owner: str, base: str, look: dict | None) -> dict:
+    """An open pull request as the talk session and `talk_plan` see it.
+    `look` is what its change holds, read from git: {"changes": [(status,
+    path), ...] (old names of renamed files too), "never": [reasons it must
+    not merge from a text], "scripts": bool}; None when it could not be read."""
+    look = look if isinstance(look, dict) else None
+    changes = list(look.get("changes") or []) if look else []
+    return {
+        "number": pr.get("number"),
+        "title": " ".join(str(pr.get("title") or "").split())[:160],
+        "sha": pr.get("headRefOid") or "",
+        "checks": ci_state(pr.get("statusCheckRollup")),
+        "mergeable": pr.get("mergeable") or "UNKNOWN",
+        "draft": bool(pr.get("isDraft")),
+        "base": pr.get("baseRefName") or "",
+        "own": (pr.get("author") or {}).get("login") == owner
+        and not pr.get("isCrossRepository"),
+        "to_base": pr.get("baseRefName") == base,
+        "files_known": look is not None,
+        "never": [str(r) for r in (look.get("never") or [])] if look else [],
+        "trading": bool(trading_violations(changes)),
+        "team_code": bool(protected_violations(changes)) or bool(look and look.get("scripts")),
+        "labels": sorted(
+            str(l.get("name") or "") for l in pr.get("labels") or [] if l.get("name")
+        ),
+    }
+
+
+def merge_refusal(card: dict | None) -> str:
+    """Why a pull request is not merged from a text, or ''."""
+    if not card:
+        return "it is not an open pull request"
+    if not card.get("own"):
+        return "someone else opened it"
+    if card.get("draft"):
+        return "it is a draft"
+    if not card.get("to_base"):
+        return f"it does not target main (it targets {card.get('base') or 'nothing'})"
+    if not card.get("files_known"):
+        return "what it changes could not be read"
+    if card.get("never"):
+        return f"it {card['never'][0]}, and that is never merged from a text"
+    if card.get("checks") != "pass":
+        return f"its checks have not passed ({card.get('checks')})"
+    if card.get("mergeable") != "MERGEABLE":
+        return f"GitHub cannot merge it right now ({card.get('mergeable')})"
+    return ""
+
+
+def merge_line(card: dict, label: str) -> str:
+    """One pull request in a plan, with what Nicola should know before the tap."""
+    marks = []
+    if card.get("trading"):
+        marks.append("CHANGES HOW PULSE TRADES")
+    if card.get("team_code"):
+        marks.append("changes the team's own code or settings")
+    if label in (card.get("labels") or []):
+        marks.append("the team had stopped on it for you")
+    title = card["title"][:PLAN_TITLE]
+    return f"Merge #{card['number']} {title}" + (f" ({'; '.join(marks)})" if marks else "")
+
+
+def switch_value(value) -> str:
+    """'true' / 'false' for what a session sent as a switch's value, else ''."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    word = str(value or "").strip().lower()
+    return {"true": "true", "on": "true", "false": "false", "off": "false"}.get(word, "")
+
+
+def talk_plan(
+    actions, cards: list[dict], paused: bool, switches: dict | None = None, label: str = ""
+) -> dict:
+    """What a talk session's actions come to: `confirm` (the steps of one plan,
+    carried out only after a tap: merge, release, setting; each with the `line`
+    he is shown; so is resume), `now` (done at once: task, idea, pause) and `refused`
+    (what is not done, with the reason). Anything not on the list is dropped."""
+    by_number = {c.get("number"): c for c in cards}
+    plan = {"confirm": [], "now": [], "refused": []}
+    seen = set()
+
+    def confirm(step: dict, name: str) -> None:
+        if len(plan["confirm"]) >= PLAN_MAX:
+            plan["refused"].append(f"{name}: more than {PLAN_MAX} steps in one plan, ask again for the rest")
+        else:
+            plan["confirm"].append(step)
+
+    for a in (actions if isinstance(actions, list) else [])[:TALK_MAX_ACTIONS]:
+        if not isinstance(a, dict) or a.get("kind") not in TALK_ACTIONS:
+            continue
+        kind = a["kind"]
+        if kind == "merge":
+            number = a.get("pr")
+            if not isinstance(number, int) or isinstance(number, bool):
+                continue
+            if ("merge", number) in seen:
+                continue
+            seen.add(("merge", number))
+            card = by_number.get(number)
+            why = "the team is paused" if paused else merge_refusal(card)
+            if why:
+                plan["refused"].append(f"#{number}: {why}")
+            else:
+                confirm(
+                    {"kind": "merge", "pr": number, "sha": card["sha"], "line": merge_line(card, label)},
+                    f"#{number}",
+                )
+        elif kind == "setting":
+            name, value = str(a.get("name") or "").strip().upper(), switch_value(a.get("value"))
+            if name not in TRADING_SWITCHES or not value or ("setting", name) in seen:
+                if name and name not in TRADING_SWITCHES:
+                    plan["refused"].append(f"{name[:40]}: not a switch I may change")
+                continue
+            seen.add(("setting", name))
+            if switches is None:
+                plan["refused"].append(f"{name}: the installed app's settings could not be read")
+                continue
+            was = switches.get(name) or switch_state(name, None)
+            if was == value:
+                plan["refused"].append(f"{name} is already {value}")
+                continue
+            confirm(
+                {
+                    "kind": "setting",
+                    "name": name,
+                    "value": value,
+                    "line": f"Set {name} to {value} (now {was}; true means: {TRADING_SWITCHES[name]})",
+                },
+                name,
+            )
+        elif kind == "release":
+            if ("release",) in seen:
+                continue
+            seen.add(("release",))
+            if paused:
+                plan["refused"].append("a release: the team is paused")
+            else:
+                confirm(
+                    {
+                        "kind": "release",
+                        "line": "Release a new version of Pulse from main and install it on this Mac",
+                    },
+                    "the release",
+                )
+        elif kind in ("task", "idea"):
+            words = " ".join(str(a.get("text") or "").split())[:IDEA_MAX]
+            if not words or (kind, words.casefold()) in seen:
+                continue
+            seen.add((kind, words.casefold()))
+            if kind == "task" and paused:
+                plan["refused"].append(f"\"{words[:60]}\": the team is paused")
+            else:
+                plan["now"].append({"kind": kind, "text": words})
+        elif kind == "resume" and (kind,) not in seen:
+            # Lifting his own pause is his to confirm: the words that asked
+            # for it came through a session.
+            seen.add((kind,))
+            if paused:
+                confirm({"kind": "resume", "line": "Resume the team (it is paused now)"}, "resume")
+        elif (kind,) not in seen:
+            seen.add((kind,))
+            plan["now"].append({"kind": kind})
+    # A release comes after the merges it should carry, whatever order was named.
+    order = {"resume": 0, "release": 2}
+    plan["confirm"].sort(key=lambda s: order.get(s["kind"], 1))
+    return plan
+
+
+def plan_title(steps: list[dict]) -> str:
+    kinds = {s["kind"] for s in steps}
+    if kinds == {"merge"}:
+        n = len(steps)
+        return f"Merge {n} pull request{'s' if n != 1 else ''} into main"
+    return f"{len(steps)} step{'s' if len(steps) != 1 else ''}, in this order"
+
+
+def plan_text(steps: list[dict]) -> str:
+    return "\n".join(f"{i}. {s['line']}" for i, s in enumerate(steps, 1))
+
+
+def plan_fresh(p: dict, now: dt.datetime) -> bool:
+    """Is the yes on this plan recent enough to act on? Both the yes and the
+    plan it was said to: what a plan says ("now true") ages too."""
+    try:
+        answered = dt.datetime.fromisoformat(p.get("answered_at") or "")
+        sent = dt.datetime.fromisoformat(p.get("sent_at") or "")
+    except ValueError:
+        return False
+    return now - answered <= dt.timedelta(minutes=PLAN_FRESH_MIN) and answered - sent <= dt.timedelta(
+        minutes=PLAN_OPEN_MIN
+    )
+
+
+def next_version(tags: list[str]) -> str:
+    """The tag after the highest `vX.Y.Z` among `tags`, one patch up; '' when
+    there is none to count from."""
+    found = [tuple(map(int, m.groups())) for m in (re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", t.strip()) for t in tags) if m]
+    if not found:
+        return ""
+    major, minor, patch = max(found)
+    return f"v{major}.{minor}.{patch + 1}"
+
+
+def checks_state(runs) -> str:
+    """GitHub's check runs on a commit: 'pass' (all finished, none failed, at
+    least one there), 'fail' (one finished badly), else 'pending' (also when
+    none has shown up yet)."""
+    runs = [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
+    done = [r for r in runs if r.get("status") == "completed"]
+    if any(r.get("conclusion") not in ("success", "skipped", "neutral") for r in done):
+        return "fail"
+    return "pass" if runs and len(done) == len(runs) else "pending"
+
+
+def _env_lines(env_text: str):
+    """(index, name, raw value) of each assignment line, read as the app's
+    dotenv reader does: `export` allowed, quotes and a trailing comment off."""
+    for i, line in enumerate(env_text.split("\n")):
+        m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$", line.rstrip("\r"))
+        if not m:
+            continue
+        value = m.group(2).strip()
+        if value[:1] in ("'", '"'):
+            end = value.find(value[0], 1)
+            value = value[1:end] if end > 0 else value[1:]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        yield i, m.group(1), value
+
+
+def switch_state(name: str, raw: str | None) -> str:
+    """'true' / 'false': what the fetcher makes of a switch's value (None =
+    not set)."""
+    word = (raw or "").lower() if raw is not None else None
+    if name in SWITCH_DEFAULT_ON:
+        return "false" if word in ("false", "0") else "true"
+    return "true" if word in ("true", "1") else "false"
+
+
+def set_switch(env_text: str, name: str, value: str) -> str:
+    """The settings file with `name=value`: written where the name first
+    stands (the line the app reads), any later line for it removed, else
+    added at the end. Every other line stays as it is."""
+    lines = env_text.split("\n")
+    hits = [i for i, key, _ in _env_lines(env_text) if key == name]
+    if hits:
+        lines[hits[0]] = f"{name}={value}" + ("\r" if lines[hits[0]].endswith("\r") else "")
+        for i in reversed(hits[1:]):
+            del lines[i]
+        return "\n".join(lines)
+    return env_text + ("" if not env_text or env_text.endswith("\n") else "\n") + f"{name}={value}\n"
+
+
+def read_switches(env_text: str) -> dict:
+    """Every trading switch as the app will read it from this settings file
+    ('true' / 'false'): the first line for a name counts, and one that is not
+    set has the fetcher's default."""
+    raw = {}
+    for _, key, value in _env_lines(env_text):
+        if key in TRADING_SWITCHES:
+            raw.setdefault(key, value)
+    return {name: switch_state(name, raw.get(name)) for name in TRADING_SWITCHES}
 
 
 def parse_button(data: str) -> tuple[str, str] | None:

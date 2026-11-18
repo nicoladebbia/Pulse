@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""The team's Telegram line to Nicola: texts out, button presses and a few
-fixed commands in.
+"""The team's Telegram line to Nicola: texts out, button presses, a few
+fixed commands and plain words in.
 
 What is typed in Telegram is data and never runs as a command:
 `rules.parse_chat` knows a handful of fixed words, a button press moves one
-proposal one step (`rules.proposal_step`), and any other text is at most a note
-kept with the proposal it replies to. Two things do reach a builder, as the
-request it works on inside the fence and behind the merge gate: an `idea:` line
-(it joins the idea list, like `team.py idea`) and such a note. Only the account
-that paired is answered; everyone else is dropped unanswered.
+proposal one step (`rules.proposal_step`), and a reply to a proposal is a note
+kept with it. Any other text is left in the `asks` folder for `team.py talk`:
+a session that can only read answers it and may ask for actions from a fixed
+list (`rules.talk_plan`); a merge among them waits for a button press here.
+Two things reach a builder, as the request it works on inside the fence and
+behind the merge gate: an idea (an `idea:` line, or a job asked for in plain
+words) and a note. Only the account that paired is answered; everyone else is
+dropped unanswered.
 
 The bot token is in ~/.pulse-team/secrets/telegram.json (owner-only). It is
 read here and nowhere else, and never goes into the environment, a log or an
@@ -41,12 +44,13 @@ import rules  # noqa: E402
 
 def set_home(home: Path) -> None:
     """Point every path at the team's folder (the runner passes its own)."""
-    global HOME, SECRETS, PROPOSALS, OUTBOX, INBOX, PAUSED, CHAT_STATE, DIGEST  # noqa: PLW0603
+    global HOME, SECRETS, PROPOSALS, OUTBOX, INBOX, ASKS, PAUSED, CHAT_STATE, DIGEST  # noqa: PLW0603
     HOME = Path(home)
     SECRETS = HOME / "secrets/telegram.json"
     PROPOSALS = HOME / "proposals.json"  # what the team asked, what was answered
     OUTBOX = HOME / "outbox"  # texts waiting for the morning, or for Telegram
     INBOX = HOME / "inbox"  # ideas Nicola texted, for the runner to put on the list
+    ASKS = HOME / "asks"  # what he texted in plain words, for `team.py talk`
     PAUSED = HOME / "paused"  # exists = everything stops, also the job that is running
     CHAT_STATE = HOME / "chat.json"  # the listener's own: update offset, heartbeat
     DIGEST = HOME / "digest.json"  # the day of the last night report
@@ -219,6 +223,7 @@ def proposal_text(p: dict) -> str:
         "idea": "I was thinking of adding this:",
         "question": "This needs you:",
         "trading": "A trading change, with its proof:",
+        "action": "Here is what I would do:",
     }.get(p.get("kind"), "")
     return f"{head}\n{p.get('title', '')}\n\n{p.get('text', '')}".strip()
 
@@ -333,6 +338,59 @@ def flush(line: Bot, now: dt.datetime) -> int:
     return sent
 
 
+PLAN_TEXT_MAX = 3500  # Telegram takes 4096 in one text
+
+
+def ask_now(line: Bot, title: str, text: str, acts: list, now: dt.datetime) -> str:
+    """Text a plan with its buttons at once, at any hour: Nicola is waiting
+    for it. `acts` is what a yes carries out. Returns the id, '' when Telegram
+    did not take the text (nothing is kept then)."""
+    if len(text.strip()) > PLAN_TEXT_MAX:
+        # Never a yes to steps he could not read: the whole plan, or none.
+        log("a plan was too long to show in full; nothing was sent")
+        return ""
+    stamp = _stamp(now)
+    p = {
+        "id": rules.proposal_id("action", random.token_hex(8), stamp),
+        "kind": "action",
+        "key": f"action-{time.time_ns()}",
+        "job": "",
+        "title": " ".join(title.split())[:200],
+        "text": text.strip(),
+        "acts": acts,
+        "state": "sent",
+        "created": stamp,
+        "sent_at": stamp,
+    }
+    try:
+        p["message_id"] = line.say(proposal_text(p), proposal_buttons(p))
+    except ChatError as e:
+        log(f"could not send a plan: {e}")
+        return ""
+    with proposals() as items:
+        items.append(p)
+    return p["id"]
+
+
+def wake_talker() -> None:
+    """Start `team.py talk` on its own: it answers what waits in `asks` and
+    carries out the plans Nicola said yes to. One at a time (its own lock);
+    a second one started meanwhile leaves at once."""
+    script = Path(__file__).resolve().parent / "team.py"
+    try:
+        HOME.mkdir(parents=True, exist_ok=True)
+        with open(HOME / "talk.log", "a") as out:
+            subprocess.Popen(  # noqa: S603
+                [sys.executable, str(script), "talk"],
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=out,
+                start_new_session=True,
+            )
+    except OSError as e:
+        log(f"could not start the talker: {type(e).__name__}")
+
+
 # -------------------------------------------------------------- incoming --
 
 
@@ -357,7 +415,7 @@ def status_text() -> str:
 
 def on_press(line: Bot, query: dict, now: dt.datetime) -> None:
     parsed = rules.parse_button(query.get("data") or "")
-    reply, shown = "I do not know that button.", None
+    reply, shown, act = "I do not know that button.", None, False
     if parsed:
         pid, answer = parsed
         with proposals() as items:  # the answer is on disk before Telegram hears back
@@ -367,6 +425,9 @@ def on_press(line: Bot, query: dict, now: dt.datetime) -> None:
                 if state != p.get("state"):
                     rules.settle(p, state, now)
                     shown = dict(p, state=state)
+                    act = p.get("kind") == "action" and state == "approved"
+    if act:
+        wake_talker()
     with contextlib.suppress(ChatError):
         line.call(
             "answerCallbackQuery",
@@ -424,6 +485,7 @@ def on_text(line: Bot, message: dict, now: dt.datetime) -> None:
                     target
                     and p.get("message_id") == target
                     and p.get("state") in (*rules.OPEN_STATES, "approved")
+                    and p.get("kind") != "action"  # a plan has no builder
                 ):
                     # Telegram hands an update over again when the listener
                     # died before confirming it: the same text is kept once.
@@ -432,7 +494,20 @@ def on_text(line: Bot, message: dict, now: dt.datetime) -> None:
                         seen.append(message.get("message_id"))
                         p["note"] = f"{p.get('note', '')} {arg}".strip()[:1000]
                     kept = True
-        reply = "Noted. The builder will see it." if kept else rules.CHAT_HELP
+        if kept:
+            reply = "Noted. The builder will see it."
+        else:
+            # Plain words: kept for the talker, which answers them.
+            ASKS.mkdir(parents=True, exist_ok=True)
+            # Named by the message: one Telegram hands over twice is kept once.
+            _save(
+                ASKS / f"{int(message.get('message_id') or 0):012d}.json",
+                {"text": arg[: rules.TALK_TEXT_MAX], "at": _stamp(now)},
+            )
+            with contextlib.suppress(ChatError):  # "typing…" while it thinks
+                line.call("sendChatAction", {"chat_id": line.chat_id, "action": "typing"})
+            wake_talker()
+            return  # the talker answers; an "on it" would only be noise
     else:
         reply = rules.CHAT_HELP
     try:
@@ -518,6 +593,7 @@ def run() -> int:
     state = _load(CHAT_STATE, {})
     state = state if isinstance(state, dict) else {}
     log("listening")
+    wake_talker()  # what was texted or approved while nobody listened
     while True:
         try:
             tick(line, state, dt.datetime.now())
