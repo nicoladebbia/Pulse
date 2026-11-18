@@ -5,6 +5,7 @@ team.py does the running (git, gh, claude); this file decides what is allowed.
 
 from __future__ import annotations
 
+import datetime as dt
 import fnmatch
 import hashlib
 import json
@@ -50,7 +51,8 @@ CI_PASS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 # Branches the team makes for its own work. A red main is fixed on MAIN_FIX_PREFIX.
 MAIN_FIX_PREFIX = "fix/night-main-"
-TEAM_PREFIXES = (MAIN_FIX_PREFIX, "feat/night-")
+INCIDENT_PREFIX = "fix/night-incident-"
+TEAM_PREFIXES = (MAIN_FIX_PREFIX, INCIDENT_PREFIX, "feat/night-")
 
 IDEA_LINE = re.compile(r"^(\s*[-*]\s+)(?:\[( |x|X|\?)\]\s+)?(\S.*)$")
 
@@ -90,6 +92,50 @@ def protected_violations(changes: list[tuple[str, str]]) -> list[str]:
             # A migration already applied to the live database is frozen.
             reasons.append(f"edits or removes an existing migration: {path}")
     return reasons
+
+
+# What decides how Pulse buys and sells. A change here that the team thought
+# of by itself (a fix for an incident) is Nicola's to merge. The list errs on
+# the wide side: the fetcher's entry point and its pipeline hold the switches
+# for trading (which mode runs, dry runs, the stop for a new position) next to
+# code that has nothing to do with it.
+TRADING_GLOBS = [
+    "crates/pulse-fetcher/src/main.rs",
+    "crates/pulse-fetcher/src/pipeline/mod.rs",
+    "crates/pulse-fetcher/src/pipeline/trading.rs",
+    "crates/pulse-fetcher/src/pipeline/signals.rs",
+    "crates/pulse-fetcher/src/pipeline/live.rs",
+    "crates/pulse-fetcher/src/pipeline/form4.rs",  # which insider buys become trades
+    "crates/pulse-fetcher/src/sources/edgar.rs",
+    "crates/pulse-fetcher/src/decisions.rs",  # runs inside every buy
+    "crates/pulse-fetcher/src/candidates.rs",
+    "crates/pulse-fetcher/src/market_prices.rs",
+    "crates/pulse-fetcher/src/entry_filters.rs",
+    "crates/pulse-fetcher/src/position_management.rs",
+    "crates/pulse-fetcher/src/position_sizing.rs",
+    "crates/pulse-fetcher/src/event_signals.rs",
+    "crates/pulse-fetcher/src/learning.rs",
+    "crates/pulse-fetcher/src/calibration.rs",
+    "crates/pulse-weights/*",
+    "crates/pulse-alpaca/*",
+    "crates/pulse-snapshot/src/ledger.rs",
+    "crates/pulse-snapshot/src/risk.rs",
+    "src-tauri/src/services/paper_trading.rs",
+    "src-tauri/src/services/cross_signals.rs",
+    "src-tauri/src/services/signals.rs",
+    "src-tauri/src/services/risk.rs",
+    "src-tauri/src/commands/trading.rs",
+]
+
+
+def trading_violations(changes: list[tuple[str, str]]) -> list[str]:
+    """Reasons a change the team started by itself needs Nicola: it touches
+    how Pulse trades."""
+    return [
+        f"changes how Pulse trades: {path}"
+        for _status, path in changes
+        if any(fnmatch.fnmatch(path, g) for g in TRADING_GLOBS)
+    ]
 
 
 def forbidden_content(diff: str) -> list[str]:
@@ -226,6 +272,22 @@ def retry_now(state: dict, key: str) -> None:
         attempts[key] = {"sha": "", "result": "", "tries": 0, "parked": True}
 
 
+def night_due(
+    now: dt.datetime, start: tuple[int, int], catch_up_min: int, last_night: str
+) -> str:
+    """The night an hourly wake-up should start, as its date, or "" when it is
+    not time. The shift opens at `start` (hour, minute); a wake-up up to
+    `catch_up_min` minutes late still starts it (the Mac was busy or asleep);
+    each night starts once."""
+    opened = now.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
+    if opened > now:
+        opened -= dt.timedelta(days=1)
+    if now - opened >= dt.timedelta(minutes=catch_up_min):
+        return ""
+    night = opened.date().isoformat()
+    return "" if night == last_night else night
+
+
 # Reasons that carry raw error output. A PR comment names them and leaves the
 # output to the night's page.
 PRIVATE_REASONS = (
@@ -275,6 +337,40 @@ def mark_idea(text: str, idea_text: str, mark: str, note: str) -> str:
             lines[i] = f"{m.group(1)}[{mark}] {idea_text} — {note}"
             break
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def reopen_idea(text: str, key: str) -> str:
+    """Set the WAITING line (`- [?] idea — why`) of the idea named `key`
+    (`idea_key`) back to open. The idea's own words may hold a dash too, so
+    every place the reason could start is tried, longest idea first."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = IDEA_LINE.match(line)
+        if not m or (m.group(2) or " ") != "?":
+            continue
+        parts = m.group(3).strip().split(" — ")
+        for n in range(len(parts), 0, -1):
+            idea = " — ".join(parts[:n])
+            if idea_key(idea) == key:
+                lines[i] = f"{m.group(1)}[ ] {idea}"
+                return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    return text
+
+
+def add_ideas(text: str, new: list[str]) -> tuple[str, int]:
+    """Append each new idea as an open line, unless the list already has it
+    (open, built or waiting). Returns the text and how many joined."""
+    have = {i["text"].split(" — ")[0].casefold() for i in parse_ideas(text)}
+    added = 0
+    for idea in new:
+        idea = " ".join(idea.split())
+        if idea and idea.casefold() not in have:
+            have.add(idea.casefold())
+            text += (
+                "" if not text or text.endswith("\n") else "\n"
+            ) + f"- [ ] {idea}\n"
+            added += 1
+    return text, added
 
 
 def slug(text: str, limit: int = 40) -> str:
@@ -334,9 +430,14 @@ def select_jobs(
     base: str,
     label: str,
     main_sha: str = "",
+    incidents: list[dict] | None = None,
+    shift: str = "night",
 ) -> tuple[list[dict], list[dict]]:
-    """Tonight's queue, in the agreed order: a broken main first, then open PRs
-    (oldest first), then ideas from the top of the list. Returns (jobs, skipped)."""
+    """This shift's queue, in the agreed order: incidents first, then a broken
+    main, then open PRs (oldest first), then ideas from the top of the list.
+    A shift started for an incident does that and nothing else. By day only
+    the light work is taken: the ideas that are small fixes (`small_fix`), and
+    none while main is not known to pass. Returns (jobs, skipped)."""
 
     def pr_why(pr: dict) -> str | None:
         key, sha = f"pr-{pr['number']}", pr.get("headRefOid") or ""
@@ -361,6 +462,9 @@ def select_jobs(
         }
 
     by_age = sorted(prs, key=lambda p: p.get("createdAt") or "")
+    jobs, skipped = list(incidents or []), []
+    if shift == "incident" or (shift == "day" and not main_ok):
+        return jobs, skipped
     if not main_ok:
         # Nothing else can pass its checks while main is red. If an earlier
         # night already opened a fix, carry on with that one instead of a second.
@@ -370,13 +474,17 @@ def select_jobs(
                 pr.get("author") or {}
             ).get("login") == owner:
                 why = pr_why(pr)
-                return ([], [skip_pr(pr, why)]) if why else ([pr_job(pr, label)], [])
+                if why:
+                    return jobs, [skip_pr(pr, why)]
+                return [*jobs, pr_job(pr, label)], []
         why = stuck(state, "main", main_sha) or error_cap(state, "main", main_sha)
         if why:
-            return [], [{"kind": "main", "title": title, "why": why}]
-        return [{"kind": "main", "key": "main", "title": title, "sha": main_sha}], []
-    jobs, skipped = [], []
+            return jobs, [{"kind": "main", "title": title, "why": why}]
+        main = {"kind": "main", "key": "main", "title": title, "sha": main_sha}
+        return [*jobs, main], []
     for pr in by_age:
+        if shift == "day":
+            break  # checking and reviewing pull requests is night work
         why = pr_why(pr)
         if why:
             skipped.append(skip_pr(pr, why))
@@ -385,6 +493,8 @@ def select_jobs(
     for idea in ideas:
         if idea["state"] != "open":
             continue
+        if shift == "day" and not small_fix(idea["text"]):
+            continue  # building a feature is night work
         key = idea_key(idea["text"])
         why = error_cap(state, key, "")
         if why:
@@ -392,3 +502,959 @@ def select_jobs(
         else:
             jobs.append({"kind": "idea", "key": key, "title": idea["text"], "sha": ""})
     return jobs, skipped
+
+
+# -------------------------------------------------------------- shifts --
+# The Mac wakes the team every hour. These rules say what that hour is for,
+# and when work that is running has to step aside.
+
+DAY_HOURS = (9, 21)  # light work by day starts from 09:00 and before 21:00
+ACTIVE_MIN = 10  # a session log of Nicola's own changed this recently: he is working
+INCIDENTS_PER_DAY = 2
+INCIDENT_MAX_AGE_H = 24  # an older trigger is about a problem already texted again
+HELD_DAYS = 7  # how long a job that stepped aside may go on from where it stopped
+ACT_AFTER_DAYS = 7  # the watch only texts for its first week, then it also acts
+SMALL_FIX = re.compile(r"fix:\s*\S", re.I)
+
+
+def small_fix(idea: str) -> bool:
+    """An idea line that starts with `fix:` is a small fix: light enough for
+    the day."""
+    return bool(SMALL_FIX.match(idea.strip()))
+
+
+def project_folder(path: str) -> str:
+    """The name of the folder the Claude CLI keeps a working folder's session
+    logs in: the path with everything but letters and digits turned to `-`."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def owner_active(
+    logs: list[tuple[str, float]],
+    now: float,
+    home: str,
+    own: tuple[str, ...],
+    minutes: int = ACTIVE_MIN,
+) -> bool:
+    """Is Nicola using Claude on this Mac right now? `logs` is every project
+    folder with the time its newest session log changed. His own sessions run
+    in folders under his home folder (`home`); the team's (`own`) do not count,
+    and neither do the ones other programs start in temporary folders."""
+    mine = project_folder(home)
+    theirs = tuple(project_folder(path) for path in own)
+    return any(
+        (name == mine or name.startswith(mine + "-"))
+        and not name.startswith(theirs)
+        and 0 <= now - changed < minutes * 60
+        for name, changed in logs
+    )
+
+
+def day_used(state: dict, today: dt.date) -> int:
+    """Minutes of day work already done today."""
+    day = state.get("day")
+    if not isinstance(day, dict) or day.get("date") != today.isoformat():
+        return 0
+    minutes = day.get("minutes")
+    return minutes if isinstance(minutes, int) and minutes > 0 else 0
+
+
+def add_day_minutes(state: dict, today: dt.date, minutes: int) -> None:
+    state["day"] = {
+        "date": today.isoformat(),
+        "minutes": day_used(state, today) + max(0, minutes),
+    }
+
+
+def shift_due(
+    now: dt.datetime,
+    night: str,
+    state: dict,
+    *,
+    paused: bool,
+    incident: bool,
+    active: bool,
+    day_budget: int,
+    hours: tuple[int, int] = DAY_HOURS,
+) -> str:
+    """What an hourly wake-up is for: "night" (`night` is the date `night_due`
+    gave), "incident" (a serious problem waits, at any hour), "day" (light
+    work, inside the day's hours and its time budget, and only while Nicola is
+    not using Claude on this Mac), or "" for nothing. Paused, it is nothing."""
+    if paused:
+        return ""
+    if night:
+        return "night"  # it takes the incidents first
+    if incident:
+        return "incident"
+    if active or not hours[0] <= now.hour < hours[1]:
+        return ""
+    return "day" if day_used(state, now.date()) < day_budget else ""
+
+
+def yield_reason(
+    kind: str,
+    shift: str,
+    *,
+    paused: bool,
+    incident: bool,
+    active: bool,
+    over_budget: bool,
+) -> str:
+    """Why the job that is running has to stop now and keep its work, or ''.
+    `pause` stops everything. A serious problem comes before any other job.
+    By day the team also steps aside for Nicola and stays inside its budget;
+    work on an incident does neither. Kind `check` is the night's own check
+    of main, which only `pause` stops."""
+    if paused:
+        return "paused from Telegram"
+    if kind in ("incident", "check"):
+        return ""
+    if incident:
+        return "a serious problem came first"
+    if shift == "day" and active:
+        return "Nicola started using Claude on this Mac"
+    if shift == "day" and over_budget:
+        return "the day's time for the team is used up"
+    return ""
+
+
+def waiting(state: dict, key: str, now: dt.datetime) -> dict | None:
+    """The note left for a job that stepped aside and has not gone on yet, or
+    None. A note older than HELD_DAYS is no longer one: main has moved on, and
+    starting over is better than going on."""
+    held = state.get("held")
+    item = held.get(key) if isinstance(held, dict) else None
+    if not isinstance(item, dict):
+        return None
+    try:
+        age = now - dt.datetime.fromisoformat(str(item.get("at")))
+    except (TypeError, ValueError):
+        return None
+    return item if dt.timedelta(0) <= age <= dt.timedelta(days=HELD_DAYS) else None
+
+
+def hold(state: dict, key: str, branch: str, now: dt.datetime) -> None:
+    """A job stepped aside. `branch` holds its unfinished work on this Mac
+    ('' when it had none yet); its next turn goes on from there. Notes too old
+    to count are thrown away here, so the book never grows."""
+    if not isinstance(state.get("held"), dict):
+        state["held"] = {}
+    held = state["held"]
+    for old in [k for k in held if waiting(state, k, now) is None]:
+        del held[old]
+    held[key] = {"branch": branch, "at": now.isoformat(timespec="seconds")}
+
+
+def release(state: dict, key: str) -> None:
+    held = state.get("held")
+    if isinstance(held, dict):
+        held.pop(key, None)
+
+
+def held_branch(state: dict, key: str, now: dt.datetime) -> str:
+    """The branch a job that stepped aside goes on from, or ''."""
+    item = waiting(state, key, now) or {}
+    return item["branch"] if isinstance(item.get("branch"), str) else ""
+
+
+def incidents_today(state: dict, today: dt.date) -> list[str]:
+    """The problems an incident job was started for today."""
+    book = state.get("incidents")
+    if not isinstance(book, dict) or book.get("date") != today.isoformat():
+        return []
+    return [k for k in book.get("keys") or [] if isinstance(k, str)]
+
+
+def record_incident(state: dict, problem: str, today: dt.date) -> None:
+    state["incidents"] = {
+        "date": today.isoformat(),
+        "keys": [*incidents_today(state, today), problem],
+    }
+
+
+def incident_jobs(
+    triggers: list[dict], state: dict, now: dt.datetime, per_day: int = INCIDENTS_PER_DAY
+) -> tuple[list[dict], list[dict]]:
+    """The incident jobs to do for the triggers in the queue, oldest first, and
+    the triggers to throw away with the reason: (jobs, dropped). A trigger is
+    {file, key, text, evidence, at}, written by the watch or by hand. One job
+    per problem per day and `per_day` jobs a day at most; a trigger that is
+    malformed or older than a day is dropped. A job that was started and had
+    to stop midway (`hold`) is not a second one: it goes on."""
+    jobs, dropped = [], []
+    done = incidents_today(state, now.date())
+    new = 0
+    for t in sorted(triggers, key=lambda t: str(t.get("at") or "")):
+        problem, text = t.get("key"), t.get("text")
+        try:
+            at = dt.datetime.fromisoformat(str(t.get("at")))
+            if at.tzinfo is not None:  # the runner's clock has no zone
+                raise ValueError
+        except ValueError:
+            at = None
+        readable = isinstance(problem, str) and problem and isinstance(text, str) and text
+        if not readable or at is None:
+            dropped.append(_dropped(t, "it could not be read"))
+            continue
+        key = f"incident-{slug(problem, 30)}-{at:%m%d%H%M}"
+        going = waiting(state, key, now) is not None
+        if now - at > dt.timedelta(hours=INCIDENT_MAX_AGE_H):
+            why = "it is more than a day old"
+        elif any(j["problem"] == problem for j in jobs):
+            why = "this problem is in the queue already"
+        elif going:
+            why = ""
+        elif problem in done:
+            why = "this problem was already worked on today"
+        elif len(done) + new >= per_day:
+            why = f"{per_day} incidents a day is the limit"
+        else:
+            why, new = "", new + 1
+        if why:
+            dropped.append(_dropped(t, why, key))
+            continue
+        jobs.append(
+            {
+                "kind": "incident",
+                "key": key,
+                "problem": problem,
+                "title": " ".join(text.split())[:300],
+                "evidence": str(t.get("evidence") or "")[:EVIDENCE_MAX],
+                "file": str(t.get("file") or ""),
+                "sha": "",
+            }
+        )
+    return jobs, dropped
+
+
+def incident_wanted(new: dict, queued: list[dict], state: dict, now: dt.datetime) -> bool:
+    """Would the runner take this trigger, beside what already waits in the
+    queue? The watch asks before it queues a problem and says the team is on
+    it, so that it never promises a look that the day's limits rule out."""
+    mark = "\0the new one"
+    jobs, _ = incident_jobs([*queued, {**new, "file": mark}], state, now)
+    return any(j["file"] == mark for j in jobs)
+
+
+def _dropped(trigger: dict, why: str, key: str = "") -> dict:
+    return {
+        "kind": "incident",
+        "key": key,  # of the job it would have been ('' when it cannot be read)
+        "file": str(trigger.get("file") or ""),
+        "title": " ".join(str(trigger.get("text") or "a trigger").split())[:120],
+        "why": why,
+    }
+
+
+# What of the watch's findings the team also works on: the serious ones whose
+# cause can be in Pulse's own code. A position without a stop that the next run
+# did not repair, trading runs that keep failing, trading that went silent, a
+# briefing that keeps failing.
+INCIDENT_KEYS = ("stop:", "manage", "auto", "silent", "briefing:")
+EVIDENCE_MAX = 6000
+LOG_LINE_MAX = 300
+ANSI_CODES = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# A value that follows a name like these, in an address, a header or a setting:
+# `name=value`, `name: value`, `name => value`, `name%3Dvalue`, with the value
+# in quotes (all of it, spaces too) or in Rust's `Some(…)`.
+# - Names that only ever mean a secret count wherever they stand in a word
+#   (`db_password`, `SECRETKEY`, `PHPSESSID`), and so does `token` at a word's
+#   end (`mytoken`, `accessToken`).
+# - The short ones have to stand as a word of their own (`sig`, `apiKey`,
+#   `X-Auth`), so that `signal=0.3`, `tokens: 1532`, `author: x` or `monkey=3`
+#   keep their values.
+# - A name that ends in what is counted or pointed at (`key_count`,
+#   `token_type`, `secret_name`) is no secret either.
+_SEP = r"\s*(?:=>|%3[Dd]|[=:])\s*"
+_SURE = (
+    r"secret(?!ar)|password|passwd|passphrase|credential|private[-_]?key"
+    r"|access[-_]?key|api[-_]?key|sess(?:ion)?[-_]?id"
+)
+_OWN_WORD = r"key|pwd|signature|sig|auth|authorization|bearer|session|sid"
+_COUNTED = r"count|len|length|size|total|limit|type|name|path|file|dir"
+SECRET_VALUE = re.compile(
+    r"(?i)((?:" + _SURE + r"|token(?![a-z])"
+    r"|(?:(?<![A-Za-z])|(?-i:(?<=[a-z])(?=[A-Z])))(?:" + _OWN_WORD + r")(?![a-z]))"
+    r"(?![\w-]{0,40}(?:" + _COUNTED + r")s?[\"']?" + _SEP + r")"
+    r"[\w-]{0,40}[\"']?" + _SEP + r"(?:Some\(\s*)?(?:(?:bearer|basic|token)\s+)?)"
+    r"(?:\"[^\"]*\"?|'[^']*'?|[^\s&\"',;]+)"
+)
+# The same with only a space before the value, as a header is sometimes
+# printed. Words stay ("authorization failed", "Basic authentication"): the
+# value has to look like a key, with a digit in it or 16 characters long.
+SECRET_WORD = re.compile(
+    r"(?i)\b((?:(?:proxy-)?authorization[\"']?\s+)?(?:bearer|basic)\s+"
+    r"|(?:x-api-key|authorization|password|passwd|passphrase|secret|token|api[-_]?key)"
+    r"[\"']?\s+)"
+    r"(?:(?=[^\s\"',;]*\d)[^\s\"',;]{6,}|[^\s\"',;]{16,})"
+)
+# A signed web token: three runs with dots between, the first always `eyJ…`.
+WEB_TOKEN = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}(?:\.[A-Za-z0-9_\-]*)?")
+COOKIES = re.compile(r"(?i)((?:set-)?cookie[\"']?\s*[=:]\s*).*")
+# Keys that say what they are by how they start, with the - and _ inside them.
+KNOWN_KEY = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk|pk|rk|pa|gsk|ghp|gho|ghs|github_pat|xox[abprs])[-_][A-Za-z0-9_\-]{10,}"
+)
+# A number, a colon and a long tail: how a bot's token is written into an address.
+ID_AND_KEY = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{0,6}\d{6,}:[A-Za-z0-9_\-]{20,}")
+# A run of letters and digits long enough to be a key, whatever it is called:
+# 20 or more with both letters and digits in it, or 32 or more of anything.
+# Words joined by - or _ (an order's id, a function's name, a UUID) are not one
+# run, so what a cause is found with stays readable.
+LONG_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{20,}"
+    r"|[A-Za-z0-9]{32,})(?![A-Za-z0-9])"
+)
+USERINFO = re.compile(r"(://)[^/\s:@]+:[^/\s@]+@")
+
+
+def incident_worthy(finding: dict) -> bool:
+    key = str(finding.get("key") or "")
+    return (
+        bool(finding.get("serious"))
+        and key != "stop:dry"
+        and any(key == k or (k.endswith(":") and key.startswith(k)) for k in INCIDENT_KEYS)
+    )
+
+
+def watch_acts(memory: dict, now: dt.datetime, off: bool) -> bool:
+    """May the watch start an incident job, or does it only text? Only texts
+    while switched off, and for the first week after its first look (kept in
+    `memory`), so its alarms can be seen to be true ones first."""
+    since = memory.setdefault("since", _stamp(now))
+    if off:
+        return False
+    try:
+        return now - dt.datetime.fromisoformat(str(since)) >= dt.timedelta(days=ACT_AFTER_DAYS)
+    except ValueError:
+        memory["since"] = _stamp(now)
+        return False
+
+
+def redact_log(text: str, home: str = "") -> str:
+    """The end of a log, made fit to show a session: no colour codes, the home
+    folder as `~`, and nothing that looks like a key or a password. A session
+    is never handed a secret, and a failed request can print the address it
+    called with the key in it. It is a net, not a proof: a short secret after
+    a bare word ("token abc") or under a name of its own passes."""
+    lines = []
+    for line in ANSI_CODES.sub("", text).splitlines():
+        line = "".join(c for c in line if c == "\t" or c.isprintable())
+        if home:
+            line = line.replace(home, "~")
+        line = USERINFO.sub(r"\1[removed]@", line)
+        line = COOKIES.sub(r"\1[removed]", line)
+        line = SECRET_VALUE.sub(r"\1[removed]", line)
+        line = SECRET_WORD.sub(r"\1[removed]", line)
+        line = WEB_TOKEN.sub("[removed]", line)
+        line = KNOWN_KEY.sub("[removed]", line)
+        line = ID_AND_KEY.sub("[removed]", line)
+        line = LONG_TOKEN.sub("[removed]", line)
+        lines.append(line[:LOG_LINE_MAX])
+    out = "\n".join(lines).strip()
+    return out[-EVIDENCE_MAX:]
+
+
+def trigger(finding: dict, evidence: str, now: dt.datetime) -> dict:
+    """What the watch leaves in the queue for the runner."""
+    return {
+        "key": str(finding["key"]),
+        "text": str(finding["text"]),
+        "evidence": evidence[-EVIDENCE_MAX:],
+        "at": now.isoformat(timespec="seconds"),
+    }
+
+
+# ---------------------------------------------------------------- chat --
+# Telegram. Everything typed there is data: these functions decide what a text
+# or a button press means, and nothing else in the team reads the words.
+
+CHAT_HELP = (
+    "I understand:\n"
+    "idea: <what you want> — goes on the team's list\n"
+    "status — what the team did last and what waits for you\n"
+    "pause — everything stops, also the job that is running\n"
+    "resume — back to work\n"
+    "To add a note to something I asked, reply to that message."
+)
+CHAT_COMMANDS = ("status", "pause", "resume", "help")
+IDEA_MAX = 300
+# What Nicola can press under each kind of proposal: (label, answer).
+BUTTONS = {
+    "idea": (("Build it", "yes"), ("Not now", "later"), ("No", "no")),
+    "question": (("Try again", "yes"), ("Leave it", "no")),
+    "trading": (("Apply it", "yes"), ("No", "no")),
+}
+CONFIRM = (("Yes, apply it", "confirm"), ("Cancel", "cancel"))
+APPROVED = {
+    "idea": "Build it. It joins the list and the team builds it at night.",
+    "question": "Trying again on the next run.",
+    "trading": "Applying it on the next run.",
+}
+DECLINED = {
+    "idea": "No. I will not bring it up again.",
+    "question": "Left as it is.",
+    "trading": "No. Nothing changes.",
+}
+OPEN_STATES = ("sent", "confirming")  # texted, no final answer yet
+IDEAS_PER_WEEK = 3
+LATER_DAYS = 14  # "Not now" comes back after this
+EXPIRE_DAYS = 7  # a text nobody answered
+
+
+def parse_chat(text: str) -> tuple[str, str]:
+    """What a text from the owner asks for, as (command, argument): `idea`,
+    `status`, `pause`, `resume`, `help`, or `note` for anything else."""
+    text = (text or "").strip()
+    word, _, rest = text.partition(" ")
+    head = word.lower().lstrip("/").split("@", 1)[0]
+    if head.startswith("idea:") or head.rstrip(":") == "idea":
+        idea = text.split(":", 1)[1] if ":" in word else rest
+        idea = " ".join(idea.split())[:IDEA_MAX]
+        return ("idea", idea) if idea else ("help", "")
+    if head == "start":  # Telegram's own first message to a bot
+        return ("help", "")
+    if head in CHAT_COMMANDS and not rest.strip():
+        return (head, "")
+    return ("note", text) if text else ("help", "")
+
+
+def parse_button(data: str) -> tuple[str, str] | None:
+    """A button press as (proposal id, answer), or None for anything else."""
+    m = re.fullmatch(r"p:([0-9a-f]{8}):(yes|later|no|confirm|cancel)", data or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def from_owner(update: dict, chat_id: int, user_id: int) -> bool:
+    """Only the account that paired, in the private chat it paired from."""
+    event = update.get("message") or update.get("callback_query") or {}
+    message = event if "message" in update else (event.get("message") or {})
+    sender, chat = event.get("from") or {}, message.get("chat") or {}
+    return bool(
+        chat_id
+        and user_id
+        and chat.get("type") == "private"
+        and chat.get("id") == chat_id
+        and sender.get("id") == user_id
+        and not sender.get("is_bot")
+    )
+
+
+def proposal_step(p: dict, answer: str) -> tuple[str, str]:
+    """A button press on a proposal: (its new state, what to tell Nicola). The
+    first answer stands; a later press only hears what was recorded. A trading
+    change is asked twice."""
+    state, kind = p.get("state"), p.get("kind")
+    if state == "sent":
+        if answer == "yes":
+            if kind == "trading":
+                return "confirming", "This changes how Pulse trades. Sure?"
+            return "approved", APPROVED.get(kind, "Yes.")
+        if answer == "later" and kind == "idea":
+            return "later", f"Not now. I will bring it up again in {LATER_DAYS} days."
+        if answer == "no":
+            return "declined", DECLINED.get(kind, "No.")
+    elif state == "confirming":
+        if answer == "confirm":
+            return "approved", APPROVED["trading"]
+        if answer == "cancel":
+            return "sent", "Cancelled. Nothing changes."
+    if state in OPEN_STATES:
+        return state, "That button does not fit this message."
+    return state, f"Already recorded: {state}."
+
+
+def send_at(
+    now: dt.datetime, serious: bool, first: int = 8, last: int = 22
+) -> dt.datetime:
+    """When a text may go out: at once for a serious problem or by day,
+    otherwise the next morning."""
+    if serious or first <= now.hour < last:
+        return now
+    morning = now.replace(hour=first, minute=0, second=0, microsecond=0)
+    return morning if now.hour < first else morning + dt.timedelta(days=1)
+
+
+def _stamp(when: dt.datetime) -> str:
+    return when.isoformat(timespec="seconds")
+
+
+def due_proposals(
+    proposals: list[dict], now: dt.datetime, cap: int = IDEAS_PER_WEEK
+) -> list[dict]:
+    """The queued proposals to text now, oldest first. Questions and trading
+    proposals always go; new-feature ideas stop at `cap` in a calendar week."""
+    week = now.isocalendar()[:2]
+    sent = sum(
+        1
+        for p in proposals
+        if p.get("kind") == "idea"
+        and p.get("sent_at")
+        and dt.datetime.fromisoformat(p["sent_at"]).isocalendar()[:2] == week
+    )
+    due = []
+    for p in proposals:
+        if p.get("state") != "queued" or (p.get("not_before") or "") > _stamp(now):
+            continue
+        if p.get("kind") == "idea":
+            if sent >= cap:
+                continue
+            sent += 1
+        due.append(p)
+    return due
+
+
+def settle(p: dict, state: str, now: dt.datetime) -> None:
+    """Record the state a button press led to. "Not now" goes back in the
+    queue for later."""
+    p["state"], p["answered_at"] = state, _stamp(now)
+    if state == "later":
+        p["state"] = "queued"
+        p["not_before"] = _stamp(now + dt.timedelta(days=LATER_DAYS))
+        p["message_id"] = None
+
+
+def expire(proposals: list[dict], now: dt.datetime) -> int:
+    """A text nobody answered in a week is closed. Returns how many. The week
+    counts from the last thing that happened to it, so a first press on a
+    trading change gives the second one its own week."""
+    limit, closed = _stamp(now - dt.timedelta(days=EXPIRE_DAYS)), 0
+    for p in proposals:
+        last = max(p.get("sent_at") or "", p.get("answered_at") or "")
+        if p.get("state") in OPEN_STATES and last and last < limit:
+            p["state"], closed = "expired", closed + 1
+    return closed
+
+
+def proposal_id(kind: str, key: str, created: str) -> str:
+    return hashlib.sha1(f"{kind}|{key}|{created}".encode()).hexdigest()[:8]
+
+
+# ---------------------------------------------------------------- the watch --
+#
+# `watch.py` looks at the installed Pulse every ten minutes and hands what it
+# saw to `watch_findings`. A fact it could not read is None, and a check
+# without its facts says nothing: no reading is never read as "all is well"
+# or as "something is wrong".
+
+WATCH_GAP_MIN = 25  # two looks further apart than this: the Mac slept between
+# Market open and no position run for this long: two hourly turns missed. One
+# missed turn is a broker blip, and it is not worth a text at night.
+SILENT_MIN = 130
+CLOCK_MIN = 70  # the broker's clock silent at every look for this long
+# A failure older than this is no longer "happening now".
+RECENT_MIN = 90
+# Two failed runs closer than this are one turn tried twice, not two turns.
+TURN_MIN = 45
+STALL_MIN = 130  # the hourly schedule has skipped two turns
+STUCK_FETCH_MIN = 180  # a briefing on local AI takes up to about 70 minutes
+DEAD_FETCH_MIN = 10
+LISTENER_MIN = 15
+# Failed tries before a missing briefing is serious. The evening has only the
+# turns of 21:00, 22:00 and 23:00, and a try that fails after an hour of work
+# takes the next turn with it: two failures are all a slow evening can show.
+BRIEFING_TRIES = {"morning": 3, "evening": 2}
+# A try that starts at 23:00 can fail after midnight and still belongs to the
+# evening before: a briefing's day ends at this hour of the next morning.
+BRIEFING_DAY_ENDS_H = 3
+# One text per problem: a serious one is repeated once a day while it lasts,
+# anything else once a week.
+ALERT_AGAIN_H = {True: 24, False: 7 * 24}
+# A serious problem that keeps ending and coming back is texted as back this
+# many times; after that nothing more is said about it until a day has passed.
+FLAP_MAX = 3
+ALERT_KEEP_DAYS = 30
+SCHEDULERS = {
+    "com.pulse.scheduled-fetch": "the hourly schedule (briefings and trading)",
+    "com.pulse.live-signals": "the live signals",
+}
+
+
+def _hm(t: dt.datetime, now: dt.datetime) -> str:
+    return f"{t:%H:%M}" if t.date() == now.date() else f"{t:%a %H:%M}"
+
+
+def briefing_day(t: dt.datetime) -> dt.date:
+    """The day a briefing try belongs to (see BRIEFING_DAY_ENDS_H)."""
+    return (t - dt.timedelta(hours=BRIEFING_DAY_ENDS_H)).date()
+
+
+def awake_since(
+    ticks: list[dt.datetime], now: dt.datetime, gap_min: int = WATCH_GAP_MIN
+) -> dt.datetime:
+    """Since when the watch has been looking without a break. A Mac that slept
+    saw nothing, so nothing is said about the time it was asleep."""
+    start = now
+    for t in sorted((t for t in ticks if t <= now), reverse=True):
+        if start - t > dt.timedelta(minutes=gap_min):
+            break
+        start = t
+    return start
+
+
+def watch_findings(facts: dict, memory: dict, now: dt.datetime) -> list[dict]:
+    """What is wrong right now, as [{key, serious, text}]. `memory` is the
+    watch's own notebook between looks (when a position was first seen without
+    a stop, since when the broker's clock is silent) and is updated here.
+
+    Serious means: texted at any hour. Everything else waits for the day."""
+    found: list[dict] = []
+    awake = facts.get("awake") or now
+    events = facts.get("events")
+    progress = facts.get("progress") or {}
+
+    def add(key: str, serious: bool, text: str, **more) -> None:
+        found.append({"key": key, "serious": serious, "text": text, **more})
+
+    def minutes(since: dt.datetime) -> int:
+        """How long something has lasted, counting only time the watch was awake."""
+        return int((now - max(since, awake)).total_seconds() // 60)
+
+    def hm(t: dt.datetime) -> str:
+        return _hm(t, now)
+
+    running = bool(
+        progress
+        and progress.get("stage") not in ("complete", "failed")
+        and progress.get("updated")
+        and now - progress["updated"] < dt.timedelta(minutes=DEAD_FETCH_MIN)
+    )
+
+    # A held position without a stop at the broker.
+    bare, seen = facts.get("bare"), memory.setdefault("bare", {})
+    if bare is not None and events is not None:
+        ids = {str(b["id"]) for b in bare}
+        for gone in [k for k in seen if k not in ids]:
+            del seen[gone]
+        # Every finished position run, and whether it was a dry one: with
+        # EXIT_DRY_RUN it names what it would have done and places nothing.
+        # Only the latest run counts, so the alarm is back with the first real
+        # run after the exits are armed.
+        passes: list[tuple[dt.datetime, bool]] = []
+        dry_run = False
+        for kind, when, _ in events:
+            if kind == "manage_dry":
+                dry_run = True
+            elif kind in ("manage_start", "manage_fail"):
+                dry_run = False
+            elif kind == "manage_ok":
+                passes.append((when, dry_run))
+                dry_run = False
+        dry = bool(passes) and passes[-1][1]
+        for b in bare:
+            first = dt.datetime.fromisoformat(seen.setdefault(str(b["id"]), _stamp(now)))
+            since = [p for p in passes if p[0] > first]
+            if since and not dry:
+                add(
+                    f"stop:{b['id']}",
+                    True,
+                    f"{b['ticker']} has no stop at the broker, and the position run at "
+                    f"{hm(since[-1][0])} did not put one back. Nothing limits the loss on it "
+                    "until it has one.",
+                    name=str(b["ticker"]),
+                )
+        if dry and bare:
+            names = ", ".join(str(b["ticker"]) for b in bare[:10])
+            add(
+                "stop:dry",
+                False,
+                f"Exits are in dry-run mode (EXIT_DRY_RUN), so {len(bare)} open "
+                f"position{'s have' if len(bare) != 1 else ' has'} no stop at the broker: {names}.",
+            )
+
+    def in_a_row(first: dt.datetime, second: dt.datetime) -> bool:
+        """Two failed turns of the same day, with the second still fresh. The
+        turns need not be an hour apart: a slow briefing takes the turn after
+        it, so two failures in a row can be two hours apart."""
+        return (
+            first.date() == second.date()
+            and second - first >= dt.timedelta(minutes=TURN_MIN)
+            and now - second <= dt.timedelta(minutes=RECENT_MIN)
+        )
+
+    if events is not None:
+        # Position management failing twice in a row.
+        runs: list[list] = []
+        for kind, when, detail in events:
+            if kind == "manage_start":
+                runs.append([when, "", ""])
+            elif kind in ("manage_ok", "manage_fail") and runs and not runs[-1][1]:
+                runs[-1][1:] = [kind, detail]
+        last = runs[-2:]
+        if (
+            len(last) == 2
+            and all(r[1] == "manage_fail" for r in last)
+            and in_a_row(last[0][0], last[1][0])
+        ):
+            add(
+                "manage",
+                True,
+                f"Position management failed twice in a row (at {hm(last[0][0])} and "
+                f"{hm(last[1][0])}, exit {last[1][2] or '?'}). Exits and stop updates are "
+                "not happening. The stops already at the broker still hold.",
+            )
+
+        # Buying failing twice in a row.
+        oks = [w for k, w, _ in events if k == "auto_ok"]
+        fails = [(w, d) for k, w, d in events if k == "auto_fail" and (not oks or w > max(oks))]
+        if len(fails) >= 2 and in_a_row(fails[-2][0], fails[-1][0]):
+            add(
+                "auto",
+                True,
+                f"Buying failed twice in a row (at {hm(fails[-2][0])} and "
+                f"{hm(fails[-1][0])}, exit {fails[-1][1] or '?'}). No new positions are "
+                "opened. The ones held are not affected.",
+            )
+
+        # A briefing that keeps failing. One made by the app or by hand is in
+        # the database and not in the log: after it the schedule stops trying,
+        # so the failures before it are over.
+        day = briefing_day(now)
+        today = [(k, w, d) for k, w, d in events if briefing_day(w) == day]
+        made = list(facts.get("briefings") or [])  # an earlier day's is before every try
+        for slot, tries in BRIEFING_TRIES.items():
+            done = [w for k, w, d in today if k == "brief_done" and d == slot] + made
+            failed = [
+                (w, d.split()[-1])
+                for k, w, d in today
+                if k == "brief_fail" and d.split()[0] == slot and (not done or w > max(done))
+            ]
+            if len(failed) >= tries:
+                until = " until midnight" if slot == "evening" else ""
+                add(
+                    f"briefing:{slot}:{day.isoformat()}",
+                    True,
+                    f"The {slot} briefing failed {len(failed)} times (last try "
+                    f"{hm(failed[-1][0])}, exit {failed[-1][1]}). The schedule tries again "
+                    f"every hour{until}.",
+                )
+
+    # The market is open and nobody looks at the positions.
+    market = facts.get("market")
+    if events is not None and market == "open" and facts.get("session_start"):
+        starts = [w for k, w, _ in events if k == "manage_start"]
+        base = max([facts["session_start"], *starts[-1:]])
+        idle = minutes(base)
+        if idle >= SILENT_MIN:
+            why = ""
+            if running and progress.get("started"):
+                why = (
+                    f" A fetch has been running since {hm(progress['started'])} and holds "
+                    "up the hourly schedule."
+                )
+            said = f"last at {hm(starts[-1])}" if starts else "no run in the log"
+            add(
+                "silent",
+                True,
+                f"The market is open and Pulse has not looked at its positions for {idle} "
+                f"minutes ({said}).{why} The stops at the broker still hold, but exits and "
+                "stop updates are not happening.",
+            )
+
+    # The broker's clock does not answer, so trading is skipped without a word.
+    if facts.get("session_start") and market == "unknown":
+        since = dt.datetime.fromisoformat(memory.setdefault("clock_bad", _stamp(now)))
+        if minutes(since) >= CLOCK_MIN:
+            add(
+                "clock",
+                False,
+                f"The broker's clock has not answered for {minutes(since)} minutes. Pulse "
+                "skips trading while it cannot tell whether the market is open. That is an "
+                "outage at the broker, the network, or a missing key.",
+            )
+    else:
+        memory.pop("clock_bad", None)
+
+    # A fetch that hangs, or one that died midway.
+    if progress and progress.get("stage") not in ("complete", "failed"):
+        started, updated = progress.get("started"), progress.get("updated")
+        label = progress.get("label") or progress.get("stage") or "?"
+        if running and started and minutes(started) >= STUCK_FETCH_MIN:
+            add(
+                "fetch:stuck",
+                False,
+                f"A fetch has been running since {hm(started)} ({minutes(started)} minutes, "
+                f'now at "{label}"). While it runs the hourly schedule waits, trading included.',
+            )
+        elif (
+            updated
+            and facts.get("fetching") is False
+            and now - updated >= dt.timedelta(minutes=DEAD_FETCH_MIN)
+        ):
+            add(
+                f"fetch:died:{_stamp(started or updated)}",
+                False,
+                f"The fetch that started at {hm(started or updated)} stopped midway "
+                f'(at "{label}", last sign of life {hm(updated)}). The schedule tries again '
+                "at the next hour.",
+            )
+
+    # The schedulers.
+    for label, what in SCHEDULERS.items():
+        if (facts.get("loaded") or {}).get(label) is False:
+            add(
+                f"scheduler:{label}",
+                False,
+                f"{what[0].upper()}{what[1:]} is not loaded in launchd ({label}), so it does "
+                "not run. Running scripts/install-app.sh puts it back.",
+            )
+    stamp = facts.get("stamp")
+    if (
+        stamp
+        and stamp.date() == now.date()
+        and 9 <= now.hour <= 20
+        and not running
+        and facts.get("fetching") is not True  # a long run is busy, not stalled
+        and minutes(stamp) >= STALL_MIN
+    ):
+        add(
+            "scheduler:stalled",
+            False,
+            f"The hourly schedule has not run since {hm(stamp)}. Briefings and trading "
+            "depend on it.",
+        )
+
+    # Crashes.
+    for name in facts.get("crashes") or []:
+        add(f"crash:{name}", False, f"Pulse crashed (crash report {name}).")
+    for where in facts.get("panics") or []:
+        add(
+            f"panic:{where}:{now.date().isoformat()}",
+            False,
+            f"The fetcher crashed in its own code ({where}).",
+        )
+
+    # The team itself.
+    wake = facts.get("team_wake")
+    if wake and facts.get("team_running") is False and minutes(wake) >= STALL_MIN:
+        add(
+            "team",
+            False,
+            f"The team's own hourly wake-up has not run since {hm(wake)}, so the night "
+            "shift would not start.",
+        )
+    beat = facts.get("listener")
+    if facts.get("paired") and beat and minutes(beat) >= LISTENER_MIN:
+        add(
+            "listener",
+            False,
+            f"The Telegram listener has been silent since {hm(beat)}: buttons and commands "
+            "do nothing until it is back (team.py install restarts it).",
+        )
+    return found
+
+
+def watch_over(key: str, alert: dict, facts: dict, now: dt.datetime) -> str | None:
+    """What to say when a serious problem has ended, or None while that cannot
+    be told. A finding that is merely no longer listed is not the end of it:
+    the market may have closed, or the facts may be missing this time.
+
+    "Solved" is said for a problem that went away. A briefing whose day ended
+    without it is over too, and that is said as it is."""
+    events = facts.get("events")
+    if events is None:
+        return None
+    sent = dt.datetime.fromisoformat(alert["sent"])
+
+    def after(kind: str, detail: str | None = None) -> dt.datetime | None:
+        times = [
+            w for k, w, d in events if k == kind and w > sent and (detail is None or d == detail)
+        ]
+        return max(times) if times else None
+
+    if key.startswith("stop:") and key != "stop:dry":
+        bare = facts.get("bare")
+        if bare is None or key[5:] in {str(b["id"]) for b in bare}:
+            return None
+        return (
+            f"Solved. {alert.get('name') or 'The position'} is no longer open without a "
+            "stop: it has one now, or the position was closed."
+        )
+    if key == "silent" and (t := after("manage_start")):
+        return f"Solved. Pulse is looking at its positions again (run at {_hm(t, now)})."
+    if key == "manage" and (t := after("manage_ok")):
+        return f"Solved. Position management works again (run at {_hm(t, now)})."
+    if key == "auto" and (t := after("auto_ok")):
+        return f"Solved. Buying works again (run at {_hm(t, now)})."
+    if key.startswith("briefing:"):
+        _, slot, day = key.split(":")
+        # In the log when the schedule made it, only in the database when the
+        # app or a hand did.
+        rows = facts.get("briefings")
+        made = [
+            w for k, w, d in events if k == "brief_done" and d == slot and w > sent
+        ] + [w for w in rows or [] if w > sent]
+        made = [w for w in made if briefing_day(w).isoformat() == day]
+        if made:
+            return f"Solved. The {slot} briefing was made after all, at {_hm(max(made), now)}."
+        # "Not made" is only said with the database read: the log alone does
+        # not know a briefing made outside the schedule.
+        if rows is not None and briefing_day(now).isoformat() > day:
+            when = dt.date.fromisoformat(day)
+            return f"The {slot} briefing of {when:%a} {when.day} {when:%b} was not made."
+    return None
+
+
+def watch_alerts(
+    found: list[dict], facts: dict, memory: dict, now: dt.datetime
+) -> list[tuple[str, bool]]:
+    """The texts to send for what the watch found, as [(text, serious)], and
+    the watch's book of what it already said (kept in `memory`).
+
+    One text per problem: while it lasts nothing is said twice within a day (a
+    week when it is not serious, however often it comes and goes). The end of
+    a serious problem is said once, and only when it can be told for sure.
+    After that the same problem coming back is a new text: its end was told,
+    so its return must be, or the next "Solved" would be about nothing. One
+    that keeps coming and going is texted as back FLAP_MAX times; the last of
+    those says so, and then it is quiet until a day has passed."""
+    book = memory.setdefault("alerts", {})
+    out: list[tuple[str, bool]] = []
+    for f in found:
+        old = book.get(f["key"])
+        lasting = bool(old and old.get("open"))
+        again = dt.timedelta(hours=ALERT_AGAIN_H[bool(f["serious"])])
+        recent = bool(old) and now - dt.datetime.fromisoformat(old["sent"]) < again
+        back = bool(old) and bool(f["serious"]) and not lasting
+        if recent and not back:
+            old["open"] = True
+            continue
+        flaps = old.get("flaps", 0) + 1 if back and recent else 0
+        if flaps > FLAP_MAX:  # said for the last time today
+            old["open"] = True
+            continue
+        first = old["first"] if lasting else _stamp(now)
+        book[f["key"]] = {
+            "first": first,
+            "sent": _stamp(now),
+            "serious": bool(f["serious"]),
+            "open": True,
+            **({"name": f["name"]} if f.get("name") else {}),
+            **({"flaps": flaps} if flaps else {}),
+        }
+        text = f["text"]
+        if lasting:
+            since = _hm(dt.datetime.fromisoformat(first), now)
+            text = f"Still not solved (first seen {since}). {text}"
+        elif flaps == FLAP_MAX:
+            text = (
+                f"It is back again. {text} It keeps coming and going, so I will not "
+                "text about it again until a day has passed."
+            )
+        elif flaps:
+            text = f"It is back. {text}"
+        out.append((text, bool(f["serious"])))
+    listed = {f["key"] for f in found}
+    for key, alert in list(book.items()):
+        if alert.get("open") and key not in listed:
+            if not alert.get("serious"):
+                alert["open"] = False
+            elif over := watch_over(key, alert, facts, now):
+                alert["open"] = False
+                if alert.get("flaps", 0) < FLAP_MAX:
+                    out.append((over, False))
+        age = now - dt.datetime.fromisoformat(alert["sent"])
+        if age > dt.timedelta(days=ALERT_KEEP_DAYS):
+            del book[key]
+    return out
