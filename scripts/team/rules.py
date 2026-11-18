@@ -871,8 +871,10 @@ def trigger(finding: dict, evidence: str, now: dt.datetime) -> dict:
 # or a button press means, and nothing else in the team reads the words.
 
 CHAT_HELP = (
-    "I understand:\n"
-    "idea: <what you want> — goes on the team's list\n"
+    "Text me in plain words what you want: a question, or a job like "
+    "\"merge the open pull requests\" or \"build me a chart of my risk\".\n"
+    "Fixed words that always work:\n"
+    "idea: <what you want> — goes on the team's list for the night\n"
     "status — what the team did last and what waits for you\n"
     "pause — everything stops, also the job that is running\n"
     "resume — back to work\n"
@@ -885,17 +887,20 @@ BUTTONS = {
     "idea": (("Build it", "yes"), ("Not now", "later"), ("No", "no")),
     "question": (("Try again", "yes"), ("Leave it", "no")),
     "trading": (("Apply it", "yes"), ("No", "no")),
+    "action": (("Do it", "yes"), ("Cancel", "no")),
 }
 CONFIRM = (("Yes, apply it", "confirm"), ("Cancel", "cancel"))
 APPROVED = {
     "idea": "Build it. It joins the list and the team builds it at night.",
     "question": "Trying again on the next run.",
     "trading": "Applying it on the next run.",
+    "action": "Doing it now.",
 }
 DECLINED = {
     "idea": "No. I will not bring it up again.",
     "question": "Left as it is.",
     "trading": "No. Nothing changes.",
+    "action": "Cancelled. Nothing was done.",
 }
 OPEN_STATES = ("sent", "confirming")  # texted, no final answer yet
 IDEAS_PER_WEEK = 3
@@ -918,6 +923,103 @@ def parse_chat(text: str) -> tuple[str, str]:
     if head in CHAT_COMMANDS and not rest.strip():
         return (head, "")
     return ("note", text) if text else ("help", "")
+
+
+# ---- plain words -----------------------------------------------------------
+# A text that is none of the fixed words goes to a session that can only read.
+# It answers, and may ask for actions from the list below. The words it sends
+# back are data too: `talk_plan` decides what each one comes to, and a merge
+# never happens before Nicola pressed the button under the plan.
+
+TALK_ACTIONS = ("merge", "task", "idea", "pause", "resume")
+TALK_MAX_ACTIONS = 12
+TALK_HISTORY = 8  # earlier turns a session is shown
+TALK_TEXT_MAX = 1500  # of one text from Nicola
+
+
+def pr_card(pr: dict, owner: str, base: str) -> dict:
+    """An open pull request as the talk session and `talk_plan` see it."""
+    files = [f.get("path", "") for f in pr.get("files") or []]
+    changes = [("M", path) for path in files]
+    return {
+        "number": pr.get("number"),
+        "title": " ".join(str(pr.get("title") or "").split())[:160],
+        "sha": pr.get("headRefOid") or "",
+        "checks": ci_state(pr.get("statusCheckRollup")),
+        "mergeable": pr.get("mergeable") or "UNKNOWN",
+        "draft": bool(pr.get("isDraft")),
+        "base": pr.get("baseRefName") or "",
+        "own": (pr.get("author") or {}).get("login") == owner
+        and not pr.get("isCrossRepository"),
+        "to_base": pr.get("baseRefName") == base,
+        "trading": bool(trading_violations(changes)),
+        "team_code": bool(protected_violations(changes)),
+    }
+
+
+def merge_refusal(card: dict | None) -> str:
+    """Why a pull request is not merged from a text, or ''."""
+    if not card:
+        return "it is not an open pull request"
+    if not card.get("own"):
+        return "someone else opened it"
+    if card.get("draft"):
+        return "it is a draft"
+    if not card.get("to_base"):
+        return f"it does not target main (it targets {card.get('base') or 'nothing'})"
+    if card.get("trading"):
+        return "it changes how Pulse trades; that is decided with its proof, not from a text"
+    if card.get("checks") != "pass":
+        return f"its checks have not passed ({card.get('checks')})"
+    if card.get("mergeable") != "MERGEABLE":
+        return f"GitHub cannot merge it right now ({card.get('mergeable')})"
+    return ""
+
+
+def talk_plan(actions, cards: list[dict], paused: bool) -> dict:
+    """What a talk session's actions come to: `merges` (cards, to confirm with
+    one tap), `now` (done at once: task, idea, pause, resume) and `refused`
+    (what is not done, with the reason). Anything not on the list is dropped."""
+    by_number = {c.get("number"): c for c in cards}
+    plan = {"merges": [], "now": [], "refused": []}
+    seen = set()
+    for a in (actions if isinstance(actions, list) else [])[:TALK_MAX_ACTIONS]:
+        if not isinstance(a, dict) or a.get("kind") not in TALK_ACTIONS:
+            continue
+        kind = a["kind"]
+        if kind == "merge":
+            number = a.get("pr")
+            if not isinstance(number, int) or isinstance(number, bool):
+                continue
+            if ("merge", number) in seen:
+                continue
+            seen.add(("merge", number))
+            why = "the team is paused" if paused else merge_refusal(by_number.get(number))
+            if why:
+                plan["refused"].append(f"#{number}: {why}")
+            else:
+                plan["merges"].append(by_number[number])
+        elif kind in ("task", "idea"):
+            words = " ".join(str(a.get("text") or "").split())[:IDEA_MAX]
+            if not words or (kind, words.casefold()) in seen:
+                continue
+            seen.add((kind, words.casefold()))
+            if kind == "task" and paused:
+                plan["refused"].append(f"\"{words[:60]}\": the team is paused")
+            else:
+                plan["now"].append({"kind": kind, "text": words})
+        elif (kind,) not in seen:
+            seen.add((kind,))
+            plan["now"].append({"kind": kind})
+    return plan
+
+
+def merge_plan_text(cards: list[dict]) -> str:
+    lines = []
+    for c in cards:
+        mark = " (changes the team's own code or settings)" if c.get("team_code") else ""
+        lines.append(f"#{c['number']} {c['title']}{mark}")
+    return "\n".join(lines)
 
 
 def parse_button(data: str) -> tuple[str, str] | None:

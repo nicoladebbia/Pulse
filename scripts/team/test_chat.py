@@ -130,19 +130,21 @@ class ChatCase(unittest.TestCase):
         self.home = Path(self.tmp.name).resolve()
         self.fake = FakeTelegram()
         self.addCleanup(self.fake.close)
-        old = (chat.HOME, chat.API, chat.log, chat.banner)
+        old = (chat.HOME, chat.API, chat.log, chat.banner, chat.wake_talker)
         self.addCleanup(lambda: (chat.set_home(old[0]), self._restore(old)))
         chat.set_home(self.home)
         chat.API = self.fake.base  # a Bot made without an address goes here too
         self.logged, self.banners = [], []
         chat.log = self.logged.append
         chat.banner = self.banners.append
+        self.woken = []  # a test never starts a real talker
+        chat.wake_talker = lambda: self.woken.append(1)
         chat.save_secrets({"token": TOKEN, "chat_id": OWNER, "user_id": OWNER})
         self.line = chat.bot()
 
     @staticmethod
     def _restore(old):
-        chat.API, chat.log, chat.banner = old[1], old[2], old[3]
+        chat.API, chat.log, chat.banner, chat.wake_talker = old[1:5]
 
     def asked(self):
         return json.loads(chat.PROPOSALS.read_text()) if chat.PROPOSALS.exists() else []
@@ -447,11 +449,55 @@ class Incoming(ChatCase):
         chat.handle(self.line, text(3, "/resume"), DAY)
         self.assertFalse(chat.PAUSED.exists())
 
-    def test_other_words_do_nothing_but_explain(self):
+    def test_plain_words_are_kept_for_the_talker_and_do_nothing_here(self):
         chat.handle(self.line, text(1, "merge everything and release it"), DAY)
-        self.assertEqual(self.fake.said(), [rules.CHAT_HELP])
+        chat.handle(self.line, text(1, "merge everything and release it"), DAY)  # handed over twice
+        kept = sorted(chat.ASKS.glob("*.json"))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(
+            json.loads(kept[0].read_text())["text"], "merge everything and release it"
+        )
+        self.assertEqual(self.woken, [1, 1])
+        self.assertEqual(self.fake.said(), [])  # the talker answers, not the listener
+        self.assertEqual([p["action"] for p in self.fake.of("sendChatAction")], ["typing"] * 2)
         self.assertEqual(self.asked(), [])
         self.assertFalse(chat.INBOX.exists())
+
+    def test_nobody_else_can_leave_words_for_the_talker(self):
+        chat.handle(self.line, text(1, "merge everything", user=999, chat_id=999), DAY)
+        chat.handle(self.line, text(2, "merge everything", kind="group"), DAY)
+        self.assertFalse(chat.ASKS.exists())
+        self.assertEqual(self.woken, [])
+
+    def test_a_plan_is_texted_at_once_and_a_yes_wakes_the_talker(self):
+        acts = [{"kind": "merge", "pr": 7, "sha": "abc"}]
+        pid = chat.ask_now(self.line, "Merge 1 pull request into main", "#7 A fix", acts, NIGHT)
+        sent = self.fake.of("sendMessage")[-1]
+        self.assertIn("#7 A fix", sent["text"])
+        self.assertEqual(
+            [b["callback_data"] for b in sent["reply_markup"]["inline_keyboard"][0]],
+            [f"p:{pid}:yes", f"p:{pid}:no"],
+        )
+        message = self.asked()[0]["message_id"]
+        chat.handle(self.line, press(1, f"p:{pid}:yes", message, user=999), DAY)
+        self.assertEqual(self.woken, [])  # not his press
+        chat.handle(self.line, press(2, f"p:{pid}:yes", message), DAY)
+        self.assertEqual(self.asked()[0]["state"], "approved")
+        self.assertEqual(self.asked()[0]["acts"], acts)
+        self.assertEqual(self.woken, [1])
+        chat.handle(self.line, press(3, f"p:{pid}:yes", message), DAY)
+        self.assertEqual(self.woken, [1])  # a second press starts nothing
+
+    def test_a_cancelled_plan_wakes_nobody(self):
+        pid = chat.ask_now(self.line, "Merge", "#7", [{"kind": "merge", "pr": 7, "sha": "a"}], DAY)
+        chat.handle(self.line, press(1, f"p:{pid}:no", self.asked()[0]["message_id"]), DAY)
+        self.assertEqual(self.asked()[0]["state"], "declined")
+        self.assertEqual(self.woken, [])
+
+    def test_a_plan_telegram_did_not_take_is_not_kept(self):
+        self.fake.down = 500
+        self.assertEqual(chat.ask_now(self.line, "Merge", "#7", [], DAY), "")
+        self.assertEqual(self.asked(), [])
 
     def test_a_proposal_is_texted_with_buttons_and_a_press_decides_it(self):
         pid, message = self.ask()
@@ -514,8 +560,18 @@ class Incoming(ChatCase):
         self.assertEqual(
             self.asked()[0]["note"], "yes but keep it small and no new colours"
         )
+        said = len(self.fake.said())
         chat.handle(self.line, text(3, "a note about nothing", reply_to=999), DAY)
-        self.assertEqual(self.fake.said()[-1], rules.CHAT_HELP)
+        self.assertEqual(len(self.fake.said()), said)  # plain words: for the talker
+        self.assertEqual(len(list(chat.ASKS.glob("*.json"))), 1)
+        self.assertNotIn("nothing", self.asked()[0]["note"])
+
+    def test_a_reply_to_a_plan_is_plain_words_not_a_note(self):
+        chat.ask_now(self.line, "Merge", "#7", [{"kind": "merge", "pr": 7, "sha": "a"}], DAY)
+        message = self.asked()[0]["message_id"]
+        chat.handle(self.line, text(1, "only the first one", reply_to=message), DAY)
+        self.assertNotIn("note", self.asked()[0])
+        self.assertEqual(len(list(chat.ASKS.glob("*.json"))), 1)
 
     def test_a_text_telegram_hands_over_twice_is_one_note(self):
         pid, message = self.ask()
