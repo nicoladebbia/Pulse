@@ -4,6 +4,10 @@
 //! ask for the account behind a client. Both come from the environment
 //! (`.env`), never from the code, so the repository names nobody. Unset, the
 //! requests still go out, just without a contact.
+//!
+//! Reddit may not answer those. On 2026-11-17 every feed request that named no
+//! account came back 404, whichever way the address was spelled. With
+//! `PULSE_REDDIT_USER` set, the agent is the one Pulse sent before it moved here.
 
 const RESEARCH_AGENT: &str = "Pulse/1.0 (personal research reader)";
 const REDDIT_AGENT: &str = "macos:com.pulse.fetcher:0.1.0";
