@@ -127,6 +127,11 @@ const FEEDS: &[(&str, &str, &str, &str)] = &[
     ("freedom_health", "Peter Attia", "https://peterattiamd.com/feed/", "en"),
 ];
 
+/// The id a feed's articles carry, and its row in `feed_runs`.
+fn feed_id(name: &str) -> String {
+    format!("rss_{}", name.to_lowercase().replace(' ', "_"))
+}
+
 pub async fn fetch_all() -> anyhow::Result<Vec<RawArticle>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -140,7 +145,10 @@ pub async fn fetch_all() -> anyhow::Result<Vec<RawArticle>> {
             let name = name.to_string();
             let url = url.to_string();
             let lang = lang.to_string();
-            async move { fetch_single(&client, &sector, &name, &url, &lang).await }
+            async move {
+                let fetch = fetch_single(&client, &sector, &name, &url, &lang);
+                crate::feed_runs::watch(feed_id(&name), "rss", &name, &sector, fetch).await
+            }
         })
         .collect();
 
@@ -163,19 +171,25 @@ async fn fetch_single(
     name: &str,
     url: &str,
     lang: &str,
-) -> anyhow::Result<Vec<RawArticle>> {
+) -> anyhow::Result<(Vec<RawArticle>, usize)> {
     super::API_CALLS.rss_feeds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Try with retry on connection errors
-    let response = match client.get(url).header("User-Agent", "Pulse/0.1").send().await {
-        Ok(r) => r.bytes().await?,
+    let reply = match client.get(url).header("User-Agent", "Pulse/0.1").send().await {
+        Ok(r) => r,
         Err(_) => {
             // Single retry after 3s
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            client.get(url).header("User-Agent", "Pulse/0.1").send().await?.bytes().await?
+            client.get(url).header("User-Agent", "Pulse/0.1").send().await?
         }
     };
+    let status = reply.status();
+    let response = reply.bytes().await?;
 
-    let feed = feed_rs::parser::parse(&response[..])?;
+    // A blocked or moved feed answers with a page that is not a feed. The status
+    // is the useful half of that error, so it goes in front.
+    let feed = feed_rs::parser::parse(&response[..])
+        .map_err(|e| anyhow::anyhow!("HTTP {}: {}", status.as_u16(), e))?;
+    let entries = feed.entries.len();
     let mut articles = Vec::new();
 
     // Take articles from the last 48 hours (pipeline runs at 8 AM + 9 PM,
@@ -234,7 +248,7 @@ async fn fetch_single(
                 published_at: pub_date.map(|dt| dt.to_rfc3339()),
                 content_snippet,
                 sector: sector.to_string(),
-                feed_id: format!("rss_{}", name.to_lowercase().replace(' ', "_")),
+                feed_id: feed_id(name),
                 language: lang.to_string(),
                 source_type: "news".to_string(),
                 financial_metadata: None,
@@ -243,5 +257,23 @@ async fn fetch_single(
     }
 
     tracing::info!("Fetched {} articles from {}", articles.len(), name);
-    Ok(articles)
+    Ok((articles, entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `feed_runs` holds one row per feed id per run, and the id is made from the
+    /// name: two feeds sharing a name would be counted as one.
+    #[test]
+    fn every_feed_has_its_own_id() {
+        let mut seen = std::collections::HashSet::new();
+        let repeated: Vec<_> = FEEDS
+            .iter()
+            .map(|(_, name, _, _)| feed_id(name))
+            .filter(|id| !seen.insert(id.clone()))
+            .collect();
+        assert!(repeated.is_empty(), "feed ids used twice: {repeated:?}");
+    }
 }

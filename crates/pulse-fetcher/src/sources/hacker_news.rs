@@ -29,7 +29,9 @@ pub async fn fetch() -> anyhow::Result<Vec<RawArticle>> {
     let mut articles = Vec::new();
 
     for (sector, url) in ENDPOINTS {
-        match fetch_endpoint(&client, sector, url).await {
+        let fetch = fetch_endpoint(&client, sector, url);
+        let name = format!("Hacker News ({sector})");
+        match crate::feed_runs::watch(feed_id(sector), "hacker_news", &name, sector, fetch).await {
             Ok(a) => articles.extend(a),
             Err(e) => tracing::warn!("HN fetch error for {}: {}", sector, e),
         }
@@ -64,11 +66,16 @@ fn is_productivity_story(title: &str) -> bool {
     KEYWORDS.iter().any(|k| t.contains(k))
 }
 
+/// The id an endpoint's articles carry, and its row in `feed_runs`.
+fn feed_id(sector: &str) -> String {
+    format!("hn_{sector}")
+}
+
 async fn fetch_endpoint(
     client: &reqwest::Client,
     sector: &str,
     url: &str,
-) -> anyhow::Result<Vec<RawArticle>> {
+) -> anyhow::Result<(Vec<RawArticle>, usize)> {
     super::API_CALLS.hacker_news.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resp: HNResponse = client
         .get(url)
@@ -76,6 +83,7 @@ async fn fetch_endpoint(
         .await?
         .json()
         .await?;
+    let entries = resp.hits.len();
 
     let articles: Vec<RawArticle> = resp
         .hits
@@ -94,7 +102,7 @@ async fn fetch_endpoint(
                 published_at: hit.created_at,
                 content_snippet: format!("{} points", hit.points.unwrap_or(0)),
                 sector: sector.to_string(),
-                feed_id: format!("hn_{}", sector),
+                feed_id: feed_id(sector),
                 language: "en".to_string(),
                 source_type: "news".to_string(),
                 financial_metadata: None,
@@ -103,5 +111,23 @@ async fn fetch_endpoint(
         .collect();
 
     tracing::info!("Fetched {} articles from HN ({})", articles.len(), sector);
-    Ok(articles)
+    Ok((articles, entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `feed_runs` holds one row per feed id per run: two feeds sharing an id
+    /// would be counted as one.
+    #[test]
+    fn every_feed_has_its_own_id() {
+        let mut seen = std::collections::HashSet::new();
+        let repeated: Vec<_> = ENDPOINTS
+            .iter()
+            .map(|(sector, _)| feed_id(sector))
+            .filter(|id| !seen.insert(id.clone()))
+            .collect();
+        assert!(repeated.is_empty(), "feed ids used twice: {repeated:?}");
+    }
 }
