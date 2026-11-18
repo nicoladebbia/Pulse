@@ -4,6 +4,8 @@ import datetime as dt
 import importlib
 import json
 import os
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -647,6 +649,59 @@ class Guard(unittest.TestCase):
         ]:
             self.assertIsNotNone(self.blocked(cmd), cmd)
 
+    def test_quoting_case_and_wrappers_do_not_hide_a_command(self):
+        for cmd in [
+            '"gh" pr merge 5',
+            "git 'push' origin main",
+            'la""unchctl list',
+            "Launchctl list",
+            "Osascript -e 'beep'",
+            "cat ~/Library/Application\\ Support/com.pulse.a''pp/pulse.db",
+            "Pulse-Fetcher --mode daily",
+            "Cargo run -p pulse-fetcher",
+            "setsid pulse-fetcher --mode daily",
+            "stdbuf -oL pulse-fetcher --mode daily",
+            "arch -arm64 pulse-fetcher --mode daily",
+            'bash -c -- "pulse-fetcher --mode daily"',
+            "pulse-fetcher --mode daily # --db-path",
+            "pulse-fetcher --mode daily --db-pathx /tmp/a.db",
+        ]:
+            self.assertIsNotNone(self.blocked(cmd), cmd)
+        for cmd in [
+            'pulse-fetcher --db-path "$PULSE_DB_PATH" --mode daily  # on the copy',
+            'pulse-fetcher --db-path="$PULSE_DB_PATH" --mode daily',
+            'bash -c -- "cargo test"',
+            "git commit -m 'explain the push step (#12)'",
+            "git commit -m \"say what 'gh' pr view shows\"",
+            "cargo test  # run the fetcher's tests",
+        ]:
+            self.assertIsNone(self.blocked(cmd), cmd)
+
+    def test_a_global_flag_is_left_alone_only_where_it_is_the_scripts_own(self):
+        for cmd in [
+            "pnpm test -g foo",
+            "pnpm vitest run -g x",
+            "pnpm exec playwright test -g x",
+            "pnpm --filter web test -g foo",
+            "pnpm test -- -g foo",
+            "npm ls -g --depth=0",
+        ]:
+            self.assertIsNone(self.blocked(cmd), cmd)
+        for cmd in [
+            "pnpm add -g x",
+            "pnpm add test -g",
+            "npm i -g x",
+            "npm --global install x",
+            "pnpm --filter web add -g x",
+            "pnpm env use -g 22",
+            "pnpm -g env use 22",
+            "npm install-test -g x",
+            "pnpm self-update -g",
+            "npm config set -g prefix /tmp/x",
+            "yarn global add x",
+        ]:
+            self.assertIsNotNone(self.blocked(cmd), cmd)
+
     def test_every_refusal_says_how_to_get_past_a_false_alarm(self):
         for cmd in [
             "git push",
@@ -820,7 +875,7 @@ class Page(unittest.TestCase):
             "Needs you",
             "changes a protected file",
             "Next thing",
-            "Earlier nights",
+            "Earlier runs",
             "release Pulse",
             "marked as draft",
         ]:
@@ -937,6 +992,47 @@ class Runner(unittest.TestCase):
             state["attempts"], {}
         )  # setting the line back to [ ] starts over
 
+    def test_a_job_that_stepped_aside_waits_and_is_not_an_attempt(self):
+        state = {}
+        aside = self.res(
+            "yielded",
+            reasons=["it stepped aside: paused from Telegram"],
+            held="feat/night-dark-mode-1116",
+        )
+        self.team.after_job(self.job, aside, state)
+        now = dt.datetime.now()
+        self.assertEqual(
+            rules.held_branch(state, self.job["key"], now), "feat/night-dark-mode-1116"
+        )
+        self.assertNotIn("attempts", state)
+        self.assertIn("- [ ] dark mode\n", self.ideas())  # still open, and not a failure
+        self.team.after_job(self.job, self.res("merged", pr=60, pushed="abc"), state)
+        self.assertEqual(state["held"], {})  # over: nothing waits any more
+
+    def test_an_incidents_trigger_stays_while_it_waits_and_goes_when_it_is_over(self):
+        self.team.QUEUE.mkdir(exist_ok=True)
+        path = self.team.QUEUE / "t.json"
+        path.write_text("{}")
+        job = {
+            "kind": "incident",
+            "key": "incident-manage-11161430",
+            "problem": "manage",
+            "title": "Position management failed twice.",
+            "file": "t.json",
+            "sha": "",
+        }
+        state = {}
+        self.team.after_job(job, self.res("yielded", held=""), state)
+        self.assertTrue(path.exists())
+        self.assertIsNotNone(rules.waiting(state, job["key"], dt.datetime.now()))
+        self.team.after_job(
+            job, self.res("blocked", reasons=["the broker was down"]), state
+        )
+        self.assertFalse(path.exists())
+        self.assertEqual(state["held"], {})
+        self.assertEqual(state.get("attempts", {}), {})  # never tried again by itself
+        self.assertEqual(self.ideas().count("[ ]"), 2)  # and the idea list is not its book
+
     def test_pr_and_main_outcomes_are_remembered_by_commit(self):
         state = {}
         job = {"kind": "pr", "key": "pr-5", "title": "t", "pr": 5, "sha": "origin-head"}
@@ -993,8 +1089,15 @@ class Runner(unittest.TestCase):
         self.assertEqual(
             env["PULSE_NO_LIVE_DB"], "1"
         )  # the fetcher refuses the live one
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
-        self.assertIn("pushInsteadOf", env["GIT_CONFIG_KEY_0"])
+        settings = {
+            (env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"])
+            for i in range(int(env["GIT_CONFIG_COUNT"]))
+        }
+        for address in ("https://github.com/", "git@github.com:"):
+            self.assertIn(
+                ("url.night-team-no-push://blocked/.pushInsteadOf", address), settings
+            )
+        self.assertIn(("gc.auto", "0"), settings)  # no housekeeping inside the fence
         hooks = self.team.guard_settings(self.team.HOME / "my wt")["hooks"][
             "PreToolUse"
         ]
@@ -1030,6 +1133,54 @@ class Runner(unittest.TestCase):
         self.assertIn("timed out", err)
         self.assertLess(time.time() - began, 5)
 
+    def poll_fast(self):
+        self.addCleanup(setattr, self.team, "POLL_S", self.team.POLL_S)
+        self.team.POLL_S = 0.1
+
+    def test_a_command_can_be_told_to_stop(self):
+        self.poll_fast()
+        asked = []
+
+        def cancel():
+            asked.append(1)
+            return "paused from Telegram" if len(asked) >= 2 else ""
+
+        began = time.time()
+        code, out, err = self.team.sh(
+            ["bash", "-c", "sleep 20 & echo $!; wait"], cancel=cancel
+        )
+        self.assertEqual(code, self.team.STOPPED)
+        self.assertIn("[stopped: paused from Telegram]", err)
+        self.assertLess(time.time() - began, 5)
+        gone = False  # what the command had started went with it
+        for _ in range(40):
+            try:
+                os.kill(int(out), 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            time.sleep(0.05)
+        self.assertTrue(gone)
+
+    def test_a_question_that_fails_stops_nothing(self):
+        self.poll_fast()
+
+        def cancel():
+            raise OSError("the disk is gone")
+
+        code, out, _ = self.team.sh(["bash", "-c", "sleep 0.4; echo done"], cancel=cancel)
+        self.assertEqual((code, out.strip()), (0, "done"))
+
+    def test_a_command_that_is_asked_still_has_its_time_limit(self):
+        self.poll_fast()
+        began = time.time()
+        code, _, err = self.team.sh(
+            ["bash", "-c", "sleep 20"], timeout=1, cancel=lambda: ""
+        )
+        self.assertEqual(code, 124)
+        self.assertIn("timed out", err)
+        self.assertLess(time.time() - began, 5)
+
     def test_a_command_that_cannot_start_fails_instead_of_raising(self):
         code, out, err = self.team.sh(["/nonexistent/night-team-tool"])
         self.assertEqual((code, out), (127, ""))
@@ -1041,6 +1192,218 @@ class Runner(unittest.TestCase):
         code, out, _ = self.team.sh(["bash", "-c", "printf 'ok \\xff\\n'"])
         self.assertEqual(code, 0)
         self.assertTrue(out.startswith("ok"))
+
+
+@unittest.skipUnless(shutil.which("sqlite3"), "needs the sqlite3 command")
+class DatabaseCopy(unittest.TestCase):
+    """The copy of the live database that sessions read, against real files."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        saved = os.environ.get("PULSE_TEAM_HOME")
+        os.environ["PULSE_TEAM_HOME"] = str(root / "home")
+        self.team = importlib.reload(importlib.import_module("team"))
+        if saved is None:
+            os.environ.pop("PULSE_TEAM_HOME", None)
+        else:
+            os.environ["PULSE_TEAM_HOME"] = saved
+        # A space in the path, as in "Application Support".
+        self.live = root / "the app" / "pulse.db"
+        self.live.parent.mkdir()
+        self.team.LIVE_DB = self.live
+        self.copy = self.team.DB_COPY
+        self.real_sh, self.calls = self.team.sh, []
+        self.team.log = lambda _msg: None
+        self.write(1)
+
+    def write(self, n, closed=True):
+        """Put row `n` in the live database, the way Pulse does (with a -wal).
+        `closed`: as Pulse leaves it when it closes, with the -wal folded in
+        and gone."""
+        was = self.live.stat().st_mtime_ns if self.live.exists() else 0
+        con = sqlite3.connect(self.live)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA wal_autocheckpoint=0")
+        con.execute("CREATE TABLE IF NOT EXISTS t(x)")
+        con.execute("INSERT INTO t VALUES (?)", (n,))
+        con.commit()
+        if closed:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            con.close()
+            for suffix in ("-wal", "-shm"):
+                Path(f"{self.live}{suffix}").unlink(missing_ok=True)
+            if self.live.stat().st_mtime_ns <= was:
+                # Two writes within one tick of a coarse file-system clock.
+                os.utime(self.live, ns=(was + 10**7, was + 10**7))
+        return con
+
+    def rows(self, path):
+        con = sqlite3.connect(path)
+        try:
+            return [x for (x,) in con.execute("SELECT x FROM t ORDER BY x")]
+        finally:
+            con.close()
+
+    def no_read_only(self, during=None):
+        """macOS's sqlite on a closed database: opening it read-only fails.
+        `during` runs in the middle of the other way of copying."""
+
+        def sh(cmd, **kw):
+            self.calls.append(cmd)
+            if "-readonly" in cmd:
+                return 1, "", "Error: unable to open database file\n"
+            if during:
+                during()
+            return self.real_sh(cmd, **kw)
+
+        self.team.sh = sh
+
+    def leftovers(self):
+        return sorted(
+            x.name for x in self.copy.parent.iterdir() if x.name != self.copy.name
+        )
+
+    def test_the_live_database_is_copied(self):
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(self.rows(self.copy), [1])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_database_that_pulse_has_closed_is_copied_too(self):
+        self.no_read_only()
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(self.rows(self.copy), [1])
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("immutable=1", self.calls[1][1])
+        self.assertIn("the%20app", self.calls[1][1])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_the_live_database_is_never_written_to(self):
+        before = self.live.read_bytes(), self.live.stat().st_mtime_ns
+        self.no_read_only()
+        self.team.copy_database()
+        self.assertEqual((self.live.read_bytes(), self.live.stat().st_mtime_ns), before)
+        self.assertEqual([x.name for x in self.live.parent.iterdir()], ["pulse.db"])
+
+    def test_what_waits_in_a_wal_is_never_left_out(self):
+        con = self.write(2, closed=False)  # row 2 is only in the -wal
+        self.addCleanup(con.close)
+        self.no_read_only()
+        self.assertIn("unable to open", self.team.copy_database())
+        self.assertEqual(len(self.calls), 1)  # the one file alone was not read
+        self.assertFalse(self.copy.exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_copy_that_pulse_wrote_into_is_thrown_away(self):
+        self.team.copy_database()
+        held = []
+        self.addCleanup(lambda: [con.close() for con in held])
+        self.no_read_only(during=lambda: held.append(self.write(2, closed=False)))
+        self.assertIn("unable to open", self.team.copy_database())
+        # read-only, the other way, and read-only once more now that Pulse is open
+        self.assertEqual(["-readonly" in c for c in self.calls], [True, False, True])
+        self.assertEqual(self.rows(self.copy), [1])  # the earlier copy stays
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_write_that_came_and_went_meanwhile_is_in_the_copy(self):
+        once = [3]
+        self.no_read_only(during=lambda: once and self.write(once.pop()))
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(["-readonly" in c for c in self.calls], [True, False] * 2)
+        self.assertEqual(self.rows(self.copy), [1, 3])
+
+    def test_a_database_that_never_stops_changing_is_given_up(self):
+        n = iter(range(2, 99))
+        self.no_read_only(during=lambda: self.write(next(n)))
+        self.assertEqual(
+            self.team.copy_database(), "Pulse wrote to its database during the copy"
+        )
+        self.assertEqual(len(self.calls), 4)
+        self.assertFalse(self.copy.exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_copy_that_broke_while_pulse_wrote_is_made_again(self):
+        once = [3]
+
+        def sh(cmd, **kw):
+            self.calls.append(cmd)
+            if "-readonly" in cmd:
+                return 1, "", "Error: unable to open database file\n"
+            if once:
+                self.write(once.pop())
+                return 1, "", "Error: database disk image is malformed\n"
+            return self.real_sh(cmd, **kw)
+
+        self.team.sh = sh
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(self.rows(self.copy), [1, 3])
+
+    def test_a_copy_that_breaks_by_itself_is_a_failure(self):
+        def sh(cmd, **kw):
+            self.calls.append(cmd)
+            return 1, "", "Error: disk I/O error\n"
+
+        self.team.sh = sh
+        self.assertEqual(self.team.copy_database(), "Error: disk I/O error")
+        self.assertEqual(len(self.calls), 2)  # nothing changed meanwhile: no second round
+        self.assertFalse(self.copy.exists())
+
+    def test_a_folder_with_a_quote_in_its_name_is_copied_into(self):
+        self.team.DB_COPY = self.copy.parent.parent / "the team's" / "pulse-copy.db"
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(self.rows(self.team.DB_COPY), [1])
+
+    def test_a_write_meanwhile_is_copied_the_usual_way(self):
+        held = []
+        self.addCleanup(lambda: [con.close() for con in held])
+        first = []
+
+        def sh(cmd, **kw):
+            self.calls.append(cmd)
+            if "-readonly" in cmd and not first:
+                first.append(cmd)
+                return 1, "", "Error: unable to open database file\n"
+            if "-readonly" not in cmd:
+                held.append(self.write(2, closed=False))
+            return self.real_sh(cmd, **kw)
+
+        self.team.sh = sh
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.rows(self.copy), [1, 2])
+
+    def test_no_live_database_is_no_failure(self):
+        self.live.unlink()
+        self.assertEqual(self.team.copy_database(), "")
+        self.assertFalse(self.copy.exists())
+
+    def test_a_failed_copy_is_in_the_report_with_the_age_of_the_one_read(self):
+        report = {"notes": []}
+        self.team.fresh_database(report)
+        self.assertEqual(report["notes"], [])
+        old = dt.datetime(2026, 11, 15, 2, 30).timestamp()
+        os.utime(self.copy, (old, old))
+        self.team.sh = lambda cmd, **kw: (1, "", "Error: disk I/O error")
+        self.team.fresh_database(report)
+        self.team.fresh_database(report)  # said once
+        self.assertEqual(
+            report["notes"],
+            [
+                "Pulse's database could not be copied, so sessions read the copy "
+                "of Sun 15 Nov, 02:30"
+            ],
+        )
+
+    def test_a_failed_copy_with_none_before_it_is_said_too(self):
+        report = {"notes": []}
+        self.team.sh = lambda cmd, **kw: (1, "", "")
+        self.team.fresh_database(report)
+        self.assertEqual(
+            report["notes"],
+            ["Pulse's database could not be copied, so sessions had none to read"],
+        )
 
 
 def g(*args, cwd):
@@ -1059,6 +1422,176 @@ def commit(cwd, path, text, message="change"):
     g("add", "-A", cwd=cwd)
     g("commit", "-q", "-m", message, cwd=cwd)
     return g("rev-parse", "HEAD", cwd=cwd)
+
+
+class Schedule(unittest.TestCase):
+    """launchd only wakes the team every hour; these decide when the night starts."""
+
+    START, LATE = (2, 30), 210
+
+    def due(self, when, last=""):
+        return rules.night_due(
+            dt.datetime.fromisoformat(when), self.START, self.LATE, last
+        )
+
+    def test_the_night_starts_at_its_minute_and_not_before(self):
+        self.assertEqual(self.due("2026-11-15T02:29:59"), "")
+        self.assertEqual(self.due("2026-11-15T02:30:04"), "2026-11-15")
+
+    def test_a_late_wake_up_still_starts_it_until_the_morning(self):
+        self.assertEqual(self.due("2026-11-15T05:30:02"), "2026-11-15")
+        self.assertEqual(self.due("2026-11-15T06:00:00"), "")
+        self.assertEqual(self.due("2026-11-15T14:30:00"), "")
+
+    def test_a_night_starts_once(self):
+        self.assertEqual(self.due("2026-11-15T03:30:01", last="2026-11-15"), "")
+        self.assertEqual(
+            self.due("2026-11-16T02:30:01", last="2026-11-15"), "2026-11-16"
+        )
+
+    def test_a_shift_that_opens_before_midnight_keeps_its_own_date(self):
+        late_evening = dict(start=(23, 30), catch_up_min=210)
+        after_midnight = dt.datetime.fromisoformat("2026-11-16T00:30:00")
+        self.assertEqual(
+            rules.night_due(after_midnight, last_night="", **late_evening), "2026-11-15"
+        )
+        self.assertEqual(
+            rules.night_due(after_midnight, last_night="2026-11-15", **late_evening), ""
+        )
+
+
+class Wake(unittest.TestCase):
+    """An hourly wake-up from launchd, against a temporary home folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        old_home = os.environ.get("PULSE_TEAM_HOME")
+        os.environ["PULSE_TEAM_HOME"] = self.tmp.name
+        self.team = importlib.reload(importlib.import_module("team"))
+
+        def restore():
+            if old_home is None:
+                os.environ.pop("PULSE_TEAM_HOME", None)
+            else:
+                os.environ["PULSE_TEAM_HOME"] = old_home
+            importlib.reload(self.team)
+
+        self.addCleanup(restore)
+        self.home = Path(self.tmp.name)
+        self.worked = []
+        self.team.work = lambda args, run, state, report, started: self.worked.append(
+            dict(state)
+        )
+        self.team.finish = lambda report, run, state, started: 0
+        self.team.log = lambda msg: None
+        self.args = lambda scheduled: type(
+            "Args", (), {"scheduled": scheduled, "no_merge": True, "only": ""}
+        )()
+
+    def night(self, answer):
+        self.addCleanup(setattr, rules, "night_due", rules.night_due)
+        rules.night_due = lambda now, start, late, last: answer
+
+    def test_the_agent_names_no_hour_and_hands_the_runner_its_hour(self):
+        job = self.team.launchd_job("/usr/bin/python3", self.home / "bin", ["/usr/bin"])
+        self.assertEqual(job["StartCalendarInterval"], {"Minute": self.team.RUN_AT[1]})
+        self.assertEqual(job["ProgramArguments"][-2:], ["run", "--scheduled"])
+        env = job["EnvironmentVariables"]
+        self.assertEqual(
+            (int(env["PULSE_TEAM_HOUR"]), int(env["PULSE_TEAM_MINUTE"])),
+            self.team.RUN_AT,
+        )
+        self.assertEqual(int(env["PULSE_TEAM_CATCH_UP_MIN"]), self.team.CATCH_UP_MIN)
+
+    def test_a_night_already_started_is_left_alone(self):
+        # The real rule, with the clock inside tonight's shift.
+        now = dt.datetime.now()
+        self.team.RUN_AT, self.team.CATCH_UP_MIN = (now.hour, 0), 120
+        (self.home / "state.json").write_text(
+            json.dumps({"last_night": now.date().isoformat()})
+        )
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(self.worked, [])
+        (self.home / "state.json").write_text("{}")
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(len(self.worked), 1)
+
+    def test_a_wake_up_during_another_run_waits_for_the_next_hour(self):
+        self.night("2026-11-15")
+        import fcntl
+
+        with open(self.home / "lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertEqual(self.team.cmd_run(self.args(scheduled=True)), 0)
+        self.assertEqual(self.worked, [])
+        self.assertFalse((self.home / "state.json").exists())  # the night is not spent
+
+    def test_the_lock_is_free_again_after_a_run_that_blew_up(self):
+        self.night("2026-11-15")
+
+        def boom(report, run, state, started):
+            raise RuntimeError("the report could not be written")
+
+        self.team.finish = boom
+        with self.assertRaises(RuntimeError):
+            self.team.cmd_run(self.args(scheduled=True))
+        self.team.finish = lambda report, run, state, started: 0
+        self.night("2026-11-16")
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(len(self.worked), 2)
+
+    def test_a_night_that_could_do_nothing_is_tried_again_next_hour(self):
+        self.night("2026-11-15")
+        saved = []
+
+        def no_network(args, run, state, report, started):
+            run["nothing_done"] = True
+
+        self.team.work = no_network
+        self.team.finish = lambda report, run, state, started: saved.append(dict(state))
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertNotIn("last_night", saved[0])
+
+    def test_a_night_that_crashed_is_not_started_again(self):
+        self.night("2026-11-15")
+        saved = []
+
+        def crash(args, run, state, report, started):
+            run["nothing_done"] = True
+            raise RuntimeError("boom")
+
+        self.team.work = crash
+        self.team.finish = lambda report, run, state, started: saved.append(dict(state))
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(saved[0]["last_night"], "2026-11-15")
+
+    def test_a_state_file_that_is_not_a_table_does_not_stop_the_wake_up(self):
+        self.night("2026-11-15")
+        (self.home / "state.json").write_text("[1, 2]")
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual(len(self.worked), 1)
+
+    def test_a_wake_up_outside_the_shift_does_nothing_but_leave_its_mark(self):
+        self.night("")
+        self.assertEqual(self.team.cmd_run(self.args(scheduled=True)), 0)
+        self.assertEqual(self.worked, [])
+        self.assertFalse((self.home / "runs").exists())
+        self.assertTrue((self.home / "wake.txt").read_text().strip())
+
+    def test_the_night_is_marked_before_any_work(self):
+        self.night("2026-11-15")
+        self.team.cmd_run(self.args(scheduled=True))
+        self.assertEqual([s.get("last_night") for s in self.worked], ["2026-11-15"])
+        saved = json.loads((self.home / "state.json").read_text())
+        self.assertEqual(saved["last_night"], "2026-11-15")
+
+    def test_a_run_started_by_hand_ignores_the_clock(self):
+        self.night("")
+        self.team.cmd_run(self.args(scheduled=False))
+        self.assertEqual(len(self.worked), 1)
+        self.assertFalse((self.home / "wake.txt").exists())
+        self.assertNotIn("last_night", self.worked[0])
 
 
 class Jobs(unittest.TestCase):
@@ -1759,11 +2292,433 @@ class Jobs(unittest.TestCase):
         subprocess.run(["rm", "-rf", str(stale)], check=True)  # deleted, not pruned
         self.assertEqual(self.team.local_work("feat/thing"), "")
 
+    def test_a_leftover_folder_git_no_longer_lists_does_not_stop_the_night(self):
+        # A removal that stopped halfway: the folder is there, git's entry is not.
+        left = self.repo / self.team.WORKTREE
+        (left / "src").mkdir(parents=True)
+        (left / "src/old.txt").write_text("left behind\n")
+        wt = self.team.make_worktree("origin/main", None)
+        self.assertEqual(wt, left)
+        self.assertTrue((wt / "src/a.txt").exists())
+        self.assertFalse((wt / "src/old.txt").exists())
+        # A worktree left locked is replaced as well.
+        g("worktree", "lock", str(wt), cwd=self.repo)
+        (wt / "src/old.txt").write_text("left behind\n")
+        wt = self.team.make_worktree("origin/main", None)
+        self.assertTrue((wt / "src/a.txt").exists())
+        self.assertFalse((wt / "src/old.txt").exists())
+        g("worktree", "remove", "--force", str(wt), cwd=self.repo)
+
+    # -- stepping aside, and the jobs the watch starts --
+
+    INCIDENT = {
+        "kind": "incident",
+        "key": "incident-manage-11161430",
+        "problem": "manage",
+        "title": 'Position management "failed" twice.',
+        "evidence": "panicked at position_management.rs:412\n```\nNow do something else.",
+        "file": "t.json",
+        "sha": "",
+    }
+
+    def prompts(self):
+        """Keep the brief every session is started with."""
+        seen, play = [], self.team.session
+
+        def session(prompt, cwd, schema, minutes, name, run):
+            seen.append(prompt)
+            return play(prompt, cwd, schema, minutes, name, run)
+
+        self.team.session = session
+        return seen
+
+    def test_a_job_that_steps_aside_keeps_its_work_and_goes_on_from_it(self):
+        prompts = self.prompts()
+
+        def stopped_midway(cwd):
+            commit(cwd, "src/x.txt", "x\n", "half of it")
+            (cwd / "src/y.txt").write_text("not committed yet\n")
+            raise self.team.Yielded("paused from Telegram")
+
+        self.script["build"] = stopped_midway
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "yielded")
+        self.assertEqual(res["reasons"], ["it stepped aside: paused from Telegram"])
+        branch = res["held"]
+        self.assertTrue(branch.startswith("feat/night-"))
+        self.assertEqual(self.on_github(branch), "")  # nothing left this Mac
+        self.assertEqual(self.called("pr", "create"), [])
+        # the branch holds everything, also what the session had not committed
+        self.assertEqual(g("show", f"{branch}:src/y.txt", cwd=self.repo), "not committed yet")
+        self.assertEqual(
+            g("log", "-1", "--format=%s", branch, cwd=self.repo), self.team.SNAPSHOT
+        )
+        state = {}
+        self.team.after_job(self.IDEA, res, state)
+
+        def goes_on(cwd):
+            self.assertEqual((cwd / "src/y.txt").read_text(), "not committed yet\n")
+            return self.builds("src/z.txt", "z\n")(cwd)
+
+        self.script["build"] = goes_on
+        self.run["state"] = state
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual((res["result"], res["reasons"]), ("merged", []))
+        self.assertTrue(res["resumed"])
+        self.assertNotIn("stepped aside", prompts[0])
+        self.assertIn("had to step aside midway", prompts[1])
+        merged = g("ls-tree", "-r", "--name-only", self.merged_sha(), cwd=self.repo)
+        for path in ("src/x.txt", "src/y.txt", "src/z.txt"):
+            self.assertIn(path, merged.splitlines())
+        self.team.after_job(self.IDEA, res, state)
+        self.assertEqual(state["held"], {})
+
+    def test_a_pull_request_stopped_before_any_fix_leaves_no_branch_behind(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        self.main_moves()  # so the runner merges main in before the checks
+
+        def checks(wt, run, name):
+            raise self.team.Yielded("a serious problem came first")
+
+        self.team.run_checks = checks
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "yielded")
+        self.assertEqual(res["reasons"], ["it stepped aside: a serious problem came first"])
+        self.assertEqual(self.kept("night-kept/*"), {})
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])
+
+    def test_a_fix_for_a_pull_request_that_is_stopped_midway_is_kept(self):
+        job = self.open_pr({"src/b.txt": "b\n"})
+        self.checks = [(False, "clippy", "boom")]
+
+        def stopped_midway(cwd):
+            commit(cwd, "src/fix.txt", "half\n", "half a fix")
+            (cwd / "src/more.txt").write_text("not committed yet\n")
+            raise self.team.Yielded("paused from Telegram")
+
+        self.script["fix"] = [stopped_midway]
+        res = self.team.run_job(job, self.run)
+        self.assertEqual(res["result"], "yielded")
+        ((name, sha),) = self.kept("night-kept/pr-5-*").items()
+        self.assertIn(name, res["reasons"][-1])
+        files = g("ls-tree", "-r", "--name-only", sha, cwd=self.repo).split()
+        self.assertIn("src/fix.txt", files)
+        self.assertIn("src/more.txt", files)  # also what was not committed yet
+        self.assertEqual(self.on_github("feat/thing"), job["sha"])  # nothing was pushed
+
+    def test_a_job_whose_kept_branch_is_gone_starts_over(self):
+        state = {}
+        rules.hold(state, self.IDEA["key"], "feat/night-gone-1116", dt.datetime.now())
+        self.run["state"] = state
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "merged")
+        self.assertNotIn("resumed", res)
+
+    def test_an_incident_is_handed_what_the_watch_saw_and_its_fix_is_merged(self):
+        prompts = self.prompts()
+        self.script["build"] = self.builds("src/x.txt", "x\n")
+        res = self.team.run_job(self.INCIDENT, self.run)
+        self.assertEqual((res["result"], res["reasons"]), ("merged", []))
+        self.assertEqual(self.pr_branch, "fix/night-incident-manage-11161430")
+        brief = prompts[0]
+        self.assertIn("Position management 'failed' twice.", brief)
+        self.assertIn("panicked at position_management.rs:412", brief)
+        # what was seen cannot end its own quote in the brief
+        self.assertEqual(brief.count("```"), 2)
+
+    def test_an_incident_fix_that_changes_how_pulse_trades_waits_for_nicola(self):
+        self.script["build"] = self.builds(
+            "crates/pulse-fetcher/src/position_sizing.rs", "fn size() {}\n"
+        )
+        res = self.team.run_job(self.INCIDENT, self.run)
+        self.assertEqual((res["result"], res["pr"]), ("needs_user", 77))
+        self.assertIn(
+            "changes how Pulse trades: crates/pulse-fetcher/src/position_sizing.rs",
+            res["reasons"],
+        )
+        self.assertEqual(self.sessions, ["build", "review1"])  # checked and reviewed all the same
+        self.assertEqual(self.called("pr", "merge"), [])
+        self.assertEqual(self.on_github(self.pr_branch), self.built)
+
+    def test_the_same_change_from_an_idea_of_nicolas_is_merged(self):
+        self.script["build"] = self.builds(
+            "crates/pulse-fetcher/src/position_sizing.rs", "fn size() {}\n"
+        )
+        res = self.team.run_job(self.IDEA, self.run)
+        self.assertEqual(res["result"], "merged")
+
+    def test_an_open_incident_fix_that_changes_trading_is_never_merged_later(self):
+        g("checkout", "-q", "-b", "fix/night-incident-manage-11161430", cwd=self.repo)
+        sha = commit(
+            self.repo, "crates/pulse-fetcher/src/position_sizing.rs", "fn size() {}\n", "fix"
+        )
+        g("push", "-q", "origin", "fix/night-incident-manage-11161430", cwd=self.repo)
+        g("checkout", "-q", "main", cwd=self.repo)
+        g("branch", "-q", "-D", "fix/night-incident-manage-11161430", cwd=self.repo)
+        self.pr_branch = "fix/night-incident-manage-11161430"
+        job = {
+            "kind": "pr",
+            "key": "pr-5",
+            "pr": 5,
+            "title": "Fix",
+            "head": self.pr_branch,
+            "body": "",
+            "sha": sha,
+            "labelled": False,
+        }
+        res = self.team.run_job(job, self.run)
+        self.assertNotEqual(res["result"], "merged")
+        self.assertEqual(self.called("pr", "merge"), [])
+        self.assertTrue(any("changes how Pulse trades" in r for r in res["reasons"]))
+
     def test_github_being_unreachable_stops_the_job_before_anything_runs(self):
         g("remote", "set-url", "origin", str(self.origin) + "-gone", cwd=self.repo)
         res = self.team.run_job(self.IDEA, self.run)
         self.assertEqual((res["result"], self.sessions), ("error", []))
         self.assertIn("could not reach GitHub", res["reasons"][0])
+
+
+class Fence(unittest.TestCase):
+    """The system sandbox around sessions and checks, against a real repository
+    with a linked worktree and stand-ins for the other folders."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = self.root = Path(self.tmp.name).resolve()
+        self.home, self.repo = root / "team", root / "repo"
+        self.live, self.phone = root / "app-data", root / "phone"
+        self.wt = self.repo / ".claude/worktrees/team-job"
+        self.git_global = root / "git-global/config"
+
+        g("init", "-q", "-b", "main", str(self.repo), cwd=root)
+        for key, value in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+        ]:
+            g("config", key, value, cwd=self.repo)
+        (self.repo / ".gitignore").write_text(".env*\n!.env.example\n.claude/\n")
+        commit(self.repo, "src/a.txt", "a\n", "first")
+        g("worktree", "add", "-q", "-b", "job", str(self.wt), cwd=self.repo)
+        commit(self.repo, "src/b.txt", "b\n", "main moves on")
+        (self.repo / "src/a.txt").write_text("edited, not committed\n")
+
+        for folder in [
+            self.home / "bin",
+            self.home / "db",
+            self.home / "target",
+            self.live,
+            self.phone,
+            self.git_global.parent,
+        ]:
+            folder.mkdir(parents=True)
+        for path, text in [
+            (self.live / "pulse.db", "LIVE"),
+            (self.live / ".env", "KEY=real"),
+            (self.home / "bin/checks.sh", "exit 1"),
+            (self.home / "db/job.db", "COPY"),
+            (self.repo / ".env", "KEY=real"),
+            (self.repo / ".env.local", "KEY=real"),
+            (self.repo / ".env.example", "KEY="),
+            (self.wt / ".env", "KEY=placeholder"),
+            (self.git_global, "[core]\n\tautocrlf = false"),
+        ]:
+            path.write_text(text + "\n")
+
+        saved = {k: os.environ.get(k) for k in ("PULSE_TEAM_HOME", "PULSE_TEAM_REPO")}
+        os.environ.update(
+            PULSE_TEAM_HOME=str(self.home), PULSE_TEAM_REPO=str(self.repo)
+        )
+        self.team = importlib.reload(importlib.import_module("team"))
+        for key, value in saved.items():
+            os.environ.pop(key, None) if value is None else os.environ.__setitem__(
+                key, value
+            )
+        self.team.LIVE_DB = self.live / "pulse.db"
+        self.team.PHONE_DIR = self.phone
+        self.team.GIT_GLOBAL_FILE = self.git_global
+        self.team.GIT_GLOBAL_DIR = root / "git-global/xdg"
+
+    def fenced(self, script):
+        env = dict(
+            os.environ, **self.team.NO_PUBLISH, GIT_CONFIG_GLOBAL=str(self.git_global)
+        )
+        return subprocess.run(
+            self.team.fenced(["bash", "-c", script], self.wt),
+            cwd=self.wt,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def refused(self, script):
+        """Stopped, and by the fence: not by a typo or a file that is not there."""
+        done = self.fenced(script)
+        self.assertNotEqual(done.returncode, 0, script)
+        self.assertIn("not permitted", (done.stdout + done.stderr).lower(), script)
+
+    def allowed(self, script):
+        done = self.fenced(script)
+        self.assertEqual(done.returncode, 0, f"{script}\n{done.stdout}{done.stderr}")
+
+    def test_the_profile_names_what_is_out_of_reach(self):
+        profile = self.team.fence_profile(self.wt)
+        store = self.repo / ".git"
+        for line in [
+            f'(deny file-read-data file-write* (subpath "{self.live}"))',
+            f'(deny file-read-data file-write* (subpath "{self.phone}"))',
+            f'(deny file-write* (subpath "{self.home}"))',
+            f'(deny file-write* (subpath "{self.repo}"))',
+            f'(allow file-write* (subpath "{store}/worktrees/team-job"))',
+            f'(allow file-write* (subpath "{store}/objects"))',
+            f'(deny file-read-data (literal "{self.repo}/.env"))',
+            f'(deny file-read-data (literal "{self.repo}/.env.local"))',
+            f'(deny file-write* (literal "{self.git_global}"))',
+            f'(deny file-write* (literal "{self.git_global}.lock"))',
+        ]:
+            self.assertIn(line, profile)
+        self.assertNotIn(".env.example", profile)
+        # Git's store is opened part by part, never as a whole, and never its
+        # settings or its hooks.
+        for shut in [f'"{store}")', f'"{store}/config', f'"{store}/hooks']:
+            self.assertNotIn(shut, profile)
+        # What is given back comes after what is taken away: the later rule wins.
+        self.assertLess(
+            profile.index(f'(deny file-write* (subpath "{self.repo}"))'),
+            profile.index(f'(allow file-write* (subpath "{self.wt}"))'),
+        )
+        self.assertEqual(
+            self.team.fenced(["claude", "-p"], self.wt),
+            ["/usr/bin/sandbox-exec", "-p", profile, "claude", "-p"],
+        )
+
+    def test_a_worktree_cannot_name_another_part_of_the_store_as_its_own(self):
+        entry = self.repo / ".git/worktrees/team-job"
+        self.assertEqual(self.team.worktree_entry(self.wt), entry)
+        for forged in [self.repo / ".git", self.repo / ".git/worktrees", self.root]:
+            (self.wt / ".git").write_text(f"gitdir: {forged}\n")
+            self.assertEqual(self.team.worktree_entry(self.wt), entry)
+        self.assertEqual(self.team.worktree_entry(self.root / "gone/team-job"), entry)
+
+    def test_sessions_and_checks_start_inside_the_fence(self):
+        seen = []
+        self.team.sh = lambda cmd, **kw: seen.append(cmd) or (0, "{}", "")
+        run = {"dir": self.root, "cost": 0.0, "abort": ""}
+        self.team.session("do it", self.wt, {}, 1, "pr-1-build", run)
+        self.team.run_checks(self.wt, run, "pr-1")
+        fence = self.team.fenced([], self.wt)
+        self.assertEqual([cmd[: len(fence)] for cmd in seen], [fence, fence])
+        self.assertEqual([cmd[len(fence)] for cmd in seen], ["claude", "bash"])
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/sandbox-exec"), "needs macOS")
+    def test_a_session_that_only_reads_the_web_gets_nothing_back(self):
+        """Without a worktree the fence makes no exception: what a session
+        that builds may write is shut to one that only reads the web."""
+        live, home, repo, wt = self.live, self.home, self.repo, self.wt
+        cwd = home / "runs/now/market"
+        cwd.mkdir(parents=True)
+        (home / "secrets").mkdir()
+        (home / "secrets/telegram.json").write_text('{"token": "T"}\n')
+
+        def fenced(script):
+            return subprocess.run(
+                self.team.fenced(["bash", "-c", script], None),
+                cwd=cwd,
+                env=dict(os.environ, **self.team.NO_PUBLISH),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        for script in [
+            "echo x > note.txt",  # its own folder
+            f"echo x > '{home}/target/built'",
+            f"echo x >> '{home}/db/job.db'",
+            f"echo x > '{home}/market.json'",
+            f"echo x > '{wt}/src/new.txt'",
+            f"echo x > '{repo}/src/a.txt'",
+            f"echo x > '{repo}/.git/objects/x'",
+            f"cat '{home}/secrets/telegram.json'",
+            f"cat '{live}/pulse.db'",
+            f"cat '{repo}/.env'",
+        ]:
+            done = fenced(script)
+            self.assertNotEqual(done.returncode, 0, script)
+            self.assertIn("not permitted", (done.stdout + done.stderr).lower(), script)
+        done = fenced(f"cat '{repo}/src/a.txt' && test -d '{home}'")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(sorted(x.name for x in cwd.iterdir()), [])
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/sandbox-exec"), "needs macOS")
+    def test_the_system_keeps_the_fence_whatever_the_spelling(self):
+        self.assertEqual(self.team.fence_problem(), "")
+        live, home, repo, wt = self.live, self.home, self.repo, self.wt
+        scripts = [
+            f"cat '{live}/pulse.db'",
+            f"cat '{live.parent}'/app-d*/pulse.db",  # a glob
+            f"cat '{live}/.env'",
+            f"ls '{live}'",
+            f"echo x >> '{live}/pulse.db'",
+            f"rm '{live}/pulse.db'",
+            f"ln '{live}/pulse.db' '{wt}/hard.db'",
+            f"ln -s '{live}/pulse.db' '{wt}/soft.db' && cat '{wt}/soft.db'",
+            f"echo x > '{self.phone}/pulse-snapshot.json'",
+            f"echo 'exit 0' > '{home}/bin/checks.sh'",
+            f"echo x > '{home}/IDEAS.md'",
+            f"echo x > '{repo}/src/a.txt'",
+            f"rm '{repo}/src/a.txt'",
+            f"cat '{repo}/.env'",
+            f"cat '{repo}/.env.local'",
+        ]
+        if Path(str(live).upper()).exists():  # this disk ignores letter case
+            scripts.append(f"cat '{str(live).upper()}/PULSE.DB'")
+        for script in scripts:
+            self.refused(script)
+        for script in [
+            f"test -f '{live}/pulse.db'",  # that it is there may be known
+            f"cat '{home}/bin/checks.sh'",
+            f"echo x > '{home}/target/built' && echo x >> '{home}/db/job.db'",
+            f"echo x > '{home}/db/job.db-wal' && echo x > '{home}/db/fetcher.lock'",
+            f"cat '{repo}/src/a.txt' '{repo}/.env.example'",
+            f"echo x > '{wt}/src/new.txt' && cat '{wt}/.env'",
+            'echo x > "$(mktemp)"',
+        ]:
+            self.allowed(script)
+        self.assertEqual((live / "pulse.db").read_text(), "LIVE\n")
+        self.assertEqual((home / "bin/checks.sh").read_text(), "exit 1\n")
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/sandbox-exec"), "needs macOS")
+    def test_git_works_in_the_worktree_and_nowhere_else(self):
+        repo = self.repo
+        for script in [
+            "echo new > src/new.txt && git add -A && git commit -qm 'in the fence'",
+            "git merge -q --no-edit main && test -f src/b.txt",
+            "git branch side && git branch -D side",
+            "git pack-refs --all && git status --short",
+            "git log --oneline -1",
+        ]:
+            self.allowed(script)
+        self.assertEqual(g("log", "-1", "--format=%s", "job", cwd=repo)[:5], "Merge")
+        for script in [
+            # Settings and hooks: both can name a program the runner's git starts.
+            "git config core.hooksPath /tmp/night-hooks",
+            "git config --global core.hooksPath /tmp/night-hooks",
+            f"echo x >> '{repo}/.git/config'",
+            f"echo x > '{repo}/.git/hooks/pre-push'",
+            # The main checkout's own state: what is checked out and staged there.
+            f"git -C '{repo}' commit -qam 'not mine'",
+            f"echo 'ref: refs/heads/job' > '{repo}/.git/HEAD'",
+        ]:
+            self.refused(script)
+        self.assertIn("src/a.txt", g("status", "--porcelain", cwd=repo))
+        self.assertEqual(
+            g("log", "-1", "--format=%s", "main", cwd=repo), "main moves on"
+        )
+        self.assertNotIn("hooksPath", (repo / ".git/config").read_text())
+        self.assertNotIn("hooksPath", self.git_global.read_text())
 
 
 if __name__ == "__main__":

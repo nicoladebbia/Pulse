@@ -13,7 +13,10 @@ placeholder API keys and a placeholder `.env` in the worktree (see `night_env`
 and `write_placeholder_env` in team.py), a debug build of the fetcher follows
 `PULSE_DB_PATH` to the copy, and `PULSE_NO_LIVE_DB` makes every Pulse binary
 refuse the live database. A shell command can be spelled in ways no
-pattern sees, which is why none of these layers stands alone.
+pattern sees, which is why none of these layers stands alone: the runner also
+starts every session inside a system sandbox (`fence_profile` in team.py) that
+keeps the live data, the team's own files and the main checkout out of reach
+whatever the spelling. The patterns here are the early, readable refusal.
 
     guard.py <main checkout> <session's worktree>
 
@@ -22,11 +25,16 @@ Exit 2 blocks the tool call and shows the reason to the session.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
 import shlex
+import socket
 import sys
+import threading
+import unicodedata
+import urllib.parse
 
 # A command word can follow the start, white space, a shell separator, a quote
 # (bash -c "git push") or a slash (/usr/bin/git push).
@@ -58,6 +66,9 @@ GIT_STASH = re.compile(GIT + r"stash\b(?!\s+(?:list|show)\b)")
 SECRET_FILE = re.compile(r"(?<![\w])\.env(?![\w])(?!\.example)", re.I)
 # The patterns see words, not meaning, so a search or a commit message that only
 # mentions one is blocked too. Every Bash refusal says how to get past that.
+# What a shell drops before it runs a command. The patterns are tried on the
+# command as written and again without these (`"gh" pr merge`, `la""unchctl`).
+QUOTING = re.compile(r"[\"'\\]")
 REWORD = " (if those words are only inside a commit message or a search, reword it or use the Grep tool)"
 
 # These open the live database unless told otherwise. The copy made for the app
@@ -73,15 +84,26 @@ ASSIGNMENT = re.compile(r"^[A-Za-z_]\w*=")
 # a number or a duration (`timeout 30s`, `nice -n 5`).
 BEFORE_COMMAND = {
     "time", "nohup", "exec", "env", "command", "caffeinate", "nice", "timeout",
-    "gtimeout", "xargs", "then", "do", "else", "if", "while", "!", "{",
+    "gtimeout", "xargs", "setsid", "stdbuf", "arch", "builtin", "noglob",
+    "then", "do", "else", "if", "while", "!", "{",
 }  # fmt: skip
-TAKES_VALUE = {"-s", "--signal", "-u", "--unset", "-I", "-J", "-C", "--chdir", "-a"}
+TAKES_VALUE = {
+    "-s", "--signal", "-u", "--unset", "-I", "-J", "-C", "--chdir", "-a", "-arch",
+}  # fmt: skip
 DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 SHELL_SCRIPT_FLAG = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # -c, -lc, -ic
 CARGO_RUN = {"run", "r"}
 NODE_TOOLS = {"npm", "pnpm", "yarn"}
 GLOBAL_FLAGS = {"-g", "--global", "--location=global"}
+# With a global flag only these are left alone: they run a script or a program,
+# so the flag is that program's own (`pnpm test -g name`), or they only look
+# (`npm ls -g`). Everything else with the flag changes what is on the Mac.
+RUNS_OR_LOOKS = {
+    "test", "t", "run", "run-script", "exec", "x", "vitest", "playwright",
+    "ls", "list", "ll", "la", "root", "bin", "prefix", "outdated", "why",
+}  # fmt: skip
+NODE_TAKES_VALUE = {"--filter", "-F", "-C", "--dir", "--prefix"}
 CARGO_TAKES_VALUE = {"--color", "--config", "-C", "-Z"}
 ONLY_PRINTS = {"--help", "-h", "--version", "-V"}
 REDIRECT = re.compile(r"^\d*[<>]")
@@ -92,19 +114,20 @@ NEVER = [
         "the installed app's data and the phone snapshot are off limits; use the copy in $PULSE_DB_PATH",
     ),
     (
-        re.compile(WORD + r"(?:launchctl|sudo|osascript|crontab)\b"),
+        re.compile(WORD + r"(?:launchctl|sudo|osascript|crontab)\b", re.I),
         "launchctl, sudo, osascript and crontab are not for unattended sessions",
     ),
     (
         re.compile(
             WORD
             + r"(?:brew\s+(?:install|uninstall|reinstall|upgrade|tap)|cargo\s+install"
-            r"|rustup\s+(?:default|update|self|toolchain)|security\s+(?:[a-z]+-[a-z-]+|export|import))\b"
+            r"|rustup\s+(?:default|update|self|toolchain)|security\s+(?:[a-z]+-[a-z-]+|export|import))\b",
+            re.I,
         ),
         INSTALLS,
     ),
     (
-        re.compile(r"install-app\.sh|install-launchd\.sh"),
+        re.compile(r"install-app\.sh|install-launchd\.sh", re.I),
         "installing onto this Mac needs Nicola",
     ),
     (
@@ -120,14 +143,90 @@ NEVER = [
     ),
 ]
 TMP_ROOTS = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/")
-SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".tauri", ".config/gh", "Library/Keychains")
+SECRET_DIRS = (
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".tauri",
+    ".config/gh",
+    "Library/Keychains",
+    ".pulse-team/secrets",  # the Telegram token
+)
 # Tools that schedule or start work outside this session.
 BLOCKED_TOOLS = {"CronCreate", "CronDelete", "RemoteTrigger"}
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_TOOLS = {"Read", "Grep", "Glob"}
+# All a session that only reads the web may call: the search, the page fetch
+# and the call that hands back its answer.
+WEB_TOOLS = {"WebSearch", "WebFetch", "StructuredOutput"}
+# The two of them that send something to a site: the words of a search and the
+# address of a page.
+SENDING_TOOLS = {"WebSearch", "WebFetch"}
+# The runner lists here, one to a line, what names the owner of this Mac: the
+# local part of the account's e-mail address, the user name, the full name.
+# Every session knows them (the CLI tells it the address, every path holds the
+# user name), and a web page may ask for them.
+PRIVATE_ENV = "PULSE_TEAM_PRIVATE"
+PRIVATE_MIN = 6  # a shorter word would refuse ordinary searches
+
+
+def plain(text) -> str:
+    """Letters and digits only, lower case, with percent signs decoded: the
+    form in which `J.Doe@x`, `j%2Edoe%40x` and `J Doe at x` are all `jdoex`."""
+    text = str(text)
+    for _ in range(3):  # an address can be encoded more than once
+        text = urllib.parse.unquote(text)
+    text = unicodedata.normalize("NFKD", text).lower()
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+def private_words(listed: str) -> list[str]:
+    words = {plain(line) for line in listed.splitlines()}
+    return sorted(w for w in words if len(w) >= PRIVATE_MIN)
+
+
+def sending_block_reason(
+    args: dict, private: str | None, web_only: bool
+) -> str | None:
+    """A search or a page fetch may not carry the owner's name or address:
+    in capitals or small letters, with other signs between the letters,
+    percent-encoded or backwards. It is a net, not a proof: a name in a code
+    of its own (base64, say) or in look-alike letters of another alphabet
+    passes."""
+    if private is None:
+        # Only a session that reads nothing but the web must have the list.
+        return "the runner did not say what is private" if web_only else None
+    words = private_words(private)
+    if web_only and not words:
+        # An empty list would switch the check off without a word.
+        return "the runner did not say what is private"
+    said = plain(json.dumps(args, ensure_ascii=False))
+    for word in words:
+        if word in said or word[::-1] in said:
+            return "a search or a page address may not name the owner of this Mac"
+    return None
+
+
+def _without_comment(segment: str) -> str:
+    """The segment up to a shell comment: an unquoted `#` that starts a word."""
+    quote, i = "", 0
+    while i < len(segment):
+        ch = segment[i]
+        if ch == "\\" and quote != "'":
+            i += 2  # the next character is taken as it is
+            continue
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or segment[i - 1].isspace()):
+            return segment[:i]
+        i += 1
+    return segment
 
 
 def _words(segment: str) -> list[str]:
+    segment = _without_comment(segment)
     try:
         return shlex.split(segment)
     except ValueError:  # an unbalanced quote: the separator sat inside a string
@@ -148,7 +247,7 @@ def _command(words: list[str]) -> list[str]:
             ASSIGNMENT.match(word)
             or word.startswith("-")
             or DURATION.match(word)
-            or os.path.basename(word) in BEFORE_COMMAND
+            or os.path.basename(word).lower() in BEFORE_COMMAND
         ):
             i += 1
         else:
@@ -181,14 +280,22 @@ def _commands(cmd: str):
         words = _command(_words(segment))
         if not words:
             continue
-        first = os.path.basename(words[0])
+        # Lower case: on this Mac's disk `Pulse-Fetcher` starts the same program.
+        first = os.path.basename(words[0]).lower()
         rest = [w for w in words[1:] if not REDIRECT.match(w)]
         yield first, rest, segment
         if first in SHELLS:
-            for i, word in enumerate(rest[:-1]):
-                if SHELL_SCRIPT_FLAG.match(word):
-                    yield from _commands(rest[i + 1])
-                    break
+            yield from _commands(_script(rest))
+
+
+def _script(args: list[str]) -> str:
+    """What `bash -c "…"` runs: the first word after the flag that is not an
+    option itself (`bash -c -- "…"`)."""
+    for i, word in enumerate(args):
+        if SHELL_SCRIPT_FLAG.match(word):
+            later = [w for w in args[i + 1 :] if not w.startswith(("-", "+"))]
+            return later[0] if later else ""
+    return ""
 
 
 def runs_on_live_db(cmd: str) -> bool:
@@ -196,8 +303,9 @@ def runs_on_live_db(cmd: str) -> bool:
     run`) without --db-path. Without the flag they open the live database, and
     the fetcher's default mode is a full daily run. Building, testing, copying
     or searching for a binary is fine, and so is asking one for its help text."""
-    for first, rest, segment in _commands(cmd):
-        if "--db-path" in segment:
+    for first, rest, _ in _commands(cmd):
+        # The flag itself, not the same letters in a comment or a longer word.
+        if any(w == "--db-path" or w.startswith("--db-path=") for w in rest):
             continue
         if PULSE_BINARY.match(first):
             if not (rest and all(w in ONLY_PRINTS for w in rest)):
@@ -208,15 +316,25 @@ def runs_on_live_db(cmd: str) -> bool:
 
 
 def installs_globally(cmd: str) -> bool:
-    """npm, pnpm or yarn asked to install onto the Mac instead of into the
+    """npm, pnpm or yarn asked to change what is on the Mac instead of the
     project, wherever the flag stands. What follows `--` belongs to the script
-    being run (`pnpm test -- -g name`), not to the tool."""
+    being run (`pnpm test -- -g name`), not to the tool, and so does a flag
+    after a command that only runs something or only looks."""
     for first, rest, _ in _commands(cmd):
         if first not in NODE_TOOLS:
             continue
         own = rest[: rest.index("--")] if "--" in rest else rest
-        plain = [w for w in own if not w.startswith("-")]
-        if GLOBAL_FLAGS & set(own) or (first == "yarn" and plain[:1] == ["global"]):
+        plain, value_next = [], False
+        for word in own:
+            if value_next:
+                value_next = False
+            elif word in NODE_TAKES_VALUE:
+                value_next = True
+            elif not word.startswith("-"):
+                plain.append(word)
+        if first == "yarn" and plain[:1] == ["global"]:
+            return True
+        if GLOBAL_FLAGS & set(own) and not RUNS_OR_LOOKS & set(plain[:1]):
             return True
     return False
 
@@ -227,6 +345,17 @@ def bash_block_reason(cmd: str, repo: str) -> str | None:
 
 
 def _bash_block_reason(cmd: str, repo: str) -> str | None:
+    reason = _reason(cmd, repo)
+    if reason:
+        return reason
+    bare = QUOTING.sub("", cmd)
+    return _reason(bare, repo, parsed=False) if bare != cmd else None
+
+
+def _reason(cmd: str, repo: str, parsed: bool = True) -> str | None:
+    """`parsed` off leaves out the checks that read the command word by word:
+    they have already seen it, and without its quoting it no longer splits the
+    way a shell would split it."""
     if GIT_PUSH.search(cmd):
         return "commit only; the runner pushes after its checks"
     if GIT_STASH.search(cmd):
@@ -235,15 +364,19 @@ def _bash_block_reason(cmd: str, repo: str) -> str | None:
         if (m.group(1), m.group(2) or "") not in GH_ALLOWED:
             call = f"gh {m.group(1)} {m.group(2) or ''}".strip()
             return f"`{call}` is not allowed here; gh is read-only for sessions"
-    if runs_on_live_db(cmd):
+    if parsed and runs_on_live_db(cmd):
         return (
             'run Pulse binaries (and `cargo run`) only with --db-path "$PULSE_DB_PATH", never on the '
             "live database; the dev app (`pnpm tauri dev`) takes it from the environment"
         )
     if SECRET_FILE.search(cmd):
         return ".env files hold real keys and are off limits"
-    if installs_globally(cmd):
+    if parsed and installs_globally(cmd):
         return INSTALLS
+    return _never(cmd, repo)
+
+
+def _never(cmd: str, repo: str) -> str | None:
     for pattern, reason in NEVER:
         if pattern.search(cmd):
             return reason
@@ -312,10 +445,133 @@ def write_block_reason(path: str, cwd: str, worktree: str = "") -> str | None:
     return f"write only inside your worktree ({root}) or a temp folder"
 
 
-def decide(event: dict, repo: str, worktree: str = "") -> str | None:
+# Endings a network keeps for itself, or that lead nowhere on the public web.
+OWN_ENDINGS = {
+    "arpa",
+    "corp",
+    "home",
+    "internal",
+    "intranet",
+    "invalid",
+    "lan",
+    "local",
+    "localdomain",
+    "localhost",
+    "onion",
+    "private",
+    "test",
+}
+LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+LOOKUP_S = 5  # well inside the hook's own time limit
+
+
+def ascii_host(host: str) -> str:
+    """A host in the plain spelling it is looked up by (`münchen.de` is
+    `xn--mnchen-3ya.de`), or '' when it has none."""
+    try:
+        return host.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        return ""
+
+
+def public_host(host: str) -> bool:
+    """Whether a host can only be a site on the public web, by its spelling:
+    two or more parts of plain letters, digits and hyphens, the last one a
+    word. That leaves out a bare machine name, a number in any spelling
+    (`127.1`, `0x7f.1`, `1.2.3.4.`) and the names networks keep for
+    themselves (`printer.local`, `db.internal`)."""
+    host = host.lower()
+    host = host[:-1] if host.endswith(".") else host
+    labels = host.split(".")
+    if len(host) > 253 or len(labels) < 2:
+        return False
+    if not all(LABEL.fullmatch(label) for label in labels):
+        return False
+    last = labels[-1]
+    return (last.isalpha() or last.startswith("xn--")) and last not in OWN_ENDINGS
+
+
+def _addresses(host: str) -> list[str] | None:
+    """Where a name leads, or None when that could not be found out in time."""
+    found: list = []
+
+    def look() -> None:
+        try:
+            found.append([item[4][0] for item in socket.getaddrinfo(host, None)])
+        except (OSError, UnicodeError):
+            found.append(None)
+
+    thread = threading.Thread(target=look, daemon=True)
+    thread.start()
+    thread.join(LOOKUP_S)
+    return found[0] if found else None
+
+
+# IPv6 ranges that only wrap an IPv4 address: the address inside is what counts.
+_WRAPS_V4 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::/96"))
+
+
+def _public_address(address) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(address).split("%")[0])
+    except ValueError:
+        return False
+    if ip.version == 6:
+        inner = ip.ipv4_mapped
+        if inner is None and any(ip in net for net in _WRAPS_V4):
+            inner = ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
+        if inner is not None:
+            return inner.is_global
+    return ip.is_global
+
+
+def fetch_block_reason(url: str, lookup=None) -> str | None:
+    """A session that only reads the web fetches pages of the public web and
+    nothing nearer: not this Mac, not its network. A page it read can ask it
+    for an address, so the address is judged by its spelling and by where its
+    name leads (a public-looking name can point at this Mac)."""
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        host = parts.hostname or ""
+        parts.port  # noqa: B018 - reading it is what checks it
+    except ValueError:
+        return "that is not a web address"
+    if parts.scheme.lower() not in ("http", "https") or "@" in parts.netloc:
+        return "a page fetch takes a plain http(s) address"
+    host = ascii_host(host)
+    if not public_host(host):
+        return (
+            "a page fetch is for a site on the public web, "
+            "not for a machine or a network of its own"
+        )
+    addresses = (lookup or _addresses)(host)
+    if not addresses:
+        return "that site's name could not be looked up"
+    if not all(_public_address(address) for address in addresses):
+        return "that site's name leads into a private network"
+    return None
+
+
+def decide(
+    event: dict,
+    repo: str,
+    worktree: str = "",
+    web_only: bool = False,
+    private: str | None = None,
+    lookup=None,
+) -> str | None:
     tool = event.get("tool_name") or ""
     args = event.get("tool_input") or {}
     cwd = event.get("cwd") or os.getcwd()
+    if web_only and tool not in WEB_TOOLS:
+        # The session is started without any other tool. This is the second
+        # lock on the same door, should one ever be there after all.
+        return f"{tool or 'this tool'} is not for a session that only reads the web"
+    if tool in SENDING_TOOLS:
+        reason = sending_block_reason(args, private, web_only)
+        if reason or not web_only or tool != "WebFetch":
+            return reason
+        return fetch_block_reason(str(args.get("url") or ""), lookup)
     if tool.startswith("mcp__"):
         return "connectors (mail, calendar, drive and the rest) are not for unattended sessions"
     if tool in BLOCKED_TOOLS:
@@ -339,8 +595,20 @@ def main() -> int:
         return 2  # fail closed
     # The runner passes both paths on the command line, so a session's shell
     # never has a variable that points at the main checkout.
-    args = sys.argv[1:] + ["", ""]
-    reason = decide(event, args[0], args[1])
+    args = sys.argv[1:] + ["", "", ""]
+    try:
+        reason = decide(
+            event,
+            args[0],
+            args[1],
+            web_only=args[2] == "web",
+            private=os.environ.get(PRIVATE_ENV),
+        )
+    except Exception as error:  # noqa: BLE001 - whatever it is, the answer is no
+        # Any exit but 2 lets the call through, so a guard that broke on an
+        # input it did not expect must still say no.
+        print(f"night-team guard: could not judge this call ({type(error).__name__})", file=sys.stderr)
+        return 2
     if reason:
         print(f"Blocked by the night-team guard: {reason}.", file=sys.stderr)
         return 2
