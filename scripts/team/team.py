@@ -2747,16 +2747,22 @@ def pr_look(sha: str, number: int) -> dict | None:
         code, diff = git("diff", "--text", "--no-ext-diff", "--no-textconv", fork, sha)
         if code != 0:
             return None
-        old = git("show", f"{fork}:package.json")
-        new = git("show", f"{sha}:package.json")
+        packages = []
+        for rev in (fork, sha):
+            code, text = git("show", f"{rev}:package.json")
+            if code != 0:
+                # Not there is fine; there but unreadable is not "no change".
+                listed, there = git("ls-tree", rev, "package.json")
+                if listed != 0 or there.strip():
+                    return None
+                text = ""
+            packages.append(text)
     except (OSError, subprocess.SubprocessError):
         return None
     return {
         "changes": rules.parse_name_status(names),
         "never": rules.forbidden_content(diff),
-        "scripts": bool(
-            rules.script_violations(old[1] if old[0] == 0 else "", new[1] if new[0] == 0 else "")
-        ),
+        "scripts": bool(rules.script_violations(*packages)),
     }
 
 
@@ -2892,11 +2898,10 @@ def talk_context(cards: list[dict], problem: str, switches: dict | None, facts: 
         lines.append("Trading switches: the installed app's settings could not be read.")
     else:
         lines.append(
-            "Trading switches in the installed app (paper account; a switch not "
-            "set here follows the app's default):"
+            "Trading switches as the installed app reads them (paper account):"
         )
         for name, meaning in rules.TRADING_SWITCHES.items():
-            lines.append(f"- {name} = {switches.get(name, 'not set')} (true means: {meaning})")
+            lines.append(f"- {name} = {switches.get(name)} (true means: {meaning})")
     if IDEAS.exists():
         ideas = rules.parse_ideas(IDEAS.read_text())
         waiting = [i["text"] for i in ideas if i["state"] == "open"]
@@ -3075,14 +3080,25 @@ def setting_step(step: dict) -> tuple[bool, str]:
     except (OSError, UnicodeDecodeError) as e:
         return False, f"{name}: not changed, the settings could not be written ({type(e).__name__})."
     if now != value:
-        return False, f"{name}: I wrote it but it reads back as {now or 'not set'}. Look at the Mac."
+        return False, f"{name}: I wrote it but it reads back as {now}. Look at the Mac."
     log(f"talk: {name} set to {value} in the installed app's settings")
     return True, f"{name} is now {value}. It counts from Pulse's next run."
 
 
+def main_checks(sha: str) -> str:
+    """pass | pending | fail for main's commit `sha`, 'unknown' when GitHub
+    could not be read."""
+    try:
+        runs = gh_json("api", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100")
+    except (RuntimeError, ValueError):
+        return "unknown"
+    return rules.checks_state(runs.get("check_runs") if isinstance(runs, dict) else None)
+
+
 def release_step(_step: dict) -> tuple[bool, str]:
-    """Tag the next version on main. GitHub builds it; a process of its own
-    waits for that, installs it and texts him."""
+    """Start a release of main as it is now. A process of its own waits for
+    that commit's checks (a merge of the same plan has only just started
+    them), tags it, waits for GitHub's build, installs it and texts him."""
     if paused():
         return False, "No release: the team is paused."
     git("fetch", "origin", "--prune", timeout=120)
@@ -3092,34 +3108,36 @@ def release_step(_step: dict) -> tuple[bool, str]:
         return False, "No release: I could not read the last version from GitHub."
     if facts.get("new") == 0:
         return False, f"No release: main has nothing new since {facts['last']}."
-    try:
-        runs = gh_json("api", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100")
-    except (RuntimeError, ValueError):
+    state = main_checks(sha)
+    if state == "fail":
+        return False, "No release: main's checks failed on its newest commit."
+    if state == "unknown":
         return False, "No release: I could not read main's checks from GitHub."
-    if not rules.checks_passed(runs.get("check_runs") if isinstance(runs, dict) else None):
-        return False, (
-            "No release: main's checks have not all passed yet on its newest commit. "
-            "Ask again in a few minutes."
-        )
-    code, out = gh(
-        "api", "-X", "POST", "repos/{owner}/{repo}/git/refs",
-        "-f", f"ref=refs/tags/{tag}", "-f", f"sha={sha}",
-    )  # fmt: skip
-    if code != 0:
-        return False, f"No release: GitHub did not take the tag {tag} ({out.strip()[-120:]})."
-    log(f"talk: tagged {tag} at {sha[:7]}")
-    if not spawn(["release-finish", tag], "talk-run.log"):
-        return True, (
-            f"{tag} is tagged and GitHub is building it, but I could not start the wait "
-            "for it: the app's own Update button will offer it."
-        )
+    if not spawn(["release-finish", tag, sha], "talk-run.log"):
+        return False, "No release: I could not start it on this Mac."
+    log(f"talk: release {tag} of {sha[:7]} handed over")
+    first = (
+        "Main's checks have passed, so I tag it now."
+        if state == "pass"
+        else "I wait for main's checks to pass first, then tag it."
+    )
     return True, (
-        f"{tag} is tagged. GitHub builds it now (about 20 minutes); "
-        "I install it on this Mac and text you when it is in."
+        f"Release {tag} is under way. {first} GitHub then builds it (about 20 minutes); "
+        "I install it on this Mac and text you when it is in, or when something stops it."
     )
 
 
-PLAN_STEPS = {"merge": merge_step, "setting": setting_step, "release": release_step}
+def resume_step(_step: dict) -> tuple[bool, str]:
+    chat.PAUSED.unlink(missing_ok=True)
+    return True, "The team is back at work."
+
+
+PLAN_STEPS = {
+    "merge": merge_step,
+    "setting": setting_step,
+    "release": release_step,
+    "resume": resume_step,
+}
 
 
 def apply_plan(steps) -> list[str]:
@@ -3154,7 +3172,7 @@ def app_running() -> bool:
 
 
 def fetcher_running() -> bool:
-    return sh(["pgrep", "-f", "pulse-fetcher"], cwd=HOME, timeout=20)[0] == 0
+    return sh(["pgrep", "-x", "pulse-fetcher"], cwd=HOME, timeout=20)[0] == 0
 
 
 def release_outcome(tag: str) -> str:
@@ -3199,30 +3217,62 @@ def install_release(tag: str) -> str:
         )
     finally:
         git("worktree", "remove", "--force", str(wt))
+    if was_open:  # also after a script that stopped: it quits the app first
+        sh(["open", "-a", "Pulse"], cwd=HOME, timeout=30)
     if code != 0:
         return f"the install script stopped ({(out + err).strip()[-160:]})"
-    if was_open:
-        sh(["open", "-a", "Pulse"], cwd=HOME, timeout=30)
+    return ""
+
+
+CHECKS_WAIT_MIN = 75  # for main's checks before a tag
+
+
+def tag_release(tag: str, sha: str) -> str:
+    """Wait for the checks of main's commit `sha`, then tag it. '' when the
+    tag is on, else what stopped it."""
+    deadline = time.monotonic() + CHECKS_WAIT_MIN * 60
+    while True:
+        if paused():
+            return "the team was paused"
+        state = main_checks(sha)
+        if state == "pass":
+            break
+        if state == "fail":
+            return "main's checks failed"
+        if time.monotonic() > deadline:
+            return f"main's checks were not done after {CHECKS_WAIT_MIN} minutes"
+        time.sleep(RELEASE_POLL_S)
+    code, out = gh(
+        "api", "-X", "POST", "repos/{owner}/{repo}/git/refs",
+        "-f", f"ref=refs/tags/{tag}", "-f", f"sha={sha}",
+    )  # fmt: skip
+    if code != 0:
+        return f"GitHub did not take the tag ({out.strip()[-120:]})"
+    log(f"release: tagged {tag} at {sha[:7]}")
     return ""
 
 
 def cmd_release_finish(args) -> int:
-    """Started by a release step: wait for the build, install it, text him."""
-    tag = args.tag
-    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+    """Started by a release step: wait for main's checks, tag, wait for the
+    build, install it, text him."""
+    tag, sha = args.tag, args.sha
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag) or not re.fullmatch(r"[0-9a-f]{40}", sha):
         return 2
     line = chat.bot()
-    outcome = release_outcome(tag)
-    if outcome != "success":
-        said = f"Pulse {tag} was not installed: {outcome}. The app on this Mac is unchanged."
+    stopped = tag_release(tag, sha)
+    if stopped:
+        said = f"Pulse {tag} was not released: {stopped}. Nothing was tagged and the app is unchanged."
     else:
-        problem = install_release(tag)
-        said = (
-            f"Pulse {tag} is installed on this Mac."
-            if not problem
-            else f"Pulse {tag} is built, but not installed: {problem}. "
-            "The app's own Update button will offer it."
-        )
+        outcome = release_outcome(tag)
+        if outcome != "success":
+            said = f"Pulse {tag} was not installed: {outcome}. The app on this Mac is unchanged."
+        else:
+            problem = install_release(tag)
+            said = (
+                f"Pulse {tag} is installed on this Mac."
+                if not problem
+                else f"Pulse {tag} is built, but not installed: {problem}."
+            )
     log(f"release: {said}")
     if line:
         with contextlib.suppress(chat.ChatError):
@@ -3517,6 +3567,7 @@ def main() -> int:
         "release-finish", help="(started by a release from Telegram) wait for the build, install it"
     )
     rf.add_argument("tag")
+    rf.add_argument("sha")
     rf.set_defaults(fn=cmd_release_finish)
     for name, fn in (
         ("install", cmd_install),

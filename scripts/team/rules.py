@@ -939,10 +939,16 @@ TALK_MAX_ACTIONS = 20
 PLAN_MAX = 10  # steps in one plan: all of them must fit in the text he sees
 PLAN_TITLE = 90
 PLAN_FRESH_MIN = 60  # a yes older than this is not carried out any more
+PLAN_OPEN_MIN = 120  # a plan shown longer ago than this is too old to say yes to
+SWITCH_DEFAULT_ON = frozenset(
+    {"SHORTS_ENABLED", "EVENT_TRADES_ENABLED", "LEARNING_AUTO_APPLY", "EXIT_DRY_RUN"}
+)
 TALK_HISTORY = 8  # earlier turns a session is shown
 TALK_TEXT_MAX = 1500  # of one text from Nicola
 # The switches a plan may flip in the installed app's settings, and what each
 # one does when it is on. All of them are about the paper account.
+# SWITCH_DEFAULT_ON: what the fetcher does when a switch is not set (it reads
+# these as "on unless false or 0"; the others as "off unless true or 1").
 TRADING_SWITCHES = {
     "AUTO_TRADE_ENABLED": "Pulse buys by itself",
     "SHORTS_ENABLED": "Pulse may sell short",
@@ -1028,11 +1034,10 @@ def talk_plan(
 ) -> dict:
     """What a talk session's actions come to: `confirm` (the steps of one plan,
     carried out only after a tap: merge, release, setting; each with the `line`
-    he is shown), `now` (done at once: task, idea, pause, resume) and `refused`
+    he is shown; so is resume), `now` (done at once: task, idea, pause) and `refused`
     (what is not done, with the reason). Anything not on the list is dropped."""
     by_number = {c.get("number"): c for c in cards}
     plan = {"confirm": [], "now": [], "refused": []}
-    switches = switches or {}
     seen = set()
 
     def confirm(step: dict, name: str) -> None:
@@ -1068,10 +1073,13 @@ def talk_plan(
                     plan["refused"].append(f"{name[:40]}: not a switch I may change")
                 continue
             seen.add(("setting", name))
-            if switches.get(name) == value:
+            if switches is None:
+                plan["refused"].append(f"{name}: the installed app's settings could not be read")
+                continue
+            was = switches.get(name) or switch_state(name, None)
+            if was == value:
                 plan["refused"].append(f"{name} is already {value}")
                 continue
-            was = switches.get(name) or "not set"
             confirm(
                 {
                     "kind": "setting",
@@ -1104,11 +1112,18 @@ def talk_plan(
                 plan["refused"].append(f"\"{words[:60]}\": the team is paused")
             else:
                 plan["now"].append({"kind": kind, "text": words})
+        elif kind == "resume" and (kind,) not in seen:
+            # Lifting his own pause is his to confirm: the words that asked
+            # for it came through a session.
+            seen.add((kind,))
+            if paused:
+                confirm({"kind": "resume", "line": "Resume the team (it is paused now)"}, "resume")
         elif (kind,) not in seen:
             seen.add((kind,))
             plan["now"].append({"kind": kind})
     # A release comes after the merges it should carry, whatever order was named.
-    plan["confirm"].sort(key=lambda s: s["kind"] == "release")
+    order = {"resume": 0, "release": 2}
+    plan["confirm"].sort(key=lambda s: order.get(s["kind"], 1))
     return plan
 
 
@@ -1125,12 +1140,16 @@ def plan_text(steps: list[dict]) -> str:
 
 
 def plan_fresh(p: dict, now: dt.datetime) -> bool:
-    """Is the yes on this plan recent enough to act on?"""
+    """Is the yes on this plan recent enough to act on? Both the yes and the
+    plan it was said to: what a plan says ("now true") ages too."""
     try:
         answered = dt.datetime.fromisoformat(p.get("answered_at") or "")
+        sent = dt.datetime.fromisoformat(p.get("sent_at") or "")
     except ValueError:
         return False
-    return now - answered <= dt.timedelta(minutes=PLAN_FRESH_MIN)
+    return now - answered <= dt.timedelta(minutes=PLAN_FRESH_MIN) and answered - sent <= dt.timedelta(
+        minutes=PLAN_OPEN_MIN
+    )
 
 
 def next_version(tags: list[str]) -> str:
@@ -1143,38 +1162,65 @@ def next_version(tags: list[str]) -> str:
     return f"v{major}.{minor}.{patch + 1}"
 
 
-def checks_passed(runs) -> bool:
-    """GitHub's check runs on a commit: all finished and none failed, and at
-    least one of them is there."""
+def checks_state(runs) -> str:
+    """GitHub's check runs on a commit: 'pass' (all finished, none failed, at
+    least one there), 'fail' (one finished badly), else 'pending' (also when
+    none has shown up yet)."""
     runs = [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
-    return bool(runs) and all(
-        r.get("status") == "completed"
-        and r.get("conclusion") in ("success", "skipped", "neutral")
-        for r in runs
-    )
+    done = [r for r in runs if r.get("status") == "completed"]
+    if any(r.get("conclusion") not in ("success", "skipped", "neutral") for r in done):
+        return "fail"
+    return "pass" if runs and len(done) == len(runs) else "pending"
+
+
+def _env_lines(env_text: str):
+    """(index, name, raw value) of each assignment line, read as the app's
+    dotenv reader does: `export` allowed, quotes and a trailing comment off."""
+    for i, line in enumerate(env_text.split("\n")):
+        m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$", line.rstrip("\r"))
+        if not m:
+            continue
+        value = m.group(2).strip()
+        if value[:1] in ("'", '"'):
+            end = value.find(value[0], 1)
+            value = value[1:end] if end > 0 else value[1:]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        yield i, m.group(1), value
+
+
+def switch_state(name: str, raw: str | None) -> str:
+    """'true' / 'false': what the fetcher makes of a switch's value (None =
+    not set)."""
+    word = (raw or "").lower() if raw is not None else None
+    if name in SWITCH_DEFAULT_ON:
+        return "false" if word in ("false", "0") else "true"
+    return "true" if word in ("true", "1") else "false"
 
 
 def set_switch(env_text: str, name: str, value: str) -> str:
-    """The settings file with `name=value`: its line replaced where it stands
-    (the last one counts when it is there twice), else added at the end."""
+    """The settings file with `name=value`: written where the name first
+    stands (the line the app reads), any later line for it removed, else
+    added at the end. Every other line stays as it is."""
     lines = env_text.split("\n")
-    hits = [i for i, l in enumerate(lines) if re.match(rf"\s*(export\s+)?{re.escape(name)}\s*=", l)]
+    hits = [i for i, key, _ in _env_lines(env_text) if key == name]
     if hits:
-        lines[hits[-1]] = f"{name}={value}"
-        for i in reversed(hits[:-1]):
+        lines[hits[0]] = f"{name}={value}" + ("\r" if lines[hits[0]].endswith("\r") else "")
+        for i in reversed(hits[1:]):
             del lines[i]
         return "\n".join(lines)
     return env_text + ("" if not env_text or env_text.endswith("\n") else "\n") + f"{name}={value}\n"
 
 
 def read_switches(env_text: str) -> dict:
-    """The trading switches as the settings file has them (lower case)."""
-    out = {}
-    for line in env_text.split("\n"):
-        m = re.match(r"\s*(?:export\s+)?([A-Z_]+)\s*=\s*['\"]?([A-Za-z]+)['\"]?\s*$", line)
-        if m and m.group(1) in TRADING_SWITCHES:
-            out[m.group(1)] = m.group(2).lower()
-    return out
+    """Every trading switch as the app will read it from this settings file
+    ('true' / 'false'): the first line for a name counts, and one that is not
+    set has the fetcher's default."""
+    raw = {}
+    for _, key, value in _env_lines(env_text):
+        if key in TRADING_SWITCHES:
+            raw.setdefault(key, value)
+    return {name: switch_state(name, raw.get(name)) for name in TRADING_SWITCHES}
 
 
 def parse_button(data: str) -> tuple[str, str] | None:

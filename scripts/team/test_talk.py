@@ -111,7 +111,7 @@ class Plan(unittest.TestCase):
             ],
             cards,
             paused=False,
-            switches={"AUTO_TRADE_ENABLED": "true", "SHORTS_ENABLED": "true"},
+            switches=rules.read_switches("AUTO_TRADE_ENABLED=true"),
         )
         self.assertEqual(
             [(s["kind"], s.get("pr"), s.get("sha"), s.get("name"), s.get("value")) for s in plan["confirm"]],
@@ -133,14 +133,20 @@ class Plan(unittest.TestCase):
 
     def test_paused_nothing_merges_releases_or_starts_but_resume_and_settings_work(self):
         plan = rules.talk_plan(
-            [{"kind": "merge", "pr": 7}, {"kind": "task", "text": "a"}, {"kind": "resume"}, {"kind": "idea", "text": "b"}, {"kind": "release"}, {"kind": "setting", "name": "AUTO_TRADE_ENABLED", "value": False}],
+            [{"kind": "merge", "pr": 7}, {"kind": "task", "text": "a"}, {"kind": "resume"}, {"kind": "resume"}, {"kind": "idea", "text": "b"}, {"kind": "release"}, {"kind": "setting", "name": "SHORTS_ENABLED", "value": False}],
             [card()],
             paused=True,
-            switches={},
+            switches=rules.read_switches(""),
         )
-        self.assertEqual([s["kind"] for s in plan["confirm"]], ["setting"])  # switching trading off is never held back
+        # Switching trading off is never held back, and lifting the pause is his to confirm.
+        self.assertEqual([s["kind"] for s in plan["confirm"]], ["resume", "setting"])
+        self.assertIn("now true", plan["confirm"][1]["line"])  # not set: the app's default
         self.assertEqual(len(plan["refused"]), 3)
-        self.assertEqual(plan["now"], [{"kind": "resume"}, {"kind": "idea", "text": "b"}])
+        self.assertEqual(plan["now"], [{"kind": "idea", "text": "b"}])
+        # Not paused, a resume is nothing; settings that cannot be read change nothing.
+        plan = rules.talk_plan([{"kind": "resume"}, {"kind": "setting", "name": "SHORTS_ENABLED", "value": False}], [], False, None)
+        self.assertEqual((plan["confirm"], plan["now"]), ([], []))
+        self.assertIn("could not be read", plan["refused"][0])
 
     def test_no_more_than_the_limit_and_nothing_from_nonsense(self):
         many = [{"kind": "idea", "text": f"idea {i}"} for i in range(40)]
@@ -154,7 +160,7 @@ class Plan(unittest.TestCase):
             card(1000 + i, seen=look("crates/pulse-alpaca/src/stops.rs", "scripts/team/team.py"), title="T" * 400, labels=[{"name": "needs-you"}])
             for i in range(15)
         ]
-        plan = rules.talk_plan([{"kind": "merge", "pr": c["number"]} for c in worst], worst, False, {}, "needs-you")
+        plan = rules.talk_plan([{"kind": "merge", "pr": c["number"]} for c in worst], worst, False, None, "needs-you")
         self.assertEqual(len(plan["confirm"]), rules.PLAN_MAX)
         self.assertEqual(len(plan["refused"]), 5)
         text = rules.plan_text(plan["confirm"])
@@ -166,27 +172,50 @@ class Plan(unittest.TestCase):
         import datetime as dt
 
         now = dt.datetime(2026, 11, 18, 12, 0)
-        self.assertTrue(rules.plan_fresh({"answered_at": "2026-11-18T11:30:00"}, now))
-        self.assertFalse(rules.plan_fresh({"answered_at": "2026-11-18T10:30:00"}, now))
-        self.assertFalse(rules.plan_fresh({}, now))
-        self.assertFalse(rules.plan_fresh({"answered_at": "soon"}, now))
+        sent = "2026-11-18T11:00:00"
+        self.assertTrue(rules.plan_fresh({"sent_at": sent, "answered_at": "2026-11-18T11:30:00"}, now))
+        self.assertFalse(rules.plan_fresh({"sent_at": "2026-11-18T09:00:00", "answered_at": "2026-11-18T10:30:00"}, now))
+        # A plan shown days ago says things that may no longer be so.
+        self.assertFalse(rules.plan_fresh({"sent_at": "2026-11-15T11:00:00", "answered_at": "2026-11-18T11:59:00"}, now))
+        self.assertFalse(rules.plan_fresh({"answered_at": "2026-11-18T11:59:00"}, now))
+        self.assertFalse(rules.plan_fresh({"sent_at": sent, "answered_at": "soon"}, now))
 
     def test_the_next_version_is_one_patch_up(self):
         self.assertEqual(rules.next_version(["v0.8.7", "v0.8.10", "x", "v0.8"]), "v0.8.11")
         self.assertEqual(rules.next_version(["nightly"]), "")
 
-    def test_checks_count_only_when_all_are_done_and_none_failed(self):
+    def test_checks_pass_only_when_all_are_done_and_none_failed(self):
         done = {"status": "completed", "conclusion": "success"}
-        self.assertTrue(rules.checks_passed([done, {"status": "completed", "conclusion": "skipped"}]))
-        for bad in ([], None, [done, {"status": "in_progress"}], [done, {"status": "completed", "conclusion": "failure"}]):
-            self.assertFalse(rules.checks_passed(bad))
+        bad = {"status": "completed", "conclusion": "failure"}
+        self.assertEqual(rules.checks_state([done, {"status": "completed", "conclusion": "skipped"}]), "pass")
+        for runs in ([], None, [done, {"status": "in_progress"}], [{"status": "queued"}]):
+            self.assertEqual(rules.checks_state(runs), "pending", runs)
+        for runs in ([done, bad], [bad, {"status": "in_progress"}], [{"status": "completed", "conclusion": "cancelled"}]):
+            self.assertEqual(rules.checks_state(runs), "fail", runs)
 
-    def test_a_switch_is_replaced_where_it_stands_and_nothing_else_moves(self):
-        env = "KEY=secret\nSHORTS_ENABLED=true\n# note\nexport SHORTS_ENABLED=true\nB=1\n"
+    def test_a_switch_is_written_where_the_app_reads_it_and_nothing_else_moves(self):
+        env = "KEY=secret\nSHORTS_ENABLED=true # for now\n# note\nexport SHORTS_ENABLED=false\nB='x\ny'\n"
         out = rules.set_switch(env, "SHORTS_ENABLED", "false")
-        self.assertEqual(out, "KEY=secret\n# note\nSHORTS_ENABLED=false\nB=1\n")
+        self.assertEqual(out, "KEY=secret\nSHORTS_ENABLED=false\n# note\nB='x\ny'\n")
         self.assertEqual(rules.set_switch("A=1", "EXIT_DRY_RUN", "true"), "A=1\nEXIT_DRY_RUN=true\n")
-        self.assertEqual(rules.read_switches(out + "ALPACA_API_KEY=abc\nAUTO_TRADE_ENABLED='True'\n"), {"SHORTS_ENABLED": "false", "AUTO_TRADE_ENABLED": "true"})
+        self.assertEqual(rules.set_switch("A=1\r\nEXIT_DRY_RUN=false\r\n", "EXIT_DRY_RUN", "true"), "A=1\r\nEXIT_DRY_RUN=true\r\n")
+        self.assertEqual(rules.set_switch("#EXIT_DRY_RUN=false\n", "EXIT_DRY_RUN", "true"), "#EXIT_DRY_RUN=false\nEXIT_DRY_RUN=true\n")
+
+    def test_switches_are_read_the_way_the_app_reads_them(self):
+        # Not set: the fetcher's own defaults.
+        self.assertEqual(
+            rules.read_switches("ALPACA_API_KEY=abc\n"),
+            {"AUTO_TRADE_ENABLED": "false", "NEWS_TRADES_ENABLED": "false", "SHORTS_ENABLED": "true", "EVENT_TRADES_ENABLED": "true", "LEARNING_AUTO_APPLY": "true", "EXIT_DRY_RUN": "true"},
+        )
+        got = rules.read_switches(
+            "AUTO_TRADE_ENABLED=1\nexport NEWS_TRADES_ENABLED='True'  \nSHORTS_ENABLED=0 # off\r\n"
+            "EVENT_TRADES_ENABLED=no\nLEARNING_AUTO_APPLY=FALSE\nEXIT_DRY_RUN=false\nEXIT_DRY_RUN=true\n#AUTO_TRADE_ENABLED=false\n"
+        )
+        self.assertEqual(
+            got,
+            {"AUTO_TRADE_ENABLED": "true", "NEWS_TRADES_ENABLED": "true", "SHORTS_ENABLED": "false", "EVENT_TRADES_ENABLED": "true", "LEARNING_AUTO_APPLY": "false", "EXIT_DRY_RUN": "false"},
+        )
+        self.assertEqual(set(rules.SWITCH_DEFAULT_ON) - set(rules.TRADING_SWITCHES), set())
 
 
 DONE = {"check_runs": [{"status": "completed", "conclusion": "success"}]}
@@ -258,7 +287,7 @@ class Talker(ChatCase):
         self.assertIn("can be merged", context)
         self.assertIn("The last release is v0.8.7; main has 3 commits since", context)
         self.assertIn("AUTO_TRADE_ENABLED = true", context)
-        self.assertIn("SHORTS_ENABLED = not set", context)
+        self.assertIn("SHORTS_ENABLED = true", context)  # not set: the app's default
         self.assertNotIn("hush", context)  # a key never reaches the session
         self.assertNotIn("IGNORE ALL RULES", context)  # nor a stranger's title
         self.assertIn("#9 (opened by someone else)", context)
@@ -345,51 +374,95 @@ class Talker(ChatCase):
         self.team.APP_ENV = self.home / "missing.env"
         self.assertIn("not changed", self.team.apply_plan([{"kind": "setting", "name": "EXIT_DRY_RUN", "value": "true"}])[0])
 
-    def test_a_release_tags_main_after_the_merges_and_hands_over_the_wait(self):
+    def test_a_release_comes_after_the_merges_and_hands_over_the_wait_and_the_tag(self):
         self.answer = {"reply": "Plan follows.", "actions": [{"kind": "release"}, {"kind": "merge", "pr": 7}]}
         self.ask_text("merge 7 and release")
         self.team.cmd_talk(None)
         self.assertEqual((self.gh, self.spawned), ([], []))
         self.assertIn("1. Merge #7 Fix number 7\n2. Release a new version", self.fake.said()[-1])
+        self.checks = {"check_runs": []}  # the merge has only just started main's checks
         self.tap()
         self.team.cmd_talk(None)
-        self.assertEqual(self.gh[0][:3], ("pr", "merge", "7"))
-        self.assertEqual(self.gh[1], ("api", "-X", "POST", "repos/{owner}/{repo}/git/refs", "-f", "ref=refs/tags/v0.8.8", "-f", "sha=" + "a" * 40))
-        self.assertEqual(self.spawned, [["release-finish", "v0.8.8"]])
-        self.assertIn("v0.8.8 is tagged", self.fake.said()[-1])
+        self.assertEqual([g[:3] for g in self.gh], [("pr", "merge", "7")])  # no tag from the talker
+        self.assertEqual(self.spawned, [["release-finish", "v0.8.8", "a" * 40]])
+        self.assertIn("Release v0.8.8 is under way. I wait for main's checks", self.fake.said()[-1])
 
-    def test_no_release_when_a_merge_before_it_stopped_or_main_is_not_green(self):
+    def test_no_release_when_a_merge_before_it_stopped_or_main_is_red(self):
         plan = [{"kind": "merge", "pr": 7, "sha": "gone"}, {"kind": "release"}]
         lines = self.team.apply_plan(plan)
         self.assertIn("No release: a step before it", lines[1])
+
+        def unreadable(*a, **k):
+            raise RuntimeError("down")
+
+        read = self.team.gh_json
         for change, word in [
-            (lambda: setattr(self, "checks", {"check_runs": [{"status": "in_progress"}]}), "checks have not all passed"),
-            (lambda: setattr(self, "checks", {"check_runs": []}), "checks have not all passed"),
+            (lambda: setattr(self, "checks", {"check_runs": [{"status": "completed", "conclusion": "failure"}]}), "checks failed"),
+            (lambda: setattr(self.team, "gh_json", unreadable), "could not read main's checks"),
             (lambda: self.facts.update(new=0), "nothing new since v0.8.7"),
             (lambda: self.facts.update(next=""), "could not read the last version"),
         ]:
-            self.checks, self.facts["new"], self.facts["next"] = DONE, 3, "v0.8.8"
+            self.checks, self.facts["new"], self.facts["next"], self.team.gh_json = DONE, 3, "v0.8.8", read
             change()
             self.assertIn(word, self.team.apply_plan([{"kind": "release"}])[0])
+        self.team.gh_json = read
         chat.PAUSED.write_text("x")
         self.assertIn("paused", self.team.apply_plan([{"kind": "release"}])[0])
         self.assertEqual((self.gh, self.spawned), ([], []))
 
-    def test_a_built_release_is_installed_and_a_failed_one_is_not(self):
+    def test_the_tag_waits_for_mains_checks_and_is_never_put_on_a_red_commit(self):
+        team, sha = self.team, "a" * 40
+        team.RELEASE_POLL_S = 0
+        seen = iter([{"check_runs": []}, {"check_runs": [{"status": "in_progress"}]}, DONE])
+        team.gh_json = lambda *a, **k: next(seen)
+        self.assertEqual(team.tag_release("v0.8.8", sha), "")
+        self.assertEqual(self.gh, [("api", "-X", "POST", "repos/{owner}/{repo}/git/refs", "-f", "ref=refs/tags/v0.8.8", "-f", "sha=" + sha)])
+        self.gh.clear()
+        team.gh_json = lambda *a, **k: {"check_runs": [{"status": "completed", "conclusion": "failure"}]}
+        self.assertIn("checks failed", team.tag_release("v0.8.8", sha))
+        team.gh_json, team.CHECKS_WAIT_MIN = (lambda *a, **k: {"check_runs": []}), -1
+        self.assertIn("not done after", team.tag_release("v0.8.8", sha))
+        team.gh_json = lambda *a, **k: DONE
+        chat.PAUSED.write_text("x")
+        self.assertIn("paused", team.tag_release("v0.8.8", sha))
+        self.assertEqual(self.gh, [])
+        chat.PAUSED.unlink()
+        self.gh_code = 1
+        self.assertIn("did not take the tag", team.tag_release("v0.8.8", sha))
+
+    def test_a_built_release_is_installed_and_one_that_stopped_is_not(self):
         import argparse
 
-        team, calls = self.team, []
+        team, calls, sha = self.team, [], "a" * 40
+        team.tag_release = lambda tag, sha: self.stopped
         team.release_outcome = lambda tag: self.outcome
         team.install_release = lambda tag: (calls.append(tag), "")[1]
-        self.outcome = "GitHub's build ended as failure"
-        team.cmd_release_finish(argparse.Namespace(tag="v0.8.8"))
+        self.stopped, self.outcome = "main's checks failed", "success"
+        team.cmd_release_finish(argparse.Namespace(tag="v0.8.8", sha=sha))
+        self.assertIn("was not released: main's checks failed", self.fake.said()[-1])
+        self.stopped, self.outcome = "", "GitHub's build ended as failure"
+        team.cmd_release_finish(argparse.Namespace(tag="v0.8.8", sha=sha))
         self.assertEqual(calls, [])
         self.assertIn("not installed", self.fake.said()[-1])
         self.outcome = "success"
-        team.cmd_release_finish(argparse.Namespace(tag="v0.8.8"))
+        team.cmd_release_finish(argparse.Namespace(tag="v0.8.8", sha=sha))
         self.assertEqual(calls, ["v0.8.8"])
         self.assertIn("v0.8.8 is installed", self.fake.said()[-1])
-        self.assertEqual(team.cmd_release_finish(argparse.Namespace(tag="v1; rm -rf")), 2)
+        said = len(self.fake.said())
+        self.assertEqual(team.cmd_release_finish(argparse.Namespace(tag="v1; rm -rf", sha=sha)), 2)
+        self.assertEqual(team.cmd_release_finish(argparse.Namespace(tag="v0.8.8", sha="main")), 2)
+        self.assertEqual(len(self.fake.said()), said)
+
+    def test_lifting_a_pause_from_plain_words_waits_for_his_tap(self):
+        chat.PAUSED.write_text("x")
+        self.answer = {"reply": "Plan follows.", "actions": [{"kind": "resume"}]}
+        self.ask_text("go on")
+        self.team.cmd_talk(None)
+        self.assertTrue(chat.PAUSED.exists())
+        self.assertIn("1. Resume the team", self.fake.said()[-1])
+        self.tap()
+        self.team.cmd_talk(None)
+        self.assertFalse(chat.PAUSED.exists())
 
     def test_a_job_starts_now_a_second_one_waits_an_idea_waits_and_pause_pauses(self):
         self.answer = {"reply": "On it.", "actions": [{"kind": "task", "text": "Add a chart"}, {"kind": "task", "text": "Add a map"}, {"kind": "idea", "text": "Dark mode"}, {"kind": "pause"}]}
@@ -403,8 +476,10 @@ class Talker(ChatCase):
         self.assertEqual(self.asked(), [])
 
     def test_a_job_already_built_is_said_so_instead_of_a_run_that_finds_nothing(self):
+        os.environ["PULSE_TEAM_HOME"] = str(self.home)  # before the reload: never the real folder
+        self.addCleanup(lambda: os.environ.pop("PULSE_TEAM_HOME", None))
         team = importlib.reload(importlib.import_module("team"))  # the real start_task
-        team.HOME, team.IDEAS = self.home, self.home / "IDEAS.md"
+        self.assertEqual((team.HOME, chat.INBOX), (self.home, self.home / "inbox"))
         spawned = []
         team.spawn = lambda args, logname: (spawned.append(args), True)[1]
         team.IDEAS.write_text("- [x] Add a chart — merged\n- [ ] Add a map\n")
