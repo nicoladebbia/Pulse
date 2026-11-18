@@ -70,7 +70,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     // companies blind on insider, the largest-weighted signal). Runs before enrichment
     // so today's new filings get their transaction details filled in the same run.
     tracing::info!("Phase 0a: Fetching targeted Form 4 filings for tracked companies...");
-    match fetch_targeted_form4(db_path, form4::TARGETED_FORM4_LIMIT, None).await {
+    match fetch_targeted_form4(db_path, form4::WIDE_FORM4_LIMIT, None, true).await {
         Ok(count) => {
             if count > 0 {
                 tracing::info!("Targeted Form 4: inserted {} new insider filings", count);
@@ -96,6 +96,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     progress.start_stage(1);
     tracing::info!("Phase 1: Collecting from sources...");
     sources::API_CALLS.reset();
+    // Per-feed counts for `feed_runs`: taken at three points below and written as
+    // soon as the repeats are gone, so a run that stops there still leaves them.
+    let feeds_run_at = crate::feed_runs::now();
     let mut all_articles = sources::collect_all().await?;
 
     // Wikipedia Pageviews — needs DB access for entity lookup (non-fatal)
@@ -109,6 +112,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Wikipedia Pageviews FAILED (non-fatal): {}", e),
     }
 
+    let feeds_fetched = crate::feed_runs::tally(&all_articles);
     let raw_articles: Vec<_> = all_articles.into_iter()
         .filter(|a| !a.sector.starts_with("freedom_"))
         .collect();
@@ -133,6 +137,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     let (raw_news, raw_financial): (Vec<_>, Vec<_>) = raw_articles
         .into_iter()
         .partition(|a| a.source_type != "financial");
+    let feeds_offered = crate::feed_runs::tally(&raw_news);
 
     // Log API calls for quota tracking — 1 row per actual HTTP request,
     // not per batch. Each source module bumps its atomic counter inside
@@ -177,6 +182,14 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
     };
     let news_articles = crate::dedup::deduplicate_with_history(raw_news, historical_hashes, historical_titles);
     tracing::info!("{} news articles after dedup", news_articles.len());
+    crate::feed_runs::record(
+        db_path,
+        &feeds_run_at,
+        "daily",
+        &feeds_fetched,
+        &feeds_offered,
+        &crate::feed_runs::tally(&news_articles),
+    );
 
     // Abort if too few new articles (not worth API cost for a thin briefing)
     let total_unique = news_articles.len() + financial_stories.len();
@@ -519,6 +532,7 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
             ),
             Err(e) => tracing::warn!("Fetch candidate record failed (non-fatal): {}", e),
         }
+        crate::feed_runs::attach(db_path, &feeds_run_at, "daily", briefing_id);
     }
 
     // Phase 8.5: Auto-backfill missing embeddings from previous failed runs (non-fatal)
@@ -931,7 +945,9 @@ pub async fn run(db_path: &Path) -> anyhow::Result<()> {
                     prev - emb_pct, prev, emb_pct
                 ));
             }
-        if !analysis_degraded {
+        // PULSE_LLM=local runs analyze on Ollama on purpose, so there is no Haiku
+        // row to expect and no fallback to report.
+        if !analysis_degraded && !pulse_llm::is_local() {
             // analyze succeeded — but on which provider? No anthropic row today
             // means the Haiku path silently fell back to Groq 70B.
             let anthropic_analyze_today: i64 = conn.query_row(
@@ -1090,7 +1106,10 @@ fn clean_theme_output(raw: &str) -> String {
         "the most important story is",
         "today's most important story is",
     ];
-    let lower = s.to_lowercase();
+    // ASCII lowercase keeps every byte where it is, so `p.len()` is a valid
+    // cut in `s`. `to_lowercase()` can change a letter's length (the Kelvin
+    // sign becomes a one-byte "k"), which would cut `s` inside a char.
+    let lower = s.to_ascii_lowercase();
     for p in &preambles {
         if lower.starts_with(p) {
             s = s[p.len()..].trim_start_matches([':', ' ', '-', '—']).trim().to_string();
@@ -1874,7 +1893,10 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     // articles, and it is the guard that makes a stale source list survivable.
     tracing::info!("Freedoms: Collecting articles...");
     sources::API_CALLS.reset();
+    // Per-feed counts for `feed_runs`, as in the daily run.
+    let feeds_run_at = crate::feed_runs::now();
     let all_articles = sources::collect_freedoms().await?;
+    let feeds_fetched = crate::feed_runs::tally(&all_articles);
     // Log per-call API usage for this fetch run
     {
         if let Ok(conn) = rusqlite::Connection::open(db_path) {
@@ -1920,8 +1942,19 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     tracing::info!("Freedoms: freshness filter dropped {} stale articles (news >72h, academic >14d); {} remain", dropped, freedom_articles.len());
     log_freedom_histogram("after-freshness", freedom_articles.iter().map(|a| a.sector.as_str()));
 
+    let feeds_offered = crate::feed_runs::tally(&freedom_articles);
+
     if freedom_articles.is_empty() {
         tracing::warn!("Freedoms: No freedom articles found, skipping");
+        // The run with nothing to offer is the one whose feeds most need a record.
+        crate::feed_runs::record(
+            db_path,
+            &feeds_run_at,
+            "freedoms",
+            &feeds_fetched,
+            &feeds_offered,
+            &crate::feed_runs::Tally::new(),
+        );
         return Ok(());
     }
 
@@ -1940,6 +1973,14 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
     };
     let unique = crate::dedup::deduplicate_with_history(freedom_articles, historical_hashes, historical_titles);
     tracing::info!("Freedoms: {} after dedup", unique.len());
+    crate::feed_runs::record(
+        db_path,
+        &feeds_run_at,
+        "freedoms",
+        &feeds_fetched,
+        &feeds_offered,
+        &crate::feed_runs::tally(&unique),
+    );
     log_freedom_histogram("after-dedup (pre_curate INPUT)", unique.iter().map(|a| a.sector.as_str()));
 
     // Phase 2.5: Pre-curate if many articles
@@ -2085,7 +2126,8 @@ pub async fn run_freedoms(db_path: &Path) -> anyhow::Result<()> {
 
     // Phase 5: Write to database
     tracing::info!("Freedoms: Writing to database...");
-    write_freedoms_to_db(db_path, &curated)?;
+    let briefing_id = write_freedoms_to_db(db_path, &curated)?;
+    crate::feed_runs::attach(db_path, &feeds_run_at, "freedoms", briefing_id);
 
     // Phase 5.5: Generate executive summary for freedoms (non-fatal)
     tracing::info!("Freedoms: Generating executive summary...");
@@ -2254,7 +2296,7 @@ fn extract_json_str(text: &str) -> &str {
 fn write_freedoms_to_db(
     db_path: &Path,
     curated: &[(&str, &crate::claude::SummarizedStory)],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i64> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2412,7 +2454,7 @@ fn write_freedoms_to_db(
         total, briefing_id, time_count, wealth_count, location_count, health_count, whoop_count
     );
 
-    Ok(())
+    Ok(briefing_id)
 }
 
 /// Drop articles that duplicate an EARLIER ARTICLE IN THE SAME BATCH.
@@ -2966,6 +3008,28 @@ fn extract_entities_from_financial_metadata(db_path: &Path) -> anyhow::Result<us
     }
 
     Ok(total)
+}
+
+#[cfg(test)]
+mod clean_theme_output_tests {
+    use super::clean_theme_output;
+
+    #[test]
+    fn a_preamble_is_cut_off_whatever_its_case() {
+        assert_eq!(
+            clean_theme_output("The Most Important Story Today Is: chips are scarce."),
+            "chips are scarce."
+        );
+        assert_eq!(clean_theme_output("TODAY'S THEME — rates fall."), "rates fall.");
+    }
+
+    #[test]
+    fn letters_that_change_length_in_lowercase_are_left_alone() {
+        // 'İ' is 2 bytes and lowercases to 3; the Kelvin sign is 3 and lowercases to 1.
+        for text in ["İstanbul'da seçim: sonuçlar belli oldu.", "\u{212A}elvin scale explained."] {
+            assert_eq!(clean_theme_output(text), text);
+        }
+    }
 }
 
 #[cfg(test)]

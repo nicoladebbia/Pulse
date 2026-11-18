@@ -1,5 +1,6 @@
 mod article_text;
 mod candidates;
+mod feed_runs;
 mod pipeline;
 mod sources;
 mod claude;

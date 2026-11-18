@@ -227,6 +227,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::error!("RSS feeds FAILED: {}", e);
             failed.push("RSS feeds");
+            crate::feed_runs::abandoned("rss");
         }
     }
     match hn {
@@ -237,6 +238,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::error!("Hacker News FAILED: {}", e);
             failed.push("Hacker News");
+            crate::feed_runs::abandoned("hacker_news");
         }
     }
     match google {
@@ -247,6 +249,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::error!("Google News FAILED: {}", e);
             failed.push("Google News");
+            crate::feed_runs::abandoned("google_news");
         }
     }
     match reddit_posts {
@@ -257,6 +260,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::warn!("Reddit FAILED (non-fatal): {}", e);
             failed.push("Reddit");
+            crate::feed_runs::abandoned("reddit");
         }
     }
     match arxiv_papers {
@@ -267,6 +271,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::warn!("ArXiv FAILED (non-fatal): {}", e);
             failed.push("ArXiv");
+            crate::feed_runs::abandoned("arxiv");
         }
     }
     match biorxiv_papers {
@@ -277,6 +282,7 @@ async fn collect_news_sources() -> (Vec<RawArticle>, Vec<&'static str>) {
         Err(e) => {
             tracing::warn!("bioRxiv FAILED (non-fatal): {}", e);
             failed.push("bioRxiv");
+            crate::feed_runs::abandoned("biorxiv");
         }
     }
 
@@ -397,6 +403,7 @@ pub(crate) async fn collect_financial_sources() -> (Vec<RawArticle>, Vec<&'stati
 pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
     SOURCES_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
     SOURCES_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::feed_runs::begin();
     // Both halves run concurrently and every source inside them keeps its own
     // time budget, so all SOURCE_COUNT sources are still in flight at once.
     let ((mut articles, mut failed_sources), (financial, financial_failed)) =
@@ -434,6 +441,7 @@ pub async fn collect_all() -> anyhow::Result<Vec<RawArticle>> {
 pub async fn collect_freedoms() -> anyhow::Result<Vec<RawArticle>> {
     SOURCES_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
     SOURCES_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::feed_runs::begin();
 
     let (articles, failed) = collect_news_sources().await;
 

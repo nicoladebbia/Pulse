@@ -692,11 +692,14 @@ mod atr_recency_tests {
 
     /// A ticker with `count` daily bars, the newest `age_days` old.
     /// Each bar has a 2.00-wide high/low range, so a healthy ATR is ~2.00.
+    ///
+    /// Counted in calendar days, not in 24-hour steps back from this moment: the
+    /// day the clocks go back is 25 hours long, so late in the evening two steps
+    /// landed on it and the second insert broke the one-bar-per-day rule.
     fn seed(conn: &Connection, ticker: &str, count: i64, age_days: i64) {
+        let today = chrono::Local::now().date_naive();
         for i in 0..count {
-            let date = (chrono::Local::now() - chrono::Duration::days(age_days + i))
-                .format("%Y-%m-%d")
-                .to_string();
+            let date = (today - chrono::Duration::days(age_days + i)).format("%Y-%m-%d").to_string();
             conn.execute(
                 "INSERT INTO entity_prices (ticker, date, high, low, close)
                  VALUES (?1, ?2, 101.0, 99.0, 100.0)",

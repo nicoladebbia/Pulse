@@ -1,7 +1,7 @@
 //! Who is asking: the contact details a few services want in a User-Agent.
 //!
-//! arXiv asks automated readers for a way to be reached, and Reddit's API
-//! rules ask for the account behind a client. Both come from the environment
+//! arXiv asks automated readers for a way to be reached, and Reddit's rules
+//! ask for the account behind a client. Both come from the environment
 //! (`.env`), never from the code, so the repository names nobody. Unset, the
 //! requests still go out, just without a contact.
 
@@ -14,7 +14,7 @@ pub fn research_user_agent() -> String {
     research_agent(std::env::var("PULSE_CONTACT_EMAIL").ok().as_deref())
 }
 
-/// The User-Agent for Reddit's public JSON API. `PULSE_REDDIT_USER` adds the
+/// The User-Agent for Reddit's public feeds. `PULSE_REDDIT_USER` adds the
 /// `(by /u/<name>)` its rules ask for.
 pub fn reddit_user_agent() -> String {
     reddit_agent(std::env::var("PULSE_REDDIT_USER").ok().as_deref())
@@ -141,7 +141,10 @@ mod tests {
             let text = std::fs::read_to_string(src.join(file)).unwrap_or_default();
             assert!(!text.is_empty(), "{file} is missing");
             assert!(!text.contains("mailto:"), "{file} holds an address");
-            assert!(!text.contains("/u/"), "{file} holds an account name");
+            // Reddit's feeds spell every author `/u/<name>`, so the reader has
+            // to mention `/u/`. What must not come back is an agent that names
+            // its account: `(by /u/<name>)`.
+            assert!(!text.contains("by /u/"), "{file} holds an account name");
         }
     }
 }
