@@ -338,10 +338,17 @@ def flush(line: Bot, now: dt.datetime) -> int:
     return sent
 
 
+PLAN_TEXT_MAX = 3500  # Telegram takes 4096 in one text
+
+
 def ask_now(line: Bot, title: str, text: str, acts: list, now: dt.datetime) -> str:
     """Text a plan with its buttons at once, at any hour: Nicola is waiting
     for it. `acts` is what a yes carries out. Returns the id, '' when Telegram
     did not take the text (nothing is kept then)."""
+    if len(text.strip()) > PLAN_TEXT_MAX:
+        # Never a yes to steps he could not read: the whole plan, or none.
+        log("a plan was too long to show in full; nothing was sent")
+        return ""
     stamp = _stamp(now)
     p = {
         "id": rules.proposal_id("action", random.token_hex(8), stamp),
@@ -349,7 +356,7 @@ def ask_now(line: Bot, title: str, text: str, acts: list, now: dt.datetime) -> s
         "key": f"action-{time.time_ns()}",
         "job": "",
         "title": " ".join(title.split())[:200],
-        "text": text.strip()[:1500],
+        "text": text.strip(),
         "acts": acts,
         "state": "sent",
         "created": stamp,
@@ -586,6 +593,7 @@ def run() -> int:
     state = _load(CHAT_STATE, {})
     state = state if isinstance(state, dict) else {}
     log("listening")
+    wake_talker()  # what was texted or approved while nobody listened
     while True:
         try:
             tick(line, state, dt.datetime.now())
