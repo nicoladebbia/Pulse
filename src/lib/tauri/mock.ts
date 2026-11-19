@@ -1,4 +1,4 @@
-import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, BacktestRun, BacktestRange, CalendarData, RiskReport } from './types';
+import type { BriefingWithStories, Story, Briefing, BriefingConnection, FreedomsBriefing, FreedomStory, ProjectIdea, Prediction, PredictionStats, CalibrationStats, UsageStats, IdeaStreamEvent, TavilyQuota, TrendThread, TrendDossier, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, BacktestRun, BacktestRange, CalendarData, RiskReport, PredictionMarkets } from './types';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -713,6 +713,25 @@ export function buildMockCalendar(): CalendarData {
 			{ date: mockDay(4), kind: 'ppi', title: 'Producer prices (PPI)', time_et: '8:30 AM', note: null, days_until: 4 },
 			{ date: mockDay(17), kind: 'fomc', title: 'Fed interest-rate decision', time_et: '2:00 PM', note: 'Two-day meeting starting 2 days before', days_until: 17 },
 			{ date: mockDay(26), kind: 'jobs', title: 'Jobs report', time_et: '8:30 AM', note: null, days_until: 26 }
+		]
+	};
+}
+// === Prediction markets fixture (read "today at 08:04") ===
+const mockMarket = (market_id: string, topic: string, question: string, probability: number, change_1d: number | null, volume_24h: number, kind: string, slug: string | null) => ({
+	market_id, topic, question, event_title: null, url: slug ? `https://polymarket.com/event/${slug}` : null,
+	probability, change_1d, change_1w: null, volume_24h, end_date: null, kind
+});
+export function buildMockPredictionMarkets(): PredictionMarkets {
+	return {
+		day: mockDay(0), fetched_at: `${mockDay(0)}T08:04:00`, source: 'polymarket',
+		markets: [
+			mockMarket('m1', 'geopolitics', 'Will there be 2 US aircraft carriers in CENTCOM on November 30?', 0.97, 0.69, 19359, 'mover', 'us-aircraft-carriers-in-centcom'),
+			mockMarket('m2', 'ai', "Will the lab's IPO valuation be between $1.25T and $1.50T?", 0.07, -0.493, 109625, 'mover', 'ipo-valuation'),
+			mockMarket('m3', 'economy', 'Will the Fed raise interest rates by 50+ bps after the December meeting?', 0.12, 0.06, 500692, 'mover', 'fed-decision-in-december'),
+			mockMarket('a1', 'economy', 'Will the Fed raise interest rates by 25 bps after the December meeting?', 0.915, -0.02, 504231, 'active', 'fed-decision-in-december'),
+			mockMarket('a2', 'geopolitics', 'Israel x Iran ceasefire continues through December 31?', 0.655, -0.02, 187267, 'active', 'israel-x-iran-ceasefire'),
+			mockMarket('a3', 'politics', 'Will Marine Le Pen win the 2027 French presidential election?', 0.458, -0.036, 171666, 'active', 'next-french-presidential-election'),
+			mockMarket('a4', 'tech', 'Will the chip maker name a new CEO by December 31?', 0.085, null, 1196452, 'active', null)
 		]
 	};
 }

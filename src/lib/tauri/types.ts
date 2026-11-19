@@ -1179,6 +1179,36 @@ export interface CalendarData {
 	held_in_blackout: string[];
 }
 
+// === Prediction markets (briefing page) ===
+
+export interface PredictionMarket {
+	market_id: string;
+	topic: string;
+	question: string;
+	event_title: string | null;
+	url: string | null;
+	/** Chance of "Yes", 0..1. */
+	probability: number;
+	/** Change of that chance in 24 hours (0.05 = five points). */
+	change_1d: number | null;
+	change_1w: number | null;
+	/** Dollars traded in 24 hours. */
+	volume_24h: number;
+	end_date: string | null;
+	/** 'mover' (odds moved five points or more in 24 hours) or 'active'. */
+	kind: string;
+}
+
+export interface PredictionMarkets {
+	/** Local day of the reading, YYYY-MM-DD. */
+	day: string;
+	/** Local time of the reading, YYYY-MM-DDTHH:MM:SS. */
+	fetched_at: string;
+	source: string;
+	/** In display order: the questions that moved, then the most traded. */
+	markets: PredictionMarket[];
+}
+
 // === Risk dashboard ===
 
 export interface PositionRisk {

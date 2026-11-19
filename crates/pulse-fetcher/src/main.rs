@@ -17,6 +17,7 @@ pub(crate) mod decisions;
 pub(crate) mod entry_filters;
 pub(crate) mod scorecard;
 pub(crate) mod calendar;
+pub(crate) mod prediction_markets;
 pub(crate) mod snapshot;
 pub(crate) mod learning;
 pub(crate) mod event_signals;
@@ -322,6 +323,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
+            // Every wake of this mode, briefing or not, so the odds on the briefing
+            // page are a few hours old at most. A few requests when it is due.
+            refresh_prediction_markets(&db_path).await;
+
             // Idempotent skip: a day is "done" only if today's daily briefing already
             // has NEWS stories. This is deliberately NOT `status='complete'` — a run
             // blocked at the Groq summarize step still writes financial stories (they
@@ -617,6 +622,14 @@ async fn main() -> anyhow::Result<()> {
                 None => tracing::info!("Phone snapshot is switched off (PULSE_SNAPSHOT=off)"),
             }
         }
+        "prediction-markets" => {
+            // Read the prediction markets now, whatever the age of the last
+            // reading: no AI, no orders, only the `prediction_markets` table.
+            match prediction_markets::refresh(&db_path, true).await? {
+                Some(n) => tracing::info!("Prediction markets: {n} questions stored"),
+                None => tracing::info!("Prediction markets: nothing done (PULSE_PREDICTION_MARKETS=off, or no database yet)"),
+            }
+        }
         "edge-report" => {
             // Step 6: re-measure the paper-trading edge on REAL fills placed after
             // the 2026-07-15 ticker fix + arming. Reads ONLY paper_trades, applies an
@@ -663,6 +676,13 @@ async fn protect_new_positions(db_path: &std::path::Path, new_buys: usize) {
     match pipeline::run_position_management(db_path).await {
         Ok(n) => tracing::info!("Stops placed for {} new buy(s) ({} action(s))", new_buys, n),
         Err(e) => tracing::warn!("Could not place stops for {} new buy(s): {} — the next hourly run retries", new_buys, e),
+    }
+}
+
+/// Never fails the run it is part of: the odds are an extra on the page.
+async fn refresh_prediction_markets(db_path: &std::path::Path) {
+    if let Err(e) = prediction_markets::refresh_if_stale(db_path).await {
+        tracing::warn!("Prediction markets refresh failed: {e:#}");
     }
 }
 

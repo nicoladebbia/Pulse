@@ -1,6 +1,6 @@
 import { invoke, Channel, type InvokeArgs } from '@tauri-apps/api/core';
 import { trackChatMessage } from '$lib/engagement';
-import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, TrendDossier, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, ExitReview, Benchmark, GoLiveGate, TradeDecision, SignalScorecard, LearningReport, TradeJournal, TradeDetail, TradeRationale, TradeExplanation, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, BacktestRun, BacktestRange, CalendarData, RiskReport } from './types';
+import type { BriefingWithStories, Story, StoryDetail, StoryHeadline, StoryTrendBadge, ChatThread, ChatMessage, ChatStreamEvent, ProjectIdea, IdeaStreamEvent, Prediction, PredictionStats, CalibrationStats, IntelligenceCounts, UsageStats, TavilyQuota, TrendThread, TrendDossier, ChatContext, CrossSignal, FinancialApiQuota, EntityPrice, Portfolio, PaperTrade, FinancialEvent, SignalEvidence, SourceHealth, FetchStatus, PortfolioAnalytics, ExitReview, Benchmark, GoLiveGate, TradeDecision, SignalScorecard, LearningReport, TradeJournal, TradeDetail, TradeRationale, TradeExplanation, BacktestConfig, BacktestResult, StreamStatus, PendingCalibrationRow, CalibrationGateStatus, ResearchPaperRow, ResearchStats, ResearchPaperDetail, ProposalBacktest, BacktestRun, BacktestRange, CalendarData, RiskReport, PredictionMarkets } from './types';
 
 export function safeInvoke<T>(cmd: string, args?: InvokeArgs): Promise<T | null>;
 export function safeInvoke<T>(cmd: string, args: InvokeArgs | undefined, fallback: T): Promise<T>;
@@ -343,6 +343,11 @@ export async function setProposalStatus(proposalId: number, status: 'kept' | 're
 
 export async function getCalendar(days = 30): Promise<CalendarData> {
 	return invoke('get_calendar', { days });
+}
+
+/** The latest prediction-market reading, or null when there is no recent one. */
+export async function getPredictionMarkets(): Promise<PredictionMarkets | null> {
+	return invoke('get_prediction_markets');
 }
 
 export async function getRiskReport(): Promise<RiskReport> {
