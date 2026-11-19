@@ -25,6 +25,7 @@ pub const FINANCIAL_RATE_LIMITS: &[(&str, i64, i64, i64, &str)] = &[
     ("biorxiv",            -1,   -1,   -1,     "bioRxiv"),
     ("rss_feeds",          -1,   -1,   -1,     "RSS Feeds"),
     ("wikipedia",          -1,   -1,   -1,     "Wikipedia"),
+    ("polymarket",         -1,   -1,   -1,     "Polymarket (prediction markets)"),
 ];
 
 /// Prices come from the shared pulse-pricing crate, which reads pricing.json

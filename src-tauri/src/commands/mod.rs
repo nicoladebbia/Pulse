@@ -13,4 +13,5 @@ pub mod trading;
 pub mod engagement;
 pub mod research;
 pub mod calendar;
+pub mod prediction_markets;
 pub mod risk;

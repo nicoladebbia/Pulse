@@ -38,6 +38,8 @@ libc = "0.2"
 quick-xml = "0.37"
 regex = "1"
 base64 = "0.22"
+# prediction markets: the market list is only practical packed (gzip). Already in the lockfile transitively.
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

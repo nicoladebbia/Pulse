@@ -5,14 +5,18 @@
 	import FeaturedCard from '$lib/components/stories/FeaturedCard.svelte';
 	import CompactStoryRow from '$lib/components/stories/CompactStoryRow.svelte';
 	import ConnectionInsight from '$lib/components/stories/ConnectionInsight.svelte';
+	import PredictionMarketsPanel from '$lib/components/stories/PredictionMarketsPanel.svelte';
 	import StoryExpanded from '$lib/components/stories/StoryExpanded.svelte';
-	import type { Story, StoryDetail, BriefingWithStories, StoryTrendBadge } from '$lib/tauri/types';
-	import { isTauri, mockBriefingData } from '$lib/tauri/mock';
+	import type { Story, StoryDetail, BriefingWithStories, StoryTrendBadge, PredictionMarkets } from '$lib/tauri/types';
+	import { isTauri, mockBriefingData, buildMockPredictionMarkets } from '$lib/tauri/mock';
 	import { getStoryTrendBadges, getTodayBriefing, safeInvoke } from '$lib/tauri/commands';
 	import { isFetching, fetchDone } from '$lib/stores/fetch';
 	import FetchTaskList from '$lib/components/FetchTaskList.svelte';
 
 	let trendBadges = $state<Map<number, StoryTrendBadge>>(new Map());
+	// What prediction markets say, read by the fetcher. An extra: without a recent
+	// reading (or if the read fails) the panel is simply not there.
+	let predictionMarkets = $state<PredictionMarkets | null>(null);
 
 	// Filings are excluded from the front-page TIERS and count. Ranking already kept them
 	// out of the top 15 on 129 of 130 days (relevance beats their hardcoded importance 5),
@@ -95,8 +99,14 @@
 		try {
 			if (!isTauri()) {
 				currentBriefing.set(mockBriefingData);
+				predictionMarkets = buildMockPredictionMarkets();
 				return;
 			}
+
+			// Not awaited: the stories must not wait for it. safeInvoke never rejects.
+			safeInvoke<PredictionMarkets | null>('get_prediction_markets').then(markets => {
+				predictionMarkets = markets;
+			});
 
 			const briefing = await Promise.race([
 				// The throwing wrapper: a DB error must show the error + Retry, not "no briefing today"
@@ -234,6 +244,11 @@
 					<ConnectionInsight {connection} />
 				{/each}
 			</div>
+		{/if}
+
+		<!-- What prediction markets say -->
+		{#if predictionMarkets && predictionMarkets.markets.length > 0}
+			<PredictionMarketsPanel data={predictionMarkets} />
 		{/if}
 
 		<!-- TIER 3: Also Today -->
